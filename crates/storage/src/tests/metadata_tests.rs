@@ -2316,7 +2316,7 @@ fn mpu_delete_upload_cascades_parts() {
         })
         .unwrap();
 
-    // Delete upload — should cascade to parts
+    // Delete upload — should cascade to parts without recycling its generation.
     store
         .delete_multipart_upload(&multipart_upload_id("uid-3"))
         .unwrap();
@@ -2331,7 +2331,7 @@ fn mpu_delete_upload_cascades_parts() {
         store
             .next_generation_id(&bucket_name("bucket"), &object_key("k"))
             .unwrap(),
-        GenerationId::MIN
+        GenerationId::new(2).unwrap()
     );
 }
 
@@ -2796,7 +2796,11 @@ fn mpu_list_uploads_stale_marker_advances_across_cluster_epochs() {
         .unwrap();
     assert_eq!(response.uploads.len(), 1);
     assert_eq!(response.uploads[0].upload_id, new_upload_id);
-    assert_eq!(response.uploads[0].object_generation_id, GenerationId::MIN);
+    assert_eq!(
+        response.uploads[0].object_generation_id,
+        GenerationId::new(2).unwrap(),
+        "deleting the earlier upload must not recycle its generation"
+    );
 }
 
 #[test]

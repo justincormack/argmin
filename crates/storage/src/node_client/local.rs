@@ -5299,6 +5299,14 @@ impl LocalStorageNodeClient {
                 if expected_command
                     .is_some_and(|command| stream_upload_matches_command(&existing, command)) =>
             {
+                if matches!(create.target, StreamUploadTarget::UploadPart { .. }) {
+                    PgMetadataStore::get_object_generation_reservation(
+                        &*pg,
+                        &create.bucket,
+                        &create.key,
+                        &create.session_id,
+                    )?;
+                }
                 Ok(true)
             }
             Ok(_) => Err(MetadataError::InvariantViolation {
@@ -5374,6 +5382,12 @@ impl LocalStorageNodeClient {
                     }
                     .into());
                 }
+                PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &request.request.bucket,
+                    &request.request.key,
+                    &request.request.session_id,
+                )?;
             }
             _ => {
                 return Err(ObjectPgActionError::InvalidRequest {
@@ -5625,6 +5639,12 @@ impl LocalStorageNodeClient {
         )?;
         if &current != request.expected_snapshot {
             return Err(ObjectPgActionError::StaleStreamFinalizeSnapshot);
+        }
+        if request.part.part_vid != current.part_generation_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream UploadPart payload generation does not match the durable session reservation"
+                    .to_string(),
+            });
         }
         let staged_segments = &current.auth_snapshot.staging_segments;
         let segments_total: u64 = staged_segments.iter().map(|segment| segment.size).sum();

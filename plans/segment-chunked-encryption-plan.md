@@ -184,7 +184,7 @@ The write-path inventory is:
 | Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff before encrypting segment zero. The current segment AEAD still does not consume that identity. | Mint the opaque standard-object subject from the reservation handoff, then construct the subject-bound segment encoder. |
 | Promoted buffered and streamed `PutObject`/POST Object | Session creation durably reserves the eventual object generation under the session ID. Each append now reloads that exact reservation through a non-cloneable storage capability, binds it to the session encryption state plus segment geometry before encryption, and consumes the capability during append. | Replace the current whole-segment cipher call with the common subject-bound session encoder without changing identity allocation or duplicating the generation in `StreamUploadRecord`. |
 | `CopyObject` destination | Reads source chunks and feeds them through the same destination session subject and append capability as streamed PUT; the source encryption state cannot supply destination identity. | Replace the current whole-segment cipher call with the same destination session encoder as streamed PUT. |
-| `UploadPart` | The session target binds upload ID and part number, but no immutable generation for the new part is fixed before its first encrypted segment. | Allocate and persist the part payload generation at session creation and bind every segment to upload, part number, part generation, and segment index. |
+| `UploadPart` | Session creation now durably reserves an immutable part payload generation under the session ID before the first segment can be encrypted; finalization and recovery require that exact reservation. The current segment AEAD still does not consume that identity. | Mint the opaque multipart-part subject from the upload, part number, and session reservation, then bind every segment to that subject and segment index. |
 | `UploadPartCopy` destination | Uses the same multipart stream append path after reading source chunks. | Use exactly the same part-session subject and encoder as ordinary `UploadPart`. |
 | Full and ranged object/copy-source reads | Infer the representation from `ObjectEncryption`, read and verify a complete segment, decrypt one AEAD record, then slice. | Dispatch on an explicit durable profile and let its subject-bound reader define stored spans, authentication, release, finalization, and physical-health evidence. |
 
@@ -841,7 +841,7 @@ Implementation update (2026-10-21):
   generation with an independently supplied reservation ID or manually compensates for staging
   failure.
 - This completed the direct-PUT ordering and ownership prerequisite used by the object- and
-  segment-subject work recorded below. Multipart part identity work remains open.
+  segment-subject work recorded below.
 - The direct-PUT reservation is now also minted only from the exact bucket-write proof for the
   admitted bucket, key, epoch, and canonical direct-commit operation. Storage captures the proof's
   bucket-incarnation generation in the non-cloneable reservation and carries it through the opaque
@@ -901,6 +901,19 @@ Implementation update (2026-10-21):
   object-generation reservation rather than being duplicated in `StreamUploadRecord`. Current
   whole-segment ciphertext is intentionally unchanged until Phase 2 supplies the common
   subject-bound encoder.
+- UploadPart and UploadPartCopy stream-session creation now reserve an immutable payload
+  generation under the session ID before publishing the session or permitting segment staging.
+  Repeated creation and crash recovery reuse that exact reservation. The stream-finalization
+  snapshot carries the generation in storage-RPC v25, command construction requires the part
+  record to use it, and replica apply reloads the durable reservation before publishing the part.
+  A forged generation cannot advance generic recovery, while successful finalization and every
+  terminal session-removal path delete the session and reservation in one object-PG transaction.
+  Reservation apply also advances the durable generation high-water stored alongside the per-key
+  write-order counter, without consuming a write sequence. A released generation therefore cannot
+  be selected again after finalization, abort, recovery, or restart.
+  The reservation is deliberately not duplicated in `StreamUploadRecord`; the next slice must
+  consume it with upload ID, part number, bucket incarnation, and segment geometry to mint the
+  opaque multipart encryption subject before the first encryption call.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the
@@ -1107,6 +1120,11 @@ and copy paths.
 - Buffered/request-owned and durable-stream staging produce equivalent encrypted committed
   representations apart from intentional random values.
 - Multipart same-part replacement, completion, abort, and restart retain exact subject binding.
+- UploadPart payload generations consume the durable generation high-water stored alongside the
+  per-key write-order counter without changing visible write ordering;
+  finalization and abort release live reservations without ever making their encryption subjects
+  reusable, including after restart. Sharing the already replicated, digest-covered high-water
+  avoids a second allocator while preserving the opaque-ID rule that gaps are harmless.
 - Response loss, pending-command replay, partial replica apply, and recovery never re-encrypt with
   a different context or publish a crossed segment.
 - Cancellation and authority expiry clean unowned ciphertext without releasing another subject's

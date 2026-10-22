@@ -193,7 +193,7 @@ impl PgStore {
             "load object write counter",
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if let Some((next_write_sequence, max_committed_generation)) = stored {
+        if let Some((next_write_sequence, max_allocated_generation)) = stored {
             let next_write_sequence =
                 u64::try_from(next_write_sequence).map_err(|_| MetadataError::Db {
                     context: "negative object write counter in database",
@@ -205,19 +205,19 @@ impl PgStore {
                         )),
                     ),
                 })?;
-            let max_committed_generation = max_committed_generation
+            let max_allocated_generation = max_allocated_generation
                 .map(|value| {
                     u64::try_from(value).map_err(|_| MetadataError::Db {
                         context: "negative object write generation counter in database",
                         source: crate::error::DatabaseError::from_sql_conversion_failure(
                             1,
                             rusqlite::types::Type::Integer,
-                            Box::from(format!("negative max_committed_generation: {value}")),
+                            Box::from(format!("negative generation high-water: {value}")),
                         ),
                     })
                 })
                 .transpose()?;
-            return Ok((next_write_sequence, max_committed_generation));
+            return Ok((next_write_sequence, max_allocated_generation));
         }
 
         let max: Option<(Option<i64>, Option<i64>)> = self.query_row_cached_optional_metadata(
@@ -292,7 +292,7 @@ impl PgStore {
                         Box::from("object write counter overflow"),
                     ),
                 })?;
-        let max_committed_generation = match (max_generation_id, generation_id) {
+        let max_allocated_generation = match (max_generation_id, generation_id) {
             (Some(current), Some(generation_id)) => Some(current.max(generation_id.get())),
             (None, Some(generation_id)) => Some(generation_id.get()),
             (current, None) => current,
@@ -308,7 +308,7 @@ impl PgStore {
                 bucket,
                 key,
                 next_write_sequence as i64,
-                max_committed_generation.map(|value| value as i64),
+                max_allocated_generation.map(|value| value as i64),
             ],
             "advance object write counter",
         )?;
@@ -350,6 +350,37 @@ impl PgStore {
                  next_version_id = max(object_version_counters.next_version_id, excluded.next_version_id)",
             params![bucket, key, following],
             "advance object version counter",
+        )?;
+        Ok(())
+    }
+
+    fn advance_object_generation_high_water_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        let (next_write_sequence, current_high_water) =
+            self.current_object_write_counter_in_open_txn(bucket, key)?;
+        let allocated_generation = current_high_water
+            .map_or(generation_id.get(), |current| current.max(generation_id.get()));
+        let allocated_generation = i64::try_from(allocated_generation).map_err(|_| MetadataError::Db {
+            context: "advance object generation high-water",
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("generation_id exceeds SQLite integer range"),
+            ),
+        })?;
+        self.execute_cached_metadata(
+            "INSERT INTO object_write_counters \
+             (bucket, key, next_write_sequence, max_committed_generation) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(bucket, key) DO UPDATE SET \
+                 next_write_sequence = excluded.next_write_sequence, \
+                 max_committed_generation = excluded.max_committed_generation",
+            params![bucket, key, next_write_sequence as i64, allocated_generation],
+            "advance object generation high-water",
         )?;
         Ok(())
     }
@@ -520,12 +551,49 @@ impl PgStore {
         generation_id: GenerationId,
         created_at_millis: u64,
     ) -> Result<(), MetadataError> {
-        match self.conn.execute(
+        self.reserve_object_generation_explicit_for_id(
+            bucket,
+            key,
+            reservation_id.as_str(),
+            generation_id,
+            created_at_millis,
+        )
+    }
+
+    fn reserve_object_generation_explicit_for_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &str,
+        generation_id: GenerationId,
+        created_at_millis: u64,
+    ) -> Result<(), MetadataError> {
+        if matches!(
+            self.object_generation_reservation_by_raw_id(reservation_id)?,
+            Some(ref existing)
+                if existing.bucket == *bucket
+                    && existing.key == *key
+                    && existing.generation_id == generation_id
+        ) {
+            return self.advance_object_generation_high_water_in_open_txn(
+                bucket,
+                key,
+                generation_id,
+            );
+        }
+        let next_generation_id = self.next_generation_id(bucket, key)?;
+        if next_generation_id.get() > generation_id.get() {
+            return Err(MetadataError::ObjectGenerationReservationConflict {
+                reservation_id: reservation_id.to_owned(),
+                generation_id: generation_id.get(),
+            });
+        }
+        let reserved = match self.conn.execute(
             "INSERT INTO object_generation_reservations \
              (reservation_id, bucket, key, generation_id, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                reservation_id.as_str(),
+                reservation_id,
                 bucket,
                 key,
                 generation_id.get() as i64,
@@ -535,26 +603,23 @@ impl PgStore {
             Ok(_) => Ok(()),
             Err(source) => match Self::object_generation_reservation_constraint_kind(&source) {
                 Some(ObjectGenerationReservationConstraint::ReservationId) => {
-                    match self.get_object_generation_reservation_by_id(reservation_id) {
-                        Ok(existing)
+                    match self.object_generation_reservation_by_raw_id(reservation_id)? {
+                        Some(existing)
                             if existing.bucket == *bucket
                                 && existing.key == *key
                                 && existing.generation_id == generation_id =>
                         {
                             Ok(())
                         }
-                        Ok(_) | Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {
-                            Err(MetadataError::Db {
+                        Some(_) | None => Err(MetadataError::Db {
                                 context: "reserve object generation explicit",
                                 source: source.into(),
-                            })
-                        }
-                        Err(error) => Err(error),
+                            }),
                     }
                 }
                 Some(ObjectGenerationReservationConstraint::Generation) => {
                     Err(MetadataError::ObjectGenerationReservationConflict {
-                        reservation_id: reservation_id.as_str().to_string(),
+                        reservation_id: reservation_id.to_owned(),
                         generation_id: generation_id.get(),
                     })
                 }
@@ -563,18 +628,30 @@ impl PgStore {
                     source: source.into(),
                 }),
             },
-        }
+        };
+        reserved?;
+        self.advance_object_generation_high_water_in_open_txn(bucket, key, generation_id)
     }
 
     fn get_object_generation_reservation_by_id(
         &self,
         reservation_id: &SessionId,
     ) -> Result<ObjectGenerationReservationIdentity, MetadataError> {
+        self.object_generation_reservation_by_raw_id(reservation_id.as_str())?
+            .ok_or_else(|| MetadataError::ObjectGenerationReservationNotFound {
+                reservation_id: reservation_id.as_str().to_owned(),
+            })
+    }
+
+    fn object_generation_reservation_by_raw_id(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<ObjectGenerationReservationIdentity>, MetadataError> {
         let raw = self
             .query_row_cached_optional_metadata(
                 "SELECT bucket, key, generation_id FROM object_generation_reservations \
                  WHERE reservation_id = ?1",
-                params![reservation_id.as_str()],
+                params![reservation_id],
                 "get object generation reservation by id",
                 |row| {
                     Ok((
@@ -583,10 +660,10 @@ impl PgStore {
                         row.get::<_, i64>(2)?,
                     ))
                 },
-            )?
-            .ok_or_else(|| MetadataError::ObjectGenerationReservationNotFound {
-                reservation_id: reservation_id.as_str().to_owned(),
-            })?;
+            )?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
         let generation_id =
             Self::parse_generation_id(raw.2, 2, "generation_id").map_err(|source| {
                 MetadataError::Db {
@@ -594,11 +671,11 @@ impl PgStore {
                     source: source.into(),
                 }
             })?;
-        Ok(ObjectGenerationReservationIdentity {
+        Ok(Some(ObjectGenerationReservationIdentity {
             bucket: raw.0,
             key: raw.1,
             generation_id,
-        })
+        }))
     }
 
     fn object_generation_reservation_constraint_kind(

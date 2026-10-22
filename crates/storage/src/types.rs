@@ -7185,6 +7185,9 @@ pub(crate) struct StreamUploadPartSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StreamUploadPartStorageSnapshot {
     pub(crate) auth_snapshot: StreamUploadPartSnapshot,
+    /// Immutable payload generation reserved under the stream session ID
+    /// before the first UploadPart segment can be written.
+    pub(crate) part_generation_id: GenerationId,
     pub(crate) existing_part: Option<MultipartPartRecord>,
     pub(crate) displaced_segments: Vec<MultipartPartSegmentRecord>,
 }

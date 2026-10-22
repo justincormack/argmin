@@ -754,6 +754,24 @@ impl StorageCluster {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_object_generation_reservation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        self.object_generation_metadata_primary_client(bucket, key)?
+            .open_object_generation_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?
+            .object_generation_reservation(reservation_id)
+    }
+
     fn reserve_put_object_generation_with_route_validation(
         &self,
         route: PutObjectMutationEffectRoute<'_>,

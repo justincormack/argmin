@@ -2136,9 +2136,9 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, MetadataError> {
-        let max: Option<i64> = self
-            .query_row_cached_optional_metadata(
-                "SELECT MAX(generation_id) FROM (
+        let (max, stored_next): (Option<i64>, Option<i64>) = self
+            .query_row_cached_metadata(
+                "SELECT (SELECT MAX(generation_id) FROM (
                      SELECT generation_id FROM objects WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM object_segments_reclaims WHERE bucket = ?1 AND key = ?2
@@ -2148,14 +2148,15 @@ impl PgMetadataStore for PgStore {
                      SELECT object_generation_id FROM multipart_uploads WHERE bucket = ?1 AND key = ?2
                      UNION ALL
                      SELECT generation_id FROM object_generation_reservations WHERE bucket = ?1 AND key = ?2
-                 )",
+                 )),
+                 (SELECT max_committed_generation FROM object_write_counters
+                      WHERE bucket = ?1 AND key = ?2)",
                 params![bucket, key],
                 "next generation id",
-                |row| row.get(0),
-            )?
-            .flatten();
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
 
-        let next = match max {
+        let next_from_rows = match max {
             None => 1u64,
             Some(v) => {
                 let current = u64::try_from(v).map_err(|_| MetadataError::Db {
@@ -2176,6 +2177,28 @@ impl PgMetadataStore for PgStore {
                 })?
             }
         };
+        let next_from_counter = match stored_next {
+            None => 1,
+            Some(value) => {
+                let current = u64::try_from(value).map_err(|_| MetadataError::Db {
+                    context: "negative generation high-water in database",
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative generation high-water: {value}")),
+                    ),
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "generation high-water overflow",
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("generation high-water overflow"),
+                    ),
+                })?
+            }
+        };
+        let next = next_from_rows.max(next_from_counter);
         GenerationId::new(next).ok_or_else(|| MetadataError::Db {
             context: "invalid next generation id",
             source: crate::error::DatabaseError::from_sql_conversion_failure(
@@ -2215,6 +2238,7 @@ impl PgMetadataStore for PgStore {
                 ],
                 "reserve object generation (insert reservation)",
             )?;
+            self.advance_object_generation_high_water_in_open_txn(bucket, key, generation_id)?;
             Ok(generation_id)
         })();
 

@@ -700,6 +700,244 @@ fn multipart_state_observation_rejects_crossed_same_pg_key() {
 }
 
 #[test]
+fn upload_part_stream_sessions_reserve_distinct_payload_generations_and_abort_releases_them() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("partgenerations");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::tests::metadata_only_test_encryption(),
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing| {
+                assert!(existing.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let upload = crate::AuthorizedMultipartUploadRecord::assume_authorized(upload);
+    let first_session = crate::tests::stream_session_id("part-gen-1");
+    let second_session = crate::tests::stream_session_id("part-gen-2");
+    cluster
+        .create_upload_part_stream_session(&upload, 1, &first_session)
+        .unwrap();
+    cluster
+        .create_upload_part_stream_session(&upload, 1, &second_session)
+        .unwrap();
+
+    let first_generation = cluster
+        .test_object_generation_reservation(&bucket, &key, &first_session)
+        .unwrap();
+    let second_generation = cluster
+        .test_object_generation_reservation(&bucket, &key, &second_session)
+        .unwrap();
+    assert_ne!(
+        first_generation, second_generation,
+        "independent staging attempts for one part require distinct payload identities"
+    );
+
+    assert!(cluster
+        .abort_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        for session_id in [&first_session, &second_session] {
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg, &bucket, &key, session_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn upload_part_payload_generations_do_not_recycle_after_finalize_or_abort_and_restart() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let (bucket, key, _, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("partgenrestart");
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(
+        b"durably unique part payload generation",
+        1,
+        0,
+    );
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: encrypted.encryption.clone(),
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing| {
+                assert!(existing.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let first_session = crate::tests::stream_session_id("gen-final");
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &first_session,
+        )
+        .unwrap();
+    let first_generation = cluster
+        .test_object_generation_reservation(&bucket, &key, &first_session)
+        .unwrap();
+    let segment = append_encrypted_test_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &first_session,
+        0,
+        &encrypted,
+    );
+    let first_part = crate::MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        generation: 0,
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
+        etag_kind: crate::EtagKind::Crc64,
+        part_vid: first_generation,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
+        ec_k: segment.ec_k,
+        ec_m: segment.ec_m,
+        last_modified: 123_456,
+        checksum: None,
+    };
+    cluster
+        .finalize_upload_part_stream(
+            &bucket,
+            &key,
+            stream_part_finalize_input(
+                &upload_id,
+                &first_session,
+                1,
+                first_part.size,
+                first_part.payload_crc64,
+            ),
+            |_| Ok::<_, ()>(prepared_stream_part((), &first_part)),
+        )
+        .unwrap()
+        .unwrap();
+
+    drop(cluster);
+    drop(map);
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let second_session = crate::tests::stream_session_id("gen-abort");
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &second_session,
+        )
+        .unwrap();
+    let second_generation = cluster
+        .test_object_generation_reservation(&bucket, &key, &second_session)
+        .unwrap();
+    assert!(second_generation.get() > first_generation.get());
+    cluster
+        .abort_stream_upload_session(&bucket, &key, &second_session)
+        .unwrap();
+
+    drop(cluster);
+    drop(map);
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let third_session = crate::tests::stream_session_id("gen-after");
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &third_session,
+        )
+        .unwrap();
+    let third_generation = cluster
+        .test_object_generation_reservation(&bucket, &key, &third_session)
+        .unwrap();
+    assert!(third_generation.get() > second_generation.get());
+}
+
+#[test]
 fn multipart_abort_fanout_rejects_live_crossed_reservation_subjects() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3489,6 +3727,9 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
     assert_encrypted_test_stream_segment_stored(&cluster, &second_segment, &second_encrypted);
 
     let raced_session_id = crate::SessionId::try_from("3a".repeat(16)).unwrap();
+    cluster
+        .reserve_put_object_generation(&bucket, &key, &raced_session_id)
+        .unwrap();
     let injected = Arc::new(AtomicBool::new(false));
     let injected_for_hook = Arc::clone(&injected);
     let map_for_hook = Arc::clone(&map);
@@ -3692,6 +3933,13 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_for_hook).unwrap();
             let staging_segments =
                 crate::PgMetadataStore::list_stream_segments(&*pg, &session_for_hook).unwrap();
+            let part_generation = crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket_for_hook,
+                &key_for_hook,
+                &session_for_hook,
+            )
+            .unwrap();
             let payload_crc64 =
                 staging_segments
                     .iter()
@@ -3706,7 +3954,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 payload_crc64,
                 etag: vec![0x3b; 8],
                 etag_kind: crate::EtagKind::Crc64,
-                part_vid: crate::GenerationId::MIN,
+                part_vid: part_generation,
                 placement_cluster_epoch: staging_segments[0].placement_cluster_epoch,
                 ec_k: staging_segments[0].ec_k,
                 ec_m: staging_segments[0].ec_m,
@@ -4117,6 +4365,9 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let pg_id = PgId::new(2);
     let requested_session_id = crate::SessionId::try_from("54".repeat(16)).unwrap();
     let winner_session_id = crate::SessionId::try_from("55".repeat(16)).unwrap();
+    cluster
+        .reserve_put_object_generation(&bucket, &key, &requested_session_id)
+        .unwrap();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let action_calls = Arc::new(AtomicUsize::new(0));
     let hook_ran_for_closure = Arc::clone(&hook_ran);
@@ -4125,6 +4376,9 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let hook_key = key.clone();
     let hook_upload_id = upload_id.clone();
     let hook_winner_session_id = winner_session_id.clone();
+    cluster
+        .reserve_put_object_generation(&bucket, &key, &winner_session_id)
+        .unwrap();
     let hook_proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
@@ -4622,6 +4876,9 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
         },
         encryption: upload.encryption.clone(),
     };
+    let part_generation = cluster
+        .reserve_put_object_generation(&bucket, &key, &session_id)
+        .unwrap();
     let pending_command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -4691,6 +4948,17 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
         assert_eq!(session.bucket, bucket);
         assert_eq!(session.key, key);
         assert_eq!(session.created_at, expected_created_at);
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            part_generation,
+            "recovery must preserve the immutable UploadPart payload generation"
+        );
         assert_eq!(
             session.target,
             crate::StreamUploadTarget::UploadPart {

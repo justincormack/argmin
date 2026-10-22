@@ -16,6 +16,39 @@ fn inconclusive_multipart_apply_failure_requires_uncertainty(
 }
 
 impl super::StorageCluster {
+    fn release_upload_part_stream_create_resources(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        let generation_result =
+            self.release_object_generation_reservation(bucket, key, session_id);
+        let proof_result = self
+            .release_bucket_write_reservation_proof(proof)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error);
+        generation_result.and(proof_result)
+    }
+
+    fn release_upload_part_stream_create_resources_unless_pending_owner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.pending_metadata_command_uses_bucket_write_reservation(pg_id, bucket, proof) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.release_upload_part_stream_create_resources(bucket, key, session_id, proof)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
     fn release_upload_part_stream_create_proof_unless_pending_owner(
         &self,
         pg_id: PgId,
@@ -1519,6 +1552,22 @@ impl super::StorageCluster {
                     error,
                 ));
             }
+            if let Err(error) = self.reserve_put_object_generation_with_route_validation(
+                super::PutObjectMutationEffectRoute {
+                    bucket_pg_id: self.bucket_metadata_pg(&bucket),
+                    object_pg_id,
+                    bucket: &bucket,
+                    key: &key,
+                    effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+                },
+                &session_id,
+                || Ok(()),
+            ) {
+                release_caller_bucket_write_proof!()?;
+                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                    error,
+                ));
+            }
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
@@ -1545,7 +1594,13 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    release_caller_bucket_write_proof!()?;
+                    self.release_upload_part_stream_create_resources(
+                        &bucket,
+                        &key,
+                        &session_id,
+                        &bucket_write_reservation,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
                     ));
@@ -1566,7 +1621,14 @@ impl super::StorageCluster {
                     | super::SnapshotSensitiveInstallOutcome::ContenderDrained,
                 ) => continue,
                 Err(error) => {
-                    release_caller_bucket_write_proof!()?;
+                    self.release_upload_part_stream_create_resources_unless_pending_owner(
+                        pg_id,
+                        &bucket,
+                        &key,
+                        &session_id,
+                        &bucket_write_reservation,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                         error,
                     ));
@@ -1770,9 +1832,33 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(error);
             }
+            if let Err(error) = self.reserve_put_object_generation_with_route_validation(
+                super::PutObjectMutationEffectRoute {
+                    bucket_pg_id: self.bucket_metadata_pg(bucket),
+                    object_pg_id,
+                    bucket,
+                    key,
+                    effect_fence,
+                },
+                session_id,
+                &mut require_valid_route,
+            ) {
+                release_caller_bucket_write_proof!()?;
+                return Err(error);
+            }
+            macro_rules! release_caller_resources {
+                () => {{
+                    self.release_upload_part_stream_create_resources(
+                        bucket,
+                        key,
+                        session_id,
+                        &bucket_write_reservation,
+                    )
+                }};
+            }
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             if let Err(error) = require_valid_route() {
-                release_caller_bucket_write_proof!()?;
+                release_caller_resources!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
             let command = match stream_creation_route.build_create_stream_upload_command(
@@ -1795,12 +1881,12 @@ impl super::StorageCluster {
                             pg_id,
                             bucket,
                             &mut work_budget,
-                        )
+                    )
                     {
-                        release_caller_bucket_write_proof!()?;
+                        release_caller_resources!()?;
                         return Err(error);
                     }
-                    release_caller_bucket_write_proof!()?;
+                    release_caller_resources!()?;
                     work_budget
                         .sleep_after_contention(
                             "UploadPart stream create log conflict retry budget exhausted",
@@ -1809,12 +1895,17 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    release_caller_bucket_write_proof!()?;
+                    release_caller_resources!()?;
                     return Err(error);
                 }
             };
+            let MetadataCommandPayload::CreateStreamUpload(expected_create_command) =
+                command.payload()
+            else {
+                unreachable!("UploadPart stream-create builder changed command kind");
+            };
             if let Err(error) = require_valid_route() {
-                release_caller_bucket_write_proof!()?;
+                release_caller_resources!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
             match self
@@ -1829,11 +1920,24 @@ impl super::StorageCluster {
                 )
             {
                 Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
-                Ok(
-                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
-                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained,
-                ) => {
-                    release_caller_bucket_write_proof!()?;
+                Ok(super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot) => {
+                    if stream_creation_route.matching_stream_upload_exists(
+                        &create,
+                        Some(expected_create_command),
+                    )? {
+                        release_caller_bucket_write_proof!()?;
+                        return Ok(session_id.clone());
+                    }
+                    release_caller_resources!()?;
+                    work_budget
+                        .sleep_after_contention(
+                            "UploadPart stream create pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained) => {
+                    release_caller_resources!()?;
                     work_budget
                         .sleep_after_contention(
                             "UploadPart stream create pending install retry budget exhausted",
@@ -1842,25 +1946,70 @@ impl super::StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    self.release_upload_part_stream_create_proof_unless_pending_owner(
+                    if stream_creation_route.matching_stream_upload_exists(
+                        &create,
+                        Some(expected_create_command),
+                    )? {
+                        release_caller_bucket_write_proof!()?;
+                        return Ok(session_id.clone());
+                    }
+                    self.release_upload_part_stream_create_resources_unless_pending_owner(
                         pg_id,
                         bucket,
+                        key,
+                        session_id,
                         &bucket_write_reservation,
                     )?;
                     return Err(error);
                 }
             }
-            match self.apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
+            let apply_outcome = match self
+                .apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                 pg_id,
                 bucket,
                 &command,
                 &mut work_budget,
-            )? {
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    match stream_creation_route.matching_stream_upload_exists(
+                        &create,
+                        Some(expected_create_command),
+                    ) {
+                        Ok(true) => {
+                            release_caller_bucket_write_proof!()?;
+                            return Ok(session_id.clone());
+                        }
+                        Ok(false) => {
+                            self.release_upload_part_stream_create_resources_unless_pending_owner(
+                                pg_id,
+                                bucket,
+                                key,
+                                session_id,
+                                &bucket_write_reservation,
+                            )?;
+                        }
+                        Err(_) => {
+                            // Ownership is ambiguous. Preserve both durable resources for exact
+                            // command recovery rather than risk releasing live command authority.
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            match apply_outcome {
                 super::ExactPendingObjectMetadataCommandOutcome::Applied => {
                     return Ok(session_id.clone());
                 }
                 super::ExactPendingObjectMetadataCommandOutcome::Reinspect => {
-                    release_caller_bucket_write_proof!()?;
+                    if stream_creation_route.matching_stream_upload_exists(
+                        &create,
+                        Some(expected_create_command),
+                    )? {
+                        release_caller_bucket_write_proof!()?;
+                        return Ok(session_id.clone());
+                    }
+                    release_caller_resources!()?;
                     work_budget
                         .sleep_after_contention(
                             "UploadPart stream create recovery retry budget exhausted",
@@ -3968,8 +4117,7 @@ impl super::StorageCluster {
                 payload_crc64,
                 etag: payload_crc64.to_be_bytes().to_vec(),
                 etag_kind: EtagKind::Crc64,
-                part_vid: GenerationId::new(u64::from(generation) + 1)
-                    .expect("multipart part generation must be nonzero"),
+                part_vid: storage_snapshot.part_generation_id,
                 placement_cluster_epoch,
                 ec_k: ec.k,
                 ec_m: ec.m,

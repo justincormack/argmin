@@ -9533,12 +9533,13 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
     assert!(
-        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 2),
-        "UploadPartCopy should have created a destination stream and appended copied data before the part commit gate"
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 3),
+        "UploadPartCopy should have reserved its part generation, created a destination stream, and appended copied data before the part commit gate"
     );
     assert_eq!(
         pre_commit_kinds.lock().unwrap().as_slice(),
         &[
+            MetadataCommandApplyTestKind::ReserveObjectGeneration,
             MetadataCommandApplyTestKind::CreateStreamUpload,
             MetadataCommandApplyTestKind::AppendStreamSegment,
         ],

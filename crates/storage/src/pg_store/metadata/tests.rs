@@ -9349,6 +9349,37 @@ fn reserve_object_generation_explicit_primary_key_conflict_must_match_identity()
     ));
 }
 
+#[test]
+fn object_generation_allocator_does_not_recycle_released_generation_after_reopen() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("generation-counter-bucket");
+    let key = trusted_object_key("generation-counter-key");
+    let first_reservation = SessionId::try_from("86".repeat(16)).unwrap();
+    let second_reservation = SessionId::try_from("87".repeat(16)).unwrap();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = store
+        .reserve_object_generation(&bucket, &key, &first_reservation)
+        .unwrap();
+    store
+        .delete_object_generation_reservation_direct(&bucket, &key, &first_reservation)
+        .unwrap();
+    drop(store);
+
+    let reopened = PgStore::open(tmp.path(), 1).unwrap();
+    let stale_reservation = SessionId::try_from("88".repeat(16)).unwrap();
+    assert!(matches!(
+        reopened.reserve_object_generation_explicit(&bucket, &key, &stale_reservation, first, 2,),
+        Err(MetadataError::ObjectGenerationReservationConflict { .. })
+    ));
+    let second = reopened
+        .reserve_object_generation(&bucket, &key, &second_reservation)
+        .unwrap();
+    assert!(
+        second.get() > first.get(),
+        "released payload generations must remain consumed across restart"
+    );
+}
+
 fn direct_put_terminal_cleanup_command(
     bucket: &BucketName,
     key: &ObjectKey,

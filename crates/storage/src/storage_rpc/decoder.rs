@@ -2002,6 +2002,7 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<StreamUploadPartStorageSnapshot, StorageRpcPayloadError> {
         let auth_snapshot = self.read_stream_upload_part_snapshot()?;
+        let part_generation_id = self.read_generation_id()?;
         let existing_part = self.read_optional_multipart_part_record()?;
         let segment_count = self.read_bounded_remaining_count(
             STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN,
@@ -2013,6 +2014,7 @@ impl<'a> StorageRpcDecoder<'a> {
         }
         Ok(StreamUploadPartStorageSnapshot {
             auth_snapshot,
+            part_generation_id,
             existing_part,
             displaced_segments,
         })

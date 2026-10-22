@@ -4308,7 +4308,10 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
     let final_generation = cluster
         .test_object_generation_reservation_for(&bucket, &key, &session_id)
         .unwrap();
-    assert_eq!(final_generation.get(), first_generation);
+    assert!(
+        final_generation.get() > first_generation,
+        "a released failed-attempt generation must remain consumed before retry"
+    );
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
@@ -6233,7 +6236,9 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
         payload_crc64: encrypted.payload_crc64 ^ 1,
         etag: vec![0x92; 8],
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -6312,7 +6317,9 @@ fn stream_part_finalize_abandons_expired_install_then_retries_transported_conten
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -6477,7 +6484,9 @@ fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent(
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -7041,7 +7050,9 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -7170,7 +7181,9 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -7331,7 +7344,9 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -7853,7 +7868,9 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
@@ -8017,6 +8034,83 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
             "crossed stream-part recovery must not release the unrelated reservation on node {node_id:?}"
         );
     }
+    let generation_mismatch_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let mut generation_mismatch_payload =
+        command(generation_mismatch_proof.clone()).payload().clone();
+    let MetadataCommandPayload::CommitStreamPart(generation_mismatch) =
+        &mut generation_mismatch_payload
+    else {
+        panic!("expected stream-part commit command");
+    };
+    generation_mismatch.part.part_vid = crate::GenerationId::new(
+        generation_mismatch
+            .part
+            .part_vid
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let generation_mismatch = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        generation_mismatch_payload,
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &generation_mismatch);
+    let generation_mismatch_error = cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            generation_mismatch_error,
+            crate::ObjectPgActionError::Metadata(
+                crate::MetadataError::InvariantViolation { context, .. }
+            ) if context == "commit stream part command payload generation mismatch"
+        ),
+        "unexpected crossed payload-generation failure: {generation_mismatch_error:?}"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(generation_mismatch.clone()),
+        "generic recovery must not advance a command with forged payload generation"
+    );
+    for (node_id, expected_session) in node_ids.into_iter().zip(&sessions_before) {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap(),
+            *expected_session,
+            "crossed payload generation must preserve the session on node {node_id:?}"
+        );
+        assert!(matches!(
+            crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1),
+            Err(crate::MetadataError::PartNotFound { .. })
+        ));
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            part.part_vid,
+            "crossed payload generation must preserve the durable session reservation"
+        );
+    }
+    clear_pending_metadata_command_for_node_for_test(&map, NodeId::new(1), pg_id);
     cluster
         .release_bucket_write_reservation_proof(&crossed_proof)
         .unwrap();
@@ -8025,6 +8119,9 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         .unwrap();
     cluster
         .release_bucket_write_reservation_proof(&crossed_bucket_proof)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&generation_mismatch_proof)
         .unwrap();
 
     let command = command(correct_proof);
@@ -8070,6 +8167,15 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         assert!(matches!(
             crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
             Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
         assert_eq!(
             crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1).unwrap(),
@@ -8169,7 +8275,9 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
         payload_crc64: encrypted.payload_crc64,
         etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: segment.placement_cluster_epoch,
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,

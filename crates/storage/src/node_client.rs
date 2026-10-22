@@ -747,6 +747,8 @@ fn load_stream_part_finalize_snapshot_from_pg(
     };
     validate_stream_part_finalize_session(&session, bucket, key, upload_id, part_number)?;
     let upload = load_in_progress_multipart_upload_from_pg(pg, bucket, key, upload_id)?;
+    let part_generation_id =
+        PgMetadataStore::get_object_generation_reservation(pg, bucket, key, session_id)?;
     let existing_part = match PgMetadataStore::get_multipart_part(pg, upload_id, part_number) {
         Ok(existing) => Some(existing),
         Err(MetadataError::PartNotFound { .. }) => None,
@@ -766,6 +768,7 @@ fn load_stream_part_finalize_snapshot_from_pg(
             existing_part_generation,
             staging_segments,
         },
+        part_generation_id,
         existing_part,
         displaced_segments,
     })

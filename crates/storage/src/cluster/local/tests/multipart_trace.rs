@@ -441,7 +441,9 @@ fn upload_multipart_trace_part(
         payload_crc64,
         etag: payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
-        part_vid: crate::GenerationId::MIN,
+        part_vid: cluster
+            .test_object_generation_reservation(bucket, key, &session_id)
+            .unwrap(),
         placement_cluster_epoch: first_segment.placement_cluster_epoch,
         ec_k: first_segment.ec_k,
         ec_m: first_segment.ec_m,

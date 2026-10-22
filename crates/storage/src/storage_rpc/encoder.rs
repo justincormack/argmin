@@ -1002,6 +1002,7 @@ fn put_stream_part_finalize_storage_snapshot(
     snapshot: &StreamUploadPartStorageSnapshot,
 ) {
     put_stream_upload_part_snapshot(out, &snapshot.auth_snapshot);
+    put_u64(out, snapshot.part_generation_id.get());
     put_optional_multipart_part_record(out, snapshot.existing_part.as_ref());
     put_u32(
         out,

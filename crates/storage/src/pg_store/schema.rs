@@ -186,7 +186,11 @@ CREATE TABLE object_version_counters (
     PRIMARY KEY (bucket, key)
 ) STRICT";
 
-/// Per-object-key durable write-order fence.
+/// Per-object-key durable write-order and payload-generation high-water fence.
+///
+/// The physical `max_committed_generation` name is retained as frozen schema
+/// evidence. It is the high-water mark for every allocated generation, including
+/// reservations that do not eventually commit.
 const CREATE_OBJECT_WRITE_COUNTERS_TABLE: &str = "\
 CREATE TABLE object_write_counters (
     bucket                    TEXT NOT NULL,

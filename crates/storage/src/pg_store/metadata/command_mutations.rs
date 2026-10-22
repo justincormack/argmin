@@ -252,6 +252,11 @@ impl PgStore {
                         reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
+                self.get_object_generation_reservation(
+                    &command.session.bucket,
+                    &command.session.key,
+                    &command.session.session_id,
+                )?;
                 if command.session.state == StreamUploadState::InProgress {
                     Ok(())
                 } else {
@@ -476,6 +481,18 @@ impl PgStore {
         if command.part.generation != expected_generation {
             return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command generation mismatch",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
+
+        let reserved_part_generation = self.get_object_generation_reservation(
+            &command.bucket,
+            &command.key,
+            &command.session_id,
+        )?;
+        if command.part.part_vid != reserved_part_generation {
+            return Err(MetadataError::InvariantViolation {
+                context: "commit stream part command payload generation mismatch",
                 reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
@@ -831,48 +848,13 @@ impl PgStore {
             "create multipart upload (begin txn)",
             "create multipart upload (commit txn)",
             |store| {
-                match store.conn.execute(
-                    "INSERT INTO object_generation_reservations \
-                     (reservation_id, bucket, key, generation_id, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        upload.upload_id.as_str(),
-                        upload.bucket,
-                        upload.key,
-                        upload.object_generation_id.get() as i64,
-                        upload.initiated_at as i64,
-                    ],
-                ) {
-                    Ok(_) => {}
-                    Err(rusqlite::Error::SqliteFailure(_, _)) => {
-                        let existing_generation = store
-                            .conn
-                            .query_row(
-                                "SELECT generation_id FROM object_generation_reservations \
-                                 WHERE reservation_id = ?1 AND bucket = ?2 AND key = ?3",
-                                params![upload.upload_id.as_str(), upload.bucket, upload.key],
-                                |row| {
-                                    let raw: i64 = row.get(0)?;
-                                    Self::parse_generation_id(raw, 0, "generation_id")
-                                },
-                            )
-                            .optional()
-                            .map_err(|e| MetadataError::Db {
-                                context: "create multipart upload explicit reservation lookup",
-                                source: e.into(),
-                            })?;
-                        if !matches!(existing_generation, Some(existing) if existing == upload.object_generation_id)
-                        {
-                            return Err(MetadataError::InvariantViolation {
-                                context: "create multipart upload explicit reservation mismatch", reason: "metadata state does not satisfy the operation invariant".into() });
-                        }
-                    }
-                    Err(e) => {
-                        return Err(MetadataError::Db { context: "create multipart upload (reserve generation)",
-                            source: e.into(),
-                        });
-                    }
-                }
+                store.reserve_object_generation_explicit_for_id(
+                    &upload.bucket,
+                    &upload.key,
+                    upload.upload_id.as_str(),
+                    upload.object_generation_id,
+                    upload.initiated_at,
+                )?;
                 match store.conn.execute(
                     "INSERT INTO multipart_uploads \
                      (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \

@@ -195,6 +195,20 @@
             .unwrap();
             PgMetadataStore::create_multipart_upload(&*pg, &existing_multipart_request).unwrap();
             PgMetadataStore::upsert_multipart_part(&*pg, &terminal_multipart_part).unwrap();
+            PgMetadataStore::reserve_object_generation(
+                &*pg,
+                &bucket,
+                &key,
+                &upload_part_stream_session_id,
+            )
+            .unwrap();
+            PgMetadataStore::reserve_object_generation(
+                &*pg,
+                &bucket,
+                &key,
+                &new_upload_part_stream_create_request.session_id,
+            )
+            .unwrap();
             pg.apply_metadata_command(&MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
                     config.cluster_epoch,
@@ -265,7 +279,7 @@
             );
             assert_eq!(
                 primary_route.next_generation_id().unwrap(),
-                GenerationId::new(11).unwrap()
+                GenerationId::new(13).unwrap()
             );
             assert_eq!(
                 acting_set_route.next_version_id().unwrap(),
@@ -659,7 +673,7 @@
             payload_crc64: 0,
             etag: Vec::new(),
             etag_kind: crate::EtagKind::Crc64,
-            part_vid: GenerationId::MIN,
+            part_vid: part_finalize_snapshot.part_generation_id,
             placement_cluster_epoch: config.cluster_epoch,
             ec_k: 4,
             ec_m: 2,

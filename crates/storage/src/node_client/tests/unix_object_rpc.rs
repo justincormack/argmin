@@ -2223,6 +2223,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             .to_string();
     let upload_id = crate::tests::multipart_upload_id("wrong-pg-stream-part-upload");
     let part_session_id = crate::tests::stream_session_id("wrong-pg-part");
+    let new_part_session_id = crate::tests::stream_session_id("new-part");
     let multipart_create = CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
@@ -2271,7 +2272,10 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         );
         pg.apply_metadata_command(&stream_create_command).unwrap();
         PgMetadataStore::create_multipart_upload(&*pg, &multipart_create).unwrap();
+        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &part_session_id).unwrap();
         PgMetadataStore::create_stream_upload(&*pg, &part_create).unwrap();
+        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &new_part_session_id)
+            .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
         if let Some(expected) = reserved_generation {
             assert_eq!(
@@ -2299,7 +2303,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
     let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
     let new_part_create = CreateStreamUploadReq {
-        session_id: crate::tests::stream_session_id("new-part"),
+        session_id: new_part_session_id,
         bucket: bucket.clone(),
         key: key.clone(),
         target: StreamUploadTarget::UploadPart {
@@ -2705,7 +2709,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         payload_crc64: 0,
         etag: Vec::new(),
         etag_kind: EtagKind::Crc64,
-        part_vid: GenerationId::MIN,
+        part_vid: part_snapshot.part_generation_id,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
         ec_m: 2,
@@ -6012,6 +6016,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
                 ec_m: 2,
             }],
         },
+        part_generation_id: GenerationId::new(40).unwrap(),
         existing_part: None,
         displaced_segments: Vec::new(),
     };
@@ -6162,6 +6167,7 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
             existing_part_generation: None,
             staging_segments: Vec::new(),
         },
+        part_generation_id: GenerationId::new(40).unwrap(),
         existing_part: None,
         displaced_segments: Vec::new(),
     };
