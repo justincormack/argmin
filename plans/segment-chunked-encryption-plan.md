@@ -1028,6 +1028,30 @@ Implementation update (2026-10-22, durable profile identity):
   payload remains a rejection specimen beside the current v2 version-vector fixture. No predecessor
   encryption-state reader was added.
 
+Implementation update (2026-10-22, integrity-witness construction boundary):
+
+- Storage now mints an opaque `SegmentShardIntegrityWitness` from the exact ordered `k+m` shard
+  acknowledgements. Minting rejects zero-data-shard and out-of-range EC shapes, missing, duplicate,
+  reordered, or crossed shard identities, and any acknowledgement whose stored size differs from
+  `ceil(stored_segment_size / k)`.
+- The witness owns the exact ordered `(ShardKey, WriteAck)` batch and its data-PG identity rather
+  than retaining a checksum-only projection. Its constructor composes the first `k` systematic
+  CRCs, including the canonical trailing EC zero padding, and requires that result to equal the
+  stored-segment CRC. Normal publication acknowledgement registration accepts only this witness
+  and obtains the registration batch from it; the raw partial-batch operation is separately named
+  and restricted to repair/backfill maintenance (plus test-only setup). This makes
+  validation-before-registration the typed API boundary rather than a caller ordering convention.
+- Direct PutObject and streamed segment append construct the witness before registering durable
+  shard acknowledgements or installing a terminal command. Crossed segment checksums and malformed
+  geometry therefore fail without publishing object metadata or a pending command. Exact durable
+  acknowledgement-row and shard-byte validation still follows witness construction. The Direct
+  PUT regression also installs a registration-boundary sentinel and proves invalid evidence never
+  reaches the first durable acknowledgement write; post-cleanup row absence is not its only proof.
+- This is deliberately the construction/pre-publication slice of the still-open witness item.
+  Persisting the witness in segment records and terminal commands, validating it during replica
+  apply/recovery, exposing it through snapshots/RPC/retained reads, and using it for repair and
+  route-history retention remain the next format-versioned slice.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

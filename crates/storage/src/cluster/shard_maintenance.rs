@@ -1,49 +1,6 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-fn systematic_data_shard_acks_match_segment(
-    shard_acks: &[WriteAck],
-    stored_size: usize,
-    segment_crc64: u64,
-) -> bool {
-    let Some((first, remaining)) = shard_acks.split_first() else {
-        return false;
-    };
-    let mut combined_crc64 = first.crc64;
-    let mut padded_size = first.stored_size;
-    for ack in remaining {
-        combined_crc64 = checksum::crc64::combine(combined_crc64, ack.crc64, ack.stored_size);
-        let Some(next_size) = padded_size.checked_add(ack.stored_size) else {
-            return false;
-        };
-        padded_size = next_size;
-    }
-
-    let Ok(stored_size) = u64::try_from(stored_size) else {
-        return false;
-    };
-    let Some(padding_size) = padded_size.checked_sub(stored_size) else {
-        return false;
-    };
-    let Ok(padding_size) = usize::try_from(padding_size) else {
-        return false;
-    };
-    // Erasure coding pads the concatenated systematic shards only at the end,
-    // by fewer than k bytes. Extend the segment checksum over those zeros so
-    // it can be compared with the composed shard acknowledgements
-    // without rescanning the assembled payload.
-    const ZERO_PADDING: [u8; u8::MAX as usize] = [0; u8::MAX as usize];
-    let Some(padding) = ZERO_PADDING.get(..padding_size) else {
-        return false;
-    };
-    let padded_segment_crc64 = checksum::crc64::combine(
-        segment_crc64,
-        checksum::crc64::checksum(padding),
-        padding_size as u64,
-    );
-    combined_crc64 == padded_segment_crc64
-}
-
 #[cfg(test)]
 mod systematic_data_shard_crc_tests {
     use super::*;
@@ -61,7 +18,7 @@ mod systematic_data_shard_crc_tests {
         let payload = b"one-plus-zero benchmark payload";
         assert!(systematic_data_shard_acks_match_segment(
             &[write_ack(payload)],
-            payload.len(),
+            payload.len() as u64,
             checksum::crc64::checksum(payload),
         ));
     }
@@ -77,7 +34,7 @@ mod systematic_data_shard_crc_tests {
 
         assert!(systematic_data_shard_acks_match_segment(
             &shard_acks,
-            payload.len(),
+            payload.len() as u64,
             checksum::crc64::checksum(payload),
         ));
     }
@@ -89,7 +46,7 @@ mod systematic_data_shard_crc_tests {
         ack.crc64 ^= 1;
         assert!(!systematic_data_shard_acks_match_segment(
             &[ack],
-            payload.len(),
+            payload.len() as u64,
             checksum::crc64::checksum(payload),
         ));
     }
@@ -108,7 +65,7 @@ mod systematic_data_shard_crc_tests {
 
             prop_assert!(systematic_data_shard_acks_match_segment(
                 &shard_acks,
-                payload.len(),
+                payload.len() as u64,
                 checksum::crc64::checksum(&payload),
             ));
         }
@@ -1958,7 +1915,7 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        self.register_payload_shard_acks(req.data_pg_id, &copied_acks)
+        self.register_maintenance_payload_shard_acks(req.data_pg_id, &copied_acks)
             .map_err(|error| match error {
                 ObjectPgActionError::Store(error) => error,
                 other => StoreError::Io {
@@ -2102,7 +2059,7 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        self.register_payload_shard_acks(req.data_pg_id, &backfilled_acks)
+        self.register_maintenance_payload_shard_acks(req.data_pg_id, &backfilled_acks)
             .map_err(|error| match error {
                 ObjectPgActionError::Store(error) => error,
                 other => StoreError::Io {
@@ -2418,7 +2375,7 @@ impl StorageCluster {
             .iter()
             .map(|repaired| (&repaired.key, repaired.ack))
             .collect();
-        self.register_payload_shard_acks(req.data_pg_id, &repaired_acks)
+        self.register_maintenance_payload_shard_acks(req.data_pg_id, &repaired_acks)
             .map_err(|error| match error {
                 ObjectPgActionError::Store(error) => error,
                 other => StoreError::Io {
@@ -2693,7 +2650,7 @@ impl StorageCluster {
         // a second full pass.
         if systematic_data_shard_acks_match_segment(
             &direct_acks,
-            req.stored_size,
+            req.stored_size as u64,
             req.segment_crc64,
         ) {
             Ok(PlacedSegmentDirectReadOutcome::Complete)
@@ -2885,7 +2842,7 @@ impl StorageCluster {
         // second full pass over dst.
         let shard_acks_match_segment = systematic_data_shard_acks_match_segment(
             &direct_acks,
-            req.stored_size,
+            req.stored_size as u64,
             req.segment_crc64,
         );
         let mut read_handles = match reader.acquire_read_handles(0..k) {

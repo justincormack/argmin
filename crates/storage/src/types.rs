@@ -2581,6 +2581,189 @@ pub struct WriteAck {
     pub stored_size: u64,
 }
 
+/// Immutable integrity evidence for one complete erasure-coded segment.
+///
+/// The witness can be minted only from the exact, canonically ordered shard
+/// acknowledgements for a segment. Besides retaining every shard checksum, it
+/// proves that all acknowledgements use the canonical shard size and that the
+/// systematic acknowledgements compose to the stored segment checksum. The
+/// witness is storage-owned so terminal publishers cannot assemble equivalent-
+/// looking evidence from independently selected physical fields.
+#[derive(PartialEq, Eq)]
+pub(crate) struct SegmentShardIntegrityWitness {
+    data_pg_id: u32,
+    shard_size: u64,
+    ordered_shard_acks: Box<[(ShardKey, WriteAck)]>,
+}
+
+impl std::fmt::Debug for SegmentShardIntegrityWitness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentShardIntegrityWitness")
+            .field("shard_size", &self.shard_size)
+            .field("shard_count", &self.ordered_shard_acks.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum SegmentShardIntegrityWitnessError {
+    #[error("EC shape must contain at least one data shard")]
+    MissingDataShard,
+    #[error("EC shape {data_shards}+{parity_shards} overflows its shard index space")]
+    InvalidShardCount { data_shards: u8, parity_shards: u8 },
+    #[error("expected {expected} shard acknowledgements, got {actual}")]
+    ShardCount { expected: usize, actual: usize },
+    #[error("expected shard {expected} at ordered position {position}, got {actual}")]
+    ShardIdentity {
+        position: usize,
+        expected: ShardKey,
+        actual: ShardKey,
+    },
+    #[error(
+        "shard {shard_index} has stored size {actual}, expected canonical shard size {expected}"
+    )]
+    NoncanonicalShardSize {
+        shard_index: u8,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("systematic shard acknowledgements do not compose to the stored segment checksum")]
+    SystematicChecksumMismatch,
+}
+
+impl SegmentShardIntegrityWitness {
+    pub(crate) fn from_ordered_shard_acks(
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        stored_segment_size: u64,
+        segment_crc64: u64,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<Self, SegmentShardIntegrityWitnessError> {
+        if ec.k == 0 {
+            return Err(SegmentShardIntegrityWitnessError::MissingDataShard);
+        }
+        let expected_count = usize::from(ec.k).checked_add(usize::from(ec.m)).ok_or(
+            SegmentShardIntegrityWitnessError::InvalidShardCount {
+                data_shards: ec.k,
+                parity_shards: ec.m,
+            },
+        )?;
+        if expected_count > usize::from(u8::MAX) + 1 {
+            return Err(SegmentShardIntegrityWitnessError::InvalidShardCount {
+                data_shards: ec.k,
+                parity_shards: ec.m,
+            });
+        }
+        if shard_batch.len() != expected_count {
+            return Err(SegmentShardIntegrityWitnessError::ShardCount {
+                expected: expected_count,
+                actual: shard_batch.len(),
+            });
+        }
+
+        let shard_size = stored_segment_size.div_ceil(u64::from(ec.k));
+        let mut ordered_shard_acks = Vec::with_capacity(expected_count);
+        for (position, (actual_key, ack)) in shard_batch.iter().enumerate() {
+            let shard_index = u8::try_from(position).map_err(|_| {
+                SegmentShardIntegrityWitnessError::InvalidShardCount {
+                    data_shards: ec.k,
+                    parity_shards: ec.m,
+                }
+            })?;
+            let expected_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index);
+            if expected_key != **actual_key {
+                return Err(SegmentShardIntegrityWitnessError::ShardIdentity {
+                    position,
+                    expected: expected_key,
+                    actual: (*actual_key).clone(),
+                });
+            }
+            if ack.stored_size != shard_size {
+                return Err(SegmentShardIntegrityWitnessError::NoncanonicalShardSize {
+                    shard_index,
+                    expected: shard_size,
+                    actual: ack.stored_size,
+                });
+            }
+            ordered_shard_acks.push(((*actual_key).clone(), *ack));
+        }
+
+        let systematic_acks = shard_batch
+            .get(..usize::from(ec.k))
+            .expect("validated shard count contains every systematic acknowledgement");
+        let systematic_acks = systematic_acks
+            .iter()
+            .map(|(_, ack)| *ack)
+            .collect::<Vec<_>>();
+        if !systematic_data_shard_acks_match_segment(
+            &systematic_acks,
+            stored_segment_size,
+            segment_crc64,
+        ) {
+            return Err(SegmentShardIntegrityWitnessError::SystematicChecksumMismatch);
+        }
+
+        Ok(Self {
+            data_pg_id,
+            shard_size,
+            ordered_shard_acks: ordered_shard_acks.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn data_pg_id(&self) -> u32 {
+        self.data_pg_id
+    }
+
+    pub(crate) fn registration_batch(&self) -> Vec<(&ShardKey, WriteAck)> {
+        self.ordered_shard_acks
+            .iter()
+            .map(|(key, ack)| (key, *ack))
+            .collect()
+    }
+}
+
+pub(crate) fn systematic_data_shard_acks_match_segment(
+    shard_acks: &[WriteAck],
+    stored_segment_size: u64,
+    segment_crc64: u64,
+) -> bool {
+    let Some((first, remaining)) = shard_acks.split_first() else {
+        return false;
+    };
+    let mut combined_crc64 = first.crc64;
+    let mut padded_size = first.stored_size;
+    for ack in remaining {
+        combined_crc64 = checksum::crc64::combine(combined_crc64, ack.crc64, ack.stored_size);
+        let Some(next_size) = padded_size.checked_add(ack.stored_size) else {
+            return false;
+        };
+        padded_size = next_size;
+    }
+
+    let Some(padding_size) = padded_size.checked_sub(stored_segment_size) else {
+        return false;
+    };
+    let Ok(padding_size) = usize::try_from(padding_size) else {
+        return false;
+    };
+    // Erasure coding pads the concatenated systematic shards only at the end,
+    // by fewer than k bytes. Extend the segment checksum over those zeros so
+    // it can be compared with the composed shard acknowledgements without
+    // rescanning the assembled payload.
+    const ZERO_PADDING: [u8; u8::MAX as usize] = [0; u8::MAX as usize];
+    let Some(padding) = ZERO_PADDING.get(..padding_size) else {
+        return false;
+    };
+    let padded_segment_crc64 = checksum::crc64::combine(
+        segment_crc64,
+        checksum::crc64::checksum(padding),
+        padding_size as u64,
+    );
+    combined_crc64 == padded_segment_crc64
+}
+
 /// Data read back from a shard.
 #[derive(Debug)]
 pub struct ShardData {
@@ -7526,6 +7709,133 @@ pub(crate) struct MultipartPartSegmentRecord {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn integrity_witness_fixture(payload: &[u8], ec: EcShape) -> (Vec<ShardKey>, Vec<WriteAck>) {
+        let shard_size = payload.len().div_ceil(usize::from(ec.k));
+        let mut padded = payload.to_vec();
+        padded.resize(shard_size * usize::from(ec.k), 0);
+        let mut acks = padded
+            .chunks_exact(shard_size)
+            .map(|shard| WriteAck {
+                crc64: checksum::crc64::checksum(shard),
+                stored_size: shard.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        acks.extend((0..ec.m).map(|parity_index| {
+            let parity = vec![parity_index.wrapping_add(0x80); shard_size];
+            WriteAck {
+                crc64: checksum::crc64::checksum(&parity),
+                stored_size: parity.len() as u64,
+            }
+        }));
+        let okh = [0x31; 16];
+        let generation = GenerationId::new(47).unwrap();
+        let keys = (0..acks.len())
+            .map(|index| ShardKey::new(&okh, generation.get(), index as u8))
+            .collect();
+        (keys, acks)
+    }
+
+    #[test]
+    fn segment_shard_integrity_witness_requires_complete_canonical_evidence() {
+        let payload = b"stored segment requiring systematic padding";
+        let ec = EcShape { k: 3, m: 2 };
+        let okh = [0x31; 16];
+        let generation = GenerationId::new(47).unwrap();
+        let (keys, acks) = integrity_witness_fixture(payload, ec);
+        let batch = keys
+            .iter()
+            .zip(&acks)
+            .map(|(key, ack)| (key, *ack))
+            .collect::<Vec<_>>();
+
+        let witness = SegmentShardIntegrityWitness::from_ordered_shard_acks(
+            5,
+            ec,
+            &okh,
+            generation,
+            payload.len() as u64,
+            checksum::crc64::checksum(payload),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(witness.data_pg_id(), 5);
+        assert_eq!(witness.shard_size, payload.len().div_ceil(3) as u64);
+        assert_eq!(
+            witness
+                .ordered_shard_acks
+                .iter()
+                .map(|(_, ack)| ack.crc64)
+                .collect::<Vec<_>>(),
+            [
+                acks[0].crc64,
+                acks[1].crc64,
+                acks[2].crc64,
+                acks[3].crc64,
+                acks[4].crc64,
+            ]
+        );
+
+        let mut crossed_keys = keys.clone();
+        crossed_keys.swap(0, 1);
+        let crossed_batch = crossed_keys
+            .iter()
+            .zip(&acks)
+            .map(|(key, ack)| (key, *ack))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            SegmentShardIntegrityWitness::from_ordered_shard_acks(
+                5,
+                ec,
+                &okh,
+                generation,
+                payload.len() as u64,
+                checksum::crc64::checksum(payload),
+                &crossed_batch,
+            ),
+            Err(SegmentShardIntegrityWitnessError::ShardIdentity { position: 0, .. })
+        ));
+
+        let mut wrong_size = acks.clone();
+        wrong_size[ec.k as usize].stored_size += 1;
+        let wrong_size_batch = keys
+            .iter()
+            .zip(&wrong_size)
+            .map(|(key, ack)| (key, *ack))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            SegmentShardIntegrityWitness::from_ordered_shard_acks(
+                5,
+                ec,
+                &okh,
+                generation,
+                payload.len() as u64,
+                checksum::crc64::checksum(payload),
+                &wrong_size_batch,
+            ),
+            Err(SegmentShardIntegrityWitnessError::NoncanonicalShardSize { shard_index: 3, .. })
+        ));
+
+        let mut wrong_crc = acks.clone();
+        wrong_crc[1].crc64 ^= 1;
+        let wrong_crc_batch = keys
+            .iter()
+            .zip(&wrong_crc)
+            .map(|(key, ack)| (key, *ack))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            SegmentShardIntegrityWitness::from_ordered_shard_acks(
+                5,
+                ec,
+                &okh,
+                generation,
+                payload.len() as u64,
+                checksum::crc64::checksum(payload),
+                &wrong_crc_batch,
+            ),
+            Err(SegmentShardIntegrityWitnessError::SystematicChecksumMismatch)
+        );
+    }
 
     fn management_lookup_test_upload(state: UploadState) -> MultipartUploadRecord {
         MultipartUploadRecord {

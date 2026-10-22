@@ -1364,6 +1364,92 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
 }
 
 #[test]
+fn stream_append_publish_validation_rejects_shards_crossed_with_segment_checksum() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("38".repeat(16)).unwrap();
+    let payload = b"stream append crossed stored segment checksum";
+    let encrypted =
+        create_encrypted_put_stream_session(&cluster, &bucket, &key, &session_id, payload);
+    let (_target, mut segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
+        .unwrap();
+    let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect();
+    segment.segment_crc64 ^= 1;
+
+    let err = cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch { .. })
+        ),
+        "crossed segment checksum should fail closed before stream metadata publish, got {err:?}"
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    let object_pg_store = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(object_pg))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::list_stream_segments(&*object_pg_store, &session_id)
+            .unwrap()
+            .is_empty(),
+        "crossed integrity evidence must not publish stream segment metadata"
+    );
+    for written_shard in &written_shards {
+        assert!(matches!(
+            cluster.load_payload_shard_ack(segment.data_pg_id, &written_shard.key),
+            Err(StoreError::NotFound)
+        ));
+    }
+}
+
+#[test]
 fn stream_append_command_id_race_accepts_matching_applied_contender() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -2187,6 +2273,9 @@ fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
                 session_id: &session_id,
                 segment_index: segment.segment_index,
                 segment_record: &segment,
+                stored_segment_size: crate::cluster::StreamAppendStoredSegmentSize::Exact(
+                    encrypted.storage_bytes.len() as u64,
+                ),
                 shard_batch: &shard_batch,
             },
             1,
@@ -2310,6 +2399,9 @@ fn stream_append_matching_competing_publish_succeeds_without_payload_cleanup() {
                 session_id: &session_id,
                 segment_index: segment.segment_index,
                 segment_record: &segment,
+                stored_segment_size: crate::cluster::StreamAppendStoredSegmentSize::Exact(
+                    encrypted.storage_bytes.len() as u64,
+                ),
                 shard_batch: &shard_batch,
             },
             1,
@@ -2464,6 +2556,9 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
                 session_id: &session_id,
                 segment_index: segment.segment_index,
                 segment_record: &segment,
+                stored_segment_size: crate::cluster::StreamAppendStoredSegmentSize::Exact(
+                    encrypted.storage_bytes.len() as u64,
+                ),
                 shard_batch: &shard_batch,
             },
             1,
@@ -2991,6 +3086,9 @@ fn stream_append_unrelated_install_contention_cleans_staged_payload() {
                 session_id: &session_id,
                 segment_index: segment.segment_index,
                 segment_record: &segment,
+                stored_segment_size: crate::cluster::StreamAppendStoredSegmentSize::Exact(
+                    encrypted.storage_bytes.len() as u64,
+                ),
                 shard_batch: &shard_batch,
             },
             1,
@@ -6101,25 +6199,27 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
+    let payload = b"encrypted stream plaintext";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
+    let crate::ObjectEncryption::SseS3(encryption) = encrypted.encryption.clone() else {
+        unreachable!("SSE-S3 segment fixture must carry SSE-S3 state");
+    };
     let encryption = crate::ObjectEncryption::SseS3(
-        crate::SseS3ObjectState::new(
-            9,
-            [10; crate::SSE_S3_WRAP_NONCE_LEN],
-            [11; crate::SSE_S3_WRAPPED_DEK_LEN],
-            [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-        )
-        .with_encrypted_checksum_metadata([13; crate::SSE_S3_CHECKSUM_NONCE_LEN], vec![14, 15, 16])
-        .unwrap(),
+        encryption
+            .with_encrypted_checksum_metadata(
+                [13; crate::SSE_S3_CHECKSUM_NONCE_LEN],
+                vec![14, 15, 16],
+            )
+            .unwrap(),
     );
     let session_id = crate::SessionId::try_from("90".repeat(16)).unwrap();
     cluster
         .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
         .unwrap();
 
-    let payload = b"encrypted stream plaintext";
-    let storage_bytes = b"encrypted stream ciphertext";
-    let payload_crc64 = checksum::crc64::checksum(payload);
-    let segment_crc64 = checksum::crc64::checksum(storage_bytes);
+    let storage_bytes = encrypted.storage_bytes.as_slice();
+    let payload_crc64 = encrypted.payload_crc64;
+    let segment_crc64 = encrypted.storage_crc64;
     assert_ne!(payload_crc64, segment_crc64);
     let (_target, segment) = cluster
         .prepare_stream_segment_append(

@@ -12073,6 +12073,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
         .unwrap();
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let payload = b"remote shard file without ack row";
     let direct_written = cluster
         .write_direct_put_segment_payload_shards(
             &bucket,
@@ -12080,7 +12081,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
             generation_id,
             0,
             &segment_okh,
-            b"remote shard file without ack row",
+            payload,
         )
         .unwrap();
     let shard_batch: Vec<(&ShardKey, WriteAck)> = direct_written
@@ -12089,8 +12090,18 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
         .map(|written| (&written.key, written.ack))
         .collect();
 
+    crate::StorageCluster::build_payload_shard_integrity_witness(
+        direct_written.data_pg_id,
+        direct_written.ec,
+        &segment_okh,
+        generation_id,
+        payload.len() as u64,
+        checksum::crc64::checksum(payload),
+        &shard_batch,
+    )
+    .unwrap();
     let err = cluster
-        .validate_payload_shard_acks(
+        .validate_registered_payload_shard_acks(
             direct_written.data_pg_id,
             direct_written.ec,
             &segment_okh,
@@ -12223,6 +12234,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
         .unwrap();
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let payload = b"remote shard ack row on wrong node";
     let direct_written = cluster
         .write_direct_put_segment_payload_shards(
             &bucket,
@@ -12230,7 +12242,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
             generation_id,
             0,
             &segment_okh,
-            b"remote shard ack row on wrong node",
+            payload,
         )
         .unwrap();
     let shard_batch: Vec<(&ShardKey, WriteAck)> = direct_written
@@ -12255,8 +12267,18 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
             .unwrap();
     }
 
+    crate::StorageCluster::build_payload_shard_integrity_witness(
+        direct_written.data_pg_id,
+        direct_written.ec,
+        &segment_okh,
+        generation_id,
+        payload.len() as u64,
+        checksum::crc64::checksum(payload),
+        &shard_batch,
+    )
+    .unwrap();
     let err = cluster
-        .validate_payload_shard_acks(
+        .validate_registered_payload_shard_acks(
             direct_written.data_pg_id,
             direct_written.ec,
             &segment_okh,

@@ -395,7 +395,15 @@ struct StreamAppendCommitRequest<'a> {
     session_id: &'a SessionId,
     segment_index: u32,
     segment_record: &'a StreamUploadSegmentRecord,
+    stored_segment_size: StreamAppendStoredSegmentSize,
     shard_batch: &'a [(&'a ShardKey, WriteAck)],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamAppendStoredSegmentSize {
+    Exact(u64),
+    #[cfg(test)]
+    DeriveFromLoadedSession,
 }
 
 pub enum BucketWriteSnapshotAction<T, E> {

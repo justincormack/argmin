@@ -1028,36 +1028,16 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
         )
         .unwrap();
     let replacement_payload = b"replacement stream session";
-    let (_target, replacement_segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: replacement_session_id.clone(),
-                segment_index: 0,
-                size: replacement_payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(replacement_payload),
-                payload_crc64: checksum::crc64::checksum(replacement_payload),
-            },
-        )
-        .unwrap();
-    let replacement_shards = cluster
-        .write_stream_segment_payload_shards(&replacement_segment, replacement_payload)
-        .unwrap();
-    let replacement_shard_batch = replacement_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &replacement_session_id,
-            replacement_segment.segment_index,
-            &replacement_segment,
-            &replacement_shard_batch,
-        )
-        .unwrap();
+    let replacement_encrypted =
+        crate::tests::sse_s3_multipart_segment_test_fixture(replacement_payload, 2, 0);
+    let replacement_segment = append_encrypted_test_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &replacement_session_id,
+        0,
+        &replacement_encrypted,
+    );
     for shard_index in 0..ec_shape.k + ec_shape.m {
         assert!(cluster
             .test_payload_shard_file_exists(

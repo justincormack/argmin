@@ -4354,6 +4354,105 @@ fn direct_put_publish_validation_rejects_truncated_shard_batch() {
 }
 
 #[test]
+fn direct_put_publish_validation_rejects_shards_crossed_with_segment_checksum() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = local_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-crossed-segment-crc-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut local_map, 1, NodeId::new(1));
+    set_route_primary(&mut local_map, 2, NodeId::new(1));
+    let map = Arc::new(local_map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("67676767676767676767676767676767".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct put crossed stored segment checksum";
+    let segment_okh = [0xd4; 16];
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
+    let mut commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    commit_req.segment_crc64 ^= 1;
+    let registration_calls = Arc::new(AtomicUsize::new(0));
+    let registration_calls_for_hook = Arc::clone(&registration_calls);
+    let _registration_hook =
+        cluster.test_install_before_direct_put_payload_ack_registration_hook(Arc::new(move || {
+            registration_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "invalid integrity evidence reached acknowledgement registration"
+                    .to_owned(),
+            })
+        }));
+
+    let err = cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch { .. })
+        ),
+        "crossed segment checksum should fail closed before metadata publish, got {err:?}"
+    );
+    assert_eq!(
+        registration_calls.load(Ordering::SeqCst),
+        0,
+        "invalid integrity evidence must be rejected before acknowledgement registration"
+    );
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert_clean_metadata_command_stream(&map, &[2]);
+    let object_pg = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+    for written_shard in &written.written_shards {
+        assert!(matches!(
+            cluster.load_payload_shard_ack(written.data_pg_id, &written_shard.key),
+            Err(StoreError::NotFound)
+        ));
+    }
+}
+
+#[test]
 fn direct_put_retries_transient_precommand_observation_within_shared_budget() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

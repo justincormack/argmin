@@ -5162,8 +5162,36 @@ impl StorageCluster {
                         return Err(ObjectPgActionError::Store(error));
                     }
                     reject_expired_direct_put_snapshot_before_command_ownership!();
+                    let Some(stored_segment_size) =
+                        req.encryption.segment_stored_size(req.size)
+                    else {
+                        cleanup_direct_put_attempt_before_command_ownership!();
+                        return Err(ObjectPgActionError::Store(
+                            StoreError::PayloadShardSetMismatch {
+                                reason: "direct PUT segment has invalid stored codec geometry"
+                                    .to_string(),
+                            },
+                        ));
+                    };
+                    let integrity_witness = match Self::build_payload_shard_integrity_witness(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        stored_segment_size,
+                        req.segment_crc64,
+                        &shard_batch,
+                    ) {
+                        Ok(witness) => witness,
+                        Err(error) => {
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error);
+                        }
+                    };
+                    #[cfg(test)]
+                    self.maybe_run_before_direct_put_payload_ack_registration_hook()?;
                     if let Err(error) =
-                        self.register_payload_shard_acks(req.data_pg_id, &shard_batch)
+                        self.register_validated_payload_shard_acks(&integrity_witness)
                     {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
@@ -5558,9 +5586,68 @@ impl StorageCluster {
             };
 
             if !payload_acks_registered {
+                let Some(stored_segment_size) = req.encryption.segment_stored_size(req.size) else {
+                    if new_pending_command {
+                        let release_result =
+                            self.release_metadata_command_bucket_write_reservation(&command);
+                        self.release_object_generation_reservation_best_effort(
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                    }
+                    return Err(ObjectPgActionError::Store(
+                        StoreError::PayloadShardSetMismatch {
+                            reason: "direct PUT segment has invalid stored codec geometry"
+                                .to_string(),
+                        },
+                    ));
+                };
+                let integrity_witness = match Self::build_payload_shard_integrity_witness(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    stored_segment_size,
+                    req.segment_crc64,
+                    &shard_batch,
+                ) {
+                    Ok(witness) => witness,
+                    Err(error) => {
+                        if new_pending_command {
+                            let release_result =
+                                self.release_metadata_command_bucket_write_reservation(&command);
+                            self.release_object_generation_reservation_best_effort(
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                            self.delete_direct_put_segment_payload_shards(
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                written_shards,
+                            );
+                            release_result
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                        }
+                        return Err(error);
+                    }
+                };
                 #[cfg(test)]
                 self.maybe_run_before_direct_put_payload_ack_registration_hook()?;
-                if let Err(error) = self.register_payload_shard_acks(req.data_pg_id, &shard_batch) {
+                if let Err(error) =
+                    self.register_validated_payload_shard_acks(&integrity_witness)
+                {
                     if new_pending_command {
                         let release_result =
                             self.release_metadata_command_bucket_write_reservation(&command);
@@ -5581,7 +5668,7 @@ impl StorageCluster {
                     return Err(error);
                 }
             }
-            if let Err(error) = self.validate_payload_shard_acks(
+            if let Err(error) = self.validate_registered_payload_shard_acks(
                 req.data_pg_id,
                 req.ec,
                 &req.segment_okh,
@@ -7091,6 +7178,9 @@ impl StorageCluster {
             session_id: input.session_id,
             segment_index: input.segment_index,
             segment_record: &segment_record,
+            stored_segment_size: StreamAppendStoredSegmentSize::Exact(
+                input.storage_bytes.len() as u64,
+            ),
             shard_batch: &shard_batch,
         };
         self.commit_stream_segment_append_with_route_validation(
@@ -7256,6 +7346,7 @@ impl StorageCluster {
             session_id,
             segment_index,
             segment_record,
+            stored_segment_size: StreamAppendStoredSegmentSize::DeriveFromLoadedSession,
             shard_batch,
         };
         self.commit_stream_segment_append_with_work_budget(
@@ -7333,6 +7424,7 @@ impl StorageCluster {
             session_id,
             segment_index,
             segment_record,
+            stored_segment_size,
             shard_batch,
         } = request;
         if bucket != route.bucket || key != route.key {
@@ -7386,19 +7478,47 @@ impl StorageCluster {
                 return Err(error);
             }
         };
-        let loaded_target;
-        let target = match target {
-            Some(target) => target,
-            None => match stream_route.load_session() {
-                Ok(session) => {
-                    loaded_target = session.target;
-                    &loaded_target
-                }
+        let loaded_session = if target.is_none() {
+            match stream_route.load_session() {
+                Ok(session) => Some(session),
                 Err(error) => {
                     cleanup_stream_append_payload!();
                     return Err(error);
                 }
-            },
+            }
+        } else {
+            None
+        };
+        let target = match target {
+            Some(target) => target,
+            None => &loaded_session
+                .as_ref()
+                .expect("missing target requires a loaded stream session")
+                .target,
+        };
+        #[cfg(not(test))]
+        let StreamAppendStoredSegmentSize::Exact(stored_segment_size) = stored_segment_size;
+        #[cfg(test)]
+        let stored_segment_size = match stored_segment_size {
+            StreamAppendStoredSegmentSize::Exact(stored_segment_size) => stored_segment_size,
+            StreamAppendStoredSegmentSize::DeriveFromLoadedSession => {
+                let Some(stored_segment_size) = loaded_session
+                    .as_ref()
+                    .and_then(|session| {
+                        session
+                            .encryption
+                            .segment_stored_size(segment_record.size)
+                    })
+                else {
+                    cleanup_stream_append_payload!();
+                    return Err(ObjectPgActionError::Store(
+                        StoreError::PayloadShardSetMismatch {
+                            reason: "stream segment has invalid stored codec geometry".to_string(),
+                        },
+                    ));
+                };
+                stored_segment_size
+            }
         };
         loop {
             if let Err(error) = require_valid_route() {
@@ -7528,13 +7648,26 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
             }
-            if let Err(error) =
-                self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
-            {
+            let integrity_witness = match Self::build_payload_shard_integrity_witness(
+                segment_record.data_pg_id,
+                ec,
+                &segment_record.segment_okh,
+                segment_record.segment_vid,
+                stored_segment_size,
+                segment_record.segment_crc64,
+                shard_batch,
+            ) {
+                Ok(witness) => witness,
+                Err(error) => {
+                    cleanup_stream_append_payload!();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.register_validated_payload_shard_acks(&integrity_witness) {
                 cleanup_stream_append_payload!();
                 return Err(error);
             }
-            if let Err(error) = self.validate_payload_shard_acks(
+            if let Err(error) = self.validate_registered_payload_shard_acks(
                 segment_record.data_pg_id,
                 ec,
                 &segment_record.segment_okh,
@@ -7721,7 +7854,18 @@ impl StorageCluster {
         }
     }
 
-    fn register_payload_shard_acks(
+    fn register_validated_payload_shard_acks(
+        &self,
+        witness: &SegmentShardIntegrityWitness,
+    ) -> Result<(), ObjectPgActionError> {
+        let data_pg_id = self.validated_data_pg(PgId::new(witness.data_pg_id()))?;
+        let shard_batch = witness.registration_batch();
+        self.metadata_pg_primary_shard_ack_route(data_pg_id)?
+            .register_shard_acks(&shard_batch)?;
+        Ok(())
+    }
+
+    fn register_maintenance_payload_shard_acks(
         &self,
         data_pg_id: u32,
         shard_batch: &[(&ShardKey, WriteAck)],
@@ -7730,6 +7874,15 @@ impl StorageCluster {
         self.metadata_pg_primary_shard_ack_route(data_pg_id)?
             .register_shard_acks(shard_batch)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn register_payload_shard_acks(
+        &self,
+        data_pg_id: u32,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), ObjectPgActionError> {
+        self.register_maintenance_payload_shard_acks(data_pg_id, shard_batch)
     }
 
     #[cfg(test)]
@@ -7742,10 +7895,35 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        self.register_payload_shard_acks(data_pg_id, &shard_batch)
+        self.register_maintenance_payload_shard_acks(data_pg_id, &shard_batch)
     }
 
-    fn validate_payload_shard_acks(
+    fn build_payload_shard_integrity_witness(
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        stored_segment_size: u64,
+        segment_crc64: u64,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<SegmentShardIntegrityWitness, ObjectPgActionError> {
+        SegmentShardIntegrityWitness::from_ordered_shard_acks(
+            data_pg_id,
+            ec,
+            segment_okh,
+            segment_vid,
+            stored_segment_size,
+            segment_crc64,
+            shard_batch,
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                reason: error.to_string(),
+            })
+        })
+    }
+
+    fn validate_registered_payload_shard_acks(
         &self,
         data_pg_id: u32,
         ec: EcShape,
@@ -7753,35 +7931,6 @@ impl StorageCluster {
         segment_vid: GenerationId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        let expected_keys = Self::payload_shard_set_keys(segment_okh, segment_vid, ec);
-        if shard_batch.len() != expected_keys.len() {
-            return Err(ObjectPgActionError::Store(
-                StoreError::PayloadShardSetMismatch {
-                    reason: format!(
-                        "expected {} shards for EC {}+{}, got {}",
-                        expected_keys.len(),
-                        ec.k,
-                        ec.m,
-                        shard_batch.len()
-                    ),
-                },
-            ));
-        }
-        for (expected_key, (actual_key, _)) in expected_keys.iter().zip(shard_batch.iter()) {
-            if expected_key != *actual_key {
-                return Err(ObjectPgActionError::Store(
-                    StoreError::PayloadShardSetMismatch {
-                        reason: format!(
-                            "expected shard {} at index {}, got {}",
-                            expected_key,
-                            expected_key.shard_index().get(),
-                            actual_key
-                        ),
-                    },
-                ));
-            }
-        }
-
         let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_route = self.metadata_pg_primary_shard_ack_route(data_pg)?;
         for (key, ack) in shard_batch {

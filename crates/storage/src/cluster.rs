@@ -96,6 +96,7 @@ use crate::storage_rpc::{
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
+use crate::types::systematic_data_shard_acks_match_segment;
 #[cfg(test)]
 use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
@@ -118,15 +119,16 @@ use crate::types::{
     PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
     PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
     PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
-    PublicAccessBlockConfig, RouteMapValidity, SegmentEncryptionSubject, SegmentStoredBytesRequest,
-    SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-    ShardScavengerPlacedShardSetReference, ShardScavengerReferenceCursor, StoredLegalHoldStatus,
-    StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot,
-    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
-    UploadState, VersionId, WriteAck, WrittenShardAck, SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT,
+    PublicAccessBlockConfig, RouteMapValidity, SegmentEncryptionSubject,
+    SegmentShardIntegrityWitness, SegmentStoredBytesRequest, SerializedBucketTagSet,
+    SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+    ShardScavengerReferenceCursor, StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput,
+    StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot, StreamSegmentAppendInput,
+    StreamSegmentAppendOutcome, StreamUploadCommandRecord, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    VersionId, WriteAck, WrittenShardAck, SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT,
 };
 #[cfg(test)]
 use crate::types::{
