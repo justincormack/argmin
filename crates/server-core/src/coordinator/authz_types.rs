@@ -258,8 +258,9 @@ impl ActiveWriteEncryption {
         }
     }
 
-    pub(super) fn encrypt_segment(
+    fn encrypt_authorized_segment(
         &self,
+        subject: &storage::SegmentEncryptionSubject,
         segment_index: u32,
         data: &[u8],
     ) -> Result<Vec<u8>, ServerError> {
@@ -267,9 +268,9 @@ impl ActiveWriteEncryption {
             ActiveWriteEncryptionKind::SseCustomer {
                 write: Some(sse_customer),
                 ..
-            } => sse_customer.encrypt_segment(segment_index, data),
+            } => sse_customer.encrypt_authorized_segment(subject, segment_index, data),
             ActiveWriteEncryptionKind::Managed { write, .. } => {
-                write.encrypt_segment(segment_index, data)
+                write.encrypt_authorized_segment(subject, segment_index, data)
             }
             ActiveWriteEncryptionKind::SseCustomer { write: None, .. } => {
                 Err(ServerError::InvalidRequest {
@@ -302,7 +303,7 @@ impl ActiveWriteEncryption {
                         .to_string(),
             });
         }
-        self.encrypt_segment(segment_index, data)
+        self.encrypt_authorized_segment(subject, segment_index, data)
     }
 
     pub(super) fn encrypt_multipart_part_segment(
@@ -326,6 +327,6 @@ impl ActiveWriteEncryption {
                         .to_string(),
             });
         }
-        self.encrypt_segment(segment_index, data)
+        self.encrypt_authorized_segment(authorization.encryption_subject(), segment_index, data)
     }
 }

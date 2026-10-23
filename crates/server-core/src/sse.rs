@@ -4,15 +4,16 @@
 use std::fmt;
 
 use argmin_crypto::aead::Aes256GcmKey;
+use argmin_crypto::cobblestone::{self, Cobblestone256Key, COBBLESTONE_SALT_LEN};
 use argmin_crypto::hmac::Sha256Key;
 #[cfg(test)]
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
-    ObjectEncryption, ObjectEncryptionStateError, SseCustomerObjectState, SseS3ObjectState,
-    SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN,
-    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
-    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_S3_WRAP_NONCE_LEN,
+    ObjectEncryption, ObjectEncryptionStateError, SegmentEncryptionSubject, SegmentPayloadCodec,
+    SseCustomerObjectState, SseS3ObjectState, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
 
 use crate::error::ServerError;
@@ -65,6 +66,15 @@ fn checksum_metadata_codec_error(_error: ChecksumMetadataCodecError) -> ServerEr
 struct AeadDescriptor<'a> {
     aad: &'a [u8],
     label: &'a str,
+}
+
+struct SegmentSealParameters<'a> {
+    payload_codec: SegmentPayloadCodec,
+    segment_nonce_prefix: &'a [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    segment_scope: SseCustomerSegmentScope,
+    payload_aead_context: &'a [u8],
+    segment_index: u32,
+    descriptor: AeadDescriptor<'a>,
 }
 
 fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerError {
@@ -311,7 +321,43 @@ impl SseCustomerWriteContext {
         &self.encryption
     }
 
-    pub fn encrypt_segment(
+    pub(crate) fn encrypt_authorized_segment(
+        &self,
+        subject: &SegmentEncryptionSubject,
+        segment_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C write context missing encryption state".to_string(),
+            });
+        };
+        let logical_plaintext_len =
+            u64::try_from(plaintext.len()).map_err(|_| ServerError::InternalError {
+                reason: "SSE-C segment length exceeds its encryption subject".to_string(),
+            })?;
+        if !subject.matches_encryption_and_geometry(
+            &self.encryption,
+            segment_index,
+            logical_plaintext_len,
+        ) {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C segment does not match its storage-minted encryption subject"
+                    .to_string(),
+            });
+        }
+        encrypt_segment_with_dek(
+            &self.dek,
+            state,
+            self.segment_scope,
+            subject,
+            segment_index,
+            plaintext,
+        )
+    }
+
+    #[cfg(test)]
+    fn encrypt_segment(
         &self,
         segment_index: u32,
         plaintext: &[u8],
@@ -321,12 +367,16 @@ impl SseCustomerWriteContext {
                 reason: "SSE-C write context missing encryption state".to_string(),
             });
         };
-        encrypt_segment_with_dek(
+        encrypt_legacy_segment_with_dek_and_prefix(
             &self.dek,
-            state,
+            state.segment_nonce_prefix(),
             self.segment_scope,
             segment_index,
             plaintext,
+            AeadDescriptor {
+                aad: SSE_C_SEGMENT_AAD,
+                label: "SSE-C",
+            },
         )
     }
 
@@ -396,7 +446,50 @@ impl ManagedEncryptionWriteContext {
         &self.encryption
     }
 
-    pub fn encrypt_segment(
+    pub(crate) fn encrypt_authorized_segment(
+        &self,
+        subject: &SegmentEncryptionSubject,
+        segment_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        let ObjectEncryption::SseS3(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "managed write context missing encryption state".to_string(),
+            });
+        };
+        let logical_plaintext_len =
+            u64::try_from(plaintext.len()).map_err(|_| ServerError::InternalError {
+                reason: "managed segment length exceeds its encryption subject".to_string(),
+            })?;
+        if !subject.matches_encryption_and_geometry(
+            &self.encryption,
+            segment_index,
+            logical_plaintext_len,
+        ) {
+            return Err(ServerError::InternalError {
+                reason: "managed segment does not match its storage-minted encryption subject"
+                    .to_string(),
+            });
+        }
+        encrypt_segment_with_dek_and_prefix(
+            &self.dek,
+            plaintext,
+            SegmentSealParameters {
+                payload_codec: state.payload_codec(),
+                segment_nonce_prefix: state.segment_nonce_prefix(),
+                segment_scope: self.segment_scope,
+                payload_aead_context: subject.payload_aead_context(),
+                segment_index,
+                descriptor: AeadDescriptor {
+                    aad: MANAGED_SEGMENT_AAD,
+                    label: MANAGED_ENCRYPTION_LABEL,
+                },
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn encrypt_segment(
         &self,
         segment_index: u32,
         plaintext: &[u8],
@@ -406,7 +499,7 @@ impl ManagedEncryptionWriteContext {
                 reason: "managed write context missing encryption state".to_string(),
             });
         };
-        encrypt_segment_with_dek_and_prefix(
+        encrypt_legacy_segment_with_dek_and_prefix(
             &self.dek,
             state.segment_nonce_prefix(),
             self.segment_scope,
@@ -878,23 +971,68 @@ fn encrypt_segment_with_dek(
     dek: &[u8; SSE_C_DEK_LEN],
     state: &SseCustomerObjectState,
     segment_scope: SseCustomerSegmentScope,
+    subject: &SegmentEncryptionSubject,
     segment_index: u32,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
     encrypt_segment_with_dek_and_prefix(
         dek,
-        state.segment_nonce_prefix(),
-        segment_scope,
-        segment_index,
         plaintext,
-        AeadDescriptor {
-            aad: SSE_C_SEGMENT_AAD,
-            label: "SSE-C",
+        SegmentSealParameters {
+            payload_codec: state.payload_codec(),
+            segment_nonce_prefix: state.segment_nonce_prefix(),
+            segment_scope,
+            payload_aead_context: subject.payload_aead_context(),
+            segment_index,
+            descriptor: AeadDescriptor {
+                aad: SSE_C_SEGMENT_AAD,
+                label: "SSE-C",
+            },
         },
     )
 }
 
 fn encrypt_segment_with_dek_and_prefix(
+    dek: &[u8; SSE_C_DEK_LEN],
+    plaintext: &[u8],
+    parameters: SegmentSealParameters<'_>,
+) -> Result<Vec<u8>, ServerError> {
+    match parameters.payload_codec {
+        SegmentPayloadCodec::SegmentAes256GcmV1 => encrypt_legacy_segment_with_dek_and_prefix(
+            dek,
+            parameters.segment_nonce_prefix,
+            parameters.segment_scope,
+            parameters.segment_index,
+            plaintext,
+            parameters.descriptor,
+        ),
+        SegmentPayloadCodec::Cobblestone256SegmentV1 => {
+            let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
+                reason: format!(
+                    "failed to create {} Cobblestone segment sealing key",
+                    parameters.descriptor.label
+                ),
+            })?;
+            let mut salt = [0_u8; COBBLESTONE_SALT_LEN];
+            argmin_crypto::random::fill(&mut salt).map_err(|_| ServerError::InternalError {
+                reason: format!(
+                    "failed to generate {} Cobblestone segment salt",
+                    parameters.descriptor.label
+                ),
+            })?;
+            cobblestone::seal(&key, salt, parameters.payload_aead_context, plaintext).map_err(
+                |_| ServerError::InternalError {
+                    reason: format!(
+                        "failed to encrypt {} Cobblestone segment",
+                        parameters.descriptor.label
+                    ),
+                },
+            )
+        }
+    }
+}
+
+fn encrypt_legacy_segment_with_dek_and_prefix(
     dek: &[u8; SSE_C_DEK_LEN],
     segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
@@ -1139,7 +1277,7 @@ fn sse_customer_checksum_profile_fixture() -> SseCustomerChecksumProfileFixture 
     let wrapped_dek = wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C").unwrap();
     let segment_nonce_prefix = [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
     let segment_plaintext = b"compat-sse-c";
-    let segment_ciphertext = encrypt_segment_with_dek_and_prefix(
+    let segment_ciphertext = encrypt_legacy_segment_with_dek_and_prefix(
         &dek,
         &segment_nonce_prefix,
         SseCustomerSegmentScope::object(),
@@ -1254,7 +1392,7 @@ fn sse_s3_checksum_profile_fixture() -> SseS3ChecksumProfileFixture {
     .unwrap();
     let segment_nonce_prefix = [0x44u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
     let segment_plaintext = b"compat-sse-s3";
-    let segment_ciphertext = encrypt_segment_with_dek_and_prefix(
+    let segment_ciphertext = encrypt_legacy_segment_with_dek_and_prefix(
         &dek,
         &segment_nonce_prefix,
         SseCustomerSegmentScope::object(),
@@ -1345,6 +1483,56 @@ mod tests {
             key_id: 7,
             wrapping_key: [11u8; 32],
         })
+    }
+
+    #[test]
+    fn cobblestone_segment_profile_dispatch_authenticates_exact_context() {
+        let dek = [0x41; SSE_C_DEK_LEN];
+        let nonce_prefix = [0x52; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
+        let context = b"storage-minted-segment-subject";
+
+        for plaintext_len in [
+            0,
+            1,
+            cobblestone::COBBLESTONE_CHUNK_LEN - 1,
+            cobblestone::COBBLESTONE_CHUNK_LEN,
+            cobblestone::COBBLESTONE_CHUNK_LEN + 1,
+        ] {
+            let plaintext = vec![0x63; plaintext_len];
+            let ciphertext = encrypt_segment_with_dek_and_prefix(
+                &dek,
+                &plaintext,
+                SegmentSealParameters {
+                    payload_codec: SegmentPayloadCodec::Cobblestone256SegmentV1,
+                    segment_nonce_prefix: &nonce_prefix,
+                    segment_scope: SseCustomerSegmentScope::object(),
+                    payload_aead_context: context,
+                    segment_index: 7,
+                    descriptor: AeadDescriptor {
+                        aad: MANAGED_SEGMENT_AAD,
+                        label: MANAGED_ENCRYPTION_LABEL,
+                    },
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                ciphertext.len() as u64,
+                SegmentPayloadCodec::Cobblestone256SegmentV1
+                    .stored_size(plaintext_len as u64)
+                    .unwrap()
+            );
+            assert_eq!(
+                cobblestone::open(Cobblestone256Key::new(&dek).unwrap(), context, &ciphertext)
+                    .unwrap(),
+                plaintext
+            );
+            assert!(cobblestone::open(
+                Cobblestone256Key::new(&dek).unwrap(),
+                b"crossed-storage-subject",
+                &ciphertext,
+            )
+            .is_err());
+        }
     }
 
     #[test]

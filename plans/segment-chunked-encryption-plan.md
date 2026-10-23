@@ -1124,6 +1124,23 @@ Implementation update (2026-10-22, fail-closed durable-profile restoration):
   immutable malformed specimens in every command/RPC carrier, authorized recovery/replay paths,
   and real encrypted write/read positive canaries for both key modes.
 
+Implementation update (2026-10-23, authority-bound write codec dispatch):
+
+- The common write boundary now consumes the storage-minted `SegmentEncryptionSubject` all the
+  way into the SSE-C or SSE-S3 write context. Both contexts independently revalidate the exact
+  encryption instance, segment index, and logical length before encryption; the coordinator also
+  retains its standard-versus-multipart provenance check. There is no non-test raw segment
+  encryption method left for PUT, POST, copy, streaming PUT, UploadPart, or UploadPartCopy to call.
+- Codec selection is one compiler-exhaustive match. The frozen segment-AES profile preserves its
+  exact nonce and AAD construction. The Cobblestone profile generates a fresh 24-byte salt and
+  authenticates the complete canonical storage subject as its context. Boundary-size tests cover
+  empty, sub-chunk, exact 16 KiB, and multi-chunk messages, assert codec-owned stored geometry,
+  and prove a crossed storage subject cannot open the ciphertext.
+- This slice deliberately does not select Cobblestone for new production encryption states. The
+  read-side profile dispatch, real operation-level write/read canaries for both key modes, and the
+  profile-versioned DEK-wrap/checksum AAD transition must land before writer selection; otherwise
+  the server could durably emit a representation that is unreadable or only partially bound.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

@@ -1919,6 +1919,21 @@ impl SegmentEncryptionSubject {
             && self.logical_plaintext_len == logical_plaintext_len
     }
 
+    /// Returns whether the supplied encryption state and segment geometry
+    /// match this subject. Operation authorization must additionally use the
+    /// provenance-specific standard-object or multipart predicate.
+    #[must_use]
+    pub fn matches_encryption_and_geometry(
+        &self,
+        encryption: &ObjectEncryption,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> bool {
+        self.object.matches_encryption(encryption)
+            && self.segment_index == segment_index
+            && self.logical_plaintext_len == logical_plaintext_len
+    }
+
     /// Returns whether this subject was minted for the exact multipart part,
     /// immutable part payload generation, encryption state, and segment
     /// geometry supplied by the caller.
@@ -1958,6 +1973,17 @@ impl SegmentEncryptionSubject {
 
     pub(crate) fn logical_plaintext_len(&self) -> u64 {
         self.logical_plaintext_len
+    }
+
+    /// Canonical associated data for the segment payload codec.
+    ///
+    /// Storage mints this subject from durable object authority. Encryption
+    /// code may authenticate the resulting bytes, but cannot construct or
+    /// alter the bucket, key, generation, provenance, or segment geometry
+    /// they encode.
+    #[must_use]
+    pub fn payload_aead_context(&self) -> &[u8] {
+        &self.canonical
     }
 
     #[cfg(test)]
@@ -9319,8 +9345,11 @@ mod tests {
 
         assert_eq!(subject.canonical_bytes(), expected);
         assert!(subject.matches_standard_object_segment(&encryption, 3, 65_537));
+        assert!(subject.matches_encryption_and_geometry(&encryption, 3, 65_537));
         assert!(!subject.matches_standard_object_segment(&encryption, 2, 65_537));
+        assert!(!subject.matches_encryption_and_geometry(&encryption, 2, 65_537));
         assert!(!subject.matches_standard_object_segment(&encryption, 3, 65_536));
+        assert!(!subject.matches_encryption_and_geometry(&encryption, 3, 65_536));
 
         let same_nonce_other_wrapped_dek = ObjectEncryption::SseS3(SseS3ObjectState::new(
             9,
@@ -9345,6 +9374,7 @@ mod tests {
             65_537,
         );
         assert!(!multipart_subject.matches_standard_object_segment(&encryption, 3, 65_537));
+        assert!(multipart_subject.matches_encryption_and_geometry(&encryption, 3, 65_537));
 
         for crossed in [
             SegmentEncryptionSubject::standard_object(
