@@ -1174,8 +1174,9 @@ Implementation update (2026-10-23, real buffered-operation canaries):
 
 - The SSE-C and SSE-S3 encryption-state constructors now take an internal, compiler-exhaustive
   payload-codec selection. Their production entry points remain explicitly pinned to
-  `SegmentAes256GcmV1`; test-only adapters can select another already-supported profile without
-  mutating a completed state or bypassing key generation, DEK wrapping, or validator construction.
+  `SegmentAes256GcmV1`; a test-only coordinator selector can select another already-supported
+  profile without mutating a completed authorization result or bypassing key generation, DEK
+  wrapping, or validator construction.
 - Real buffered PutObject canaries select `Cobblestone256SegmentV1` for both key modes and run the
   normal admitted reservation, subject-bound encryption, EC/shard write, integrity-witness,
   metadata-command apply, active snapshot, checksum-metadata open, DEK unwrap, and GetObject body
@@ -1190,8 +1191,8 @@ Implementation update (2026-10-23, real buffered-operation canaries):
 Implementation update (2026-10-23, real streamed-PutObject canaries):
 
 - Real streamed PutObject canaries now select `Cobblestone256SegmentV1` for both SSE-S3 and SSE-C
-  through the same internal encryption-state construction seam as the buffered canaries. Normal
-  production entry points remain pinned to `SegmentAes256GcmV1`.
+  through the same coordinator-owned encryption-state construction seam as the buffered canaries.
+  Normal production entry points remain pinned to `SegmentAes256GcmV1`.
 - Each canary creates the durable stream session under one admitted route, encrypts and appends two
   differently sized segments containing multiple 16 KiB records, finalizes through the session-
   bound terminal command, and reads the complete object through the normal GetObject path. The
@@ -1203,6 +1204,27 @@ Implementation update (2026-10-23, real streamed-PutObject canaries):
   UploadPart/UploadPartCopy, multipart completion, restart/retained reads, the object-subject
   DEK-wrap/checksum transition, and the remaining malformed-carrier matrix remain open before
   writer selection.
+
+Implementation update (2026-10-23, real UploadPart and multipart-completion canaries):
+
+- The test-only writer-profile selector now belongs to the coordinator and feeds the ordinary
+  SSE-S3/SSE-C construction boundary used by every new-write authorization path. Non-test builds
+  have no selector field or alternate branch: their public constructors remain hard-pinned to
+  `SegmentAes256GcmV1`. The earlier buffered and streamed PutObject canaries now use this same seam
+  instead of replacing encryption state after authorization.
+- Real UploadPart canaries create an MPU through the normal request path and first verify that its
+  durable completion candidate contains `Cobblestone256SegmentV1`. They then stream and finalize a
+  part larger than one 8 MiB internal segment, complete the upload through the multipart terminal
+  command, and read the exact object through GetObject. The first segment is an exact multiple of
+  16 KiB (and therefore exercises Cobblestone's empty terminal record); the tail segment contains
+  multiple records and a short terminal record.
+- Independent SSE-S3 and SSE-C cases traverse normal bucket encryption selection, part-session
+  generation reservation, multipart segment subjects, witness persistence, part finalization,
+  manifest publication, checksum-metadata sealing/opening, DEK unwrap, and multipart body delivery.
+  The SSE-C case supplies the customer key at creation, every part operation, completion, and read.
+- This covers ordinary UploadPart plus CompleteMultipartUpload. UploadPartCopy, CopyObject, HTTP
+  dispatch, restart/retained reads, the object-subject DEK-wrap/checksum transition, and the
+  remaining malformed-carrier matrix remain open before production writer selection.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

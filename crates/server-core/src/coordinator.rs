@@ -31,7 +31,7 @@ use storage::{
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, ManagedEncryptionAlgorithm,
-    PublicAccessBlockConfig, SessionId, StoredObject, UploadId, UploadState,
+    PublicAccessBlockConfig, SegmentPayloadCodec, SessionId, StoredObject, UploadId, UploadState,
 };
 
 use self::authz_results::*;
@@ -465,6 +465,8 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     managed_key_provider: Option<StaticManagedKeyProvider>,
+    #[cfg(test)]
+    test_new_payload_codec: SegmentPayloadCodec,
     _reclaim_sweeper: Arc<ReclaimSweeper>,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
     _shard_repair_sweeper: Arc<ShardRepairSweeper>,

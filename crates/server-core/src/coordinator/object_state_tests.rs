@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+use storage::test_support::StorageClusterMultipartTestSupport as _;
 
 struct MultipartMetadataRaceSync {
     snapshot_reached: Arc<Barrier>,
@@ -5674,7 +5675,7 @@ fn put_and_read_direct_cobblestone_object(
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect();
     let admission = coord.admit_storage_route_for_request().unwrap();
-    let mut authorized = coord
+    let authorized = coord
         .prepare_put_object_write_with_storage_admission(
             &admission,
             &AuthorizePutObjectRequest {
@@ -5691,24 +5692,6 @@ fn put_and_read_direct_cobblestone_object(
         )
         .unwrap();
 
-    authorized.write_encryption = match sse_customer {
-        Some(request) => ActiveWriteEncryption::sse_customer(
-            crate::sse::test_prepare_sse_customer_write_with_payload_codec(
-                coord.sse_c_validator.as_ref().unwrap(),
-                request,
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-            )
-            .unwrap(),
-        ),
-        None => ActiveWriteEncryption::managed(
-            ManagedEncryptionAlgorithm::Aes256,
-            crate::sse::test_prepare_managed_encryption_write_with_payload_codec(
-                coord.managed_key_provider.as_ref().unwrap(),
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-            )
-            .unwrap(),
-        ),
-    };
     assert_eq!(
         authorized
             .write_encryption
@@ -5754,7 +5737,8 @@ fn put_and_read_direct_cobblestone_object(
 #[test]
 fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let mut coord = setup_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -5765,7 +5749,8 @@ fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
 #[test]
 fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_sse_c(tmp.path());
+    let mut coord = setup_coordinator_with_sse_c(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -5791,7 +5776,7 @@ fn stream_put_and_read_cobblestone_object(
     payload.extend_from_slice(&second);
 
     let admission = coord.admit_storage_route_for_request().unwrap();
-    let mut authorized = coord
+    let authorized = coord
         .prepare_put_object_write_with_storage_admission(
             &admission,
             &AuthorizePutObjectRequest {
@@ -5807,24 +5792,6 @@ fn stream_put_and_read_cobblestone_object(
             },
         )
         .unwrap();
-    authorized.write_encryption = match sse_customer {
-        Some(request) => ActiveWriteEncryption::sse_customer(
-            crate::sse::test_prepare_sse_customer_write_with_payload_codec(
-                coord.sse_c_validator.as_ref().unwrap(),
-                request,
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-            )
-            .unwrap(),
-        ),
-        None => ActiveWriteEncryption::managed(
-            ManagedEncryptionAlgorithm::Aes256,
-            crate::sse::test_prepare_managed_encryption_write_with_payload_codec(
-                coord.managed_key_provider.as_ref().unwrap(),
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-            )
-            .unwrap(),
-        ),
-    };
     assert_eq!(
         authorized
             .write_encryption
@@ -5894,7 +5861,8 @@ fn stream_put_and_read_cobblestone_object(
 #[test]
 fn stream_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let mut coord = setup_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -5905,7 +5873,8 @@ fn stream_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
 #[test]
 fn stream_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_sse_c(tmp.path());
+    let mut coord = setup_coordinator_with_sse_c(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -5913,6 +5882,132 @@ fn stream_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let request = test_sse_customer_request();
 
     stream_put_and_read_cobblestone_object(&coord, "customer-stream", Some(&request));
+}
+
+fn upload_part_and_read_cobblestone_object(
+    coord: &Coordinator,
+    key: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let payload_len =
+        INTERNAL_SEGMENT_SIZE + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37;
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let encryption = match sse_customer {
+        Some(request) => WriteEncryptionRequest::sse_customer(request),
+        None => WriteEncryptionRequest::none(),
+    };
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption,
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let candidate = coord
+        .storage_node()
+        .test_get_multipart_completion_candidate(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(key),
+            &upload.upload_id,
+        )
+        .unwrap();
+    assert_eq!(
+        candidate.encryption().payload_codec(),
+        storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        "CreateMultipartUpload must persist the selected writer profile"
+    );
+
+    let part = test_helpers::upload_part(
+        coord,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            data: &payload,
+            claimed_checksum: None,
+            sse_customer,
+        },
+    )
+    .unwrap();
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: Some(u64::try_from(payload.len()).unwrap()),
+            cond: NO_WRITE,
+            sse_customer,
+        })
+        .unwrap();
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        object.system_metadata.checksum().is_some(),
+        "multipart completion must seal checksum metadata under the upload encryption state"
+    );
+    assert_eq!(object.body.read_all().unwrap(), payload);
+}
+
+#[test]
+fn upload_part_cobblestone_sse_s3_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let mut coord = setup_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    upload_part_and_read_cobblestone_object(&coord, "managed-part", None);
+}
+
+#[test]
+fn upload_part_cobblestone_sse_c_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let mut coord = setup_coordinator_with_sse_c(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+    let request = test_sse_customer_request();
+
+    upload_part_and_read_cobblestone_object(&coord, "customer-part", Some(&request));
 }
 
 #[test]

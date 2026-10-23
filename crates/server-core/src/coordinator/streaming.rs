@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use storage::SegmentPayloadCodec;
 use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SessionId,
     StreamUploadTarget,
@@ -20,14 +22,30 @@ use super::{
     ActiveWriteEncryption, BucketSummary, Coordinator, WriteEncryptionRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
+#[cfg(not(test))]
+use crate::sse::{prepare_managed_encryption_write, prepare_sse_customer_write};
 use crate::sse::{
-    prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
-    resume_sse_customer_write, validate_sse_customer_read, ManagedEncryptionWriteContext,
-    SseCustomerRequest, SseCustomerResponseHeaders, SseCustomerSegmentScope,
-    SseCustomerWriteContext,
+    resume_managed_encryption_write, resume_sse_customer_write, validate_sse_customer_read,
+    ManagedEncryptionWriteContext, SseCustomerRequest, SseCustomerResponseHeaders,
+    SseCustomerSegmentScope, SseCustomerWriteContext,
+};
+#[cfg(test)]
+use crate::sse::{
+    test_prepare_managed_encryption_write_with_payload_codec,
+    test_prepare_sse_customer_write_with_payload_codec,
 };
 
 impl Coordinator {
+    #[cfg(test)]
+    fn new_payload_codec(&self) -> SegmentPayloadCodec {
+        self.test_new_payload_codec
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_select_new_payload_codec(&mut self, payload_codec: SegmentPayloadCodec) {
+        self.test_new_payload_codec = payload_codec;
+    }
+
     pub fn retained_stream_upload_cleanup(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
@@ -123,7 +141,15 @@ impl Coordinator {
                         .ok_or(ServerError::NotImplemented {
                             feature: "SSE-C requires ARGMIN_SSE_C_VALIDATOR_KEY".to_string(),
                         })?;
-                Ok(Some(prepare_sse_customer_write(validator, request)?))
+                #[cfg(test)]
+                let write = test_prepare_sse_customer_write_with_payload_codec(
+                    validator,
+                    request,
+                    self.new_payload_codec(),
+                )?;
+                #[cfg(not(test))]
+                let write = prepare_sse_customer_write(validator, request)?;
+                Ok(Some(write))
             }
         }
     }
@@ -137,7 +163,17 @@ impl Coordinator {
             .ok_or(ServerError::NotImplemented {
                 feature: "SSE-S3 requires managed key provider configuration".to_string(),
             })?;
-        prepare_managed_encryption_write(provider)
+        #[cfg(test)]
+        {
+            test_prepare_managed_encryption_write_with_payload_codec(
+                provider,
+                self.new_payload_codec(),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            prepare_managed_encryption_write(provider)
+        }
     }
 
     pub(super) fn resolve_write_encryption(
