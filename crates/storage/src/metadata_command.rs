@@ -5294,6 +5294,85 @@ mod tests {
         )
     }
 
+    fn object_encryption_carrier_count(payload: &MetadataCommandPayload) -> usize {
+        match payload {
+            MetadataCommandPayload::CommitDirectPutObject(_) => 1,
+            MetadataCommandPayload::CommitMultipartObject(command) => {
+                1 + command.stream_uploads.len()
+            }
+            MetadataCommandPayload::PutObjectMetadata(_) => 1,
+            MetadataCommandPayload::CreateStreamUpload(_) => 1,
+            MetadataCommandPayload::CommitStreamPart(_) => 1,
+            MetadataCommandPayload::CreateMultipartUpload(_) => 1,
+            MetadataCommandPayload::AbortMultipartUpload(command) => {
+                1 + command.cleanup.stream_uploads.len()
+            }
+            MetadataCommandPayload::CreateBucket(_)
+            | MetadataCommandPayload::PutBucketVersioning(_)
+            | MetadataCommandPayload::PutBucketAcl(_)
+            | MetadataCommandPayload::PutBucketProperty(_)
+            | MetadataCommandPayload::PutBucketSubresource(_)
+            | MetadataCommandPayload::MarkBucketDeleting(_)
+            | MetadataCommandPayload::DeleteFinalizedBucket(_)
+            | MetadataCommandPayload::ReserveObjectGeneration(_)
+            | MetadataCommandPayload::ReleaseObjectGeneration(_)
+            | MetadataCommandPayload::ReserveObjectVersion(_)
+            | MetadataCommandPayload::DeleteObjectVersion(_)
+            | MetadataCommandPayload::InsertDeleteMarker(_)
+            | MetadataCommandPayload::AppendStreamSegment(_)
+            | MetadataCommandPayload::AbortStreamUpload(_)
+            | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+            | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => 0,
+        }
+    }
+
+    fn assert_every_encryption_carrier_rejects_malformed_profile(
+        envelope: &MetadataCommandEnvelope,
+        encryption: &ObjectEncryption,
+    ) {
+        let expected_carriers = object_encryption_carrier_count(envelope.payload());
+        let mut encoded_encryption = Vec::new();
+        encode_object_encryption(&mut encoded_encryption, encryption);
+        let carrier_offsets = envelope
+            .command_bytes()
+            .windows(encoded_encryption.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == encoded_encryption).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            carrier_offsets.len(),
+            expected_carriers,
+            "{} encryption-carrier inventory changed",
+            envelope.payload().kind_name()
+        );
+
+        // ObjectEncryption is encoded as its one-byte mode, an optional-value tag,
+        // a four-byte state length, and then the self-describing state. The state
+        // version and payload-codec tag are its first two bytes.
+        let state_offset_within_carrier = 1 + 1 + 4;
+        for (carrier_ordinal, carrier_offset) in carrier_offsets.into_iter().enumerate() {
+            for (case, state_offset, value) in [
+                ("historical nested version", 0, 1),
+                ("former plaintext codec", 1, 0),
+                ("unknown codec", 1, 3),
+            ] {
+                let mut malformed = envelope.command_bytes();
+                malformed[carrier_offset + state_offset_within_carrier + state_offset] = value;
+
+                assert!(
+                    decode_metadata_command_log_entry_header(&malformed).is_err(),
+                    "{} carrier {carrier_ordinal} {case} passed header inspection",
+                    envelope.payload().kind_name()
+                );
+                assert!(
+                    decode_metadata_command_envelope_for_test(&malformed).is_err(),
+                    "{} carrier {carrier_ordinal} {case} passed full decoding",
+                    envelope.payload().kind_name()
+                );
+            }
+        }
+    }
+
     fn assert_immutable_v8_command_is_rejected(
         current: &MetadataCommandEnvelope,
         expected_v8_checksum: u64,
@@ -7387,6 +7466,10 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
+            assert_every_encryption_carrier_rejects_malformed_profile(
+                &envelope,
+                &sse_s3_encryption,
+            );
             assert_immutable_v10_sse_s3_v1_command_is_rejected(
                 &envelope,
                 IMMUTABLE_V10_SSE_S3_V1_ALL_VARIANT_CHECKSUMS[offset],

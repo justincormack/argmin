@@ -1314,6 +1314,23 @@ Implementation update (2026-10-23, crossed ciphertext/profile framing):
   object-subject DEK-wrap/checksum transition and the remaining malformed command/RPC/recovery
   carrier matrix remain open before production writer selection.
 
+Implementation update (2026-10-23, exhaustive metadata-command carriers):
+
+- The frozen all-variant metadata-command corpus now has a compiler-exhaustive inventory of every
+  `MetadataCommandPayload` variant that embeds `ObjectEncryption`. Adding a command variant
+  therefore requires an explicit carrier decision in the test rather than silently escaping the
+  matrix.
+- Every embedded occurrence is located independently, including the object plus terminal-session
+  pair in multipart completion and the upload plus terminal-session pair in multipart abort. Each
+  occurrence is mutated in turn to a historical nested state version, former plaintext codec tag
+  `0`, and unknown codec tag. Both lightweight recovery header inspection and full authorized
+  command decoding must reject every mutation.
+- This factors command coverage through the one shared nested-state decoder and the already-tested
+  pending-slot restoration boundary: the command kind cannot select a weaker parser, while the
+  existing restart sentinel proves rejected bytes remain pending and cannot advance the log or
+  mutate object state. Storage-RPC carrier inventory and the remaining authorized recovery/replay
+  effect sentinels remain open, as does the object-subject DEK-wrap/checksum transition.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 
