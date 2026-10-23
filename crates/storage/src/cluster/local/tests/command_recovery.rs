@@ -28,6 +28,197 @@ struct RepeatedFullMapFailureSource {
     include_discovery_failure: bool,
 }
 
+#[test]
+fn authorized_recovery_rejects_malformed_encryption_profile_before_effects() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "malformed-encryption-profile-recovery");
+    let bucket = BucketName::new("malformed-encryption-profile-recovery").unwrap();
+    let key = crate::ObjectKey::new("object").unwrap();
+    create_test_bucket(&fixture.cluster, &bucket);
+
+    let reservation_id = crate::SessionId::try_from("e7".repeat(16)).unwrap();
+    let generation_id = fixture
+        .cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"malformed encryption profile recovery sentinel";
+    let segment_okh = [0xe7; 16];
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &fixture.cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
+    let request = direct_put_commit_req(
+        &fixture.cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(fixture.pg_id.get()).unwrap();
+    let command = fixture
+        .cluster
+        .prepare_commit_direct_put_object_command(
+            fixture.pg_id,
+            &primary_pg,
+            &request,
+            crate::VersionId::Null,
+            request.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+
+    let encryption_state = request.encryption.encode_state().unwrap();
+    let mut malformed_bytes = command.command_bytes();
+    let encryption_state_offset = malformed_bytes
+        .windows(encryption_state.len())
+        .position(|window| window == encryption_state)
+        .expect("direct PUT command must contain its exact encryption state");
+    assert_eq!(
+        malformed_bytes
+            .windows(encryption_state.len())
+            .filter(|window| *window == encryption_state)
+            .count(),
+        1,
+        "recovery sentinel requires one unambiguous encryption carrier"
+    );
+    malformed_bytes[encryption_state_offset + 1] = 0;
+    primary_pg
+        .test_insert_raw_pending_metadata_command_slot(
+            command.id(),
+            checksum::crc64::checksum(&malformed_bytes),
+            &malformed_bytes,
+            Some(&bucket),
+        )
+        .unwrap();
+    drop(primary_pg);
+
+    let before_states: Vec<_> = fixture
+        .node_ids
+        .iter()
+        .map(|node_id| {
+            fixture
+                .active_map
+                .node(*node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(fixture.pg_id.get())
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap()
+        })
+        .collect();
+    let _serial = lock_metadata_command_apply_hook_test();
+    let apply_attempts = Arc::new(AtomicUsize::new(0));
+    let apply_attempts_for_hook = Arc::clone(&apply_attempts);
+    let _hook = fixture
+        .cluster
+        .test_install_metadata_command_apply_attempt_hook(Arc::new(move |_command| {
+            apply_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+    let pending = PendingMetadataCommandObservation::new(
+        fixture.active_epoch,
+        NonZeroU64::new(command.id().log_index().get()).unwrap(),
+        checksum::crc64::checksum(&malformed_bytes),
+    );
+    fixture
+        .authority
+        .set_pg_state(fixture.pg_id, PgState::Peering)
+        .unwrap();
+    for node_id in fixture.node_ids {
+        fixture.now_ms += 1;
+        heartbeat_authority_with_pending(
+            &mut fixture.authority,
+            &fixture.active_map,
+            node_id,
+            fixture.pg_id,
+            (node_id == primary.node_id()).then_some(pending),
+            fixture.now_ms,
+        );
+    }
+
+    let error = fixture
+        .handle
+        .recover_reported_pending_metadata_command(
+            &fixture.authority,
+            fixture.now_ms + 1,
+            None,
+            fixture.pg_id,
+            primary.node_id(),
+            pending,
+        )
+        .expect_err("malformed encryption state must not enter authorized recovery");
+    assert!(
+        matches!(
+            error,
+            PendingMetadataCommandRefreshRecoveryError::Store(
+                StoreError::MetadataCommandLogConflict { .. }
+            )
+        ),
+        "unexpected malformed-profile recovery error: {error:?}"
+    );
+    assert_eq!(
+        apply_attempts.load(Ordering::SeqCst),
+        0,
+        "malformed profile bytes must fail before command apply"
+    );
+
+    for (node_id, before_state) in fixture.node_ids.into_iter().zip(before_states) {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        assert_eq!(pg.metadata_command_replica_state().unwrap(), before_state);
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+    let primary_pg = primary.storage_node().get_pg(fixture.pg_id.get()).unwrap();
+    assert!(matches!(
+        primary_pg.pending_metadata_command_slot_any_epoch(primary.node_id().as_u32()),
+        Err(StoreError::MetadataCommandLogConflict { .. })
+    ));
+    assert!(
+        primary_pg
+            .test_clear_pending_metadata_command_slot()
+            .unwrap(),
+        "recovery must leave the malformed slot present"
+    );
+    for shard in &written.written_shards {
+        assert!(
+            fixture
+                .cluster
+                .test_payload_shard_file_exists(
+                    written.data_pg_id,
+                    written.ec,
+                    &segment_okh,
+                    generation_id,
+                    shard.key.shard_index().get(),
+                )
+                .unwrap(),
+            "recovery must not delete staged shard {}",
+            shard.key.shard_index().get()
+        );
+    }
+}
+
 impl ControlPlaneRuntimeMapSource for RepeatedFullMapFailureSource {
     fn runtime_map_snapshot(
         &self,

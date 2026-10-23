@@ -967,7 +967,7 @@ the eventual reader exists before the first payload effect.
 - [x] Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
   commands, apply/recovery, snapshots, RPC, retained reads, repair, and route-history retention.
 - [x] Add the durable profile discriminator and profile-aware stored-size calculations.
-- [ ] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
+- [x] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
   complete valid and invalid cross-product at construction, decoding, apply/recovery, and restart.
 - [ ] Integrate the codec with every encrypted write path while retaining the old reader if required by
   the selected format transition.
@@ -1347,6 +1347,24 @@ Implementation update (2026-10-23, exhaustive storage-RPC carriers):
   this closes current byte-decoding coverage for metadata-command and storage-RPC carriers. The
   remaining malformed-profile work is effect-boundary coverage for authorized recovery/replay and
   restored durable state, plus the object-subject DEK-wrap/checksum transition.
+
+Implementation update (2026-10-23, authorized recovery effect boundary):
+
+- A dynamic control-plane recovery regression now installs a checksummed pending Direct PUT command
+  whose outer command envelope, identity, and recovery observation are canonical but whose nested
+  payload-codec discriminator is the retired plaintext tag `0`. It then advertises that exact pending
+  identity through the normal heartbeat/Peering authorization path and invokes the production
+  reported-command recovery entry point.
+- Recovery rejects the slot while loading the authenticated historical command, before it can become
+  a recovery command. An apply-attempt sentinel remains at zero; every acting-set replica retains its
+  exact pre-attempt proof and absent object state; the malformed pending slot remains present; and all
+  staged shard files remain present. Recovery therefore cannot consume, abandon, reissue, apply, or
+  clean up a command whose nested payload profile fails decoding.
+- Together with the compiler-exhaustive profile registry, four-pair construction/apply/reopen matrix,
+  immutable command and RPC carrier mutations, checkpoint rejection, and restored-slot restart
+  sentinels, this closes the complete valid/invalid codec/encryption-state cross-product item. The
+  object-subject DEK-wrap/checksum AAD transition remains a separate open format change before the
+  production writer may select Cobblestone.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
