@@ -139,6 +139,7 @@ pub struct ActiveObjectReadRoute<'admission> {
     key: ObjectKey,
     version_id: Option<VersionId>,
     snapshot_mode: ObjectReadSnapshotMode,
+    bucket_incarnation_generation: Option<u64>,
     pg_id: ObjectMetadataPgId,
 }
 
@@ -510,7 +511,26 @@ struct ObjectReadMetadataRoute<'a> {
     key: &'a ObjectKey,
     version_id: Option<VersionId>,
     snapshot_mode: ObjectReadSnapshotMode,
+    bucket_incarnation_generation: Option<u64>,
     pg_id: ObjectMetadataPgId,
+}
+
+impl ObjectReadMetadataRoute<'_> {
+    fn bind_payload_encryption_subjects(
+        &self,
+        snapshot: &mut crate::ObjectReadSnapshot,
+    ) -> Result<(), ObjectPgActionError> {
+        let Some(bucket_incarnation_generation) = self.bucket_incarnation_generation else {
+            return Ok(());
+        };
+        snapshot
+            .bind_payload_encryption_subjects(bucket_incarnation_generation)
+            .map_err(|reason| {
+                ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                    reason: reason.to_string(),
+                })
+            })
+    }
 }
 
 struct ObjectMetadataMutationEffectRoute<'a> {
@@ -567,6 +587,7 @@ impl ActiveObjectReadRoute<'_> {
             key: &self.key,
             version_id: self.version_id,
             snapshot_mode: self.snapshot_mode,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
             pg_id: self.pg_id,
         };
         self.admission
@@ -584,6 +605,7 @@ impl ActiveObjectReadRoute<'_> {
             key: &self.key,
             version_id: self.version_id,
             snapshot_mode: self.snapshot_mode,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
             pg_id: self.pg_id,
         };
         self.admission
@@ -893,6 +915,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             key: &self.key,
             version_id: None,
             snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
+            bucket_incarnation_generation: None,
             pg_id: self.object_pg_id,
         };
         match self.admission.cluster.load_object_if_on_route(

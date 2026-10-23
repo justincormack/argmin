@@ -496,6 +496,42 @@ impl StorageClusterRouteAdmission {
             key: key.clone(),
             version_id,
             snapshot_mode,
+            bucket_incarnation_generation: None,
+            pg_id: self.cluster.object_metadata_pg(bucket, key),
+        })
+    }
+
+    /// Derive payload-read authority bound to the bucket incarnation loaded
+    /// during request authorization.
+    ///
+    /// Storage uses the incarnation only to mint opaque payload-encryption
+    /// subjects after the exact object snapshot has been loaded. Metadata-only
+    /// callers should continue to use [`Self::active_object_read_route`].
+    pub fn active_object_payload_read_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        snapshot_mode: ObjectReadSnapshotMode,
+        bucket_incarnation: &BucketIncarnationReadSubject,
+    ) -> Result<ActiveObjectReadRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
+        if !bucket_incarnation.matches_bucket(bucket) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "derive payload read route from bucket incarnation",
+            }
+            .into());
+        }
+        Ok(ActiveObjectReadRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            snapshot_mode,
+            bucket_incarnation_generation: Some(
+                bucket_incarnation.bucket_incarnation_generation(),
+            ),
             pg_id: self.cluster.object_metadata_pg(bucket, key),
         })
     }

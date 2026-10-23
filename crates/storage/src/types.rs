@@ -4,7 +4,7 @@
 /// Core types for the storage layer.
 use crate::error::StoreError;
 use argmin_crypto::hmac::Sha256Key;
-use std::{num::NonZeroU64, str::FromStr};
+use std::{num::NonZeroU64, str::FromStr, sync::Arc};
 
 pub use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
@@ -3269,6 +3269,7 @@ pub struct ObjectPayloadSegment {
     subject: ObjectPayloadSubject,
     record: ObjectPayloadSegmentRecord,
     stored_size: usize,
+    encryption_subject: Option<Arc<SegmentEncryptionSubject>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3337,6 +3338,7 @@ impl ObjectPayloadSegment {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Object(record),
             stored_size,
+            encryption_subject: None,
         })
     }
 
@@ -3364,6 +3366,7 @@ impl ObjectPayloadSegment {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Multipart(record),
             stored_size,
+            encryption_subject: None,
         })
     }
 
@@ -3393,6 +3396,17 @@ impl ObjectPayloadSegment {
             ObjectPayloadSegmentRecord::Object(_) => None,
             ObjectPayloadSegmentRecord::Multipart(record) => Some(record.part_number),
         }
+    }
+
+    /// Exact storage-minted logical subject authenticated by this segment's
+    /// payload codec.
+    ///
+    /// Metadata-only and low-level diagnostic snapshots need not carry this
+    /// authority. A production payload read binds it from the admitted bucket
+    /// incarnation before transferring the snapshot to the reader.
+    #[must_use]
+    pub fn encryption_subject(&self) -> Option<&SegmentEncryptionSubject> {
+        self.encryption_subject.as_deref()
     }
 
     pub(crate) fn matches_subject(
@@ -5140,6 +5154,35 @@ pub struct BucketSnapshot {
     pub tags: LoadedBucketSubresource<SerializedBucketTagSet>,
     pub lifecycle: LoadedBucketSubresource<String>,
     pub cors: LoadedBucketSubresource<String>,
+    bucket_incarnation_read_subject: BucketIncarnationReadSubject,
+}
+
+impl BucketSnapshot {
+    pub(crate) fn from_authoritative_load(
+        bucket: BucketInfo,
+        request: BucketSnapshotRequest,
+        policy: LoadedBucketSubresource<String>,
+        tags: LoadedBucketSubresource<SerializedBucketTagSet>,
+        lifecycle: LoadedBucketSubresource<String>,
+        cors: LoadedBucketSubresource<String>,
+    ) -> Self {
+        let bucket_incarnation_read_subject =
+            BucketIncarnationReadSubject::from_authoritative_bucket(&bucket);
+        Self {
+            bucket,
+            request,
+            policy,
+            tags,
+            lifecycle,
+            cors,
+            bucket_incarnation_read_subject,
+        }
+    }
+
+    #[must_use]
+    pub fn bucket_incarnation_read_subject(&self) -> BucketIncarnationReadSubject {
+        self.bucket_incarnation_read_subject.clone()
+    }
 }
 
 impl std::fmt::Debug for BucketInfo {
@@ -5221,6 +5264,7 @@ pub struct BucketFastPathInfo {
     pub bucket_abac_enabled: bool,
     pub tags: BucketFastPathTags,
     pub encryption: EffectiveBucketEncryptionConfig,
+    bucket_incarnation_read_subject: BucketIncarnationReadSubject,
 }
 
 /// Durable identity used to prove a bucket fast-path cache entry is current.
@@ -5230,12 +5274,86 @@ pub struct BucketFastPathIdentity {
     pub bucket_incarnation_generation: u64,
 }
 
+/// Opaque bucket-incarnation identity used when minting payload-read
+/// encryption subjects.
+///
+/// The value is derived from an authoritative bucket snapshot or validated
+/// fast-path entry. Callers can carry it into an admitted object-read route,
+/// but cannot assemble a bucket/incarnation pair independently.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BucketIncarnationReadSubject {
+    bucket: BucketName,
+    bucket_incarnation_generation: u64,
+}
+
+impl BucketIncarnationReadSubject {
+    fn from_authoritative_bucket(bucket: &BucketInfo) -> Self {
+        Self {
+            bucket: bucket.name.clone(),
+            bucket_incarnation_generation: bucket.bucket_incarnation_generation,
+        }
+    }
+
+    pub(crate) fn matches_bucket(&self, bucket: &BucketName) -> bool {
+        self.bucket == *bucket
+    }
+
+    pub(crate) const fn bucket_incarnation_generation(&self) -> u64 {
+        self.bucket_incarnation_generation
+    }
+}
+
+impl std::fmt::Debug for BucketIncarnationReadSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketIncarnationReadSubject")
+            .finish_non_exhaustive()
+    }
+}
+
 impl BucketFastPathInfo {
     #[must_use]
     pub const fn identity(&self) -> BucketFastPathIdentity {
         BucketFastPathIdentity {
             bucket_execution_generation: self.bucket_execution_generation,
             bucket_incarnation_generation: self.bucket_incarnation_generation,
+        }
+    }
+
+    #[must_use]
+    pub fn bucket_incarnation_read_subject(&self) -> BucketIncarnationReadSubject {
+        self.bucket_incarnation_read_subject.clone()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn cache_test_fixture(name: BucketName) -> Self {
+        let bucket_incarnation_read_subject = BucketIncarnationReadSubject {
+            bucket: name.clone(),
+            bucket_incarnation_generation: 1,
+        };
+        Self {
+            name,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
+            created_at: 0,
+            state: BucketState::Active,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            policy: BucketFastPathPolicy::Absent,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            bucket_execution_generation: 0,
+            bucket_incarnation_generation: 1,
+            multipart_upload_id_authority: MultipartUploadIdAuthority::for_test(),
+            bucket_abac_enabled: false,
+            tags: BucketFastPathTags::NotApplicable,
+            encryption: EffectiveBucketEncryptionConfig::default(),
+            bucket_incarnation_read_subject,
         }
     }
 }
@@ -5394,6 +5512,7 @@ impl From<&BucketSnapshot> for BucketFastPathInfo {
                 LoadedBucketSubresource::NotRequested => BucketFastPathTags::NotApplicable,
             },
             encryption: snapshot.bucket.encryption,
+            bucket_incarnation_read_subject: snapshot.bucket_incarnation_read_subject.clone(),
         }
     }
 }
@@ -5890,6 +6009,72 @@ impl ObjectReadSnapshot {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+
+    pub(crate) fn bind_payload_encryption_subjects(
+        &mut self,
+        bucket_incarnation_generation: u64,
+    ) -> Result<(), &'static str> {
+        if self
+            .object_segments
+            .iter()
+            .chain(&self.multipart_part_segments)
+            .any(|segment| segment.encryption_subject.is_some())
+        {
+            return Err("object payload encryption subjects are already bound");
+        }
+        let Some(live) = self.stored.as_live() else {
+            return Ok(());
+        };
+        for segment in &mut self.object_segments {
+            if segment.part_number().is_some() {
+                return Err("standard object payload contains a multipart segment");
+            }
+            segment.encryption_subject = Some(Arc::new(SegmentEncryptionSubject::standard_object(
+                ObjectEncryptionSubject::standard_object(
+                    bucket_incarnation_generation,
+                    &live.bucket,
+                    &live.key,
+                    live.generation_id,
+                    &live.encryption,
+                ),
+                segment.segment_index(),
+                segment.size(),
+            )));
+        }
+
+        let part_generations = self
+            .multipart_parts
+            .iter()
+            .map(|part| (part.record.part_number, part.record.part_vid))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if part_generations.len() != self.multipart_parts.len() {
+            return Err("multipart snapshot contains duplicate part numbers");
+        }
+        for segment in &mut self.multipart_part_segments {
+            let ObjectPayloadSegmentRecord::Multipart(record) = &segment.record else {
+                return Err("multipart payload contains a standard object segment");
+            };
+            let part_generation_id = part_generations
+                .get(&record.part_number)
+                .copied()
+                .ok_or("multipart segment has no matching part generation")?;
+            segment.encryption_subject = Some(Arc::new(SegmentEncryptionSubject::multipart_part(
+                ObjectEncryptionSubject::standard_object(
+                    bucket_incarnation_generation,
+                    &live.bucket,
+                    &live.key,
+                    live.generation_id,
+                    &live.encryption,
+                ),
+                &record.upload_id,
+                record.part_number,
+                part_generation_id,
+                record.segment_index,
+                record.size,
+            )));
+        }
+        Ok(())
     }
 
     /// Render storage-owned physical placement details for the local debug endpoint.
@@ -8650,6 +8835,150 @@ mod tests {
     }
 
     #[test]
+    fn object_read_snapshot_binds_standard_payload_subject_once() {
+        let bucket = BucketName::try_from("subject-bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("subject-key".to_string()).unwrap();
+        let generation_id = GenerationId::new(29).unwrap();
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let stored = StoredObject::Live(LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: 9,
+            etag: ObjectEtag::single_part(17),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 1, m: 0 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: encryption.clone(),
+        });
+        let segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 3,
+            size: 9,
+            segment_crc64: 17,
+            segment_okh: [23; 16],
+            segment_vid: generation_id,
+            data_pg_id: 31,
+            placement_cluster_epoch: ClusterEpoch::new(37).unwrap(),
+            ec_k: 1,
+            ec_m: 0,
+            shard_integrity: None,
+        };
+        let mut snapshot =
+            ObjectReadSnapshot::from_records(stored, vec![segment], vec![], vec![]).unwrap();
+        assert!(snapshot.object_segments[0].encryption_subject().is_none());
+
+        snapshot.bind_payload_encryption_subjects(41).unwrap();
+        let expected = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(41, &bucket, &key, generation_id, &encryption),
+            3,
+            9,
+        );
+        let actual = snapshot.object_segments[0].encryption_subject().unwrap();
+        assert_eq!(actual.canonical_bytes(), expected.canonical_bytes());
+        assert!(actual.matches_standard_object_segment(&encryption, 3, 9));
+        assert_eq!(
+            snapshot.bind_payload_encryption_subjects(43),
+            Err("object payload encryption subjects are already bound")
+        );
+    }
+
+    #[test]
+    fn object_read_snapshot_binds_multipart_payload_provenance() {
+        let bucket = BucketName::try_from("multipart-subject-bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("multipart-subject-key".to_string()).unwrap();
+        let upload_id = UploadId::try_from("ab".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        let generation_id = GenerationId::new(47).unwrap();
+        let part_generation_id = GenerationId::new(53).unwrap();
+        let version_id = VersionId::from_u64(59);
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let stored = StoredObject::Live(LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: 11,
+            etag: ObjectEtag::multipart(17_u64.to_be_bytes(), 1),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 1, m: 0 },
+            layout: ObjectLayout::MultipartManifest {
+                parts_count: std::num::NonZeroU32::new(1).unwrap(),
+            },
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: encryption.clone(),
+        });
+        let part = ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            part_number: 7,
+            size: 11,
+            payload_crc64: 17,
+            etag: 17_u64.to_be_bytes().to_vec(),
+            etag_kind: EtagKind::Crc64,
+            part_vid: part_generation_id,
+            placement_cluster_epoch: ClusterEpoch::new(61).unwrap(),
+            ec_k: 1,
+            ec_m: 0,
+            data_pg_id: 67,
+            checksum: None,
+        };
+        let segment = MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: version_id.to_u64(),
+            part_number: 7,
+            segment_index: 2,
+            size: 11,
+            segment_crc64: 17,
+            segment_okh: [71; 16],
+            segment_vid: GenerationId::new(73).unwrap(),
+            data_pg_id: 67,
+            placement_cluster_epoch: ClusterEpoch::new(61).unwrap(),
+            ec_k: 1,
+            ec_m: 0,
+            shard_integrity: None,
+        };
+        let mut snapshot =
+            ObjectReadSnapshot::from_records(stored, vec![], vec![part], vec![segment]).unwrap();
+
+        snapshot.bind_payload_encryption_subjects(79).unwrap();
+        let actual = snapshot.multipart_part_segments[0]
+            .encryption_subject()
+            .unwrap();
+        assert!(actual.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            part_generation_id,
+            2,
+            11,
+        ));
+        assert!(!actual.matches_standard_object_segment(&encryption, 2, 11));
+    }
+
+    #[test]
     fn object_payload_placement_diagnostic_is_storage_owned() {
         let bucket = BucketName::try_from("bucket".to_string()).unwrap();
         let key = ObjectKey::try_from("key".to_string()).unwrap();
@@ -9906,34 +10235,24 @@ mod tests {
         assert!(!debug.contains("secret-policy"));
         assert!(!debug.contains("<LifecycleConfiguration>secret</LifecycleConfiguration>"));
 
-        let fast_debug = format!(
-            "{:?}",
-            BucketFastPathInfo {
-                name: info.name.clone(),
-                owner_principal: info.owner_principal.clone(),
-                owner_canonical_id: info.owner_canonical_id.clone(),
-                created_at: info.created_at,
-                state: info.state,
-                versioning: info.versioning,
-                object_lock: info.object_lock,
-                public_access_block: info.public_access_block,
-                ownership_controls: info.ownership_controls,
-                bucket_policy_present: info.bucket_policy_present,
-                bucket_policy_public: info.bucket_policy_public,
-                bucket_policy_generation: info.bucket_policy_generation,
-                policy: BucketFastPathPolicy::Loaded("secret-policy".to_string()),
-                bucket_lifecycle_present: info.bucket_lifecycle_present,
-                bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-                bucket_execution_generation: info.bucket_execution_generation,
-                bucket_incarnation_generation: info.bucket_incarnation_generation,
-                multipart_upload_id_authority: info.multipart_upload_id_authority(),
-                bucket_abac_enabled: info.bucket_abac_enabled,
-                tags: BucketFastPathTags::Loaded(SerializedBucketTagSet::new(
-                    "<Tagging><TagSet><Tag><Key>secret</Key><Value>tags</Value></Tag></TagSet></Tagging>".to_string(),
-                )),
-                encryption: info.encryption,
-            }
+        let snapshot = BucketSnapshot::from_authoritative_load(
+            info,
+            BucketSnapshotRequest {
+                policy: true,
+                tags: BucketSnapshotTagsRequest::Always,
+                lifecycle: true,
+                cors: false,
+            },
+            LoadedBucketSubresource::Loaded("secret-policy".to_string()),
+            LoadedBucketSubresource::Loaded(SerializedBucketTagSet::new(
+                "<Tagging><TagSet><Tag><Key>secret</Key><Value>tags</Value></Tag></TagSet></Tagging>".to_string(),
+            )),
+            LoadedBucketSubresource::Loaded(
+                "<LifecycleConfiguration>secret</LifecycleConfiguration>".to_string(),
+            ),
+            LoadedBucketSubresource::NotRequested,
         );
+        let fast_debug = format!("{:?}", BucketFastPathInfo::from(&snapshot));
         assert!(fast_debug.contains(r#""own\ner""#));
         assert!(!fast_debug.contains("secret-policy"));
         assert!(!fast_debug.contains("secret-tags"));

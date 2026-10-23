@@ -389,14 +389,14 @@ impl SharedStorageNode {
             BucketSubresourceKind::Cors,
         )?;
 
-        Ok(BucketSnapshot {
-            bucket: bucket_info,
+        Ok(BucketSnapshot::from_authoritative_load(
+            bucket_info,
             request,
             policy,
             tags,
             lifecycle,
             cors,
-        })
+        ))
     }
 
     fn load_bucket_snapshot_subresource(

@@ -203,6 +203,13 @@ pub mod test_support {
 
     use super::*;
 
+    /// Construct a cache entry for coordinator cache-behavior tests without
+    /// exposing the storage-owned read-incarnation provenance field.
+    #[must_use]
+    pub fn bucket_fast_path_cache_fixture(name: BucketName) -> BucketFastPathInfo {
+        BucketFastPathInfo::cache_test_fixture(name)
+    }
+
     /// Opaque failure from a storage-owned test operation.
     ///
     /// Cross-crate tests receive only a bounded diagnostic category. The
@@ -3991,11 +3998,11 @@ pub use types::{
     AuthorizedMultipartUploadListParts, AuthorizedMultipartUploadPart,
     BeginUploadPartStreamSessionReq, BucketAclSummary, BucketDeleteDiagnostic,
     BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo, BucketFastPathPolicy,
-    BucketFastPathTags, BucketInfo, BucketName, BucketNameError, BucketObjectLockConfig,
-    BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, BucketState, BucketVersioningState, BucketWriteDrainRecord,
-    BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId, ChecksumAlgorithm,
-    ChecksumBytes, ChecksumType, ClusterEpoch, CompleteMultipartCommitInput,
+    BucketFastPathTags, BucketIncarnationReadSubject, BucketInfo, BucketName, BucketNameError,
+    BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketVersioningState,
+    BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CompleteMultipartCommitInput,
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateBucketConfig,
     CreateMultipartUploadInput, CreateMultipartUploadOutcome, CreateStreamUploadReq, DataLayout,
     DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,

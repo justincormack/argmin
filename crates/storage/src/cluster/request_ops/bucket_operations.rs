@@ -1930,6 +1930,7 @@ impl super::StorageCluster {
             key,
             version_id,
             snapshot_mode,
+            bucket_incarnation_generation: None,
             pg_id: self.object_metadata_pg(bucket, key),
         };
         self.load_object_read_snapshot_if_on_route(&route, action, || Ok(()))
@@ -1975,7 +1976,10 @@ impl super::StorageCluster {
                 &subject.identity,
                 route.snapshot_mode,
             ) {
-                Ok(snapshot) => return Ok(Ok(ObjectReadSnapshotOutcome { value, snapshot })),
+                Ok(mut snapshot) => {
+                    route.bind_payload_encryption_subjects(&mut snapshot)?;
+                    return Ok(Ok(ObjectReadSnapshotOutcome { value, snapshot }));
+                }
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     work_budget
                         .sleep_after_contention(

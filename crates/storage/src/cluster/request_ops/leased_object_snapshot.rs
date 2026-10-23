@@ -121,6 +121,7 @@ impl ActiveObjectReadRoute<'_> {
             key: &self.key,
             version_id: self.version_id,
             snapshot_mode: self.snapshot_mode,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
             pg_id: self.pg_id,
         };
         let repair_fence = RetainedActiveRouteRepairFence {
@@ -154,6 +155,7 @@ impl ActiveObjectReadRoute<'_> {
             key: &self.key,
             version_id: self.version_id,
             snapshot_mode: self.snapshot_mode,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
             pg_id: self.pg_id,
         };
         self.admission
@@ -180,6 +182,7 @@ impl StorageCluster {
             key,
             version_id,
             snapshot_mode,
+            bucket_incarnation_generation: None,
             pg_id: self.object_metadata_pg(bucket, key),
         };
         self.load_leased_object_read_snapshot_if_on_route(&route, action, None, || Ok(()))
@@ -247,7 +250,8 @@ impl StorageCluster {
                 &subject.identity,
                 route.snapshot_mode,
             ) {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    route.bind_payload_encryption_subjects(&mut snapshot)?;
                     require_valid_route()?;
                     return Ok(Ok(LeasedObjectReadSnapshotOutcome {
                         value,

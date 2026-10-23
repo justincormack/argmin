@@ -905,14 +905,14 @@ impl<'a> StorageRpcDecoder<'a> {
     }
 
     fn read_bucket_snapshot(&mut self) -> Result<BucketSnapshot, StorageRpcPayloadError> {
-        Ok(BucketSnapshot {
-            bucket: self.read_bucket_info()?,
-            request: self.read_bucket_snapshot_request()?,
-            policy: self.read_loaded_bucket_subresource()?,
-            tags: self.read_loaded_bucket_tags()?,
-            lifecycle: self.read_loaded_bucket_subresource()?,
-            cors: self.read_loaded_bucket_subresource()?,
-        })
+        Ok(BucketSnapshot::from_authoritative_load(
+            self.read_bucket_info()?,
+            self.read_bucket_snapshot_request()?,
+            self.read_loaded_bucket_subresource()?,
+            self.read_loaded_bucket_tags()?,
+            self.read_loaded_bucket_subresource()?,
+            self.read_loaded_bucket_subresource()?,
+        ))
     }
 
     fn read_loaded_bucket_subresource(

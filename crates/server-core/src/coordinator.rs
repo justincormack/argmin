@@ -568,32 +568,7 @@ mod bucket_fast_path_cache_tests {
     use std::panic::AssertUnwindSafe;
 
     fn bucket_fast_path_info(name: &str) -> storage::BucketFastPathInfo {
-        storage::BucketFastPathInfo {
-            name: trusted_bucket_name(name),
-            owner_principal: "owner".to_string(),
-            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
-            created_at: 0,
-            state: storage::BucketState::Active,
-            versioning: s3_types::BucketVersioningState::Disabled,
-            object_lock: s3_types::BucketObjectLockConfig {
-                enabled: false,
-                default_retention: None,
-            },
-            public_access_block: None,
-            ownership_controls: None,
-            bucket_policy_present: false,
-            bucket_policy_public: false,
-            bucket_policy_generation: 0,
-            policy: storage::BucketFastPathPolicy::Absent,
-            bucket_lifecycle_present: false,
-            bucket_lifecycle_generation: 0,
-            bucket_execution_generation: 0,
-            bucket_incarnation_generation: 0,
-            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
-            bucket_abac_enabled: false,
-            tags: storage::BucketFastPathTags::NotApplicable,
-            encryption: storage::EffectiveBucketEncryptionConfig::default(),
-        }
+        storage::test_support::bucket_fast_path_cache_fixture(trusted_bucket_name(name))
     }
 
     #[test]

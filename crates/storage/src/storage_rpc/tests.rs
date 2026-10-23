@@ -5239,14 +5239,14 @@ mod tests {
         let decoded = decode_bucket_snapshot_request(&bytes).unwrap();
         assert_eq!(decoded, request);
 
-        let snapshot = BucketSnapshot {
-            bucket: test_bucket_info("bucket"),
-            request: request.request,
-            policy: LoadedBucketSubresource::Loaded("{\"Statement\":[]}".to_string()),
-            tags: LoadedBucketSubresource::Missing,
-            lifecycle: LoadedBucketSubresource::Loaded("<LifecycleConfiguration/>".to_string()),
-            cors: LoadedBucketSubresource::NotRequested,
-        };
+        let snapshot = BucketSnapshot::from_authoritative_load(
+            test_bucket_info("bucket"),
+            request.request,
+            LoadedBucketSubresource::Loaded("{\"Statement\":[]}".to_string()),
+            LoadedBucketSubresource::Missing,
+            LoadedBucketSubresource::Loaded("<LifecycleConfiguration/>".to_string()),
+            LoadedBucketSubresource::NotRequested,
+        );
         let response = StorageRpcBucketSnapshotResponse {
             outcome: StorageRpcBucketSnapshotOutcome::Loaded(Box::new(snapshot)),
         };

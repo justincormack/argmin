@@ -136,6 +136,7 @@ pub(super) struct LoadedBucketHandle {
     bucket: BucketSummary,
     bucket_execution_generation: u64,
     bucket_incarnation_generation: u64,
+    bucket_incarnation_read_subject: storage::BucketIncarnationReadSubject,
     request: BucketHandleRequest,
     policy: LoadedBucketValue<String>,
     tags: LoadedBucketValue<s3_types::TagSet>,
@@ -172,6 +173,7 @@ impl LoadedBucketHandle {
         bucket: BucketSummary,
         bucket_execution_generation: u64,
         bucket_incarnation_generation: u64,
+        bucket_incarnation_read_subject: storage::BucketIncarnationReadSubject,
         request: BucketHandleRequest,
         subresources: LoadedBucketSubresources,
     ) -> Self {
@@ -179,6 +181,7 @@ impl LoadedBucketHandle {
             bucket,
             bucket_execution_generation,
             bucket_incarnation_generation,
+            bucket_incarnation_read_subject,
             request,
             policy: subresources.policy,
             tags: subresources.tags,
@@ -197,6 +200,12 @@ impl LoadedBucketHandle {
 
     pub(super) const fn bucket_incarnation_generation(&self) -> u64 {
         self.bucket_incarnation_generation
+    }
+
+    pub(super) const fn bucket_incarnation_read_subject(
+        &self,
+    ) -> &storage::BucketIncarnationReadSubject {
+        &self.bucket_incarnation_read_subject
     }
 
     pub(super) const fn fast_path_identity(&self) -> storage::BucketFastPathIdentity {
@@ -335,6 +344,7 @@ impl<'a> BucketHandleLoader<'a> {
         expected_bucket_owner: Option<&str>,
         request: BucketHandleRequest,
     ) -> Result<LoadedBucketHandle, ServerError> {
+        let bucket_incarnation_read_subject = snapshot.bucket_incarnation_read_subject();
         let bucket_execution_generation = snapshot.bucket.bucket_execution_generation;
         let bucket_incarnation_generation = snapshot.bucket.bucket_incarnation_generation;
         let bucket = Coordinator::validate_expected_bucket_owner(
@@ -347,6 +357,7 @@ impl<'a> BucketHandleLoader<'a> {
             bucket,
             bucket_execution_generation,
             bucket_incarnation_generation,
+            bucket_incarnation_read_subject,
             request,
             LoadedBucketSubresources::new(
                 Self::from_storage_subresource(snapshot.policy),

@@ -1141,6 +1141,35 @@ Implementation update (2026-10-23, authority-bound write codec dispatch):
   profile-versioned DEK-wrap/checksum AAD transition must land before writer selection; otherwise
   the server could durably emit a representation that is unreadable or only partially bound.
 
+Implementation update (2026-10-23, authority-bound whole-segment read dispatch):
+
+- Authorized bucket loading now produces an opaque bucket-incarnation read subject. Opening an
+  admitted payload route requires that subject and storage binds every returned payload segment to
+  its exact storage-owned `SegmentEncryptionSubject`. Standard-object subjects include the live
+  object generation; multipart subjects additionally include the durable upload ID, part number,
+  and non-recycled part payload generation. One-shot binding rejects missing multipart provenance,
+  duplicate part records, and already-bound snapshots. The opaque bucket subject is captured once
+  at authoritative snapshot construction and copied privately into fast-path entries; its public
+  metadata DTO fields cannot remint or alter it. Crossed-bucket subjects fail before the read route
+  is opened, while same-bucket snapshot and fast-path incarnation substitution tests prove the
+  original authoritative incarnation remains bound.
+- The coordinator no longer reconstructs segment encryption identity from independent primitive
+  fields. SSE-C and SSE-S3 reads consume the opaque segment subject, revalidate its encryption
+  instance and geometry, and select the durable codec through one compiler-exhaustive dispatch.
+  The legacy whole-segment AES-GCM profile retains its frozen nonce/AAD behavior. Cobblestone opens
+  its commitment and records with the complete canonical subject as context; plaintext from each
+  record remains private until that record authenticates, and the caller-owned ciphertext buffer
+  is replaced only after the complete segment succeeds.
+- Storage-owned regressions pin exact standard and multipart subject provenance, one-shot binding,
+  and crossed-bucket rejection. Codec tests cover empty, boundary, and multi-record Cobblestone
+  messages, exact-context success, crossed-context rejection, and no caller-visible plaintext on
+  failure. Production still writes the legacy profile, so real S3 operation canaries for a
+  Cobblestone writer remain open.
+- This is intentionally the common whole-segment reader needed before writer selection. It does
+  not claim Phase 3 positioned shard IO or Phase 4 incremental HTTP emission: those phases will
+  move the same subject-bound codec operation onto authenticated selected chunks and define the
+  post-header transport-abort behavior for later-record failures.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

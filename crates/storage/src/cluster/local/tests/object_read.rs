@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::node_client::{ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute};
-use crate::{BucketSnapshotLoadError, ObjectPgActionError, StorageClusterRouteHandle};
+use crate::{
+    BucketFastPathInfo, BucketSnapshotLoadError, ObjectEncryptionSubject, ObjectPgActionError,
+    SegmentEncryptionSubject, StorageClusterRouteHandle,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
@@ -600,6 +603,177 @@ fn retained_read_healthy_path_reads_only_the_data_shards() {
         (0..SharedStorageNode::DEFAULT_EC_SHAPE.k).collect::<Vec<_>>(),
         "healthy retained reads must not materialize parity shards"
     );
+}
+
+#[test]
+fn admitted_payload_read_route_mints_exact_segment_encryption_subjects() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("payload-read-subject-bucket");
+    let key = crate::tests::object_key("payload-read-subject-key");
+    write_committed_direct_segment_for(&cluster, &bucket, &key, b"subject-bound payload");
+
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let mut bucket_snapshot = admission
+        .active_bucket_route(&bucket)
+        .unwrap()
+        .load_bucket_snapshot(crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let authoritative_incarnation = bucket_snapshot.bucket.bucket_incarnation_generation;
+    let substituted_snapshot_incarnation = authoritative_incarnation.checked_add(100).unwrap();
+    bucket_snapshot.bucket.bucket_incarnation_generation = substituted_snapshot_incarnation;
+    let bucket_incarnation = bucket_snapshot.bucket_incarnation_read_subject();
+    assert_eq!(
+        bucket_incarnation.bucket_incarnation_generation(),
+        authoritative_incarnation,
+        "mutating the snapshot DTO must not mint substituted read authority"
+    );
+    let route = admission
+        .active_object_payload_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            &bucket_incarnation,
+        )
+        .unwrap();
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let live = outcome.snapshot().stored.as_live().unwrap();
+    let segment = &outcome.snapshot().object_segments[0];
+    let actual_subject = segment.encryption_subject().unwrap();
+    let expected_subject = SegmentEncryptionSubject::standard_object(
+        ObjectEncryptionSubject::standard_object(
+            authoritative_incarnation,
+            &bucket,
+            &key,
+            live.generation_id,
+            &live.encryption,
+        ),
+        segment.segment_index(),
+        segment.size(),
+    );
+    let substituted_subject = SegmentEncryptionSubject::standard_object(
+        ObjectEncryptionSubject::standard_object(
+            substituted_snapshot_incarnation,
+            &bucket,
+            &key,
+            live.generation_id,
+            &live.encryption,
+        ),
+        segment.segment_index(),
+        segment.size(),
+    );
+    assert_eq!(
+        actual_subject.payload_aead_context(),
+        expected_subject.payload_aead_context()
+    );
+    assert_ne!(
+        actual_subject.payload_aead_context(),
+        substituted_subject.payload_aead_context()
+    );
+
+    let mut fast_path = BucketFastPathInfo::from(&bucket_snapshot);
+    let substituted_fast_path_incarnation = authoritative_incarnation.checked_add(200).unwrap();
+    fast_path.bucket_incarnation_generation = substituted_fast_path_incarnation;
+    let fast_path_subject = fast_path.bucket_incarnation_read_subject();
+    assert_eq!(
+        fast_path_subject.bucket_incarnation_generation(),
+        authoritative_incarnation,
+        "mutating the fast-path DTO must not mint substituted read authority"
+    );
+    let fast_path_outcome = admission
+        .active_object_payload_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            &fast_path_subject,
+        )
+        .unwrap()
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let fast_path_segment = &fast_path_outcome.snapshot().object_segments[0];
+    assert_eq!(
+        fast_path_segment
+            .encryption_subject()
+            .unwrap()
+            .payload_aead_context(),
+        expected_subject.payload_aead_context()
+    );
+    assert_ne!(
+        fast_path_segment
+            .encryption_subject()
+            .unwrap()
+            .payload_aead_context(),
+        SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                substituted_fast_path_incarnation,
+                &bucket,
+                &key,
+                live.generation_id,
+                &live.encryption,
+            ),
+            fast_path_segment.segment_index(),
+            fast_path_segment.size(),
+        )
+        .payload_aead_context()
+    );
+
+    let other_bucket = crate::tests::bucket_name("payload-read-subject-other-bucket");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    admission
+        .active_bucket_route(&other_bucket)
+        .unwrap()
+        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+            name: other_bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+    let other_snapshot = admission
+        .active_bucket_route(&other_bucket)
+        .unwrap()
+        .load_bucket_snapshot(crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let error = match admission.active_object_payload_read_route(
+        &bucket,
+        &key,
+        None,
+        crate::ObjectReadSnapshotMode::FullPayloadLayout,
+        &other_snapshot.bucket_incarnation_read_subject(),
+    ) {
+        Ok(_) => panic!("foreign bucket incarnation unexpectedly opened payload read route"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.retained_store_error(),
+        Some(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "derive payload read route from bucket incarnation",
+        })
+    ));
 }
 
 #[test]

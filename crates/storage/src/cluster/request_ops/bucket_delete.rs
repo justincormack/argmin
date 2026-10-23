@@ -364,14 +364,14 @@ impl super::StorageCluster {
             BucketSubresourceKind::Cors,
         )?;
 
-        Ok(BucketSnapshot {
-            bucket: bucket_info,
+        Ok(BucketSnapshot::from_authoritative_load(
+            bucket_info,
             request,
             policy,
             tags,
             lifecycle,
             cors,
-        })
+        ))
     }
 
     /// Load a raw Active-bucket authorization snapshot only after proving that

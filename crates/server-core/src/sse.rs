@@ -4,7 +4,10 @@
 use std::fmt;
 
 use argmin_crypto::aead::Aes256GcmKey;
-use argmin_crypto::cobblestone::{self, Cobblestone256Key, COBBLESTONE_SALT_LEN};
+use argmin_crypto::cobblestone::{
+    self, Cobblestone256Key, Cobblestone256MessageLayout, Cobblestone256StreamOpener,
+    COBBLESTONE_HEADER_LEN, COBBLESTONE_SALT_LEN,
+};
 use argmin_crypto::hmac::Sha256Key;
 #[cfg(test)]
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
@@ -75,6 +78,29 @@ struct SegmentSealParameters<'a> {
     payload_aead_context: &'a [u8],
     segment_index: u32,
     descriptor: AeadDescriptor<'a>,
+}
+
+pub(crate) struct AuthorizedSegmentRead<'a> {
+    subject: &'a SegmentEncryptionSubject,
+    segment_scope: SseCustomerSegmentScope,
+    segment_index: u32,
+    plaintext_len: usize,
+}
+
+impl<'a> AuthorizedSegmentRead<'a> {
+    pub(crate) fn new(
+        subject: &'a SegmentEncryptionSubject,
+        segment_scope: SseCustomerSegmentScope,
+        segment_index: u32,
+        plaintext_len: usize,
+    ) -> Self {
+        Self {
+            subject,
+            segment_scope,
+            segment_index,
+            plaintext_len,
+        }
+    }
 }
 
 fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerError {
@@ -754,7 +780,50 @@ pub(crate) fn resume_managed_encryption_write(
     })
 }
 
-pub(crate) fn decrypt_managed_encryption_segment_in_place(
+pub(crate) fn decrypt_authorized_managed_encryption_segment_in_place(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    read: AuthorizedSegmentRead<'_>,
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), ServerError> {
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    let encryption = ObjectEncryption::SseS3(state.clone());
+    if !read.subject.matches_encryption_and_geometry(
+        &encryption,
+        read.segment_index,
+        read.plaintext_len as u64,
+    ) {
+        return Err(ServerError::InternalError {
+            reason: "managed segment does not match its storage-minted read subject".to_string(),
+        });
+    }
+    decrypt_segment_with_dek_and_prefix_in_place(
+        &dek,
+        state.payload_codec(),
+        state.segment_nonce_prefix(),
+        read,
+        ciphertext,
+        AeadDescriptor {
+            aad: MANAGED_SEGMENT_AAD,
+            label: MANAGED_ENCRYPTION_LABEL,
+        },
+    )
+}
+
+#[cfg(test)]
+fn decrypt_managed_encryption_segment_in_place(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
     segment_scope: SseCustomerSegmentScope,
@@ -775,7 +844,7 @@ pub(crate) fn decrypt_managed_encryption_segment_in_place(
         MANAGED_WRAP_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )?;
-    decrypt_segment_with_dek_and_prefix_in_place(
+    decrypt_legacy_segment_with_dek_and_prefix_in_place(
         &dek,
         state.segment_nonce_prefix(),
         segment_scope,
@@ -842,7 +911,47 @@ fn sse_customer_validator_key_unavailable() -> ServerError {
     }
 }
 
-pub(crate) fn decrypt_sse_customer_segment_in_place(
+pub(crate) fn decrypt_authorized_sse_customer_segment_in_place(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    read: AuthorizedSegmentRead<'_>,
+    ciphertext: &mut Vec<u8>,
+) -> Result<(), ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        SSE_C_WRAP_AAD,
+        "SSE-C",
+    )?;
+    let encryption = ObjectEncryption::SseCustomer(state.clone());
+    if !read.subject.matches_encryption_and_geometry(
+        &encryption,
+        read.segment_index,
+        read.plaintext_len as u64,
+    ) {
+        return Err(ServerError::InternalError {
+            reason: "SSE-C segment does not match its storage-minted read subject".to_string(),
+        });
+    }
+    decrypt_segment_with_dek_and_prefix_in_place(
+        &dek,
+        state.payload_codec(),
+        state.segment_nonce_prefix(),
+        read,
+        ciphertext,
+        AeadDescriptor {
+            aad: SSE_C_SEGMENT_AAD,
+            label: "SSE-C",
+        },
+    )
+}
+
+#[cfg(test)]
+fn decrypt_sse_customer_segment_in_place(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
@@ -860,7 +969,7 @@ pub(crate) fn decrypt_sse_customer_segment_in_place(
         SSE_C_WRAP_AAD,
         "SSE-C",
     )?;
-    decrypt_segment_with_dek_and_prefix_in_place(
+    decrypt_legacy_segment_with_dek_and_prefix_in_place(
         &dek,
         state.segment_nonce_prefix(),
         segment_scope,
@@ -1058,6 +1167,36 @@ fn encrypt_legacy_segment_with_dek_and_prefix(
 
 fn decrypt_segment_with_dek_and_prefix_in_place(
     dek: &[u8; SSE_C_DEK_LEN],
+    payload_codec: SegmentPayloadCodec,
+    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    read: AuthorizedSegmentRead<'_>,
+    ciphertext: &mut Vec<u8>,
+    descriptor: AeadDescriptor<'_>,
+) -> Result<(), ServerError> {
+    match payload_codec {
+        SegmentPayloadCodec::SegmentAes256GcmV1 => {
+            decrypt_legacy_segment_with_dek_and_prefix_in_place(
+                dek,
+                segment_nonce_prefix,
+                read.segment_scope,
+                read.segment_index,
+                ciphertext,
+                read.plaintext_len,
+                descriptor,
+            )
+        }
+        SegmentPayloadCodec::Cobblestone256SegmentV1 => decrypt_cobblestone_segment_in_place(
+            dek,
+            read.subject.payload_aead_context(),
+            ciphertext,
+            read.plaintext_len,
+            descriptor,
+        ),
+    }
+}
+
+fn decrypt_legacy_segment_with_dek_and_prefix_in_place(
+    dek: &[u8; SSE_C_DEK_LEN],
     segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
@@ -1091,6 +1230,70 @@ fn decrypt_segment_with_dek_and_prefix_in_place(
         });
     }
     ciphertext.truncate(plaintext_len);
+    Ok(())
+}
+
+fn decrypt_cobblestone_segment_in_place(
+    dek: &[u8; SSE_C_DEK_LEN],
+    payload_aead_context: &[u8],
+    ciphertext: &mut Vec<u8>,
+    plaintext_len: usize,
+    descriptor: AeadDescriptor<'_>,
+) -> Result<(), ServerError> {
+    let failure = || ServerError::InternalError {
+        reason: format!("failed to decrypt {} Cobblestone segment", descriptor.label),
+    };
+    let layout = Cobblestone256MessageLayout::from_ciphertext_len(ciphertext.len() as u64)
+        .map_err(|_| failure())?;
+    if layout.plaintext_len() != plaintext_len as u64 {
+        return Err(ServerError::InternalError {
+            reason: format!(
+                "decrypted {} Cobblestone segment length {} did not match expected {}",
+                descriptor.label,
+                layout.plaintext_len(),
+                plaintext_len
+            ),
+        });
+    }
+    let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!(
+            "failed to create {} Cobblestone segment opening key",
+            descriptor.label
+        ),
+    })?;
+    let mut opener =
+        Cobblestone256StreamOpener::new(key, payload_aead_context, ciphertext.len() as u64)
+            .map_err(|_| failure())?;
+    let mut plaintext = Vec::with_capacity(plaintext_len);
+    opener
+        .update(&ciphertext[..COBBLESTONE_HEADER_LEN], &mut plaintext)
+        .map_err(|_| failure())?;
+    for chunk_index in 0..layout.chunk_count() {
+        let range = layout
+            .ciphertext_range_for_chunk(chunk_index)
+            .map_err(|_| failure())?;
+        let start = usize::try_from(range.start).map_err(|_| failure())?;
+        let end = usize::try_from(range.end).map_err(|_| failure())?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            aead_records: 1,
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        opener
+            .update(&ciphertext[start..end], &mut plaintext)
+            .map_err(|_| failure())?;
+    }
+    opener.finish().map_err(|_| failure())?;
+    if plaintext.len() != plaintext_len {
+        return Err(ServerError::InternalError {
+            reason: format!(
+                "decrypted {} Cobblestone segment length {} did not match expected {}",
+                descriptor.label,
+                plaintext.len(),
+                plaintext_len
+            ),
+        });
+    }
+    *ciphertext = plaintext;
     Ok(())
 }
 
@@ -1526,6 +1729,33 @@ mod tests {
                     .unwrap(),
                 plaintext
             );
+            let mut dispatched = ciphertext.clone();
+            decrypt_cobblestone_segment_in_place(
+                &dek,
+                context,
+                &mut dispatched,
+                plaintext_len,
+                AeadDescriptor {
+                    aad: MANAGED_SEGMENT_AAD,
+                    label: MANAGED_ENCRYPTION_LABEL,
+                },
+            )
+            .unwrap();
+            assert_eq!(dispatched, plaintext);
+
+            let mut crossed = ciphertext.clone();
+            assert!(decrypt_cobblestone_segment_in_place(
+                &dek,
+                b"crossed-storage-subject",
+                &mut crossed,
+                plaintext_len,
+                AeadDescriptor {
+                    aad: MANAGED_SEGMENT_AAD,
+                    label: MANAGED_ENCRYPTION_LABEL,
+                },
+            )
+            .is_err());
+            assert_eq!(crossed, ciphertext);
             assert!(cobblestone::open(
                 Cobblestone256Key::new(&dek).unwrap(),
                 b"crossed-storage-subject",
@@ -1790,7 +2020,7 @@ mod tests {
             ]
         );
         let mut decrypted_segment = fixture.segment_ciphertext.clone();
-        decrypt_segment_with_dek_and_prefix_in_place(
+        decrypt_legacy_segment_with_dek_and_prefix_in_place(
             &fixture.dek,
             &fixture.segment_nonce_prefix,
             SseCustomerSegmentScope::object(),
@@ -1806,7 +2036,7 @@ mod tests {
         assert_eq!(decrypted_segment, fixture.segment_plaintext);
 
         let mut crossed_segment = fixture.segment_ciphertext.clone();
-        assert!(decrypt_segment_with_dek_and_prefix_in_place(
+        assert!(decrypt_legacy_segment_with_dek_and_prefix_in_place(
             &[0x67; SSE_C_DEK_LEN],
             &fixture.segment_nonce_prefix,
             SseCustomerSegmentScope::object(),
@@ -2116,7 +2346,7 @@ mod tests {
             ]
         );
         let mut decrypted_segment = fixture.segment_ciphertext.clone();
-        decrypt_segment_with_dek_and_prefix_in_place(
+        decrypt_legacy_segment_with_dek_and_prefix_in_place(
             &fixture.dek,
             &fixture.segment_nonce_prefix,
             SseCustomerSegmentScope::object(),

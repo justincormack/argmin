@@ -22,8 +22,9 @@ use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 use crate::error::ServerError;
 use crate::sse::{
-    decrypt_managed_encryption_segment_in_place, decrypt_sse_customer_segment_in_place,
-    SseCustomerRequest, SseCustomerSegmentScope,
+    decrypt_authorized_managed_encryption_segment_in_place,
+    decrypt_authorized_sse_customer_segment_in_place, AuthorizedSegmentRead, SseCustomerRequest,
+    SseCustomerSegmentScope,
 };
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
@@ -1097,6 +1098,13 @@ impl ReadRuntime {
         sse_customer_request: Option<&SseCustomerRequest>,
         stored_bytes: &mut Vec<u8>,
     ) -> Result<(), ServerError> {
+        let encryption_subject = segment
+            .storage_segment
+            .encryption_subject()
+            .ok_or_else(|| ServerError::InternalError {
+                reason: "payload segment is missing its storage-minted encryption subject"
+                    .to_string(),
+            })?;
         let result = match &segment.encryption {
             ObjectEncryption::SseCustomer(state) => {
                 let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
@@ -1112,14 +1120,17 @@ impl ReadRuntime {
                     .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
                         SseCustomerSegmentScope::multipart_part(p)
                     })?;
-                decrypt_sse_customer_segment_in_place(
+                decrypt_authorized_sse_customer_segment_in_place(
                     validator,
                     state,
                     request,
-                    segment_scope,
-                    segment.segment_index(),
+                    AuthorizedSegmentRead::new(
+                        encryption_subject,
+                        segment_scope,
+                        segment.segment_index(),
+                        segment.size() as usize,
+                    ),
                     stored_bytes,
-                    segment.size() as usize,
                 )
             }
             ObjectEncryption::SseS3(state) => {
@@ -1133,13 +1144,16 @@ impl ReadRuntime {
                     .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
                         SseCustomerSegmentScope::multipart_part(p)
                     })?;
-                decrypt_managed_encryption_segment_in_place(
+                decrypt_authorized_managed_encryption_segment_in_place(
                     provider,
                     state,
-                    segment_scope,
-                    segment.segment_index(),
+                    AuthorizedSegmentRead::new(
+                        encryption_subject,
+                        segment_scope,
+                        segment.segment_index(),
+                        segment.size() as usize,
+                    ),
                     stored_bytes,
-                    segment.size() as usize,
                 )
             }
         };

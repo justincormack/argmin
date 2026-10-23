@@ -457,7 +457,13 @@ impl Coordinator {
         )?;
         let route = ObjectReadSnapshotRoute {
             route: admission
-                .active_object_read_route(req.bucket, req.key, req.version_id, req.snapshot_mode)
+                .active_object_payload_read_route(
+                    req.bucket,
+                    req.key,
+                    req.version_id,
+                    req.snapshot_mode,
+                    bucket.bucket_incarnation_read_subject(),
+                )
                 .map_err(super::map_store_failure)?,
             retain_payload: req.snapshot_mode == ObjectReadSnapshotMode::FullPayloadLayout,
         };
@@ -484,11 +490,12 @@ impl Coordinator {
         )?;
         let route = ObjectReadSnapshotRoute {
             route: admission
-                .active_object_read_route(
+                .active_object_payload_read_route(
                     req.bucket,
                     req.key,
                     req.version_id,
                     ObjectReadSnapshotMode::FullPayloadLayout,
+                    bucket.bucket_incarnation_read_subject(),
                 )
                 .map_err(super::map_store_failure)?,
             retain_payload: true,
@@ -1903,10 +1910,12 @@ impl Coordinator {
                     maybe_run_bucket_policy_fast_path_hook(bucket.as_str());
                     let bucket_execution_generation = info.bucket_execution_generation;
                     let bucket_incarnation_generation = info.bucket_incarnation_generation;
+                    let bucket_incarnation_read_subject = info.bucket_incarnation_read_subject();
                     return Ok(LoadedBucketHandle::new(
                         Self::bucket_summary_for_boe_modern_fast_path(bucket_info),
                         bucket_execution_generation,
                         bucket_incarnation_generation,
+                        bucket_incarnation_read_subject,
                         request,
                         LoadedBucketSubresources::new(
                             policy,
