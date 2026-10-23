@@ -20,6 +20,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
+    use storage::test_support::StorageClusterObjectTestSupport as _;
     use storage::{StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle};
 
     use crate::metadata_blob::MetadataBlob;
@@ -392,6 +393,15 @@ Connection: close\r\n\r\n",
         setup_frontend_with_storage_handle(storage_handle)
     }
 
+    fn setup_frontend_with_payload_codec(
+        dir: &std::path::Path,
+        payload_codec: storage::SegmentPayloadCodec,
+    ) -> Arc<HttpFrontend> {
+        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
+        let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
+        setup_frontend_with_storage_handle_and_payload_codec(storage_handle, Some(payload_codec))
+    }
+
     fn setup_dynamic_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let storage_cluster = open_dynamic_test_storage_cluster(dir);
         let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
@@ -401,11 +411,18 @@ Connection: close\r\n\r\n",
     fn setup_frontend_with_storage_handle(
         storage_handle: storage::StorageClusterRouteHandle,
     ) -> Arc<HttpFrontend> {
+        setup_frontend_with_storage_handle_and_payload_codec(storage_handle, None)
+    }
+
+    fn setup_frontend_with_storage_handle_and_payload_codec(
+        storage_handle: storage::StorageClusterRouteHandle,
+        payload_codec: Option<storage::SegmentPayloadCodec>,
+    ) -> Arc<HttpFrontend> {
         let test_storage_cluster = storage_handle.current();
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+        let mut coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
                 storage_handle,
                 "us-east-1".to_string(),
                 None,
@@ -413,6 +430,12 @@ Connection: close\r\n\r\n",
                 server_core::coordinator::BackgroundWorkerMode::none(),
             )
             .unwrap();
+        if let Some(payload_codec) = payload_codec {
+            server_core::coordinator::test_helpers::select_new_payload_codec(
+                &mut coordinator,
+                payload_codec,
+            );
+        }
         let mut credentials = auth::CredentialStore::new();
         credentials
             .add(
@@ -1088,13 +1111,28 @@ Content-Length: {}\r\n\
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn completed_chunked_streaming_put_keeps_connection_reusable() {
+    async fn completed_cobblestone_chunked_streaming_put_keeps_connection_reusable() {
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend(tmp.path());
+        let frontend = setup_frontend_with_payload_codec(
+            tmp.path(),
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        );
         create_test_bucket(&frontend, "chunked-keepalive-bucket");
-        let (addr, _guard) = start_test_server(frontend).await;
+        let stream_finalization_count = Arc::new(AtomicUsize::new(0));
+        let stream_finalization_count_for_hook = Arc::clone(&stream_finalization_count);
+        let _stream_finalization_hook = frontend
+            .test_storage_cluster
+            .test_install_before_stream_put_finalize_command_id_hook(Arc::new(move || {
+                stream_finalization_count_for_hook.fetch_add(1, Ordering::SeqCst);
+            }));
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
 
-        let payload = b"complete chunked request";
+        let payload = vec![
+            b'p';
+            crate::coordinator::INTERNAL_SEGMENT_SIZE
+                + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+                + 37
+        ];
         let signed = sign_streaming_headers(
             "PUT",
             "/chunked-keepalive-bucket/key",
@@ -1102,7 +1140,7 @@ Content-Length: {}\r\n\
             payload.len(),
             &[],
         );
-        let wire = build_signed_chunked_body(&signed, payload);
+        let wire = build_signed_chunked_body(&signed, &payload);
         let put_request = format!(
             "PUT /chunked-keepalive-bucket/key HTTP/1.1\r\n\
 Host: {addr}\r\n\
@@ -1157,12 +1195,111 @@ Connection: close\r\n\r\n",
             let get_response = read_http_response(&mut client, Duration::from_secs(3));
             assert!(get_response.starts_with("HTTP/1.1 200"), "{get_response}");
             assert!(
-                get_response.as_bytes().ends_with(payload),
+                get_response.as_bytes().ends_with(&payload),
                 "second request on the keep-alive connection returned the wrong body: {get_response}"
             );
         })
         .await
         .unwrap();
+
+        assert!(
+            stream_finalization_count.load(Ordering::SeqCst) > 0,
+            "the over-segment-boundary PUT must reach promoted stream finalization"
+        );
+        assert_eq!(
+            storage::test_support::stream_upload_session_count_for_object(
+                &frontend.test_storage_cluster,
+                &storage::BucketName::try_from("chunked-keepalive-bucket".to_string()).unwrap(),
+                &storage::ObjectKey::try_from("key".to_string()).unwrap(),
+            )
+            .unwrap(),
+            0,
+            "successful promoted PUT finalization must remove its durable stream session"
+        );
+
+        let persisted_codec = frontend
+            .test_storage_cluster
+            .test_observe_object_payload_codec(
+                &storage::BucketName::try_from("chunked-keepalive-bucket".to_string()).unwrap(),
+                &storage::ObjectKey::try_from("key".to_string()).unwrap(),
+                s3_types::VersionId::Null,
+            )
+            .unwrap();
+        assert!(persisted_codec.is_cobblestone_256_segment_v1());
+        assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_cobblestone_streaming_post_round_trips_over_socket() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend_with_payload_codec(
+            tmp.path(),
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        );
+        create_test_bucket(&frontend, "post-cobblestone-bucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let payload = vec![
+            b'q';
+            2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37
+        ];
+        let fields = sign_post_policy_fields("post-cobblestone-bucket", "key", &[], &[]);
+        let (content_type, prefix, suffix) =
+            build_streaming_multipart_parts(&fields, "payload.bin");
+        let content_length = prefix.len() + payload.len() + suffix.len();
+        let request = format!(
+            "POST /post-cobblestone-bucket HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Type: {content_type}\r\n\
+Content-Length: {content_length}\r\n\
+Connection: close\r\n\r\n"
+        );
+        let body = [prefix.as_slice(), payload.as_slice(), suffix.as_slice()].concat();
+        let post_response = send_raw_http_request(&addr, &request, &body);
+        assert!(
+            post_response.starts_with("HTTP/1.1 204"),
+            "{post_response}"
+        );
+
+        let persisted_codec = frontend
+            .test_storage_cluster
+            .test_observe_object_payload_codec(
+                &storage::BucketName::try_from("post-cobblestone-bucket".to_string()).unwrap(),
+                &storage::ObjectKey::try_from("key".to_string()).unwrap(),
+                s3_types::VersionId::Null,
+            )
+            .unwrap();
+        assert!(persisted_codec.is_cobblestone_256_segment_v1());
+        assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster)
+                .unwrap(),
+            0,
+            "successful POST must remove its durable stream session"
+        );
+
+        let signed_get = sign_headers(
+            "GET",
+            "/post-cobblestone-bucket/key",
+            &addr,
+            b"",
+            &[],
+        );
+        let get_request = format!(
+            "GET /post-cobblestone-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+            signed_get.authorization, signed_get.amz_date, signed_get.amz_content_sha256,
+        );
+        let get_response = send_raw_http_request(&addr, &get_request, &[]);
+        assert!(get_response.starts_with("HTTP/1.1 200"), "{get_response}");
+        assert!(
+            get_response.as_bytes().ends_with(&payload),
+            "socket GET returned different POST payload"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

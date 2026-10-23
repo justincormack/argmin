@@ -1280,6 +1280,23 @@ Implementation update (2026-10-23, buffered HTTP dispatch canaries):
   PutObject, POST Object, and their body-ingest/finalization boundaries remain open, as do the
   object-subject DEK-wrap/checksum transition and complete malformed-carrier matrix.
 
+Implementation update (2026-10-23, socket-level body-ingest canaries):
+
+- A raw TCP canary sends a signed `aws-chunked` PutObject body larger than the 8 MiB internal
+  segment boundary. The request passes through HTTP framing, streaming SigV4 decoding, promoted
+  stream-session creation, append, terminal publication, and response rendering. A storage-owned
+  finalization-boundary observer proves that promotion actually occurred, and the test requires
+  successful finalization to remove the durable session. A second signed request on the same
+  keep-alive connection reads the exact plaintext, while a storage-owned observation proves the
+  durable object selected `Cobblestone256SegmentV1` rather than the legacy whole-segment codec.
+- A separate raw TCP canary signs and sends a multipart/form-data POST policy request with a
+  multi-record file body. It requires the normal 204 response, exact signed-GET readback, durable
+  Cobblestone profile selection, and removal of the completed stream session. This covers the POST
+  body parser and its stream-finalization boundary rather than invoking the coordinator directly.
+- These cases close the positive socket-level streamed PutObject and POST Object ingestion and
+  finalization gaps for SSE-S3. The object-subject DEK-wrap/checksum transition and complete
+  malformed-carrier matrix remain open before production writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 
