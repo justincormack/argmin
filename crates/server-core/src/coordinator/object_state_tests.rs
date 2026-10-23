@@ -5775,6 +5775,146 @@ fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     put_and_read_direct_cobblestone_object(&coord, "customer", Some(&request));
 }
 
+fn stream_put_and_read_cobblestone_object(
+    coord: &Coordinator,
+    key: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let first: Vec<u8> = (0..(argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 19))
+        .map(|index| u8::try_from(index % 241).unwrap())
+        .collect();
+    let second: Vec<u8> = (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let mut payload = Vec::with_capacity(first.len() + second.len());
+    payload.extend_from_slice(&first);
+    payload.extend_from_slice(&second);
+
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let mut authorized = coord
+        .prepare_put_object_write_with_storage_admission(
+            &admission,
+            &AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: match sse_customer {
+                    Some(request) => WriteEncryptionRequest::sse_customer(request),
+                    None => WriteEncryptionRequest::none(),
+                },
+            },
+        )
+        .unwrap();
+    authorized.write_encryption = match sse_customer {
+        Some(request) => ActiveWriteEncryption::sse_customer(
+            crate::sse::test_prepare_sse_customer_write_with_payload_codec(
+                coord.sse_c_validator.as_ref().unwrap(),
+                request,
+                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+            )
+            .unwrap(),
+        ),
+        None => ActiveWriteEncryption::managed(
+            ManagedEncryptionAlgorithm::Aes256,
+            crate::sse::test_prepare_managed_encryption_write_with_payload_codec(
+                coord.managed_key_provider.as_ref().unwrap(),
+                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+            )
+            .unwrap(),
+        ),
+    };
+    assert_eq!(
+        authorized
+            .write_encryption
+            .object_encryption()
+            .payload_codec(),
+        storage::SegmentPayloadCodec::Cobblestone256SegmentV1
+    );
+
+    let session_id = coord
+        .begin_stream_put_session_with_storage_admission_and_cleanup_deadline(
+            &admission,
+            &authorized,
+            admission.authority_valid_until_ms(),
+        )
+        .unwrap();
+    for (segment_index, segment) in [&first[..], &second[..]].into_iter().enumerate() {
+        coord
+            .append_stream_put_data_with_storage_admission(
+                &admission,
+                &AppendStreamPutRequest {
+                    bucket: authorized.bucket_typed(),
+                    key: authorized.key_typed(),
+                    session_id: &session_id,
+                    segment_index: u32::try_from(segment_index).unwrap(),
+                    data: segment,
+                    sse_customer,
+                },
+            )
+            .unwrap();
+    }
+    coord
+        .finalize_authorized_stream_put_with_storage_admission(
+            &admission,
+            &AuthorizedFinalizeStreamPutRequest {
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(&payload),
+                total_size: u64::try_from(payload.len()).unwrap(),
+                metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                cond: NO_WRITE,
+            },
+            &authorized,
+        )
+        .unwrap();
+    drop(admission);
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        object.system_metadata.checksum().is_some(),
+        "stream finalization must seal checksum metadata under the session encryption state"
+    );
+    assert_eq!(object.body.read_all().unwrap(), payload);
+}
+
+#[test]
+fn stream_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    stream_put_and_read_cobblestone_object(&coord, "managed-stream", None);
+}
+
+#[test]
+fn stream_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_sse_c(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+    let request = test_sse_customer_request();
+
+    stream_put_and_read_cobblestone_object(&coord, "customer-stream", Some(&request));
+}
+
 #[test]
 fn bucket_encryption_block_and_unblock() {
     let tmp = test_util::tempdir();

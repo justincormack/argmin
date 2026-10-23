@@ -1187,6 +1187,23 @@ Implementation update (2026-10-23, real buffered-operation canaries):
   completion, restart/retained reads, the object-subject DEK-wrap/checksum transition, and the
   remaining malformed-carrier matrix stay open before writer selection.
 
+Implementation update (2026-10-23, real streamed-PutObject canaries):
+
+- Real streamed PutObject canaries now select `Cobblestone256SegmentV1` for both SSE-S3 and SSE-C
+  through the same internal encryption-state construction seam as the buffered canaries. Normal
+  production entry points remain pinned to `SegmentAes256GcmV1`.
+- Each canary creates the durable stream session under one admitted route, encrypts and appends two
+  differently sized segments containing multiple 16 KiB records, finalizes through the session-
+  bound terminal command, and reads the complete object through the normal GetObject path. The
+  tests therefore exercise stable session/generation authority, distinct segment subjects,
+  per-segment witnesses, terminal publication, checksum-metadata sealing/opening, DEK unwrap, and
+  concatenated body delivery. The SSE-C case also supplies the customer key at every append and
+  read boundary.
+- These are storage-operation canaries for streamed PutObject. HTTP PUT/POST dispatch, copy,
+  UploadPart/UploadPartCopy, multipart completion, restart/retained reads, the object-subject
+  DEK-wrap/checksum transition, and the remaining malformed-carrier matrix remain open before
+  writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 
