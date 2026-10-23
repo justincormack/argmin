@@ -1297,6 +1297,23 @@ Implementation update (2026-10-23, socket-level body-ingest canaries):
   finalization gaps for SSE-S3. The object-subject DEK-wrap/checksum transition and complete
   malformed-carrier matrix remain open before production writer selection.
 
+Implementation update (2026-10-23, crossed ciphertext/profile framing):
+
+- The authorized segment-read entry points now have an explicit crossed-format matrix for both
+  SSE-C and SSE-S3. Each case loads the exact opaque segment subject through an admitted storage
+  payload-read route, then proves ciphertext produced by the frozen whole-segment AES-GCM codec is
+  rejected when the persisted profile selects Cobblestone and vice versa. The payload crosses a
+  16 KiB record boundary so the new-format case is not an empty or single-record special case.
+- The crossed ciphertext lengths are deliberately valid for the selected profile. In particular,
+  the legacy-as-Cobblestone cases first prove their framing maps to the subject's exact plaintext
+  geometry, then require the authentication-failure diagnostic rather than a length rejection.
+  Those Cobblestone failures also prove the caller-owned ciphertext remains unchanged; no partially
+  opened bytes from a failed profile interpretation become available to the caller. Exact-profile
+  positive cases remain covered by the existing codec and operation canaries.
+- This closes the old-to-new and new-to-old byte-framing row of the malformed-profile matrix. The
+  object-subject DEK-wrap/checksum transition and the remaining malformed command/RPC/recovery
+  carrier matrix remain open before production writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

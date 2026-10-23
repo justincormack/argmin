@@ -1240,6 +1240,84 @@ fn decrypt_segment_with_dek_and_prefix_in_place(
     }
 }
 
+#[cfg(test)]
+pub(crate) struct CrossedSegmentTestInput<'a> {
+    pub(crate) source_codec: SegmentPayloadCodec,
+    pub(crate) subject: &'a SegmentEncryptionSubject,
+    pub(crate) segment_scope: SseCustomerSegmentScope,
+    pub(crate) segment_index: u32,
+    pub(crate) plaintext: &'a [u8],
+}
+
+#[cfg(test)]
+pub(crate) fn test_encrypt_crossed_managed_segment(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    input: CrossedSegmentTestInput<'_>,
+) -> Result<Vec<u8>, ServerError> {
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    encrypt_segment_with_dek_and_prefix(
+        &dek,
+        input.plaintext,
+        SegmentSealParameters {
+            payload_codec: input.source_codec,
+            segment_nonce_prefix: state.segment_nonce_prefix(),
+            segment_scope: input.segment_scope,
+            payload_aead_context: input.subject.payload_aead_context(),
+            segment_index: input.segment_index,
+            descriptor: AeadDescriptor {
+                aad: MANAGED_SEGMENT_AAD,
+                label: MANAGED_ENCRYPTION_LABEL,
+            },
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_encrypt_crossed_sse_customer_segment(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    input: CrossedSegmentTestInput<'_>,
+) -> Result<Vec<u8>, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        SSE_C_WRAP_AAD,
+        "SSE-C",
+    )?;
+    encrypt_segment_with_dek_and_prefix(
+        &dek,
+        input.plaintext,
+        SegmentSealParameters {
+            payload_codec: input.source_codec,
+            segment_nonce_prefix: state.segment_nonce_prefix(),
+            segment_scope: input.segment_scope,
+            payload_aead_context: input.subject.payload_aead_context(),
+            segment_index: input.segment_index,
+            descriptor: AeadDescriptor {
+                aad: SSE_C_SEGMENT_AAD,
+                label: "SSE-C",
+            },
+        },
+    )
+}
+
 fn decrypt_legacy_segment_with_dek_and_prefix_in_place(
     dek: &[u8; SSE_C_DEK_LEN],
     segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
