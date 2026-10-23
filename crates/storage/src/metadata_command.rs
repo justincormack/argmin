@@ -3923,27 +3923,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
     }
 
     fn skip_object_encryption(&mut self) -> Result<(), String> {
-        let encryption_type = self.read_u8()?;
-        if !matches!(encryption_type, 1..=2) {
-            return Err(format!("invalid object encryption type {encryption_type}"));
-        }
-        let has_state = match self.read_u8()? {
-            0 => false,
-            1 => {
-                self.read_bytes()?;
-                true
-            }
-            tag => {
-                return Err(format!(
-                    "invalid optional object encryption state tag {tag}"
-                ))
-            }
-        };
-        match (encryption_type, has_state) {
-            (1 | 2, true) => Ok(()),
-            (1 | 2, false) => Err("encrypted object is missing encryption state".to_string()),
-            _ => unreachable!("object encryption type was validated above"),
-        }
+        self.read_object_encryption().map(|_| ())
     }
 
     fn read_object_encryption(&mut self) -> Result<ObjectEncryption, String> {
@@ -6480,13 +6460,51 @@ mod tests {
             let mut header_decoder = MetadataCommandLogEntryDecoder::new(encoded);
             assert_eq!(
                 header_decoder.skip_object_encryption(),
-                Err("invalid object encryption type 0".to_owned())
+                Err("invalid object encryption type".to_owned())
             );
 
             let mut full_decoder = MetadataCommandLogEntryDecoder::new(encoded);
             assert_eq!(
                 full_decoder.read_object_encryption(),
                 Err("invalid object encryption type".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_command_header_and_full_decoders_reject_malformed_payload_profiles_identically() {
+        let encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let mut encoded = Vec::new();
+        encode_object_encryption(&mut encoded, &encryption);
+
+        for (case, state_offset, value) in [
+            ("historical nested version", 0, 1),
+            ("former plaintext codec", 1, 0),
+            ("unknown codec", 1, 3),
+        ] {
+            let mut malformed = encoded.clone();
+            let framed_state_offset = 1 + 1 + 4;
+            malformed[framed_state_offset + state_offset] = value;
+
+            let mut header_decoder = MetadataCommandLogEntryDecoder::new(&malformed);
+            let header_result = header_decoder.skip_object_encryption();
+            let mut full_decoder = MetadataCommandLogEntryDecoder::new(&malformed);
+            let full_result = full_decoder.read_object_encryption().map(|_| ());
+
+            assert_eq!(header_result, full_result, "{case}");
+            assert!(header_result.is_err(), "{case} unexpectedly decoded");
+            assert_eq!(
+                header_decoder.remaining(),
+                full_decoder.remaining(),
+                "{case}"
             );
         }
     }

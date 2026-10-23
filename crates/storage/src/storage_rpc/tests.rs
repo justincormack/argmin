@@ -521,6 +521,34 @@ mod tests {
             decode_stream_upload_match_request(&encoded).unwrap(),
             request
         );
+
+        let current_state = request.request.encryption.encode_state().unwrap();
+        let state_offset = encoded
+            .windows(current_state.len())
+            .position(|window| window == current_state)
+            .expect("current encryption state must occur in the RPC fixture");
+        assert_eq!(
+            encoded
+                .windows(current_state.len())
+                .filter(|window| *window == current_state)
+                .count(),
+            1,
+            "RPC fixture must identify one exact encryption-state carrier"
+        );
+        for (case, nested_offset, malformed_value) in [
+            ("historical nested version", 0, 1),
+            ("former plaintext codec", 1, 0),
+            ("unknown codec", 1, 3),
+        ] {
+            let mut malformed = encoded.clone();
+            malformed[state_offset + nested_offset] = malformed_value;
+            assert!(matches!(
+                decode_stream_upload_match_request(&malformed),
+                Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid object encryption state"
+                ))
+            ), "{case} RPC payload unexpectedly decoded");
+        }
     }
 
     #[test]

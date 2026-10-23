@@ -1106,6 +1106,24 @@ Implementation update (2026-10-22, payload-profile compatibility registry founda
   and restart rejection with effect sentinels, and real encrypted write/read positive canaries for
   both key modes. This foundation does not enable a Cobblestone production writer.
 
+Implementation update (2026-10-22, fail-closed durable-profile restoration):
+
+- Metadata-checkpoint verification now decodes the exact nested `ObjectEncryption` state in every
+  durable carrier: live object rows, multipart-upload rows, and stream-upload rows. A correctly
+  resealed checkpoint containing a historical nested version, former plaintext codec tag `0`, or
+  unknown codec tag is rejected before checkpoint installation opens its mutation transaction.
+  Payloadless delete-marker rows retain their canonical null/null representation. The adversarial
+  matrix verifies both the precise carrier diagnostic and unchanged destination replica state.
+- Lightweight metadata-command header inspection now validates the same nested encryption state
+  as full command decoding. A restored pending command with an invalid codec can therefore no
+  longer survive header inspection and reach recovery scheduling merely because its outer bytes
+  and checksum are canonical. All four valid profiles have restart sentinels proving the malformed
+  slot remains unconsumed while the applied log and object table remain unchanged.
+- The frozen storage-RPC v27 carrier now has independent historical-version, tag-0, and unknown-tag
+  mutations that fail in the normal decoder. The complete cross-product item remains open for
+  immutable malformed specimens in every command/RPC carrier, authorized recovery/replay paths,
+  and real encrypted write/read positive canaries for both key modes.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

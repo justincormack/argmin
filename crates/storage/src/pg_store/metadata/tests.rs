@@ -2652,6 +2652,66 @@ fn payload_profile_cross_product_survives_command_decode_apply_and_restart() {
                 bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
             })),
         );
+
+        let current_state = encryption.encode_state().unwrap();
+        let mut malformed_command_bytes = command.command_bytes();
+        let state_offset = malformed_command_bytes
+            .windows(current_state.len())
+            .position(|window| window == current_state)
+            .expect("direct PUT command must contain its exact encryption state");
+        assert_eq!(
+            malformed_command_bytes
+                .windows(current_state.len())
+                .filter(|window| *window == current_state)
+                .count(),
+            1,
+            "{profile:?} command must carry one exact encryption state"
+        );
+        malformed_command_bytes[state_offset + 1] = 0;
+        let malformed_tmp = test_util::tempdir();
+        let malformed_store = PgStore::open(malformed_tmp.path(), 1).unwrap();
+        malformed_store
+            .test_insert_raw_pending_metadata_command_slot(
+                command.id(),
+                checksum::crc64::checksum(&malformed_command_bytes),
+                &malformed_command_bytes,
+                Some(&bucket),
+            )
+            .unwrap();
+        drop(malformed_store);
+        let malformed_reopened = PgStore::open(malformed_tmp.path(), 1).unwrap();
+        assert!(
+            matches!(
+                malformed_reopened.pending_metadata_command_slot_any_epoch(0),
+                Err(StoreError::MetadataCommandLogConflict { .. })
+            ),
+            "{profile:?} malformed restored pending command unexpectedly decoded"
+        );
+        assert_eq!(
+            malformed_reopened
+                .metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            0
+        );
+        let object_count: i64 = malformed_reopened
+            .conn
+            .query_row("SELECT count(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            object_count, 0,
+            "{profile:?} malformed command mutated objects"
+        );
+        let pending_count: i64 = malformed_reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM metadata_command_pending_slot",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1, "{profile:?} malformed slot was consumed");
+
         let decoded = decode_metadata_command_envelope(
             &command.command_bytes(),
             &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
@@ -5708,6 +5768,129 @@ fn install_metadata_transfer_checkpoint_base_restores_complete_stream_session() 
         destination.get_stream_upload(&session_id).unwrap(),
         expected
     );
+}
+
+fn checkpoint_with_every_object_encryption_carrier() -> MetadataCommandCheckpoint {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let encryption = metadata_only_test_encryption();
+    let encryption_type = encryption.encryption_type() as u8;
+    let encryption_state = encryption.encode_state().unwrap();
+    let owner_id = CanonicalUserId::from_principal("owner");
+    source
+        .conn
+        .execute(
+            "INSERT INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+              last_modified, ec_k, ec_m, status, data_layout, encryption_type, encryption_state, \
+              owner_principal, owner_canonical_id) \
+             VALUES ('profile-checkpoint', 'object', 0, 1, 1, 0, X'', 0, 1, 1, 0, 0, 0, \
+                     ?1, ?2, 'owner', ?3)",
+            params![encryption_type, encryption_state, owner_id.as_str()],
+        )
+        .unwrap();
+
+    let upload_id = crate::tests::multipart_upload_id("profile-checkpoint");
+    insert_digest_multipart_upload(&source, &upload_id);
+
+    let bucket = trusted_bucket_name("profile-checkpoint");
+    let key = trusted_object_key("stream");
+    let session_id = SessionId::try_from("cd".repeat(16)).unwrap();
+    let proof = test_bucket_write_reservation_proof(
+        &bucket,
+        &key,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    );
+    source
+        .create_stream_upload_explicit(
+            &StreamUploadCommandRecord::from(&StreamUploadRecord {
+                session_id,
+                bucket,
+                key,
+                target: StreamUploadTarget::PutObject,
+                state: StreamUploadState::InProgress,
+                created_at: 123,
+                bucket_incarnation_generation: 1,
+                cleanup_after: Some(456),
+                encryption,
+                next_segment_vid: GenerationId::new(7).unwrap(),
+                bucket_write_reservation: Some(proof.clone()),
+            }),
+            GenerationId::new(7).unwrap(),
+            Some(456),
+            Some(&proof),
+        )
+        .unwrap();
+    source.refresh_metadata_command_state_digest().unwrap();
+    source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap()
+}
+
+#[test]
+fn metadata_checkpoint_rejects_malformed_payload_profiles_in_every_carrier_without_mutation() {
+    let base = checkpoint_with_every_object_encryption_carrier();
+
+    for table_name in ["objects", "multipart_uploads", "stream_uploads"] {
+        for (case, state_offset, malformed_value) in [
+            ("historical nested version", 0, 1),
+            ("former plaintext codec", 1, 0),
+            ("unknown codec", 1, 3),
+        ] {
+            let mut checkpoint = base.clone();
+            let block = checkpoint
+                .table_blocks
+                .iter_mut()
+                .find(|block| block.table_name == table_name)
+                .unwrap();
+            assert_eq!(block.rows.len(), 1, "{table_name} fixture row count");
+            let state_index = block
+                .columns
+                .iter()
+                .position(|column| column == "encryption_state")
+                .unwrap();
+            let MetadataCheckpointValue::Blob(state) = &mut block.rows[0].values[state_index]
+            else {
+                panic!("{table_name} fixture encryption state must be a blob");
+            };
+            state[state_offset] = malformed_value;
+            PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint);
+
+            assert!(
+                matches!(
+                    checkpoint.verify(),
+                    Err(MetadataCommandCheckpointValidationError::InvalidObjectEncryptionRow {
+                        table_name: actual_table,
+                        row_index: 0,
+                    }) if actual_table == table_name
+                ),
+                "{table_name} {case} checkpoint unexpectedly verified"
+            );
+
+            let destination_tmp = test_util::tempdir();
+            let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+            let before = destination.metadata_command_replica_state().unwrap();
+            let destination_epoch = ClusterEpoch::new(19).unwrap();
+            assert!(
+                matches!(
+                    destination.install_metadata_transfer_checkpoint_base(
+                        2,
+                        destination_epoch,
+                        &checkpoint,
+                    ),
+                    Err(StoreError::MetadataCheckpointInvalid { .. })
+                ),
+                "{table_name} {case} checkpoint unexpectedly installed"
+            );
+            assert_eq!(
+                destination.metadata_command_replica_state().unwrap(),
+                before
+            );
+            assert!(destination
+                .metadata_command_replica_state_can_initialize()
+                .unwrap());
+        }
+    }
 }
 
 #[test]

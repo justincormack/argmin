@@ -217,6 +217,10 @@ pub enum MetadataCommandCheckpointValidationError {
         table_name: String,
         row_index: usize,
     },
+    InvalidObjectEncryptionRow {
+        table_name: String,
+        row_index: usize,
+    },
     TableDigestMismatch {
         table_name: String,
         expected_digest: u64,
@@ -418,7 +422,86 @@ impl MetadataCommandCheckpoint {
         values: &[MetadataCheckpointValue],
     ) -> Result<(), MetadataCommandCheckpointValidationError> {
         Self::verify_bucket_tag_row(table, row_index, values)?;
-        Self::verify_acl_grants_row(table, columns, row_index, values)
+        Self::verify_acl_grants_row(table, columns, row_index, values)?;
+        Self::verify_object_encryption_row(table, columns, row_index, values)
+    }
+
+    fn verify_object_encryption_row(
+        table: &MetadataDigestTable,
+        columns: &[&str],
+        row_index: usize,
+        values: &[MetadataCheckpointValue],
+    ) -> Result<(), MetadataCommandCheckpointValidationError> {
+        if !matches!(
+            table.name,
+            "objects" | "multipart_uploads" | "stream_uploads"
+        ) {
+            return Ok(());
+        }
+
+        let invalid = || {
+            Err(
+                MetadataCommandCheckpointValidationError::InvalidObjectEncryptionRow {
+                    table_name: table.name.to_owned(),
+                    row_index,
+                },
+            )
+        };
+        let Some(encryption_type_index) = columns
+            .iter()
+            .position(|column| *column == "encryption_type")
+        else {
+            return invalid();
+        };
+        let Some(encryption_state_index) = columns
+            .iter()
+            .position(|column| *column == "encryption_state")
+        else {
+            return invalid();
+        };
+
+        match (
+            values.get(encryption_type_index),
+            values.get(encryption_state_index),
+        ) {
+            (
+                Some(MetadataCheckpointValue::Integer(encryption_type)),
+                Some(MetadataCheckpointValue::Blob(encryption_state)),
+            ) => {
+                let Ok(encryption_type) = u8::try_from(*encryption_type) else {
+                    return invalid();
+                };
+                let Some(encryption_type) = ObjectEncryptionType::from_u8(encryption_type) else {
+                    return invalid();
+                };
+                ObjectEncryption::decode(encryption_type, Some(encryption_state.clone()))
+                    .map(|_| ())
+                    .map_err(|_| {
+                        MetadataCommandCheckpointValidationError::InvalidObjectEncryptionRow {
+                            table_name: table.name.to_owned(),
+                            row_index,
+                        }
+                    })
+            }
+            (Some(MetadataCheckpointValue::Null), Some(MetadataCheckpointValue::Null))
+                if table.name == "objects" =>
+            {
+                let Some(status_index) = columns.iter().position(|column| *column == "status")
+                else {
+                    return invalid();
+                };
+                if matches!(
+                    values.get(status_index),
+                    Some(MetadataCheckpointValue::Integer(status))
+                        if *status == ObjectState::DeleteMarker as u8 as i64
+                ) {
+                    Ok(())
+                } else {
+                    invalid()
+                }
+            }
+            _ => invalid(),
+        }
     }
 
     fn verify_bucket_tag_row(
