@@ -5668,14 +5668,54 @@ fn bucket_encryption_defaults_to_sse_s3() {
     );
 }
 
+fn direct_cobblestone_payload() -> Vec<u8> {
+    (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect()
+}
+
+fn assert_cobblestone_object(
+    coord: &Coordinator,
+    key: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+    payload: &[u8],
+) {
+    let persisted_codec = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(key),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert!(persisted_codec.is_cobblestone_256_segment_v1());
+    assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        object.system_metadata.checksum().is_some(),
+        "the production PUT/GET path must seal and reopen checksum metadata"
+    );
+    assert_eq!(object.body.read_all().unwrap(), payload);
+}
+
 fn put_and_read_direct_cobblestone_object(
     coord: &Coordinator,
     key: &str,
     sse_customer: Option<&crate::sse::SseCustomerRequest>,
 ) {
-    let payload: Vec<u8> = (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
-        .map(|index| u8::try_from(index % 251).unwrap())
-        .collect();
+    let payload = direct_cobblestone_payload();
     let admission = coord.admit_storage_route_for_request().unwrap();
     let authorized = coord
         .prepare_put_object_write_with_storage_admission(
@@ -5716,24 +5756,7 @@ fn put_and_read_direct_cobblestone_object(
         .unwrap();
     drop(admission);
 
-    let object = coord
-        .get_object(&GetObjectRequest {
-            sse_customer,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                key,
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert!(
-        object.system_metadata.checksum().is_some(),
-        "the production PUT/GET path must seal and reopen checksum metadata"
-    );
-    assert_eq!(object.body.read_all().unwrap(), payload);
+    assert_cobblestone_object(coord, key, sse_customer, &payload);
 }
 
 #[test]
@@ -5760,6 +5783,50 @@ fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let request = test_sse_customer_request();
 
     put_and_read_direct_cobblestone_object(&coord, "customer", Some(&request));
+}
+
+#[test]
+fn direct_put_cobblestone_sse_s3_survives_storage_restart() {
+    let tmp = test_util::tempdir();
+    {
+        let mut coord = setup_coordinator(tmp.path());
+        coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_and_read_direct_cobblestone_object(&coord, "managed-restart", None);
+    }
+
+    let coord = setup_coordinator(tmp.path());
+    assert_cobblestone_object(
+        &coord,
+        "managed-restart",
+        None,
+        &direct_cobblestone_payload(),
+    );
+}
+
+#[test]
+fn direct_put_cobblestone_sse_c_survives_storage_restart() {
+    let tmp = test_util::tempdir();
+    let request = test_sse_customer_request();
+    {
+        let mut coord = setup_coordinator_with_sse_c(tmp.path());
+        coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+        put_and_read_direct_cobblestone_object(&coord, "customer-restart", Some(&request));
+    }
+
+    let coord = setup_coordinator_with_sse_c(tmp.path());
+    assert_cobblestone_object(
+        &coord,
+        "customer-restart",
+        Some(&request),
+        &direct_cobblestone_payload(),
+    );
 }
 
 fn stream_put_and_read_cobblestone_object(

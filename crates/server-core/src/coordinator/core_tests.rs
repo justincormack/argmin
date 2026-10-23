@@ -10355,6 +10355,99 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     scenario.finish().unwrap();
 }
 
+fn cobblestone_body_uses_retained_route_after_unix_data_pg_move(
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let tmp = test_util::tempdir();
+    let mut scenario = TestRetainedReadPgMoveScenario::new(tmp.path()).unwrap();
+    let validator = sse_customer.map(|_| test_sse_customer_validator_config());
+    let mut coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+            scenario.route_handle(),
+            "us-east-1".to_string(),
+            validator,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+
+    let bucket = scenario.bucket().to_string();
+    let key = scenario.key().to_string();
+    coord
+        .create_bucket_for_owner("default-owner", &bucket, false)
+        .unwrap();
+    if sse_customer.is_some() {
+        enable_bucket_sse_c_test(&coord, &bucket, test_requester(), None).unwrap();
+    }
+    let payload: Vec<u8> = (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: match sse_customer {
+                Some(request) => WriteEncryptionRequest::sse_customer(request),
+                None => WriteEncryptionRequest::none(),
+            },
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(&bucket, &key, test_requester(), None),
+            data: &payload,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let persisted_codec = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name(&bucket),
+            &trusted_object_key(&key),
+            put.version_id,
+        )
+        .unwrap();
+    assert!(persisted_codec.is_cobblestone_256_segment_v1());
+    scenario.prepare_after_put(put.version_id).unwrap();
+
+    let read = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                &bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    // The old-route data shard is corrupted after the body has captured its
+    // exact subject and leases. The first read must use retained Unix routing,
+    // identify the bad shard from the durable witness, reconstruct, and then
+    // authenticate the Cobblestone records against that captured subject.
+    scenario.corrupt_and_advance_after_body_created().unwrap();
+    assert_eq!(read.body.read_all().unwrap(), payload);
+
+    scenario.finish().unwrap();
+}
+
+#[test]
+fn cobblestone_sse_s3_body_uses_retained_route_after_unix_data_pg_move() {
+    cobblestone_body_uses_retained_route_after_unix_data_pg_move(None);
+}
+
+#[test]
+fn cobblestone_sse_c_body_uses_retained_route_after_unix_data_pg_move() {
+    let request = test_sse_customer_request();
+    cobblestone_body_uses_retained_route_after_unix_data_pg_move(Some(&request));
+}
+
 #[test]
 fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let bucket = "list-epoch-change-bucket";

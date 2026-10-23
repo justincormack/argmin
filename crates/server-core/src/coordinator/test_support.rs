@@ -365,14 +365,17 @@ pub(crate) fn setup_same_process_coordinators_with_single_pg_without_background_
 }
 
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
+    setup_coordinator_with_sse_c_validator(dir, test_sse_customer_validator_config())
+}
+
+pub(crate) fn test_sse_customer_validator_config() -> SseCustomerValidatorConfig {
     use base64::Engine;
 
-    let validator = SseCustomerValidatorConfig::from_base64(
+    SseCustomerValidatorConfig::from_base64(
         1,
         &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
     )
-    .unwrap();
-    setup_coordinator_with_sse_c_validator(dir, validator)
+    .unwrap()
 }
 
 pub(crate) fn setup_coordinator_with_sse_c_validator(

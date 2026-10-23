@@ -1249,6 +1249,23 @@ Implementation update (2026-10-23, real copy-path canaries):
   PUT/POST/copy dispatch, restart/retained reads, the object-subject DEK-wrap/checksum transition,
   and the remaining malformed-carrier matrix remain open before production writer selection.
 
+Implementation update (2026-10-23, restart and retained-route canaries):
+
+- Independent SSE-S3 and SSE-C canaries now write a real buffered Cobblestone object, drop the
+  complete coordinator/storage runtime, reopen the same durable stores with production readers,
+  assert the restored object still records `Cobblestone256SegmentV1`, reopen its encrypted checksum
+  metadata and DEK, and read back every byte. The reopened coordinator retains the normal legacy
+  writer selection, so success depends on the persisted profile rather than process-local state.
+- Independent SSE-S3 and SSE-C retained-read canaries write a multi-record Cobblestone object on a
+  `2+1` topology, create the response body at the original epoch, corrupt one systematic shard,
+  move the data PG to a disjoint Unix acting set, and publish the successor map while retaining the
+  original route. The already-created body must acquire its exact historical leases, identify the
+  corrupt shard through the durable witness, reconstruct from the surviving shards, and authenticate
+  every record with its storage-minted subject.
+- These cases close the operation-level restart and retained-read positive-canary gap. HTTP
+  PUT/POST/copy dispatch, the object-subject DEK-wrap/checksum transition, and the complete
+  malformed-carrier matrix remain open before production writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 
