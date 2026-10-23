@@ -273,6 +273,14 @@ pub struct DirectPutEncryptionReservation<'admission> {
 }
 
 impl<'admission> DirectPutEncryptionReservation<'admission> {
+    /// Returns the exact storage-minted object subject used to bind DEK
+    /// wrapping and encrypted checksum metadata before this reservation is
+    /// consumed by the segment writer.
+    #[must_use]
+    pub fn object_encryption_subject(&self) -> &ObjectEncryptionSubject {
+        &self.subject
+    }
+
     /// Extends this exact object subject with the sole standard-object segment
     /// and transfers the generation reservation into that segment capability.
     #[must_use]

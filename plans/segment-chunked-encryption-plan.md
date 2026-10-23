@@ -1366,6 +1366,26 @@ Implementation update (2026-10-23, authorized recovery effect boundary):
   object-subject DEK-wrap/checksum AAD transition remains a separate open format change before the
   production writer may select Cobblestone.
 
+Implementation update (2026-10-23, purpose-separated object subjects):
+
+- Storage now derives non-cloneable `DekWrapEncryptionSubject` and
+  `ChecksumEncryptionSubject` values from the exact owner-minted `ObjectEncryptionSubject`.
+  Their frozen V1 encodings extend the complete canonical object identity with independent
+  `dek-wrap` and `checksum-metadata` purpose tags; neither server-core nor a crypto caller can
+  assemble those fields or substitute a segment subject as arbitrary associated data.
+- The purpose subjects borrow the original object subject and retain its complete immutable
+  encryption binding. Before consuming the exposed AEAD context, the crypto boundary can therefore
+  reject same-wrap-nonce substitution of wrapping-key identity, wrapped DEK, validator state, or
+  segment nonce prefix. The wrapped DEK deliberately remains outside its own circular AAD bytes,
+  while the opaque authority still proves the exact pre-transition state.
+- Exact encoding, purpose separation, crossed logical subject, same-instance/different-key-material,
+  and segment-to-object derivation tests pin this prerequisite. Direct-PUT generation authority now
+  exposes the borrowed object subject before it is consumed into a segment reservation.
+- This slice does not reinterpret persisted encryption state. The next format slice must add the
+  explicit provisional-session versus committed-object wrap binding, perform the one-way terminal
+  rewrap/checksum seal for every write operation, and mint the corresponding read subject for HEAD,
+  GET, listing, copy, restart, and retained-route paths before the open Phase 2 checkbox is closed.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

@@ -1441,6 +1441,9 @@ pub const SSE_S3_CHECKSUM_NONCE_LEN: usize = OBJECT_ENCRYPTION_CHECKSUM_NONCE_LE
 const OBJECT_ENCRYPTION_SUBJECT_DOMAIN: &[u8] = b"argmin:object-encryption-subject";
 const OBJECT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
 const OBJECT_ENCRYPTION_INSTANCE_ID_LEN: usize = 1 + OBJECT_ENCRYPTION_WRAP_NONCE_LEN;
+const OBJECT_ENCRYPTION_PURPOSE_SUBJECT_VERSION: u8 = 1;
+const DEK_WRAP_ENCRYPTION_PURPOSE_TAG: u8 = 1;
+const CHECKSUM_METADATA_ENCRYPTION_PURPOSE_TAG: u8 = 2;
 const SEGMENT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
 const STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG: u8 = 1;
 const MULTIPART_PART_SEGMENT_PROVENANCE_TAG: u8 = 2;
@@ -1614,6 +1617,99 @@ pub struct ObjectEncryptionSubject {
     immutable_encryption_binding: ObjectEncryptionImmutableBinding,
 }
 
+/// Opaque canonical associated data for wrapping one object's DEK.
+///
+/// Storage derives this value from an exact [`ObjectEncryptionSubject`]. The
+/// encryption boundary may consume its bytes as AEAD associated data, but
+/// cannot assemble or alter the logical object identity they contain.
+///
+/// ```compile_fail
+/// use storage::DekWrapEncryptionSubject;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(subject: &DekWrapEncryptionSubject) {
+///     require_clone(subject);
+/// }
+/// ```
+pub struct DekWrapEncryptionSubject<'subject> {
+    object: &'subject ObjectEncryptionSubject,
+    canonical: Box<[u8]>,
+}
+
+/// Opaque canonical associated data for one object's encrypted checksum
+/// metadata.
+///
+/// The distinct purpose tag prevents otherwise identical DEK-wrap and
+/// checksum ciphertexts from being moved between cryptographic roles.
+///
+/// ```compile_fail
+/// use storage::ChecksumEncryptionSubject;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(subject: &ChecksumEncryptionSubject) {
+///     require_clone(subject);
+/// }
+/// ```
+pub struct ChecksumEncryptionSubject<'subject> {
+    object: &'subject ObjectEncryptionSubject,
+    canonical: Box<[u8]>,
+}
+
+fn purpose_encryption_subject(object: &ObjectEncryptionSubject, purpose_tag: u8) -> Box<[u8]> {
+    let mut canonical = Vec::with_capacity(object.canonical.len() + 2);
+    canonical.extend_from_slice(&object.canonical);
+    canonical.push(OBJECT_ENCRYPTION_PURPOSE_SUBJECT_VERSION);
+    canonical.push(purpose_tag);
+    canonical.into_boxed_slice()
+}
+
+impl DekWrapEncryptionSubject<'_> {
+    /// Canonical associated data for the DEK-wrapping AEAD.
+    #[must_use]
+    pub fn aead_context(&self) -> &[u8] {
+        &self.canonical
+    }
+
+    /// Returns whether this purpose subject was derived from the supplied
+    /// complete immutable encryption state.
+    #[must_use]
+    pub fn matches_encryption(&self, encryption: &ObjectEncryption) -> bool {
+        self.object.matches_encryption(encryption)
+    }
+}
+
+impl ChecksumEncryptionSubject<'_> {
+    /// Canonical associated data for the checksum-metadata AEAD.
+    #[must_use]
+    pub fn aead_context(&self) -> &[u8] {
+        &self.canonical
+    }
+
+    /// Returns whether this purpose subject was derived from the supplied
+    /// complete immutable encryption state. Checksum nonce/ciphertext
+    /// enrichment is intentionally excluded from that immutable comparison.
+    #[must_use]
+    pub fn matches_encryption(&self, encryption: &ObjectEncryption) -> bool {
+        self.object.matches_encryption(encryption)
+    }
+}
+
+impl std::fmt::Debug for DekWrapEncryptionSubject<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DekWrapEncryptionSubject")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ChecksumEncryptionSubject<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChecksumEncryptionSubject")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum ObjectEncryptionImmutableBinding {
     SseCustomer {
@@ -1719,6 +1815,26 @@ impl ObjectEncryptionSubject {
         self.encryption_instance_id == encryption.encryption_instance_id()
             && self.immutable_encryption_binding
                 == ObjectEncryptionImmutableBinding::from_encryption(encryption)
+    }
+
+    /// Derives the purpose-separated DEK-wrap subject from this exact object
+    /// identity.
+    #[must_use]
+    pub fn dek_wrap_subject(&self) -> DekWrapEncryptionSubject<'_> {
+        DekWrapEncryptionSubject {
+            object: self,
+            canonical: purpose_encryption_subject(self, DEK_WRAP_ENCRYPTION_PURPOSE_TAG),
+        }
+    }
+
+    /// Derives the purpose-separated checksum-metadata subject from this
+    /// exact object identity.
+    #[must_use]
+    pub fn checksum_subject(&self) -> ChecksumEncryptionSubject<'_> {
+        ChecksumEncryptionSubject {
+            object: self,
+            canonical: purpose_encryption_subject(self, CHECKSUM_METADATA_ENCRYPTION_PURPOSE_TAG),
+        }
     }
 
     #[cfg(test)]
@@ -1984,6 +2100,20 @@ impl SegmentEncryptionSubject {
     #[must_use]
     pub fn payload_aead_context(&self) -> &[u8] {
         &self.canonical
+    }
+
+    /// Recovers the purpose-separated DEK-wrap subject from the exact object
+    /// identity embedded in this storage-minted segment subject.
+    #[must_use]
+    pub fn dek_wrap_subject(&self) -> DekWrapEncryptionSubject<'_> {
+        self.object.dek_wrap_subject()
+    }
+
+    /// Recovers the purpose-separated checksum-metadata subject from the
+    /// exact object identity embedded in this storage-minted segment subject.
+    #[must_use]
+    pub fn checksum_subject(&self) -> ChecksumEncryptionSubject<'_> {
+        self.object.checksum_subject()
     }
 
     #[cfg(test)]
@@ -9524,6 +9654,111 @@ mod tests {
         ] {
             assert_ne!(crossed, subject);
         }
+    }
+
+    #[test]
+    fn object_encryption_purpose_subjects_have_exact_separated_encodings_and_binding() {
+        let bucket = BucketName::try_from("purpose-bucket").unwrap();
+        let key = ObjectKey::try_from("path/to/object").unwrap();
+        let encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let same_instance_other_wrapped_dek = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [13; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let crossed_key = ObjectKey::try_from("path/to/crossed").unwrap();
+        let object = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let crossed_object = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &crossed_key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let same_instance_crossed_binding = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &same_instance_other_wrapped_dek,
+        );
+
+        let mut expected_object = vec![32];
+        expected_object.extend_from_slice(b"argmin:object-encryption-subject");
+        expected_object.extend_from_slice(&[1, 2, 13, 2]);
+        expected_object.extend_from_slice(&[10; 12]);
+        expected_object.extend_from_slice(&17_u64.to_be_bytes());
+        expected_object.extend_from_slice(&14_u16.to_be_bytes());
+        expected_object.extend_from_slice(b"purpose-bucket");
+        expected_object.extend_from_slice(&14_u16.to_be_bytes());
+        expected_object.extend_from_slice(b"path/to/object");
+        expected_object.extend_from_slice(&23_u64.to_be_bytes());
+
+        let wrap = object.dek_wrap_subject();
+        let checksum = object.checksum_subject();
+        let mut expected_wrap = expected_object.clone();
+        // Immutable V1 evidence: purpose-subject version 1, DEK-wrap tag 1.
+        // Keep these literal bytes independent of the production constants so
+        // changing either discriminator requires an explicit format decision.
+        expected_wrap.extend_from_slice(&[1, 1]);
+        let mut expected_checksum = expected_object;
+        // Immutable V1 evidence: purpose-subject version 1,
+        // checksum-metadata tag 2.
+        expected_checksum.extend_from_slice(&[1, 2]);
+        assert_eq!(wrap.aead_context(), expected_wrap);
+        assert_eq!(checksum.aead_context(), expected_checksum);
+        assert_ne!(wrap.aead_context(), checksum.aead_context());
+        assert!(wrap.matches_encryption(&encryption));
+        assert!(checksum.matches_encryption(&encryption));
+        assert!(!wrap.matches_encryption(&same_instance_other_wrapped_dek));
+        assert!(!checksum.matches_encryption(&same_instance_other_wrapped_dek));
+        assert_ne!(
+            wrap.aead_context(),
+            crossed_object.dek_wrap_subject().aead_context()
+        );
+
+        // Wrapped-DEK bytes cannot be included in the AAD used to create
+        // those same bytes. The opaque subject nevertheless retains the
+        // complete immutable binding and rejects a same-instance
+        // substitution before the encryption boundary consumes its context.
+        assert_eq!(
+            wrap.aead_context(),
+            same_instance_crossed_binding
+                .dek_wrap_subject()
+                .aead_context()
+        );
+
+        let segment = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            3,
+            29,
+        );
+        assert_eq!(segment.dek_wrap_subject().aead_context(), expected_wrap);
+        assert_eq!(segment.checksum_subject().aead_context(), expected_checksum);
     }
 
     #[test]
