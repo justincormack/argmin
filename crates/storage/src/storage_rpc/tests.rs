@@ -36,6 +36,74 @@ mod tests {
         MetadataCommandDecodeAuthority::new_for_test()
     }
 
+    fn assert_encryption_carrier_rejects_malformed_state<T>(
+        carrier: &str,
+        value: &T,
+        expected_occurrences: usize,
+        encode: impl Fn(&mut Vec<u8>, &T),
+        decode: impl Fn(&[u8]) -> Result<T, StorageRpcPayloadError>,
+    ) {
+        let encryption_state = crate::tests::metadata_only_test_encryption()
+            .encode_state()
+            .expect("SSE-S3 test encryption has durable state");
+        let mut encoded = Vec::new();
+        encode(&mut encoded, value);
+
+        decode(&encoded).unwrap_or_else(|error| {
+            panic!("valid {carrier} encryption carrier did not decode: {error:?}")
+        });
+
+        let state_offsets = encoded
+            .windows(encryption_state.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == encryption_state).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_offsets.len(),
+            expected_occurrences,
+            "{carrier} must expose every expected encryption-state carrier"
+        );
+
+        for (occurrence, state_offset) in state_offsets.into_iter().enumerate() {
+            let encryption_type_offset = state_offset
+                .checked_sub(6)
+                .expect("encryption state follows type and optional-bytes prefix");
+            assert_eq!(encoded[encryption_type_offset + 1], 1);
+            for (case, malformed_value) in
+                [("former plaintext encryption type", 0), ("unknown encryption type", 3)]
+            {
+                let mut malformed = encoded.clone();
+                malformed[encryption_type_offset] = malformed_value;
+                assert!(
+                    matches!(
+                        decode(&malformed),
+                        Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "invalid object encryption type"
+                        ))
+                    ),
+                    "{carrier} occurrence {occurrence} unexpectedly accepted {case}"
+                );
+            }
+            for (case, nested_offset, malformed_value) in [
+                ("historical nested version", 0, 1),
+                ("former plaintext codec", 1, 0),
+                ("unknown codec", 1, 3),
+            ] {
+                let mut malformed = encoded.clone();
+                malformed[state_offset + nested_offset] = malformed_value;
+                assert!(
+                    matches!(
+                        decode(&malformed),
+                        Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "invalid object encryption state"
+                        ))
+                    ),
+                    "{carrier} occurrence {occurrence} unexpectedly accepted {case}"
+                );
+            }
+        }
+    }
+
     fn test_segment_shard_integrity(
         codec: SegmentPayloadCodec,
         logical_size: u64,
@@ -549,6 +617,265 @@ mod tests {
                 ))
             ), "{case} RPC payload unexpectedly decoded");
         }
+    }
+
+    #[test]
+    fn every_storage_rpc_encryption_carrier_rejects_malformed_nested_profiles() {
+        let bucket = BucketName::try_from("encryption-carrier-bucket").unwrap();
+        let key = ObjectKey::try_from("encryption-carrier-key").unwrap();
+        let session_id = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        let upload_id = UploadId::try_from("ab".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        let owner = OwnerIdentity::from_principal("encryption-carrier-owner");
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let reservation = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "encryption-carrier-reservation".to_string(),
+            owner_token: "encryption-carrier-owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind:
+                crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                    .to_string(),
+            created_at: 2,
+            lease_deadline: 3,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let stream = StreamUploadRecord {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            state: StreamUploadState::InProgress,
+            created_at: 4,
+            bucket_incarnation_generation: 1,
+            cleanup_after: Some(5),
+            encryption: encryption.clone(),
+            next_segment_vid: GenerationId::new(6).unwrap(),
+            bucket_write_reservation: None,
+        };
+        let multipart_upload = MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 7,
+            state: UploadState::InProgress,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: owner.clone(),
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_generation_id: GenerationId::new(8).unwrap(),
+            initiated_object_identity: None,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: encryption.clone(),
+        };
+        let live_object = LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(9).unwrap(),
+            size: 10,
+            etag: ObjectEtag::single_part(11),
+            last_modified: 12,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 1, m: 0 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: encryption.clone(),
+        };
+        let direct_put = CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: session_id.clone(),
+            versioning: BucketVersioningState::Disabled,
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(13).unwrap(),
+            size: 14,
+            etag_crc64: 15,
+            ec: EcShape { k: 1, m: 0 },
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: encryption.clone(),
+            segment_index: 0,
+            segment_crc64: 16,
+            segment_okh: [0x17; 16],
+            segment_vid: GenerationId::new(18).unwrap(),
+            data_pg_id: 19,
+            bucket_write_reservation: reservation,
+        };
+        let create_stream = CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            encryption: encryption.clone(),
+        };
+        let create_multipart = CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: owner.clone(),
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: encryption.clone(),
+        };
+        let replay = MultipartCompletionReplay {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            fingerprint: MultipartCompletionFingerprint::from_bytes([0x20; 32]),
+            version_id: VersionId::Null,
+            etag: ObjectEtag::single_part(21),
+            size: 22,
+            last_modified: 23,
+            tags: None,
+            system_metadata_blob: None,
+            encryption: encryption.clone(),
+        };
+        let stream_command = crate::StreamUploadCommandRecord::from(&stream);
+        let terminal_stream = TerminalStreamCleanupRecord::from(&stream);
+        let stream_commit = StreamPutCommitInput {
+            versioning: BucketVersioningState::Disabled,
+            version_id: VersionId::Null,
+            owner: owner.clone(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            etag_crc64: 24,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: encryption.clone(),
+        };
+        let complete_multipart = CompleteMultipartCommitRequest {
+            bucket,
+            key,
+            upload_id,
+            completion_fingerprint: MultipartCompletionFingerprint::from_bytes([0x25; 32]),
+            versioning: BucketVersioningState::Disabled,
+            owner,
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(26).unwrap(),
+            size: 27,
+            etag_crc64: [0x28; 8],
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption,
+            expected_stale_payload_source: None,
+            expected_current_object_identity: None,
+            conditional_completion: false,
+            part_records: Vec::new(),
+            selected_streaming_segments: Vec::new(),
+            expected_cleanup: CompleteMultipartCommitCleanup::default(),
+        };
+
+        macro_rules! assert_carrier {
+            ($name:literal, $value:expr, $encoder:path, $decoder:ident) => {
+                assert_encryption_carrier_rejects_malformed_state(
+                    $name,
+                    $value,
+                    1,
+                    $encoder,
+                    |payload| {
+                        let mut decoder = StorageRpcDecoder::new(payload);
+                        let value = decoder.$decoder()?;
+                        decoder.finish()?;
+                        Ok(value)
+                    },
+                )
+            };
+        }
+
+        assert_carrier!(
+            "CommitDirectPutObjectReq",
+            &direct_put,
+            put_commit_direct_put_object_req,
+            read_commit_direct_put_object_req
+        );
+        assert_carrier!(
+            "CreateStreamUploadReq",
+            &create_stream,
+            put_create_stream_upload_req,
+            read_create_stream_upload_req
+        );
+        assert_carrier!(
+            "StreamUploadCommandRecord",
+            &stream_command,
+            put_stream_upload_command_record,
+            read_stream_upload_command_record
+        );
+        assert_carrier!(
+            "StreamUploadRecord",
+            &stream,
+            put_stream_upload_record,
+            read_stream_upload_record
+        );
+        assert_carrier!(
+            "TerminalStreamCleanupRecord",
+            &terminal_stream,
+            put_terminal_stream_cleanup_record,
+            read_terminal_stream_cleanup_record
+        );
+        assert_carrier!(
+            "StreamPutCommitInput",
+            &stream_commit,
+            put_stream_put_commit_input,
+            read_stream_put_commit_input
+        );
+        assert_carrier!(
+            "CompleteMultipartCommitRequest",
+            &complete_multipart,
+            put_complete_multipart_commit_request,
+            read_complete_multipart_commit_request
+        );
+        assert_carrier!(
+            "CreateMultipartUploadReq",
+            &create_multipart,
+            put_create_multipart_upload_req,
+            read_create_multipart_upload_req
+        );
+        assert_carrier!(
+            "MultipartUploadRecord",
+            &multipart_upload,
+            put_multipart_upload_record,
+            read_multipart_upload_record
+        );
+        assert_carrier!(
+            "MultipartCompletionReplay",
+            &replay,
+            put_multipart_completion_replay,
+            read_multipart_completion_replay
+        );
+        assert_carrier!(
+            "LiveObjectRecord",
+            &live_object,
+            put_live_object_record,
+            read_live_object_record
+        );
     }
 
     #[test]

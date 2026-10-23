@@ -1331,6 +1331,23 @@ Implementation update (2026-10-23, exhaustive metadata-command carriers):
   mutate object state. Storage-RPC carrier inventory and the remaining authorized recovery/replay
   effect sentinels remain open, as does the object-subject DEK-wrap/checksum transition.
 
+Implementation update (2026-10-23, exhaustive storage-RPC carriers):
+
+- The eleven primitive storage-RPC codecs that carry `ObjectEncryption` now share one explicit
+  malformed-profile matrix: direct PUT commit input, stream-session creation, command-owned and
+  runtime stream records, terminal stream cleanup, streamed PUT commit input, multipart completion,
+  multipart creation and durable upload state, multipart replay, and live-object state. Each valid
+  carrier must first round-trip through its exact private encoder/decoder pair.
+- The test identifies every embedded encryption occurrence independently and corrupts its outer
+  encryption discriminator, nested encryption-state version, and payload-codec discriminator. The
+  retired plaintext tags and unknown tags must reach the exact encryption type/state diagnostic;
+  no unrelated trailing-field failure can satisfy the matrix.
+- Higher-level RPC requests and responses compose only these primitive codecs, so their nested
+  encryption grammar cannot select a weaker decoder. Together with the preceding command inventory,
+  this closes current byte-decoding coverage for metadata-command and storage-RPC carriers. The
+  remaining malformed-profile work is effect-boundary coverage for authorized recovery/replay and
+  restored durable state, plus the object-subject DEK-wrap/checksum transition.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 
