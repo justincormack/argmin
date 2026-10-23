@@ -1170,6 +1170,23 @@ Implementation update (2026-10-23, authority-bound whole-segment read dispatch):
   move the same subject-bound codec operation onto authenticated selected chunks and define the
   post-header transport-abort behavior for later-record failures.
 
+Implementation update (2026-10-23, real buffered-operation canaries):
+
+- The SSE-C and SSE-S3 encryption-state constructors now take an internal, compiler-exhaustive
+  payload-codec selection. Their production entry points remain explicitly pinned to
+  `SegmentAes256GcmV1`; test-only adapters can select another already-supported profile without
+  mutating a completed state or bypassing key generation, DEK wrapping, or validator construction.
+- Real buffered PutObject canaries select `Cobblestone256SegmentV1` for both key modes and run the
+  normal admitted reservation, subject-bound encryption, EC/shard write, integrity-witness,
+  metadata-command apply, active snapshot, checksum-metadata open, DEK unwrap, and GetObject body
+  path. The payload crosses multiple 16 KiB records, so success cannot be supplied by an empty or
+  single-record special case. The SSE-C canary also traverses normal bucket SSE-C authorization
+  and read-header validation.
+- These canaries establish the first operation-level positive evidence without changing the
+  production writer. Streamed PutObject/POST, CopyObject, UploadPart/UploadPartCopy, multipart
+  completion, restart/retained reads, the object-subject DEK-wrap/checksum transition, and the
+  remaining malformed-carrier matrix stay open before writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

@@ -5665,6 +5665,116 @@ fn bucket_encryption_defaults_to_sse_s3() {
     );
 }
 
+fn put_and_read_direct_cobblestone_object(
+    coord: &Coordinator,
+    key: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let payload: Vec<u8> = (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let mut authorized = coord
+        .prepare_put_object_write_with_storage_admission(
+            &admission,
+            &AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: match sse_customer {
+                    Some(request) => WriteEncryptionRequest::sse_customer(request),
+                    None => WriteEncryptionRequest::none(),
+                },
+            },
+        )
+        .unwrap();
+
+    authorized.write_encryption = match sse_customer {
+        Some(request) => ActiveWriteEncryption::sse_customer(
+            crate::sse::test_prepare_sse_customer_write_with_payload_codec(
+                coord.sse_c_validator.as_ref().unwrap(),
+                request,
+                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+            )
+            .unwrap(),
+        ),
+        None => ActiveWriteEncryption::managed(
+            ManagedEncryptionAlgorithm::Aes256,
+            crate::sse::test_prepare_managed_encryption_write_with_payload_codec(
+                coord.managed_key_provider.as_ref().unwrap(),
+                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+            )
+            .unwrap(),
+        ),
+    };
+    assert_eq!(
+        authorized
+            .write_encryption
+            .object_encryption()
+            .payload_codec(),
+        storage::SegmentPayloadCodec::Cobblestone256SegmentV1
+    );
+
+    coord
+        .commit_put_object_write_with_storage_admission(
+            &admission,
+            &AuthorizedPutObjectCommitRequest {
+                data: &payload,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                cond: NO_WRITE,
+            },
+            &authorized,
+        )
+        .unwrap();
+    drop(admission);
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        object.system_metadata.checksum().is_some(),
+        "the production PUT/GET path must seal and reopen checksum metadata"
+    );
+    assert_eq!(object.body.read_all().unwrap(), payload);
+}
+
+#[test]
+fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    put_and_read_direct_cobblestone_object(&coord, "managed", None);
+}
+
+#[test]
+fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_sse_c(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+    let request = test_sse_customer_request();
+
+    put_and_read_direct_cobblestone_object(&coord, "customer", Some(&request));
+}
+
 #[test]
 fn bucket_encryption_block_and_unblock() {
     let tmp = test_util::tempdir();

@@ -626,6 +626,18 @@ pub fn prepare_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerWriteContext, ServerError> {
+    prepare_sse_customer_write_with_payload_codec(
+        validator,
+        request,
+        SegmentPayloadCodec::SegmentAes256GcmV1,
+    )
+}
+
+fn prepare_sse_customer_write_with_payload_codec(
+    validator: &SseCustomerValidatorConfig,
+    request: &SseCustomerRequest,
+    payload_codec: SegmentPayloadCodec,
+) -> Result<SseCustomerWriteContext, ServerError> {
     let mut validator_salt = [0u8; SSE_C_VALIDATOR_SALT_LEN];
     argmin_crypto::random::fill(&mut validator_salt).map_err(|_| ServerError::InternalError {
         reason: "failed to generate SSE-C validator salt".to_string(),
@@ -660,18 +672,30 @@ pub fn prepare_sse_customer_write(
 
     Ok(SseCustomerWriteContext {
         request: request.clone(),
-        encryption: ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
-            validator.key_id,
-            validator_salt,
-            validator_hmac,
-            wrap_salt,
-            wrap_nonce,
-            wrapped_dek,
-            segment_nonce_prefix,
-        )),
+        encryption: ObjectEncryption::SseCustomer(
+            SseCustomerObjectState::new(
+                validator.key_id,
+                validator_salt,
+                validator_hmac,
+                wrap_salt,
+                wrap_nonce,
+                wrapped_dek,
+                segment_nonce_prefix,
+            )
+            .with_payload_codec(payload_codec),
+        ),
         dek,
         segment_scope: SseCustomerSegmentScope::object(),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_prepare_sse_customer_write_with_payload_codec(
+    validator: &SseCustomerValidatorConfig,
+    request: &SseCustomerRequest,
+    payload_codec: SegmentPayloadCodec,
+) -> Result<SseCustomerWriteContext, ServerError> {
+    prepare_sse_customer_write_with_payload_codec(validator, request, payload_codec)
 }
 
 pub(crate) fn resume_sse_customer_write(
@@ -715,6 +739,16 @@ pub fn validate_sse_customer_read(
 pub fn prepare_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
+    prepare_managed_encryption_write_with_payload_codec(
+        provider,
+        SegmentPayloadCodec::SegmentAes256GcmV1,
+    )
+}
+
+fn prepare_managed_encryption_write_with_payload_codec(
+    provider: &impl ManagedKeyProvider,
+    payload_codec: SegmentPayloadCodec,
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
     let wrapping_key = provider.active_key();
 
     let mut wrap_nonce = [0u8; SSE_S3_WRAP_NONCE_LEN];
@@ -743,15 +777,26 @@ pub fn prepare_managed_encryption_write(
     })?;
 
     Ok(ManagedEncryptionWriteContext {
-        encryption: ObjectEncryption::SseS3(SseS3ObjectState::new(
-            wrapping_key.key_id,
-            wrap_nonce,
-            wrapped_dek,
-            segment_nonce_prefix,
-        )),
+        encryption: ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                wrapping_key.key_id,
+                wrap_nonce,
+                wrapped_dek,
+                segment_nonce_prefix,
+            )
+            .with_payload_codec(payload_codec),
+        ),
         dek,
         segment_scope: SseCustomerSegmentScope::object(),
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_prepare_managed_encryption_write_with_payload_codec(
+    provider: &impl ManagedKeyProvider,
+    payload_codec: SegmentPayloadCodec,
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
+    prepare_managed_encryption_write_with_payload_codec(provider, payload_codec)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
