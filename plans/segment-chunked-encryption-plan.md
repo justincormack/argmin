@@ -1266,6 +1266,20 @@ Implementation update (2026-10-23, restart and retained-route canaries):
   PUT/POST/copy dispatch, the object-subject DEK-wrap/checksum transition, and the complete
   malformed-carrier matrix remain open before production writer selection.
 
+Implementation update (2026-10-23, buffered HTTP dispatch canaries):
+
+- The feature-gated coordinator test-support surface can now select an already-supported payload
+  codec before the coordinator is shared with another crate. Production builds retain no selection
+  API and remain pinned to `SegmentAes256GcmV1`.
+- A server-http canary selects Cobblestone, submits an explicit SSE-S3 PutObject through the routed
+  HTTP parser/dispatcher, then submits CopyObject through the same modeled `PutObject` route using
+  `x-amz-copy-source`. Storage-owned observations require both the source and copied destination to
+  persist `Cobblestone256SegmentV1` rather than the legacy codec, and a routed GetObject returns the
+  exact multi-record plaintext.
+- This closes the buffered PutObject and CopyObject HTTP-discrimination gap. Socket-level streamed
+  PutObject, POST Object, and their body-ingest/finalization boundaries remain open, as do the
+  object-subject DEK-wrap/checksum transition and complete malformed-carrier matrix.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

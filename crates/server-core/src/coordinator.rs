@@ -23,6 +23,8 @@ use s3_types::{
 };
 #[cfg(test)]
 use storage::ObjectLockState;
+#[cfg(any(test, feature = "test-utils"))]
+use storage::SegmentPayloadCodec;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig};
 use storage::{
@@ -31,7 +33,7 @@ use storage::{
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, ManagedEncryptionAlgorithm,
-    PublicAccessBlockConfig, SegmentPayloadCodec, SessionId, StoredObject, UploadId, UploadState,
+    PublicAccessBlockConfig, SessionId, StoredObject, UploadId, UploadState,
 };
 
 use self::authz_results::*;
@@ -465,7 +467,7 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     managed_key_provider: Option<StaticManagedKeyProvider>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     test_new_payload_codec: SegmentPayloadCodec,
     _reclaim_sweeper: Arc<ReclaimSweeper>,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,

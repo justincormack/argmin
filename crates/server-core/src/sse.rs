@@ -689,7 +689,7 @@ fn prepare_sse_customer_write_with_payload_codec(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn test_prepare_sse_customer_write_with_payload_codec(
     validator: &SseCustomerValidatorConfig,
     request: &SseCustomerRequest,
@@ -791,7 +791,7 @@ fn prepare_managed_encryption_write_with_payload_codec(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn test_prepare_managed_encryption_write_with_payload_codec(
     provider: &impl ManagedKeyProvider,
     payload_codec: SegmentPayloadCodec,

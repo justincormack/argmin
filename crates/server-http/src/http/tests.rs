@@ -14,7 +14,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use storage::test_support::{
-        StorageClusterMetadataCommandTestSupport as _, StorageClusterRouteMapTestSupport as _,
+        StorageClusterMetadataCommandTestSupport as _, StorageClusterObjectTestSupport as _,
+        StorageClusterRouteMapTestSupport as _,
     };
     use storage::RouteMapValidity;
 
@@ -128,8 +129,30 @@ mod tests {
         dir: &std::path::Path,
         sse_s3_provider: Option<StaticManagedKeyProvider>,
     ) -> HttpFrontend {
+        setup_frontend_with_optional_sse_s3_and_payload_codec(dir, sse_s3_provider, None)
+    }
+
+    fn setup_frontend_with_payload_codec(
+        dir: &std::path::Path,
+        payload_codec: storage::SegmentPayloadCodec,
+    ) -> HttpFrontend {
+        let sse_s3_provider = StaticManagedKeyProvider::single(
+            ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
+        );
+        setup_frontend_with_optional_sse_s3_and_payload_codec(
+            dir,
+            Some(sse_s3_provider),
+            Some(payload_codec),
+        )
+    }
+
+    fn setup_frontend_with_optional_sse_s3_and_payload_codec(
+        dir: &std::path::Path,
+        sse_s3_provider: Option<StaticManagedKeyProvider>,
+        payload_codec: Option<storage::SegmentPayloadCodec>,
+    ) -> HttpFrontend {
         let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
-        let coordinator = match sse_s3_provider {
+        let mut coordinator = match sse_s3_provider {
             Some(provider) => Coordinator::new_with_managed_key_provider_for_storage_cluster(
                 Arc::clone(&storage_cluster),
                 "us-east-1".to_string(),
@@ -143,6 +166,12 @@ mod tests {
             ),
         }
         .unwrap();
+        if let Some(payload_codec) = payload_codec {
+            crate::coordinator::test_helpers::select_new_payload_codec(
+                &mut coordinator,
+                payload_codec,
+            );
+        }
         let mut credentials = auth::CredentialStore::new();
         credentials
             .add(
@@ -1900,6 +1929,108 @@ mod tests {
             find_header(&head_resp, "x-amz-server-side-encryption"),
             Some("AES256")
         );
+    }
+
+    #[test]
+    fn http_put_and_copy_dispatch_preserve_selected_cobblestone_codec() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend_with_payload_codec(
+            tmp.path(),
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        );
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let payload: Vec<u8> =
+            (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/mybucket/source",
+            "",
+            vec![(SSE_HEADER.to_string(), "AES256".to_string())],
+            payload.clone(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "source".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+        assert_eq!(
+            find_header(&put_resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        let source_codec = fe
+            .test_storage_cluster
+            .test_observe_object_payload_codec(
+                &test_bucket_name("mybucket"),
+                &parse_object_key("source").unwrap(),
+                VersionId::Null,
+            )
+            .unwrap();
+        assert!(source_codec.is_cobblestone_256_segment_v1());
+        assert!(!source_codec.is_segment_aes_256_gcm_v1());
+
+        let copy_req = new_req(
+            http::Method::PUT,
+            "/mybucket/destination",
+            "",
+            vec![
+                (
+                    "x-amz-copy-source".to_string(),
+                    "/mybucket/source".to_string(),
+                ),
+                (SSE_HEADER.to_string(), "AES256".to_string()),
+            ],
+            Vec::new(),
+        );
+        let copy_resp = fe
+            .dispatch_routed(
+                &copy_req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "destination".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(copy_resp.status_code, 200);
+        let destination_codec = fe
+            .test_storage_cluster
+            .test_observe_object_payload_codec(
+                &test_bucket_name("mybucket"),
+                &parse_object_key("destination").unwrap(),
+                VersionId::Null,
+            )
+            .unwrap();
+        assert!(destination_codec.is_cobblestone_256_segment_v1());
+        assert!(!destination_codec.is_segment_aes_256_gcm_v1());
+
+        let get_req = new_req(
+            http::Method::GET,
+            "/mybucket/destination",
+            "",
+            Vec::new(),
+            Vec::new(),
+        );
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "destination".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+        assert_eq!(get_resp.into_test_body_bytes().unwrap(), payload);
     }
 
     #[test]

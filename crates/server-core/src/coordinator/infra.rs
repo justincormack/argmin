@@ -660,7 +660,7 @@ impl Coordinator {
             region,
             sse_c_validator,
             managed_key_provider,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             test_new_payload_codec: storage::SegmentPayloadCodec::SegmentAes256GcmV1,
             _reclaim_sweeper: reclaim_sweeper,
             _shard_scavenger_sweeper: shard_scavenger_sweeper,
