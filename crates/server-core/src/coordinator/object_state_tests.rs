@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
-use storage::test_support::StorageClusterMultipartTestSupport as _;
+use storage::test_support::{
+    StorageClusterMultipartTestSupport as _, StorageClusterObjectTestSupport as _,
+};
 
 struct MultipartMetadataRaceSync {
     snapshot_reached: Arc<Barrier>,
@@ -6008,6 +6010,225 @@ fn upload_part_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let request = test_sse_customer_request();
 
     upload_part_and_read_cobblestone_object(&coord, "customer-part", Some(&request));
+}
+
+fn copy_and_read_cobblestone_objects(
+    coord: &mut Coordinator,
+    key_prefix: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let payload_len =
+        INTERNAL_SEGMENT_SIZE + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37;
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|index| u8::try_from(index % 239).unwrap())
+        .collect();
+    let source_key = format!("{key_prefix}-source");
+    test_helpers::put_object(
+        coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                &source_key,
+                test_requester(),
+                None,
+            ),
+            data: &payload,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let source_codec = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&source_key),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert!(
+        source_codec.is_segment_aes_256_gcm_v1(),
+        "copy source must persist the legacy segment codec before writer selection changes"
+    );
+    assert!(!source_codec.is_cobblestone_256_segment_v1());
+
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let destination_encryption = match sse_customer {
+        Some(request) => WriteEncryptionRequest::sse_customer(request),
+        None => WriteEncryptionRequest::none(),
+    };
+    let copy_key = format!("{key_prefix}-copy");
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", &source_key, None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                &copy_key,
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption,
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    let copied_codec = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&copy_key),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert!(
+        copied_codec.is_cobblestone_256_segment_v1(),
+        "CopyObject destination must persist the selected Cobblestone codec"
+    );
+    assert!(!copied_codec.is_segment_aes_256_gcm_v1());
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                &copy_key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        copied.system_metadata.checksum().is_some(),
+        "CopyObject must reseal source checksum metadata under destination encryption"
+    );
+    assert_eq!(copied.body.read_all().unwrap(), payload);
+
+    let part_copy_key = format!("{key_prefix}-part-copy");
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                &part_copy_key,
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: destination_encryption,
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let candidate = coord
+        .storage_node()
+        .test_get_multipart_completion_candidate(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(&part_copy_key),
+            &upload.upload_id,
+        )
+        .unwrap();
+    assert_eq!(
+        candidate.encryption().payload_codec(),
+        storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        "UploadPartCopy destination must retain the selected MPU writer profile"
+    );
+
+    let part = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", &source_key, None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                &part_copy_key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            sse_customer,
+        })
+        .unwrap();
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                &part_copy_key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: Some(u64::try_from(payload.len()).unwrap()),
+            cond: NO_WRITE,
+            sse_customer,
+        })
+        .unwrap();
+    let part_copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                &part_copy_key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert!(
+        part_copied.system_metadata.checksum().is_some(),
+        "multipart completion must seal checksum metadata for the copied part"
+    );
+    assert_eq!(part_copied.body.read_all().unwrap(), payload);
+}
+
+#[test]
+fn copy_paths_cobblestone_sse_s3_round_trip_from_legacy_source() {
+    let tmp = test_util::tempdir();
+    let mut coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    copy_and_read_cobblestone_objects(&mut coord, "managed", None);
+}
+
+#[test]
+fn copy_paths_cobblestone_sse_c_round_trip_from_legacy_source() {
+    let tmp = test_util::tempdir();
+    let mut coord = setup_coordinator_with_sse_c(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+    let request = test_sse_customer_request();
+
+    copy_and_read_cobblestone_objects(&mut coord, "customer", Some(&request));
 }
 
 #[test]

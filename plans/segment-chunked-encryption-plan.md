@@ -1226,6 +1226,29 @@ Implementation update (2026-10-23, real UploadPart and multipart-completion cana
   dispatch, restart/retained reads, the object-subject DEK-wrap/checksum transition, and the
   remaining malformed-carrier matrix remain open before production writer selection.
 
+Implementation update (2026-10-23, real copy-path canaries):
+
+- CopyObject and UploadPartCopy now have normal-operation Cobblestone canaries for both SSE-S3 and
+  SSE-C destinations. Each case first writes an 8 MiB-plus source while the coordinator retains its
+  default `SegmentAes256GcmV1` selection, then selects `Cobblestone256SegmentV1` only for subsequent
+  destination authorization. A narrow storage-owned observation asserts that the durable source
+  profile is `SegmentAes256GcmV1` and the durable CopyObject destination profile is
+  `Cobblestone256SegmentV1`; exact plaintext and checksum readback cannot satisfy those assertions
+  on their own. The tests therefore prove the frozen reader and new writer can be composed across a
+  real re-encrypting copy; they do not rely on a same-profile source.
+- CopyObject traverses retained source-payload authority, whole-segment legacy decryption,
+  multi-segment destination session publication, destination checksum-metadata resealing, and
+  exact GetObject readback. The SSE-C case supplies a customer key only for the destination, so the
+  source and destination key modes also differ.
+- UploadPartCopy uses the same legacy source, verifies the destination MPU durably records the
+  Cobblestone profile, copies more than one internal segment through multipart segment authority,
+  completes the manifest, and reads back exact bytes. Its SSE-C case supplies the customer key at
+  part-copy, completion, and read boundaries.
+- The operation-level storage matrix now covers buffered and streamed PutObject, ordinary
+  UploadPart, CompleteMultipartUpload, CopyObject, and UploadPartCopy in both key modes. HTTP
+  PUT/POST/copy dispatch, restart/retained reads, the object-subject DEK-wrap/checksum transition,
+  and the remaining malformed-carrier matrix remain open before production writer selection.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

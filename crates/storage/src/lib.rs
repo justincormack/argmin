@@ -1961,6 +1961,13 @@ pub mod test_support {
 
     /// Narrow logical and at-rest observations for committed objects.
     pub trait StorageClusterObjectTestSupport {
+        fn test_observe_object_payload_codec(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestObjectPayloadCodecObservation, TestStorageFailure>;
+
         fn test_observe_stored_encrypted_checksum(
             &self,
             bucket: &BucketName,
@@ -1997,6 +2004,16 @@ pub mod test_support {
     }
 
     impl StorageClusterObjectTestSupport for StorageCluster {
+        fn test_observe_object_payload_codec(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestObjectPayloadCodecObservation, TestStorageFailure> {
+            StorageCluster::test_observe_object_payload_codec(self, bucket, key, version_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
+        }
+
         fn test_observe_stored_encrypted_checksum(
             &self,
             bucket: &BucketName,
@@ -3567,6 +3584,36 @@ pub mod test_support {
         pub contains_supplied_cleartext: bool,
     }
 
+    /// Opaque observation of the durable payload codec selected for one live
+    /// object version.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TestObjectPayloadCodecObservation {
+        is_cobblestone_256_segment_v1: bool,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestObjectPayloadCodecObservation {
+        pub(crate) fn from_codec(codec: SegmentPayloadCodec) -> Self {
+            Self {
+                is_cobblestone_256_segment_v1: match codec {
+                    SegmentPayloadCodec::SegmentAes256GcmV1 => false,
+                    SegmentPayloadCodec::Cobblestone256SegmentV1 => true,
+                },
+            }
+        }
+
+        #[must_use]
+        pub const fn is_segment_aes_256_gcm_v1(self) -> bool {
+            !self.is_cobblestone_256_segment_v1
+        }
+
+        #[must_use]
+        pub const fn is_cobblestone_256_segment_v1(self) -> bool {
+            self.is_cobblestone_256_segment_v1
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     impl TestMultipartPartObservation {
         pub(crate) fn from_record(part: types::MultipartPartRecord) -> Self {
@@ -3973,8 +4020,9 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
-    TestStoredEncryptedChecksumObservation, TestStreamUploadPayloadSnapshot,
+    TestObjectPayloadCodecObservation, TestObjectPayloadRepairObservation,
+    TestObjectPayloadSnapshot, TestStoredEncryptedChecksumObservation,
+    TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

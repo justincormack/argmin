@@ -1246,6 +1246,24 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_observe_object_payload_codec(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<crate::TestObjectPayloadCodecObservation, ObjectPgActionError> {
+        let stored = self.test_get_object_version(bucket, key, version_id)?;
+        let live = stored
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "selected payload-codec observation is not a live object".to_string(),
+            })?;
+        Ok(crate::TestObjectPayloadCodecObservation::from_codec(
+            live.encryption.payload_codec(),
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_observe_stored_encrypted_checksum(
         &self,
         bucket: &BucketName,
