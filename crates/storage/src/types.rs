@@ -1938,6 +1938,20 @@ impl ObjectEncryptionSubject {
         Ok(self)
     }
 
+    /// Returns whether `encryption` is the one-way committed successor of the
+    /// provisional encryption state from which this subject was minted.
+    ///
+    /// Keeping this comparison on the opaque subject lets storage validate a
+    /// terminal publisher without exposing or reconstructing its logical
+    /// identity in a higher layer.
+    #[must_use]
+    pub(crate) fn matches_committed_encryption(&self, encryption: &ObjectEncryption) -> bool {
+        self.encryption_instance_id == encryption.encryption_instance_id()
+            && self
+                .immutable_encryption_binding
+                .is_committed_successor(encryption)
+    }
+
     /// Derives the purpose-separated DEK-wrap subject from this exact object
     /// identity.
     #[must_use]

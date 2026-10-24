@@ -324,6 +324,77 @@ fn stream_finalization_authority_is_bound_to_its_exact_admitted_route() {
 }
 
 #[test]
+fn stream_finalization_authority_rejects_provisional_terminal_encryption_before_publication() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-finalization-committed-encryption");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("commit");
+    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+        9,
+        [10; crate::SSE_S3_WRAP_NONCE_LEN],
+        [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+        [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ));
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let route_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let next_log_index_before = map.test_next_metadata_command_log_index(pg_id);
+
+    let error = route
+        .finalize_stream(&authority, 0, |_| {
+            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: 0,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: encryption.clone(),
+            })
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert_eq!(
+        error.invalid_request_reason(),
+        Some(
+            "stream finalization committed encryption does not match the authorized object subject"
+        )
+    );
+    assert_eq!(
+        map.test_next_metadata_command_log_index(pg_id),
+        next_log_index_before,
+        "provisional terminal encryption must fail before command allocation"
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_eq!(
+        route.load_stream_session(&session_id).unwrap().encryption,
+        encryption
+    );
+}
+
+#[test]
 fn stream_finalization_authority_rejects_session_mutation_after_initial_snapshot() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
@@ -355,6 +426,15 @@ fn stream_finalization_authority_rejects_session_mutation_after_initial_snapshot
     let admission = route_handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let committed_encryption = encryption
+        .bind_committed_object_ciphertexts(
+            authority.object_encryption_subject(),
+            [21; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [22; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
     let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
     let next_log_index_before = map.test_next_metadata_command_log_index(pg_id);
 
@@ -394,7 +474,7 @@ fn stream_finalization_authority_rejects_session_mutation_after_initial_snapshot
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: encryption.clone(),
+                encryption: committed_encryption.clone(),
             })
         })
         .unwrap_err();
@@ -412,6 +492,108 @@ fn stream_finalization_authority_rejects_session_mutation_after_initial_snapshot
     );
     let stored = route.load_stream_session(&session_id).unwrap();
     assert_eq!(stored.next_segment_vid, GenerationId::new(2).unwrap());
+}
+
+#[test]
+fn stream_finalization_authority_rejects_generation_mutation_after_initial_snapshot() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-finalization-generation-authority");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("generation-auth");
+    let encryption = crate::tests::metadata_only_test_encryption();
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let route_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let committed_encryption = encryption
+        .bind_committed_object_ciphertexts(
+            authority.object_encryption_subject(),
+            [21; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [22; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let next_log_index_before = map.test_next_metadata_command_log_index(pg_id);
+
+    let hook_map = Arc::clone(&map);
+    let hook_session_id = session_id.clone();
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let _hook =
+        cluster.test_install_before_stream_put_finalize_command_id_hook(Arc::new(move || {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.test_force_object_generation_reservation(
+                &hook_session_id,
+                GenerationId::new(2).unwrap(),
+            )
+            .unwrap();
+        }));
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let error = route
+        .finalize_stream(&authority, 0, move |_| {
+            action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: 0,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: committed_encryption.clone(),
+            })
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert!(hook_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        action_calls.load(Ordering::SeqCst),
+        1,
+        "changed generation must be rejected before retry command preparation"
+    );
+    assert_eq!(
+        map.test_next_metadata_command_log_index(pg_id),
+        next_log_index_before,
+        "rejected generation change must not allocate or publish a metadata command"
+    );
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    assert_eq!(
+        pg.get_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap(),
+        GenerationId::new(2).unwrap()
+    );
 }
 
 #[test]
@@ -447,6 +629,15 @@ fn stream_finalization_authority_rejects_changed_post_apply_reinspection_snapsho
     let admission = route_handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let committed_encryption = encryption
+        .bind_committed_object_ciphertexts(
+            authority.object_encryption_subject(),
+            [21; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [22; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
     let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
 
     let force_reinspection = Arc::new(AtomicBool::new(false));
@@ -499,7 +690,7 @@ fn stream_finalization_authority_rejects_changed_post_apply_reinspection_snapsho
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: encryption.clone(),
+                encryption: committed_encryption.clone(),
             })
         })
         .unwrap_err();

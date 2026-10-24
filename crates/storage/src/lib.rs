@@ -3626,16 +3626,19 @@ pub mod test_support {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TestObjectPayloadCodecObservation {
         is_cobblestone_256_segment_v1: bool,
+        is_object_subject_bound: bool,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     impl TestObjectPayloadCodecObservation {
-        pub(crate) fn from_codec(codec: SegmentPayloadCodec) -> Self {
+        pub(crate) fn from_encryption(encryption: &ObjectEncryption) -> Self {
             Self {
-                is_cobblestone_256_segment_v1: match codec {
+                is_cobblestone_256_segment_v1: match encryption.payload_codec() {
                     SegmentPayloadCodec::SegmentAes256GcmV1 => false,
                     SegmentPayloadCodec::Cobblestone256SegmentV1 => true,
                 },
+                is_object_subject_bound: encryption.key_binding()
+                    == ObjectEncryptionKeyBinding::ObjectSubjectV2,
             }
         }
 
@@ -3647,6 +3650,11 @@ pub mod test_support {
         #[must_use]
         pub const fn is_cobblestone_256_segment_v1(self) -> bool {
             self.is_cobblestone_256_segment_v1
+        }
+
+        #[must_use]
+        pub const fn is_object_subject_bound(self) -> bool {
+            self.is_object_subject_bound
         }
     }
 

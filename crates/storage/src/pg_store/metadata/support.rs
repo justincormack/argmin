@@ -176,6 +176,20 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_force_object_generation_reservation(
+        &self,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE object_generation_reservations SET generation_id = ?1 WHERE reservation_id = ?2",
+            params![generation_id.get() as i64, reservation_id],
+            "force object generation reservation for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_force_multipart_upload_object_generation(
         &self,
         upload_id: &UploadId,

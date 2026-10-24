@@ -385,6 +385,8 @@ impl std::fmt::Debug for DirectPutSegmentEncryptionReservation<'_> {
 pub struct AuthorizedStreamPutFinalization<'route, 'admission> {
     route: &'route ActivePutObjectRoute<'admission>,
     session: StreamUploadRecord,
+    generation_id: GenerationId,
+    subject: ObjectEncryptionSubject,
 }
 
 /// Non-cloneable authority to encrypt and append one exact PutObject stream
@@ -517,8 +519,20 @@ impl AuthorizedStreamPutFinalization<'_, '_> {
         &self.session.encryption
     }
 
-    fn matches_current_session(&self, current: &StreamUploadRecord) -> bool {
-        self.session.has_same_stable_identity(current)
+    /// Returns the exact object subject under which terminal DEK wrapping and
+    /// checksum metadata must be sealed.
+    #[must_use]
+    pub fn object_encryption_subject(&self) -> &ObjectEncryptionSubject {
+        &self.subject
+    }
+
+    fn matches_current_snapshot(&self, current: &crate::StreamPutFinalizeStorageSnapshot) -> bool {
+        self.session.has_same_stable_identity(&current.session)
+            && self.generation_id == current.generation_id
+    }
+
+    fn matches_committed_encryption(&self, encryption: &ObjectEncryption) -> bool {
+        self.subject.matches_committed_encryption(encryption)
     }
 }
 
@@ -594,6 +608,13 @@ struct StreamAppendCallbacks<Validate, BeforePrepare, RequireRoute, AfterPrepare
     require_valid_route: RequireRoute,
     after_prepare: AfterPrepare,
     maintain_lease: MaintainLease,
+}
+
+struct StreamPutFinalizeCallbacks<RequireRoute, ValidateSnapshot, ValidateEncryption, Action> {
+    require_valid_route: RequireRoute,
+    validate_authorized_snapshot: ValidateSnapshot,
+    validate_committed_encryption: ValidateEncryption,
+    action: Action,
 }
 
 #[derive(Clone, Copy)]
@@ -1536,10 +1557,21 @@ impl<'admission> ActivePutObjectRoute<'admission> {
     ) -> Result<AuthorizedStreamPutFinalization<'route, 'admission>, crate::StreamUploadFailure>
     {
         let session = self.load_stream_session(session_id)?;
+        let Some(bucket_write_reservation) = session.bucket_write_reservation.as_ref() else {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "PutObject stream session is missing bucket write proof".to_string(),
+                },
+            ));
+        };
         if session.bucket != self.bucket
             || session.key != self.key
             || session.session_id != *session_id
             || session.target != StreamUploadTarget::PutObject
+            || bucket_write_reservation.bucket != self.bucket
+            || bucket_write_reservation.operation_kind
+                != PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            || bucket_write_reservation.target_context.as_deref() != Some(self.key.as_str())
         {
             return Err(crate::StreamUploadFailure::from_object_pg_action(
                 ObjectPgActionError::InvalidRequest {
@@ -1548,9 +1580,25 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 },
             ));
         }
+        let generation_id = self
+            .load_stream_object_generation(session_id)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
+        self.admission
+            .require_valid_now_raw()
+            .map_err(ObjectPgActionError::from)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
+        let subject = ObjectEncryptionSubject::standard_object(
+            bucket_write_reservation.bucket_incarnation_generation,
+            &self.bucket,
+            &self.key,
+            generation_id,
+            &session.encryption,
+        );
         Ok(AuthorizedStreamPutFinalization {
             route: self,
             session,
+            generation_id,
+            subject,
         })
     }
 
@@ -1858,19 +1906,30 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 self.effect_route(),
                 &authorization.session.session_id,
                 total_size,
-                || self.admission.require_valid_now_raw(),
-                |current| {
-                    if authorization.matches_current_session(current) {
-                        Ok(())
-                    } else {
-                        Err(ObjectPgActionError::InvalidRequest {
-                            reason:
-                                "stream finalization authority no longer matches the durable session"
+                StreamPutFinalizeCallbacks {
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    validate_authorized_snapshot: |current: &crate::StreamPutFinalizeStorageSnapshot| {
+                        if authorization.matches_current_snapshot(current) {
+                            Ok(())
+                        } else {
+                            Err(ObjectPgActionError::InvalidRequest {
+                                reason: "stream finalization authority no longer matches the durable session"
                                     .to_string(),
-                        })
-                    }
+                            })
+                        }
+                    },
+                    validate_committed_encryption: |encryption: &ObjectEncryption| {
+                        if authorization.matches_committed_encryption(encryption) {
+                            Ok(())
+                        } else {
+                            Err(ObjectPgActionError::InvalidRequest {
+                                reason: "stream finalization committed encryption does not match the authorized object subject"
+                                    .to_string(),
+                            })
+                        }
+                    },
+                    action,
                 },
-                action,
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }

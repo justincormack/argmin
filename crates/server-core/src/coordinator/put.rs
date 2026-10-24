@@ -920,8 +920,12 @@ impl Coordinator {
                 }
                 let metadata_blob =
                     storage::SerializedMetadataBlob::from(metadata_blob.serialize()?);
-                let (system_metadata_blob, encryption) =
-                    Self::prepare_stored_system_metadata(&system_metadata, write_encryption)?;
+                let (system_metadata_blob, checksum) =
+                    Self::prepare_unsealed_stored_system_metadata(&system_metadata)?;
+                let encryption = write_encryption.seal_committed_object_encryption(
+                    finalization.object_encryption_subject(),
+                    checksum.as_ref(),
+                )?;
                 let owner = Self::effective_put_object_owner(
                     &bucket_info,
                     req.object.requester(),

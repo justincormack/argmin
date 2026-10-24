@@ -1227,6 +1227,10 @@ Connection: close\r\n\r\n",
             .unwrap();
         assert!(persisted_codec.is_cobblestone_256_segment_v1());
         assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+        assert!(
+            persisted_codec.is_object_subject_bound(),
+            "promoted PUT finalization must bind DEK and checksum ciphertext to the exact object subject"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1271,6 +1275,10 @@ Connection: close\r\n\r\n"
             .unwrap();
         assert!(persisted_codec.is_cobblestone_256_segment_v1());
         assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+        assert!(
+            persisted_codec.is_object_subject_bound(),
+            "POST finalization must bind DEK and checksum ciphertext to the exact object subject"
+        );
         assert_eq!(
             storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster)
                 .unwrap(),

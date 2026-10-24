@@ -1258,8 +1258,8 @@ impl super::StorageCluster {
             .ok_or_else(|| ObjectPgActionError::InvalidRequest {
                 reason: "selected payload-codec observation is not a live object".to_string(),
             })?;
-        Ok(crate::TestObjectPayloadCodecObservation::from_codec(
-            live.encryption.payload_codec(),
+        Ok(crate::TestObjectPayloadCodecObservation::from_encryption(
+            &live.encryption,
         ))
     }
 

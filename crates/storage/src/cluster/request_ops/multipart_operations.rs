@@ -518,23 +518,47 @@ impl super::StorageCluster {
             },
             session_id,
             total_size,
-            || Ok(()),
-            |_| Ok(()),
-            action,
+            super::StreamPutFinalizeCallbacks {
+                require_valid_route: || Ok(()),
+                validate_authorized_snapshot: |_: &StreamPutFinalizeStorageSnapshot| Ok(()),
+                validate_committed_encryption: |_: &ObjectEncryption| Ok(()),
+                action,
+            },
         )
     }
 
-    pub(super) fn finalize_put_object_stream_with_route_validation<T, E>(
+    pub(super) fn finalize_put_object_stream_with_route_validation<
+        T,
+        E,
+        RequireRoute,
+        ValidateSnapshot,
+        ValidateEncryption,
+        Action,
+    >(
         &self,
         route: super::PutObjectMutationEffectRoute<'_>,
         session_id: &SessionId,
         total_size: u64,
-        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-        mut validate_authorized_session: impl FnMut(
-            &StreamUploadRecord,
-        ) -> Result<(), ObjectPgActionError>,
-        mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
-    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+        callbacks: super::StreamPutFinalizeCallbacks<
+            RequireRoute,
+            ValidateSnapshot,
+            ValidateEncryption,
+            Action,
+        >,
+    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError>
+    where
+        RequireRoute: FnMut() -> Result<(), StoreError>,
+        ValidateSnapshot:
+            FnMut(&StreamPutFinalizeStorageSnapshot) -> Result<(), ObjectPgActionError>,
+        ValidateEncryption: FnMut(&ObjectEncryption) -> Result<(), ObjectPgActionError>,
+        Action: FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
+    {
+        let super::StreamPutFinalizeCallbacks {
+            mut require_valid_route,
+            mut validate_authorized_snapshot,
+            mut validate_committed_encryption,
+            mut action,
+        } = callbacks;
         let publisher =
             crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
         let super::PutObjectMutationEffectRoute {
@@ -773,7 +797,7 @@ impl super::StorageCluster {
                 Err(error) => return Err(error),
             };
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            validate_authorized_session(&storage_snapshot.session)?;
+            validate_authorized_snapshot(&storage_snapshot)?;
             let Some(effective_bucket_write_reservation) =
                 storage_snapshot.session.bucket_write_reservation.as_ref()
             else {
@@ -800,6 +824,7 @@ impl super::StorageCluster {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(Err(error)),
             };
+            validate_committed_encryption(&prepared.encryption)?;
             if let Some(projected_same_object_command) = projected_same_object_command {
                 // Keep the winner identity across later command-log contention. Its pending
                 // slot can remain visible on one replica after reinspection has stopped seeing
@@ -1013,7 +1038,7 @@ impl super::StorageCluster {
                 }
                 Err(error) => return Err(error),
             };
-            validate_authorized_session(&storage_snapshot.session)?;
+            validate_authorized_snapshot(&storage_snapshot)?;
             #[cfg(test)]
             maybe_run_before_snapshot_reinspection_action_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
@@ -1026,7 +1051,10 @@ impl super::StorageCluster {
                 existing_etag: storage_snapshot.existing_etag,
             }) {
                 Err(error) => return Ok(Err(error)),
-                Ok(_) => return Err(ObjectPgActionError::SnapshotReinspectionConflict),
+                Ok(prepared) => {
+                    validate_committed_encryption(&prepared.encryption)?;
+                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                }
             }
         }
 

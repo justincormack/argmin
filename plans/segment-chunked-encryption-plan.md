@@ -1462,6 +1462,31 @@ Implementation update (2026-10-24, buffered PUT and exact read subjects):
   transition before the Phase 2 write-path and subject-binding items can close; this slice does not
   enable the Cobblestone writer profile by itself.
 
+Implementation update (2026-10-24, streamed-object terminal subject binding):
+
+- The shared streamed-object finalizer now selects `ObjectSubjectV2` for promoted PutObject, POST
+  Object, and large CopyObject destinations. Storage loads the exact durable stream session and
+  non-recycling object-generation reservation, mints the terminal object subject from the session's
+  bucket incarnation, bucket, key, generation, codec, and encryption instance, and carries that
+  opaque subject to the crypto owner. Server-core rewraps the unchanged DEK and reseals checksum
+  metadata under the purpose-separated subject contexts before preparing the terminal command.
+- The finalization authority now binds both the complete stable session identity and the exact
+  generation observed when the subject was minted. Every retry and post-apply reinspection compares
+  both fields against one authoritative storage snapshot before invoking request preparation.
+  Changing the session allocator, immutable encryption state, or generation therefore rejects the
+  stale capability before command construction.
+- The fresh terminal-command construction boundary independently requires the prepared encryption
+  to be the one-way committed successor of that opaque subject. A provisional terminal state is
+  rejected before command-ID allocation or pending-slot mutation. Socket-level promoted PUT and
+  POST canaries, plus SSE-S3/SSE-C streamed PUT and re-encrypting CopyObject canaries, require the
+  durable `ObjectSubjectV2` binding and successful payload/checksum readback. Central generic
+  apply/recovery rejection of provisional terminal object commands remains open until all terminal
+  object publishers have migrated and the low-level recovery fixtures can be advanced together.
+- This uses the already-versioned SSE-C v6/SSE-S3 v4 key-binding discriminator, so no containing
+  format changes. Multipart uploads still retain provisional upload encryption while parts are
+  staged; CompleteMultipartUpload must perform the corresponding terminal object transition before
+  the Phase 2 subject-binding and all-write-path items can close.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

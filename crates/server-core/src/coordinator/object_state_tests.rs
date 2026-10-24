@@ -5904,6 +5904,10 @@ fn assert_cobblestone_object(
         .unwrap();
     assert!(persisted_codec.is_cobblestone_256_segment_v1());
     assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
+    assert!(
+        persisted_codec.is_object_subject_bound(),
+        "terminal publication must bind DEK and checksum ciphertext to the exact object subject"
+    );
     let object = coord
         .get_object(&GetObjectRequest {
             sse_customer,
@@ -6121,6 +6125,19 @@ fn stream_put_and_read_cobblestone_object(
         .unwrap();
     drop(admission);
 
+    let persisted = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(key),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert!(persisted.is_cobblestone_256_segment_v1());
+    assert!(
+        persisted.is_object_subject_bound(),
+        "stream finalization must bind DEK and checksum ciphertext to the exact object subject"
+    );
     let object = coord
         .get_object(&GetObjectRequest {
             sse_customer,
@@ -6379,6 +6396,10 @@ fn copy_and_read_cobblestone_objects(
         "CopyObject destination must persist the selected Cobblestone codec"
     );
     assert!(!copied_codec.is_segment_aes_256_gcm_v1());
+    assert!(
+        copied_codec.is_object_subject_bound(),
+        "CopyObject destination finalization must bind DEK and checksum ciphertext to the exact object subject"
+    );
     let copied = coord
         .get_object(&GetObjectRequest {
             sse_customer,
