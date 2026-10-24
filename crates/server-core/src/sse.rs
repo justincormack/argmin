@@ -146,6 +146,24 @@ fn require_terminal_subjects(
     Ok(())
 }
 
+#[cfg(test)]
+fn require_committed_subjects(
+    encryption: &ObjectEncryption,
+    wrap_subject: &DekWrapEncryptionSubject<'_>,
+    checksum_subject: &ChecksumEncryptionSubject<'_>,
+    label: &str,
+) -> Result<(), ServerError> {
+    if encryption.key_binding() != ObjectEncryptionKeyBinding::ObjectSubjectV2
+        || !wrap_subject.matches_encryption(encryption)
+        || !checksum_subject.matches_encryption(encryption)
+    {
+        return Err(ServerError::InternalError {
+            reason: format!("{label} committed encryption subject does not match stored state"),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerRequest {
     customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN],
@@ -498,31 +516,6 @@ impl SseCustomerWriteContext {
             )
             .map_err(object_encryption_state_error)
     }
-
-    #[cfg(test)]
-    pub(crate) fn test_seal_checksum_metadata_version(
-        &self,
-        checksum: &ObjectChecksumMetadata,
-        version: u8,
-    ) -> Result<ObjectEncryption, ServerError> {
-        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
-            return Err(ServerError::InternalError {
-                reason: "SSE-C test write context missing encryption state".to_string(),
-            });
-        };
-        let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
-            &self.dek,
-            checksum,
-            version,
-            SSE_C_CHECKSUM_AAD,
-            "SSE-C",
-        )?;
-        Ok(ObjectEncryption::SseCustomer(
-            state
-                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
-                .map_err(object_encryption_state_error)?,
-        ))
-    }
 }
 
 impl fmt::Debug for SseCustomerWriteContext {
@@ -680,31 +673,6 @@ impl ManagedEncryptionWriteContext {
                 encrypted_checksum_metadata,
             )
             .map_err(object_encryption_state_error)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_seal_checksum_metadata_version(
-        &self,
-        checksum: &ObjectChecksumMetadata,
-        version: u8,
-    ) -> Result<ObjectEncryption, ServerError> {
-        let ObjectEncryption::SseS3(state) = &self.encryption else {
-            return Err(ServerError::InternalError {
-                reason: "managed test write context missing encryption state".to_string(),
-            });
-        };
-        let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
-            &self.dek,
-            checksum,
-            version,
-            MANAGED_CHECKSUM_AAD,
-            MANAGED_ENCRYPTION_LABEL,
-        )?;
-        Ok(ObjectEncryption::SseS3(
-            state
-                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
-                .map_err(object_encryption_state_error)?,
-        ))
     }
 }
 
@@ -1076,6 +1044,50 @@ pub(crate) fn decrypt_authorized_managed_encryption_checksum(
     decrypt_managed_encryption_checksum_with_subject(provider, state, Some(subject))
 }
 
+#[cfg(test)]
+pub(crate) fn test_replace_authorized_managed_checksum_metadata_version(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    subject: &ObjectEncryptionSubject,
+    checksum: &ObjectChecksumMetadata,
+    version: u8,
+) -> Result<ObjectEncryption, ServerError> {
+    let encryption = ObjectEncryption::SseS3(state.clone());
+    let wrap_subject = subject.dek_wrap_subject();
+    let checksum_subject = subject.checksum_subject();
+    require_committed_subjects(
+        &encryption,
+        &wrap_subject,
+        &checksum_subject,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_subject.aead_context(),
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
+        &dek,
+        checksum,
+        version,
+        checksum_subject.aead_context(),
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    Ok(ObjectEncryption::SseS3(
+        state
+            .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+            .map_err(object_encryption_state_error)?,
+    ))
+}
+
 fn decrypt_managed_encryption_checksum_with_subject(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
@@ -1253,6 +1265,42 @@ pub(crate) fn decrypt_authorized_sse_customer_checksum(
     subject: &ObjectEncryptionSubject,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
     decrypt_sse_customer_checksum_with_subject(validator, state, request, Some(subject))
+}
+
+#[cfg(test)]
+pub(crate) fn test_replace_authorized_sse_customer_checksum_metadata_version(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    subject: &ObjectEncryptionSubject,
+    checksum: &ObjectChecksumMetadata,
+    version: u8,
+) -> Result<ObjectEncryption, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let encryption = ObjectEncryption::SseCustomer(state.clone());
+    let wrap_subject = subject.dek_wrap_subject();
+    let checksum_subject = subject.checksum_subject();
+    require_committed_subjects(&encryption, &wrap_subject, &checksum_subject, "SSE-C")?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_subject.aead_context(),
+        "SSE-C",
+    )?;
+    let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
+        &dek,
+        checksum,
+        version,
+        checksum_subject.aead_context(),
+        "SSE-C",
+    )?;
+    Ok(ObjectEncryption::SseCustomer(
+        state
+            .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+            .map_err(object_encryption_state_error)?,
+    ))
 }
 
 fn decrypt_sse_customer_checksum_with_subject(

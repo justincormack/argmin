@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::tests::metadata_only_test_encryption;
+use crate::tests::{committed_metadata_only_test_encryption, metadata_only_test_encryption};
 
 fn retained_object_mutation_route<'a>(
     client: &'a UnixStorageNodeClient,
@@ -1428,7 +1428,12 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                         metadata_blob: None,
                         system_metadata_blob: None,
                         object_lock: ObjectLockState::default(),
-                        encryption: metadata_only_test_encryption(),
+                        encryption: committed_metadata_only_test_encryption(
+                            1,
+                            &bucket,
+                            &key,
+                            GenerationId::new(9).unwrap(),
+                        ),
                     },
                     &[],
                 )
@@ -3348,7 +3353,12 @@ fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_de
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_only_test_encryption(
+                    1,
+                    &bucket,
+                    &key,
+                    GenerationId::new(10).unwrap(),
+                ),
             },
             &[],
         )
@@ -3518,7 +3528,12 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_only_test_encryption(
+                    1,
+                    &bucket,
+                    &key,
+                    generation_id,
+                ),
             },
             std::slice::from_ref(&segment),
         )

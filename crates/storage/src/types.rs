@@ -4421,6 +4421,35 @@ pub struct LiveObjectRecord {
     pub encryption: ObjectEncryption,
 }
 
+impl LiveObjectRecord {
+    /// Validate the encryption binding of a durable, client-visible object.
+    ///
+    /// Provisional encryption state belongs to an in-progress write. Terminal
+    /// publication normally replaces it with state bound to the exact object
+    /// subject. The sole exception is an SSE-C multipart completion performed
+    /// without repeated customer-key headers: in that case storage must retain
+    /// the exact provisional upload state because it cannot safely rewrap the
+    /// DEK after the customer key has left the request.
+    pub(crate) fn validate_terminal_encryption_binding(&self) -> Result<(), &'static str> {
+        match (&self.encryption, self.encryption.key_binding(), self.layout) {
+            (_, ObjectEncryptionKeyBinding::ObjectSubjectV2, _) => Ok(()),
+            (
+                ObjectEncryption::SseCustomer(_),
+                ObjectEncryptionKeyBinding::ProvisionalV1,
+                ObjectLayout::MultipartManifest { .. },
+            ) => Ok(()),
+            (
+                ObjectEncryption::SseCustomer(_),
+                ObjectEncryptionKeyBinding::ProvisionalV1,
+                ObjectLayout::Standard,
+            ) => Err("standard object retains provisional SSE-C encryption state"),
+            (ObjectEncryption::SseS3(_), ObjectEncryptionKeyBinding::ProvisionalV1, _) => {
+                Err("live object retains provisional SSE-S3 encryption state")
+            }
+        }
+    }
+}
+
 /// A delete marker record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteMarkerRecord {
@@ -6503,6 +6532,7 @@ impl ObjectReadSnapshot {
                 object_encryption_subject: None,
             });
         };
+        live.validate_terminal_encryption_binding()?;
         let payload_profile = live.encryption.payload_profile();
         let subject = ObjectPayloadSubject {
             bucket: live.bucket.clone(),
@@ -6645,6 +6675,18 @@ impl ObjectReadSnapshot {
 pub struct ObjectReadAuthSubject {
     pub stored: StoredObject,
     pub identity: ObjectReadAuthSubjectIdentity,
+}
+
+impl ObjectReadAuthSubject {
+    pub(crate) fn from_stored(stored: StoredObject) -> Result<Self, &'static str> {
+        if let Some(live) = stored.as_live() {
+            live.validate_terminal_encryption_binding()?;
+        }
+        Ok(Self {
+            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
+            stored,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6856,15 +6898,19 @@ fn mint_listed_object_encryption_subjects(
             if stored.bucket() != &bucket_subject.bucket {
                 return Err("listed object does not match bucket-incarnation subject");
             }
-            Ok(stored.as_live().map(|live| {
-                Arc::new(ObjectEncryptionSubject::standard_object(
-                    bucket_subject.bucket_incarnation_generation,
-                    &live.bucket,
-                    &live.key,
-                    live.generation_id,
-                    &live.encryption,
-                ))
-            }))
+            stored
+                .as_live()
+                .map(|live| {
+                    live.validate_terminal_encryption_binding()?;
+                    Ok(Arc::new(ObjectEncryptionSubject::standard_object(
+                        bucket_subject.bucket_incarnation_generation,
+                        &live.bucket,
+                        &live.key,
+                        live.generation_id,
+                        &live.encryption,
+                    )))
+                })
+                .transpose()
         })
         .collect()
 }
@@ -9519,12 +9565,43 @@ mod tests {
         );
     }
 
+    fn committed_metadata_only_encryption(
+        provisional: &ObjectEncryption,
+        bucket_incarnation_generation: u64,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> ObjectEncryption {
+        let subject = ObjectEncryptionSubject::standard_object(
+            bucket_incarnation_generation,
+            bucket,
+            key,
+            generation_id,
+            provisional,
+        );
+        provisional
+            .bind_committed_object_ciphertexts(
+                &subject,
+                [0x31; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [0x32; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                Vec::new(),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn object_read_snapshot_binds_standard_payload_subject_once() {
         let bucket = BucketName::try_from("subject-bucket".to_string()).unwrap();
         let key = ObjectKey::try_from("subject-key".to_string()).unwrap();
         let generation_id = GenerationId::new(29).unwrap();
-        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption = committed_metadata_only_encryption(
+            &crate::tests::metadata_only_test_encryption(),
+            41,
+            &bucket,
+            &key,
+            generation_id,
+        );
         let stored = StoredObject::Live(LiveObjectRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -9591,7 +9668,13 @@ mod tests {
         let generation_id = GenerationId::new(47).unwrap();
         let part_generation_id = GenerationId::new(53).unwrap();
         let version_id = VersionId::from_u64(59);
-        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption = committed_metadata_only_encryption(
+            &crate::tests::metadata_only_test_encryption(),
+            79,
+            &bucket,
+            &key,
+            generation_id,
+        );
         let stored = StoredObject::Live(LiveObjectRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -9667,10 +9750,138 @@ mod tests {
     }
 
     #[test]
+    fn live_object_read_subjects_reject_impossible_terminal_encryption_bindings() {
+        let bucket = BucketName::try_from("terminal-binding-bucket").unwrap();
+        let key = ObjectKey::try_from("terminal-binding-key").unwrap();
+        let generation_id = GenerationId::new(83).unwrap();
+        let incarnation = 89;
+        let provisional_managed = crate::tests::metadata_only_test_encryption();
+        let provisional_customer = ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+            7, [1; 16], [2; 32], [3; 16], [4; 12], [5; 48], [6; 6],
+        ));
+        let committed_managed = committed_metadata_only_encryption(
+            &provisional_managed,
+            incarnation,
+            &bucket,
+            &key,
+            generation_id,
+        );
+        let committed_customer = committed_metadata_only_encryption(
+            &provisional_customer,
+            incarnation,
+            &bucket,
+            &key,
+            generation_id,
+        );
+        let live = |layout, encryption| {
+            StoredObject::Live(LiveObjectRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id,
+                size: 0,
+                etag: match layout {
+                    ObjectLayout::Standard => ObjectEtag::single_part(0),
+                    ObjectLayout::MultipartManifest { parts_count } => {
+                        ObjectEtag::multipart(0_u64.to_be_bytes(), parts_count.get())
+                    }
+                },
+                last_modified: 0,
+                became_noncurrent_at: None,
+                storage_class: StorageClass::Standard,
+                ec: EcShape { k: 1, m: 0 },
+                layout,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
+                encryption,
+            })
+        };
+        let multipart_layout = ObjectLayout::MultipartManifest {
+            parts_count: std::num::NonZeroU32::new(1).unwrap(),
+        };
+
+        for stored in [
+            live(ObjectLayout::Standard, committed_managed.clone()),
+            live(ObjectLayout::Standard, committed_customer.clone()),
+            live(multipart_layout, committed_managed),
+            live(multipart_layout, committed_customer),
+            // AWS permits CompleteMultipartUpload without repeating SSE-C
+            // headers, so this one exact terminal shape remains readable.
+            live(multipart_layout, provisional_customer.clone()),
+        ] {
+            let snapshot = ObjectReadSnapshot::from_records(
+                stored.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(snapshot.object_encryption_subject.is_none());
+            let listed = mint_listed_object_encryption_subjects(
+                &[stored],
+                &BucketIncarnationReadSubject {
+                    bucket: bucket.clone(),
+                    bucket_incarnation_generation: incarnation,
+                },
+            )
+            .unwrap();
+            assert_eq!(listed.len(), 1);
+            assert!(listed[0].is_some());
+        }
+
+        for (stored, expected) in [
+            (
+                live(ObjectLayout::Standard, provisional_customer),
+                "standard object retains provisional SSE-C encryption state",
+            ),
+            (
+                live(ObjectLayout::Standard, provisional_managed.clone()),
+                "live object retains provisional SSE-S3 encryption state",
+            ),
+            (
+                live(multipart_layout, provisional_managed),
+                "live object retains provisional SSE-S3 encryption state",
+            ),
+        ] {
+            assert_eq!(
+                ObjectReadSnapshot::from_records(
+                    stored.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                Err(expected)
+            );
+            assert_eq!(
+                mint_listed_object_encryption_subjects(
+                    &[stored],
+                    &BucketIncarnationReadSubject {
+                        bucket: bucket.clone(),
+                        bucket_incarnation_generation: incarnation,
+                    },
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
     fn object_payload_placement_diagnostic_is_storage_owned() {
         let bucket = BucketName::try_from("bucket".to_string()).unwrap();
         let key = ObjectKey::try_from("key".to_string()).unwrap();
         let generation_id = GenerationId::new(29).unwrap();
+        let encryption = committed_metadata_only_encryption(
+            &crate::tests::metadata_only_test_encryption(),
+            1,
+            &bucket,
+            &key,
+            generation_id,
+        );
         let stored = StoredObject::Live(LiveObjectRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -9690,7 +9901,7 @@ mod tests {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: crate::tests::metadata_only_test_encryption(),
+            encryption,
         });
         let segment = ObjectSegmentRecord {
             shard_integrity: None,
@@ -9726,7 +9937,7 @@ mod tests {
         let ObjectEncryption::SseS3(state) = invalid_live.encryption else {
             panic!("fixture must use SSE-S3");
         };
-        invalid_live.encryption = ObjectEncryption::SseS3(
+        let provisional_invalid_encryption = ObjectEncryption::SseS3(
             SseS3ObjectState::new(
                 state.wrapping_key_id(),
                 *state.wrap_nonce(),
@@ -9734,6 +9945,13 @@ mod tests {
                 *state.segment_nonce_prefix(),
             )
             .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        invalid_live.encryption = committed_metadata_only_encryption(
+            &provisional_invalid_encryption,
+            1,
+            &invalid_live.bucket,
+            &invalid_live.key,
+            invalid_live.generation_id,
         );
         let mut invalid_segment = segment;
         invalid_segment.size = 1_u64 << 52;

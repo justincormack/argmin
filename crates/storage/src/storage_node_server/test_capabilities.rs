@@ -83,7 +83,12 @@
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::tests::metadata_only_test_encryption(),
+            encryption: crate::tests::committed_metadata_only_test_encryption(
+                proof.bucket_incarnation_generation,
+                &bucket,
+                &key,
+                reserved_generation,
+            ),
             segment_index: 0,
             segment_crc64: 99,
             segment_okh: [7; 16],
@@ -188,7 +193,12 @@
                     metadata_blob: None,
                     system_metadata_blob: None,
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::tests::metadata_only_test_encryption(),
+                    encryption: crate::tests::committed_metadata_only_test_encryption(
+                        1,
+                        &bucket,
+                        &key,
+                        GenerationId::new(9).unwrap(),
+                    ),
                 },
                 &[],
             )

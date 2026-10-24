@@ -81,9 +81,11 @@ impl SharedStorageNode {
         version_id: Option<VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
         let stored = Self::load_stored_object_from_object_pg(pg, bucket, key, version_id)?;
-        Ok(ObjectReadAuthSubject {
-            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
-            stored,
+        ObjectReadAuthSubject::from_stored(stored).map_err(|reason| {
+            StoreError::PayloadShardSetMismatch {
+                reason: reason.to_string(),
+            }
+            .into()
         })
     }
 

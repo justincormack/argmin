@@ -33,7 +33,7 @@ use crate::storage_rpc::{
     StorageRpcReadHandleAcquireResponse, StorageRpcStreamError,
     STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
 };
-use crate::tests::metadata_only_test_encryption;
+use crate::tests::{committed_metadata_only_test_encryption, metadata_only_test_encryption};
 use crate::types::{
     DeleteMarkerRecord, EtagKind, ObjectLockState, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
@@ -3483,6 +3483,7 @@ fn test_live_stored_object(
     generation_id: GenerationId,
     layout: ObjectLayout,
 ) -> StoredObject {
+    let encryption = committed_metadata_only_test_encryption(1, &bucket, &key, generation_id);
     StoredObject::Live(LiveObjectRecord {
         bucket,
         key,
@@ -3502,7 +3503,7 @@ fn test_live_stored_object(
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: metadata_only_test_encryption(),
+        encryption,
     })
 }
 

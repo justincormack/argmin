@@ -275,7 +275,7 @@ fn multipart_upload_lifecycle() {
     let encryption = part1_fixture.encryption.clone();
     assert_eq!(part2_fixture.encryption, encryption);
 
-    {
+    let bucket_incarnation_generation = {
         let store = metadata_node.get_pg(0).unwrap();
         store
             .create_bucket(
@@ -307,7 +307,19 @@ fn multipart_upload_lifecycle() {
                 encryption: encryption.clone(),
             })
             .unwrap();
-    }
+        store
+            .head_bucket_raw(&bucket)
+            .unwrap()
+            .bucket_incarnation_generation
+    };
+    let terminal_subject = ObjectEncryptionSubject::standard_object(
+        bucket_incarnation_generation,
+        &bucket,
+        &key,
+        GenerationId::MIN,
+        &encryption,
+    );
+    let terminal_encryption = part1_fixture.committed_encryption(&terminal_subject);
 
     // Write the two parts through the placed EC payload path and persist the
     // corresponding staging segment descriptors.
@@ -426,7 +438,7 @@ fn multipart_upload_lifecycle() {
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption,
+        encryption: terminal_encryption,
     };
     {
         let store = metadata_node.get_pg(0).unwrap();

@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SegmentPayloadCodec;
+    use crate::{ObjectEncryptionKeyBinding, SegmentPayloadCodec};
     use std::io::Cursor;
 
     fn hex_bytes(bytes: &[u8]) -> String {
@@ -6296,6 +6296,32 @@ mod tests {
         else {
             panic!("fixture must use SSE-S3");
         };
+        let generation_id = GenerationId::new(9).unwrap();
+        let provisional_encryption = ObjectEncryption::SseS3(
+            crate::SseS3ObjectState::new(
+                encryption.wrapping_key_id(),
+                *encryption.wrap_nonce(),
+                *encryption.wrapped_dek(),
+                *encryption.segment_nonce_prefix(),
+            )
+            .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let object_encryption_subject = crate::ObjectEncryptionSubject::standard_object(
+            1,
+            &bucket,
+            &key,
+            generation_id,
+            &provisional_encryption,
+        );
+        let committed_encryption = provisional_encryption
+            .bind_committed_object_ciphertexts(
+                &object_encryption_subject,
+                [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [0x52; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                Vec::new(),
+            )
+            .unwrap();
         let stored = StoredObject::Live(LiveObjectRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -6303,7 +6329,7 @@ mod tests {
             owner: owner.clone(),
             acl_grants: AclGrants::default(),
             public_read: false,
-            generation_id: GenerationId::new(9).unwrap(),
+            generation_id,
             size: 12,
             etag: ObjectEtag::single_part(55),
             last_modified: 10,
@@ -6317,15 +6343,7 @@ mod tests {
             metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::SseS3(
-                crate::SseS3ObjectState::new(
-                    encryption.wrapping_key_id(),
-                    *encryption.wrap_nonce(),
-                    *encryption.wrapped_dek(),
-                    *encryption.segment_nonce_prefix(),
-                )
-                .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
-            ),
+            encryption: committed_encryption,
         });
         let request = StorageRpcObjectReadAuthSubjectRequest {
             object: StorageRpcObjectRequest {
@@ -6342,16 +6360,35 @@ mod tests {
         let decoded = decode_object_read_auth_subject_request(&bytes).unwrap();
         assert_eq!(decoded, request);
 
-        let subject = ObjectReadAuthSubject {
-            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
-            stored: stored.clone(),
-        };
+        let subject = ObjectReadAuthSubject::from_stored(stored.clone()).unwrap();
         let response = StorageRpcObjectReadAuthSubjectResponse {
             outcome: StorageRpcObjectReadAuthSubjectOutcome::Loaded(Box::new(subject.clone())),
         };
         let bytes = encode_object_read_auth_subject_response(&response);
         let decoded = decode_object_read_auth_subject_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+        let committed_state = subject
+            .stored
+            .as_live()
+            .unwrap()
+            .encryption
+            .encode_state()
+            .unwrap();
+        let state_offsets = bytes
+            .windows(committed_state.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == committed_state).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(state_offsets.len(), 1);
+        let mut provisional_auth_subject = bytes.clone();
+        provisional_auth_subject[state_offsets[0] + 2] =
+            ObjectEncryptionKeyBinding::ProvisionalV1 as u8;
+        assert_eq!(
+            decode_object_read_auth_subject_response(&provisional_auth_subject),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "live object retains provisional SSE-S3 encryption state"
+            ))
+        );
 
         let response = StorageRpcObjectReadAuthSubjectResponse {
             outcome: StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound,
@@ -6445,6 +6482,22 @@ mod tests {
             decoded_snapshot.multipart_parts[0].record(),
             &expected_part,
             "storage-owned RPC coverage must compare every hidden durable part field",
+        );
+
+        let state_offsets = bytes
+            .windows(committed_state.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == committed_state).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(state_offsets.len(), 1);
+        let mut provisional_snapshot = bytes.clone();
+        provisional_snapshot[state_offsets[0] + 2] =
+            ObjectEncryptionKeyBinding::ProvisionalV1 as u8;
+        assert_eq!(
+            decode_object_read_snapshot_response(&provisional_snapshot),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "live object retains provisional SSE-S3 encryption state"
+            ))
         );
 
         let mut invalid_geometry = bytes.clone();

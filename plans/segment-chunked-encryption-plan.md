@@ -1,6 +1,7 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects implemented)
+Status: In progress (Phases 0 and 1 complete; Phase 2 integrated, production writer selection and
+benchmark gate remain)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -181,12 +182,12 @@ The write-path inventory is:
 
 | Effective path | Current codec selection and identity timing | Required Phase 1/2 seam |
 | --- | --- | --- |
-| Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff before encrypting segment zero. The current segment AEAD still does not consume that identity. | Mint the opaque standard-object subject from the reservation handoff, then construct the subject-bound segment encoder. |
-| Promoted buffered and streamed `PutObject`/POST Object | Session creation durably reserves the eventual object generation under the session ID. Each append now reloads that exact reservation through a non-cloneable storage capability, binds it to the session encryption state plus segment geometry before encryption, and consumes the capability during append. | Replace the current whole-segment cipher call with the common subject-bound session encoder without changing identity allocation or duplicating the generation in `StreamUploadRecord`. |
-| `CopyObject` destination | Reads source chunks and feeds them through the same destination session subject and append capability as streamed PUT; the source encryption state cannot supply destination identity. | Replace the current whole-segment cipher call with the same destination session encoder as streamed PUT. |
-| `UploadPart` | Session creation now durably reserves an immutable part payload generation under the session ID before the first segment can be encrypted; finalization and recovery require that exact reservation. The current segment AEAD still does not consume that identity. | Mint the opaque multipart-part subject from the upload, part number, and session reservation, then bind every segment to that subject and segment index. |
-| `UploadPartCopy` destination | Uses the same multipart stream append path after reading source chunks. | Use exactly the same part-session subject and encoder as ordinary `UploadPart`. |
-| Full and ranged object/copy-source reads | Infer the representation from `ObjectEncryption`, read and verify a complete segment, decrypt one AEAD record, then slice. | Dispatch on an explicit durable profile and let its subject-bound reader define stored spans, authentication, release, finalization, and physical-health evidence. |
+| Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff, mints the standard-object segment subject, and consumes it at the profile-dispatched encoder. | Complete. Production still selects the frozen whole-segment profile until the Phase 5 writer decision. |
+| Promoted buffered and streamed `PutObject`/POST Object | Session creation durably reserves the eventual object generation under the session ID. Each append reloads that exact reservation through a non-cloneable storage capability, binds it to the session encryption state plus segment geometry, and consumes it at the common profile-dispatched encoder. | Complete without duplicating the generation in `StreamUploadRecord`. |
+| `CopyObject` destination | Reads source chunks and feeds them through the same destination session subject, append capability, and profile-dispatched encoder as streamed PUT; the source encryption state cannot supply destination identity. | Complete. |
+| `UploadPart` | Session creation durably reserves a non-recycling part payload generation under the session ID before the first segment can be encrypted. The opaque multipart-part subject binds upload, part number, reservation, encryption instance, segment index, and geometry at every append; finalization and recovery require the same authority. | Complete. |
+| `UploadPartCopy` destination | Uses exactly the same multipart stream subject, append capability, and encoder as ordinary `UploadPart` after reading source chunks. | Complete. |
+| Full and ranged object/copy-source reads | Dispatch on the durable payload codec and consume storage-minted object/segment subjects. The frozen whole-segment reader authenticates a complete segment before slicing; the Cobblestone reader owns its subject-bound chunk geometry and release rules. | Common profile contract complete; real partial shard IO remains Phase 3. |
 
 `next_segment_vid` is a physical stream-segment allocator and is not a substitute for the logical
 object or part generation required by the encryption context. Streamed PUT already has a separate
@@ -929,10 +930,11 @@ Implementation update (2026-10-21):
   checkpoint-4, and RPC-25 evidence remains immutable and is rejected by current readers. Exact v9
   bytes are retained for every stream-session command whose representation changed, rather than
   reconstructing the removed layout from current structs.
-- Phase 1's storage-owned subject and one-use capability boundary is complete. Incorporating the
-  canonical subject bytes into DEK wrapping, checksum sealing, and segment AEAD would change the
-  durable cryptographic profile, so that cryptographic binding remains coupled to the Phase 2
-  codec/profile bump rather than silently reinterpreting the current whole-segment ciphertext.
+- Phase 1's storage-owned subject and one-use capability boundary is complete. The coordinated
+  Phase 2 format change now binds terminal DEK wrapping and encrypted checksum metadata to distinct
+  purpose subjects derived from the exact object subject, and binds Cobblestone segment AEAD to
+  the exact segment subject. The separately tagged frozen whole-segment codec deliberately retains
+  its historical fixed segment AAD; changing it in place would reinterpret existing ciphertext.
 
 - [x] Introduce private canonical context codecs and opaque subject constructors.
 - [x] Ensure every write path exposes its existing or newly allocated immutable generation to the
@@ -941,10 +943,10 @@ Implementation update (2026-10-21):
 - [x] Add exhaustive crossed-field and noncanonical-encoding tests for the owner-minted subjects
   and capability boundaries.
 - [x] Update the storage version dependency ledger for the durable subject-provenance changes.
-- [ ] Bind DEK wrapping, encrypted checksum metadata, and segment AEAD to the canonical subject
-  bytes as part of the Phase 2 durable codec/profile bump. This is deliberately not a remaining
-  Phase 1 item: doing it under the existing profile would reinterpret already-versioned
-  ciphertext without changing its durable profile identity.
+- [x] Bind terminal DEK wrapping and encrypted checksum metadata to distinct canonical object
+  purpose subjects, and bind the new Cobblestone segment AEAD to the canonical segment subject as
+  part of the Phase 2 durable codec/profile bump. Retain the separately tagged legacy codec's
+  historical fixed segment AAD rather than silently reinterpreting its ciphertext.
 
 Exit: no encryption operation accepts caller-assembled identity fields, and every field needed by
 the eventual reader exists before the first payload effect.
@@ -967,9 +969,9 @@ the eventual reader exists before the first payload effect.
 - [x] Add the durable profile discriminator and profile-aware stored-size calculations.
 - [x] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
   complete valid and invalid cross-product at construction, decoding, apply/recovery, and restart.
-- [ ] Integrate the codec with every encrypted write path while retaining the old reader if required by
+- [x] Integrate the codec with every encrypted write path while retaining the old reader if required by
   the selected format transition.
-- [ ] Put the current and proposed encrypted representations behind the common profile contract; the
+- [x] Put the current and proposed encrypted representations behind the common profile contract; the
   completed prerequisite leaves no plaintext bypass in write, read, range, or copy paths.
 
 Implementation update (2026-10-22):
@@ -1557,6 +1559,35 @@ Implementation update (2026-10-24, central terminal binding enforcement):
   The remaining Phase 2 subject work is auditing any persisted read/restoration boundary that can
   still admit a committed object without its exact storage-minted subject, followed by the
   production Cobblestone writer-selection decision and benchmark gate.
+
+Implementation update (2026-10-24, restored live-object read boundary):
+
+- Storage now validates the terminal encryption binding before a durable live object can become an
+  object-read authorization subject, a full or metadata-only read snapshot, or a listed-object
+  encryption subject. Standard objects must carry `ObjectSubjectV2`; multipart manifests may carry
+  either `ObjectSubjectV2` or the one AWS-required provisional SSE-C result from headerless
+  completion. Provisional SSE-S3 is never a valid live-object state. A standard object retaining
+  provisional SSE-C is likewise rejected. Delete markers remain payloadless and unaffected.
+- The check is performed by storage-owned constructors on both local durable-row loads and Unix/TLS
+  response decoding. Only after it succeeds may the admitted object route combine the exact loaded
+  object identity with the authoritative bucket-incarnation subject and mint the opaque object and
+  segment encryption subjects. HEAD, GET, attributes, listing, copy-source, restart, and retained
+  reads therefore cannot obtain crypto authority from an impossible restored terminal state. A
+  retained handoff carries the already-bound snapshot rather than reconstructing authority later.
+- Owner-local coverage persists a syntactically valid provisional SSE-S3 live row and proves that
+  authorization-subject construction rejects it. The RPC canary independently changes only the
+  binding discriminator in valid authorization-subject and snapshot responses and requires the
+  decoder to reject both. A compiler-exhaustive live-state matrix covers committed SSE-C/SSE-S3
+  standard and multipart objects, the allowed provisional SSE-C multipart exception, and each
+  invalid provisional terminal shape at both snapshot and listing boundaries.
+- This closes the persisted read/restoration subject audit. Both encrypted representations are now
+  behind the same profile-owned write/read contract across all S3 write operations; production
+  still selects the frozen whole-segment writer. The remaining Phase 2 gate is the explicit
+  Cobblestone writer-selection decision after the updated benchmark and upstream-review criteria
+  are satisfied, not another per-operation integration path.
+- Verification: `cargo nextest run --no-fail-fast` passed all 8,979 tests (six explicitly skipped),
+  `cargo clippy --all-targets --all-features -- -D warnings` passed, and
+  `./scripts/check-storage-cluster-boundaries` passed.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

@@ -2447,6 +2447,36 @@ mod tests {
         ObjectKey::try_from(key.to_string()).unwrap()
     }
 
+    fn committed_metadata_only_encryption_for_snapshot_test(
+        node: &SharedStorageNode,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        provisional: &crate::ObjectEncryption,
+    ) -> crate::ObjectEncryption {
+        let bucket_snapshot = node
+            .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+            .unwrap();
+        let subject = crate::ObjectEncryptionSubject::standard_object(
+            bucket_snapshot
+                .bucket_incarnation_read_subject()
+                .bucket_incarnation_generation(),
+            bucket,
+            key,
+            generation_id,
+            provisional,
+        );
+        provisional
+            .bind_committed_object_ciphertexts(
+                &subject,
+                [0x41; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [0x42; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                Vec::new(),
+            )
+            .unwrap()
+    }
+
     fn put_standard_object_for_snapshot_test(
         node: &SharedStorageNode,
         bucket: &BucketName,
@@ -2457,6 +2487,13 @@ mod tests {
         let object_pg = node
             .get_pg(node.pg_topology().object_pg_for(bucket, key))
             .unwrap();
+        let encryption = committed_metadata_only_encryption_for_snapshot_test(
+            node,
+            bucket,
+            key,
+            generation_id,
+            &crate::tests::metadata_only_test_encryption(),
+        );
         object_pg
             .put_object_with_segments(
                 &PutLiveObjectReq {
@@ -2475,7 +2512,7 @@ mod tests {
                     metadata_blob: None,
                     system_metadata_blob: None,
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::tests::metadata_only_test_encryption(),
+                    encryption,
                 },
                 &[],
             )
@@ -2494,6 +2531,13 @@ mod tests {
         let object_pg = node
             .get_pg(node.pg_topology().object_pg_for(bucket, key))
             .unwrap();
+        let encryption = committed_metadata_only_encryption_for_snapshot_test(
+            node,
+            bucket,
+            key,
+            generation_id,
+            &encryption,
+        );
         let segment = ObjectSegmentRecord {
             shard_integrity: None,
             bucket: bucket.clone(),
@@ -3396,6 +3440,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(snapshot.stored, fresh_subject.stored);
+    }
+
+    #[test]
+    fn object_read_auth_subject_rejects_provisional_live_encryption() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "provisional-live-bucket");
+        let key = object_key("key");
+        let object_pg = node
+            .get_pg(node.pg_topology().object_pg_for(&bucket, &key))
+            .unwrap();
+        object_pg
+            .put_object_with_segments(
+                &PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: crate::ObjectEtag::single_part(0),
+                    ec: SharedStorageNode::DEFAULT_EC_SHAPE,
+                    layout: crate::ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::tests::metadata_only_test_encryption(),
+                },
+                &[],
+            )
+            .unwrap();
+        drop(object_pg);
+
+        assert!(matches!(
+            node.load_object_read_auth_subject(&bucket, &key, None),
+            Err(ObjectPgActionError::Store(
+                StoreError::PayloadShardSetMismatch { ref reason }
+            )) if reason == "live object retains provisional SSE-S3 encryption state"
+        ));
     }
 
     #[test]

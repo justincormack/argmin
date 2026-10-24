@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::types::{
-    BucketName, ObjectEncryption, ObjectEncryptionSubject, ObjectKey, SessionId, SseS3ObjectState,
-    UploadId, SESSION_ID_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN, UPLOAD_ID_LEN,
+    BucketName, GenerationId, ObjectEncryption, ObjectEncryptionSubject, ObjectKey, SessionId,
+    SseS3ObjectState, UploadId, OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN,
+    OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
+    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
+    SSE_S3_WRAP_NONCE_LEN, UPLOAD_ID_LEN,
 };
 use argmin_crypto::aead::{Aes256GcmKey, AES_GCM_NONCE_LEN};
 
@@ -33,6 +35,36 @@ pub(super) fn metadata_only_test_encryption() -> ObjectEncryption {
         [3; SSE_S3_WRAPPED_DEK_LEN],
         [4; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
     ))
+}
+
+/// Canonical terminal encryption state for metadata-only live-object fixtures.
+///
+/// The wrapped key remains intentionally synthetic. Payload-bearing fixtures
+/// must instead use [`SseS3SegmentTestFixture::committed_encryption`] so the
+/// subject-bound DEK remains capable of opening their ciphertext.
+pub(super) fn committed_metadata_only_test_encryption(
+    bucket_incarnation_generation: u64,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+) -> ObjectEncryption {
+    let provisional = metadata_only_test_encryption();
+    let subject = ObjectEncryptionSubject::standard_object(
+        bucket_incarnation_generation,
+        bucket,
+        key,
+        generation_id,
+        &provisional,
+    );
+    provisional
+        .bind_committed_object_ciphertexts(
+            &subject,
+            [0x61; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0x62; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .expect("metadata-only live fixture must admit its exact terminal subject")
 }
 
 pub(super) struct SseS3SegmentTestFixture {

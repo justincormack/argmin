@@ -6,6 +6,8 @@ use super::test_support::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::{
+    test_replace_authorized_managed_checksum_metadata_version,
+    test_replace_authorized_sse_customer_checksum_metadata_version,
     test_sse_customer_checksum_profile_fixture, test_sse_s3_checksum_profile_inputs,
     SSE_C_CUSTOMER_KEY_LEN,
 };
@@ -6736,7 +6738,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
 
 #[test]
 fn current_sse_c_checksum_profile_persists_through_storage_and_logical_reads() {
-    let (validator, sse_customer, fixed_encryption, expected_checksum) =
+    let (validator, sse_customer, _fixed_encryption, expected_checksum) =
         test_sse_customer_checksum_profile_fixture();
     let dir = test_util::tempdir();
     let coord = setup_coordinator_with_sse_c_validator(dir.path(), validator);
@@ -6749,9 +6751,9 @@ fn current_sse_c_checksum_profile_persists_through_storage_and_logical_reads() {
     system_metadata.set_checksum(
         expected_checksum.algorithm(),
         expected_checksum.checksum_type(),
-        "initial-checksum-that-must-be-replaced".to_string(),
+        expected_checksum.value().to_string(),
     );
-    let put = test_helpers::put_object(
+    test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
@@ -6767,15 +6769,6 @@ fn current_sse_c_checksum_profile_persists_through_storage_and_logical_reads() {
         },
     )
     .unwrap();
-    coord
-        .storage_node()
-        .test_replace_object_encryption(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("obj"),
-            put.version_id,
-            &fixed_encryption,
-        )
-        .unwrap();
 
     for visible_metadata in [
         coord
@@ -7219,18 +7212,64 @@ fn current_encrypted_checksum_plaintext_v1_read_gate_requires_version_bump() {
                 .unwrap();
             enable_bucket_sse_c_test(&coord, "destination", test_requester(), None).unwrap();
 
-            let invalid_encryption = match profile {
-                Profile::SseCustomer => coord
-                    .prepare_sse_customer_write_context(Some(&sse_customer))
+            let invalid_encryption = {
+                let bucket = trusted_bucket_name("bucket");
+                let key = trusted_object_key("obj");
+                let admission = coord.admit_storage_route_for_request().unwrap();
+                let bucket_snapshot = admission
+                    .active_bucket_route(&bucket)
                     .unwrap()
+                    .load_bucket_snapshot(storage::BucketSnapshotRequest::default())
+                    .unwrap();
+                let loaded = admission
+                    .active_object_payload_read_route(
+                        &bucket,
+                        &key,
+                        None,
+                        storage::ObjectReadSnapshotMode::MetadataOnly,
+                        &bucket_snapshot.bucket_incarnation_read_subject(),
+                    )
                     .unwrap()
-                    .test_seal_checksum_metadata_version(&checksum, version)
+                    .load_leased_object_read_snapshot_if(|_| Ok::<(), ()>(()))
+                    .unwrap()
+                    .unwrap();
+                let subject = loaded
+                    .snapshot()
+                    .object_encryption_subject
+                    .as_deref()
+                    .expect("authorized object snapshot must carry its encryption subject");
+                match (profile, &loaded.snapshot().stored) {
+                    (
+                        Profile::SseCustomer,
+                        storage::StoredObject::Live(storage::LiveObjectRecord {
+                            encryption: storage::ObjectEncryption::SseCustomer(state),
+                            ..
+                        }),
+                    ) => test_replace_authorized_sse_customer_checksum_metadata_version(
+                        coord.sse_c_validator.as_ref().unwrap(),
+                        state,
+                        &sse_customer,
+                        subject,
+                        &checksum,
+                        version,
+                    )
                     .unwrap(),
-                Profile::SseS3 => coord
-                    .prepare_managed_write_context()
-                    .unwrap()
-                    .test_seal_checksum_metadata_version(&checksum, version)
+                    (
+                        Profile::SseS3,
+                        storage::StoredObject::Live(storage::LiveObjectRecord {
+                            encryption: storage::ObjectEncryption::SseS3(state),
+                            ..
+                        }),
+                    ) => test_replace_authorized_managed_checksum_metadata_version(
+                        coord.managed_key_provider.as_ref().unwrap(),
+                        state,
+                        subject,
+                        &checksum,
+                        version,
+                    )
                     .unwrap(),
+                    _ => panic!("stored encryption mode must match the selected test profile"),
+                }
             };
             coord
                 .storage_node()

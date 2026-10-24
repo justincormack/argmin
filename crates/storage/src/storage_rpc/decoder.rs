@@ -2129,10 +2129,8 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<ObjectReadAuthSubject, StorageRpcPayloadError> {
         let stored = self.read_stored_object()?;
-        Ok(ObjectReadAuthSubject {
-            identity: ObjectReadAuthSubjectIdentity::for_stored(&stored),
-            stored,
-        })
+        ObjectReadAuthSubject::from_stored(stored)
+            .map_err(StorageRpcPayloadError::InvalidObjectMetadataRequest)
     }
 
     fn read_object_read_snapshot(&mut self) -> Result<ObjectReadSnapshot, StorageRpcPayloadError> {
