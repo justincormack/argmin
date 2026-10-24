@@ -210,6 +210,42 @@ pub mod test_support {
         BucketFastPathInfo::cache_test_fixture(name)
     }
 
+    /// Mint a storage-owned committed-object subject for cryptographic
+    /// boundary tests. The bucket incarnation and generation are fixed inside
+    /// storage; callers may vary only the logical key needed for crossed-key
+    /// authentication tests and cannot inspect or alter the resulting subject.
+    #[must_use]
+    pub fn object_encryption_subject_fixture(
+        key: &ObjectKey,
+        encryption: &ObjectEncryption,
+    ) -> ObjectEncryptionSubject {
+        ObjectEncryptionSubject::standard_object(
+            7,
+            &BucketName::try_from("subject-bound-bucket")
+                .expect("fixed subject fixture bucket must be valid"),
+            key,
+            GenerationId::new(11).expect("fixed subject fixture generation must be nonzero"),
+            encryption,
+        )
+    }
+
+    /// Mint a storage-owned standard-object segment subject for cryptographic
+    /// boundary tests. Storage fixes the otherwise private object provenance
+    /// and segment index; callers can vary only the logical key, encryption
+    /// instance, and plaintext length needed for exact/crossed read tests.
+    #[must_use]
+    pub fn standard_segment_encryption_subject_fixture(
+        key: &ObjectKey,
+        encryption: &ObjectEncryption,
+        logical_plaintext_len: u64,
+    ) -> SegmentEncryptionSubject {
+        SegmentEncryptionSubject::standard_object(
+            object_encryption_subject_fixture(key, encryption),
+            0,
+            logical_plaintext_len,
+        )
+    }
+
     /// Opaque failure from a storage-owned test operation.
     ///
     /// Cross-crate tests receive only a bounded diagnostic category. The
@@ -4070,25 +4106,26 @@ pub use types::{
     MultipartUploadAuthorizationIdentity, MultipartUploadCompletionCandidate,
     MultipartUploadCompletionContext, MultipartUploadCompletionLookup, MultipartUploadIdAuthority,
     MultipartUploadListMarker, MultipartUploadListPartsCandidate, MultipartUploadListPartsLookup,
-    MultipartUploadPartCandidate, ObjectEncryption, ObjectEncryptionStateError,
-    ObjectEncryptionSubject, ObjectEtag, ObjectKey, ObjectKeyError, ObjectLayout,
-    ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectPayloadPlacementDiagnostic,
-    ObjectPayloadPlacementDiagnosticOutcome, ObjectPayloadSegment, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadMultipartPart, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
-    ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState,
-    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
-    PreparedStreamPutCommit, PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod,
-    RouteMapValidUntilMs, RouteMapValidity, SegmentEncryptionSubject, SegmentPayloadCodec,
-    SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
-    SessionId, SessionIdError, ShardData, ShardIndex, ShardKey, ShardStat, ShardStatus,
-    SseCustomerObjectState, SseS3ObjectState, StorageClass, StoredLegalHoldStatus, StoredObject,
-    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutCommitInput,
-    StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput,
-    StreamSegmentAppendOutcome, StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadIdError,
-    UploadState, VersionId, WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
+    MultipartUploadPartCandidate, ObjectEncryption, ObjectEncryptionKeyBinding,
+    ObjectEncryptionStateError, ObjectEncryptionSubject, ObjectEtag, ObjectKey, ObjectKeyError,
+    ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
+    ObjectPayloadPlacementDiagnostic, ObjectPayloadPlacementDiagnosticOutcome,
+    ObjectPayloadSegment, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+    ObjectReadMultipartPart, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
+    ObjectRetention, ObjectSegmentRecord, ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity,
+    PgId, PgState, PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit,
+    PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig,
+    PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq, PutLiveObjectValidationError,
+    PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs, RouteMapValidity,
+    SegmentEncryptionSubject, SegmentPayloadCodec, SerializedBucketTagSet, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, SessionIdError, ShardData,
+    ShardIndex, ShardKey, ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState,
+    StorageClass, StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput,
+    StreamPartFinalizeSnapshot, StreamPutCommitInput, StreamPutFinalizeSnapshot,
+    StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
+    StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadIdError, UploadState, VersionId,
+    WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
     OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
     OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,

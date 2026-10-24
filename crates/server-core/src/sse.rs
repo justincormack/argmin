@@ -12,12 +12,13 @@ use argmin_crypto::hmac::Sha256Key;
 #[cfg(test)]
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
-    ObjectEncryption, ObjectEncryptionStateError, SegmentEncryptionSubject, SegmentPayloadCodec,
-    SseCustomerObjectState, SseS3ObjectState, OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN,
-    SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN,
-    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
-    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_S3_WRAP_NONCE_LEN,
+    ChecksumEncryptionSubject, DekWrapEncryptionSubject, ObjectEncryption,
+    ObjectEncryptionKeyBinding, ObjectEncryptionStateError, ObjectEncryptionSubject,
+    SegmentEncryptionSubject, SegmentPayloadCodec, SseCustomerObjectState, SseS3ObjectState,
+    OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
 
 use crate::error::ServerError;
@@ -114,7 +115,35 @@ fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerErr
         ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce => ServerError::InternalError {
             reason: "encrypted checksum metadata state is invalid".to_string(),
         },
+        ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch => ServerError::InternalError {
+            reason: "object encryption subject does not match provisional encryption state"
+                .to_string(),
+        },
+        ObjectEncryptionStateError::ObjectEncryptionAlreadySubjectBound => {
+            ServerError::InternalError {
+                reason: "object encryption state is already bound to its committed subject"
+                    .to_string(),
+            }
+        }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn require_terminal_subjects(
+    encryption: &ObjectEncryption,
+    wrap_subject: &DekWrapEncryptionSubject<'_>,
+    checksum_subject: &ChecksumEncryptionSubject<'_>,
+    label: &str,
+) -> Result<(), ServerError> {
+    if encryption.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1
+        || !wrap_subject.matches_encryption(encryption)
+        || !checksum_subject.matches_encryption(encryption)
+    {
+        return Err(ServerError::InternalError {
+            reason: format!("{label} terminal encryption subject does not match provisional state"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -425,6 +454,51 @@ impl SseCustomerWriteContext {
         ))
     }
 
+    /// Performs the one-way terminal transition from provisional SSE-C state
+    /// to DEK and checksum ciphertext bound to the committed object subject.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seal_committed_object_encryption(
+        &self,
+        subject: &ObjectEncryptionSubject,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C write context missing encryption state".to_string(),
+            });
+        };
+        let wrap_subject = subject.dek_wrap_subject();
+        let checksum_subject = subject.checksum_subject();
+        require_terminal_subjects(&self.encryption, &wrap_subject, &checksum_subject, "SSE-C")?;
+        let mut wrap_nonce = [0u8; SSE_C_WRAP_NONCE_LEN];
+        argmin_crypto::random::fill(&mut wrap_nonce).map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-C committed wrap nonce".to_string(),
+        })?;
+        let kek = derive_wrap_key(self.request.customer_key(), state.wrap_salt())?;
+        let wrapped_dek = wrap_managed_dek(
+            &kek,
+            &wrap_nonce,
+            &self.dek,
+            wrap_subject.aead_context(),
+            "SSE-C",
+        )?;
+        let (checksum_nonce, encrypted_checksum_metadata) = encrypt_checksum_with_dek(
+            &self.dek,
+            checksum,
+            checksum_subject.aead_context(),
+            "SSE-C",
+        )?;
+        self.encryption
+            .bind_committed_object_ciphertexts(
+                subject,
+                wrap_nonce,
+                wrapped_dek,
+                checksum_nonce,
+                encrypted_checksum_metadata,
+            )
+            .map_err(object_encryption_state_error)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_seal_checksum_metadata_version(
         &self,
@@ -464,6 +538,8 @@ impl fmt::Debug for SseCustomerWriteContext {
 pub struct ManagedEncryptionWriteContext {
     encryption: ObjectEncryption,
     dek: [u8; SSE_C_DEK_LEN],
+    #[cfg_attr(not(test), allow(dead_code))]
+    wrapping_key: [u8; SSE_C_DEK_LEN],
     segment_scope: SseCustomerSegmentScope,
 }
 
@@ -559,6 +635,51 @@ impl ManagedEncryptionWriteContext {
                 .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
                 .map_err(object_encryption_state_error)?,
         ))
+    }
+
+    /// Performs the one-way terminal transition from provisional managed
+    /// state to DEK and checksum ciphertext bound to the committed object
+    /// subject.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seal_committed_object_encryption(
+        &self,
+        subject: &ObjectEncryptionSubject,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let wrap_subject = subject.dek_wrap_subject();
+        let checksum_subject = subject.checksum_subject();
+        require_terminal_subjects(
+            &self.encryption,
+            &wrap_subject,
+            &checksum_subject,
+            MANAGED_ENCRYPTION_LABEL,
+        )?;
+        let mut wrap_nonce = [0u8; SSE_S3_WRAP_NONCE_LEN];
+        argmin_crypto::random::fill(&mut wrap_nonce).map_err(|_| ServerError::InternalError {
+            reason: "failed to generate managed committed wrap nonce".to_string(),
+        })?;
+        let wrapped_dek = wrap_managed_dek(
+            &self.wrapping_key,
+            &wrap_nonce,
+            &self.dek,
+            wrap_subject.aead_context(),
+            MANAGED_ENCRYPTION_LABEL,
+        )?;
+        let (checksum_nonce, encrypted_checksum_metadata) = encrypt_checksum_with_dek(
+            &self.dek,
+            checksum,
+            checksum_subject.aead_context(),
+            MANAGED_ENCRYPTION_LABEL,
+        )?;
+        self.encryption
+            .bind_committed_object_ciphertexts(
+                subject,
+                wrap_nonce,
+                wrapped_dek,
+                checksum_nonce,
+                encrypted_checksum_metadata,
+            )
+            .map_err(object_encryption_state_error)
     }
 
     #[cfg(test)]
@@ -713,6 +834,12 @@ pub(crate) fn resume_sse_customer_write(
     request: &SseCustomerRequest,
     segment_scope: SseCustomerSegmentScope,
 ) -> Result<SseCustomerWriteContext, ServerError> {
+    if state.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1 {
+        return Err(ServerError::InternalError {
+            reason: "committed SSE-C encryption state cannot resume a provisional write"
+                .to_string(),
+        });
+    }
     validate_sse_customer_write(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
@@ -804,6 +931,7 @@ fn prepare_managed_encryption_write_with_payload_codec(
             .with_payload_codec(payload_codec),
         ),
         dek,
+        wrapping_key: *wrapping_key.wrapping_key(),
         segment_scope: SseCustomerSegmentScope::object(),
     })
 }
@@ -822,6 +950,12 @@ pub(crate) fn resume_managed_encryption_write(
     state: &SseS3ObjectState,
     segment_scope: SseCustomerSegmentScope,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
+    if state.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1 {
+        return Err(ServerError::InternalError {
+            reason: "committed managed encryption state cannot resume a provisional write"
+                .to_string(),
+        });
+    }
     let wrapping_key =
         provider
             .lookup_key(state.wrapping_key_id())
@@ -838,6 +972,7 @@ pub(crate) fn resume_managed_encryption_write(
     Ok(ManagedEncryptionWriteContext {
         encryption: ObjectEncryption::SseS3(state.clone()),
         dek,
+        wrapping_key: *wrapping_key.wrapping_key(),
         segment_scope,
     })
 }
@@ -848,19 +983,6 @@ pub(crate) fn decrypt_authorized_managed_encryption_segment_in_place(
     read: AuthorizedSegmentRead<'_>,
     ciphertext: &mut Vec<u8>,
 ) -> Result<(), ServerError> {
-    let wrapping_key =
-        provider
-            .lookup_key(state.wrapping_key_id())
-            .ok_or(ServerError::InternalError {
-                reason: "managed wrapping key for object is not available".to_string(),
-            })?;
-    let dek = unwrap_managed_dek(
-        wrapping_key.wrapping_key(),
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        MANAGED_WRAP_AAD,
-        MANAGED_ENCRYPTION_LABEL,
-    )?;
     let encryption = ObjectEncryption::SseS3(state.clone());
     if !read.subject.matches_encryption_and_geometry(
         &encryption,
@@ -871,6 +993,24 @@ pub(crate) fn decrypt_authorized_managed_encryption_segment_in_place(
             reason: "managed segment does not match its storage-minted read subject".to_string(),
         });
     }
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => MANAGED_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
     decrypt_segment_with_dek_and_prefix_in_place(
         &dek,
         state.payload_codec(),
@@ -924,9 +1064,47 @@ pub fn decrypt_managed_encryption_checksum(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    decrypt_managed_encryption_checksum_with_subject(provider, state, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decrypt_authorized_managed_encryption_checksum(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    subject: &ObjectEncryptionSubject,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    decrypt_managed_encryption_checksum_with_subject(provider, state, Some(subject))
+}
+
+fn decrypt_managed_encryption_checksum_with_subject(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    subject: Option<&ObjectEncryptionSubject>,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
     if state.encrypted_checksum_metadata().is_empty() {
         return Ok(None);
     }
+    let encryption = ObjectEncryption::SseS3(state.clone());
+    let subjects = subject.map(|subject| (subject.dek_wrap_subject(), subject.checksum_subject()));
+    if subjects.as_ref().is_some_and(|(wrap, checksum)| {
+        !wrap.matches_encryption(&encryption) || !checksum.matches_encryption(&encryption)
+    }) {
+        return Err(ServerError::InternalError {
+            reason: "managed checksum subject does not match stored encryption".to_string(),
+        });
+    }
+    let (wrap_aad, checksum_aad) = match (state.key_binding(), subjects.as_ref()) {
+        (ObjectEncryptionKeyBinding::ProvisionalV1, _) => (MANAGED_WRAP_AAD, MANAGED_CHECKSUM_AAD),
+        (ObjectEncryptionKeyBinding::ObjectSubjectV2, Some((wrap, checksum))) => {
+            (wrap.aead_context(), checksum.aead_context())
+        }
+        (ObjectEncryptionKeyBinding::ObjectSubjectV2, None) => {
+            return Err(ServerError::InternalError {
+                reason: "object-bound managed checksum requires its storage-minted subject"
+                    .to_string(),
+            });
+        }
+    };
     let wrapping_key =
         provider
             .lookup_key(state.wrapping_key_id())
@@ -937,14 +1115,14 @@ pub fn decrypt_managed_encryption_checksum(
         wrapping_key.wrapping_key(),
         state.wrap_nonce(),
         state.wrapped_dek(),
-        MANAGED_WRAP_AAD,
+        wrap_aad,
         MANAGED_ENCRYPTION_LABEL,
     )?;
     decrypt_checksum_with_dek(
         &dek,
         state.checksum_nonce(),
         state.encrypted_checksum_metadata(),
-        MANAGED_CHECKSUM_AAD,
+        checksum_aad,
         MANAGED_ENCRYPTION_LABEL,
     )
 }
@@ -981,14 +1159,6 @@ pub(crate) fn decrypt_authorized_sse_customer_segment_in_place(
     ciphertext: &mut Vec<u8>,
 ) -> Result<(), ServerError> {
     validate_sse_customer_read(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
-    let dek = unwrap_managed_dek(
-        &kek,
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        SSE_C_WRAP_AAD,
-        "SSE-C",
-    )?;
     let encryption = ObjectEncryption::SseCustomer(state.clone());
     if !read.subject.matches_encryption_and_geometry(
         &encryption,
@@ -999,6 +1169,19 @@ pub(crate) fn decrypt_authorized_sse_customer_segment_in_place(
             reason: "SSE-C segment does not match its storage-minted read subject".to_string(),
         });
     }
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => SSE_C_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        "SSE-C",
+    )?;
     decrypt_segment_with_dek_and_prefix_in_place(
         &dek,
         state.payload_codec(),
@@ -1050,23 +1233,63 @@ pub fn decrypt_sse_customer_checksum(
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    decrypt_sse_customer_checksum_with_subject(validator, state, request, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decrypt_authorized_sse_customer_checksum(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    subject: &ObjectEncryptionSubject,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    decrypt_sse_customer_checksum_with_subject(validator, state, request, Some(subject))
+}
+
+fn decrypt_sse_customer_checksum_with_subject(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    subject: Option<&ObjectEncryptionSubject>,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
     if state.encrypted_checksum_metadata().is_empty() {
         return Ok(None);
     }
     validate_sse_customer_read(validator, state, request)?;
+    let encryption = ObjectEncryption::SseCustomer(state.clone());
+    let subjects = subject.map(|subject| (subject.dek_wrap_subject(), subject.checksum_subject()));
+    if subjects.as_ref().is_some_and(|(wrap, checksum)| {
+        !wrap.matches_encryption(&encryption) || !checksum.matches_encryption(&encryption)
+    }) {
+        return Err(ServerError::InternalError {
+            reason: "SSE-C checksum subject does not match stored encryption".to_string(),
+        });
+    }
+    let (wrap_aad, checksum_aad) = match (state.key_binding(), subjects.as_ref()) {
+        (ObjectEncryptionKeyBinding::ProvisionalV1, _) => (SSE_C_WRAP_AAD, SSE_C_CHECKSUM_AAD),
+        (ObjectEncryptionKeyBinding::ObjectSubjectV2, Some((wrap, checksum))) => {
+            (wrap.aead_context(), checksum.aead_context())
+        }
+        (ObjectEncryptionKeyBinding::ObjectSubjectV2, None) => {
+            return Err(ServerError::InternalError {
+                reason: "object-bound SSE-C checksum requires its storage-minted subject"
+                    .to_string(),
+            });
+        }
+    };
     let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
         &kek,
         state.wrap_nonce(),
         state.wrapped_dek(),
-        SSE_C_WRAP_AAD,
+        wrap_aad,
         "SSE-C",
     )?;
     decrypt_checksum_with_dek(
         &dek,
         state.checksum_nonce(),
         state.encrypted_checksum_metadata(),
-        SSE_C_CHECKSUM_AAD,
+        checksum_aad,
         "SSE-C",
     )
 }
@@ -1826,6 +2049,194 @@ mod tests {
             key_id: 7,
             wrapping_key: [11u8; 32],
         })
+    }
+
+    fn object_subject(
+        encryption: &ObjectEncryption,
+        key: &str,
+    ) -> storage::ObjectEncryptionSubject {
+        storage::test_support::object_encryption_subject_fixture(
+            &storage::ObjectKey::try_from(key).unwrap(),
+            encryption,
+        )
+    }
+
+    fn segment_subject(
+        encryption: &ObjectEncryption,
+        key: &str,
+        logical_plaintext_len: usize,
+    ) -> storage::SegmentEncryptionSubject {
+        storage::test_support::standard_segment_encryption_subject_fixture(
+            &storage::ObjectKey::try_from(key).unwrap(),
+            encryption,
+            u64::try_from(logical_plaintext_len).unwrap(),
+        )
+    }
+
+    fn terminal_checksum() -> ObjectChecksumMetadata {
+        ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Crc64nvme,
+            Some(ChecksumType::FullObject),
+            "AQIDBAUGBwg=".to_string(),
+        )
+    }
+
+    #[test]
+    fn sse_customer_terminal_binding_rewraps_and_opens_only_under_exact_object_subject() {
+        let validator = validator();
+        let request = request();
+        let write = prepare_sse_customer_write_with_payload_codec(
+            &validator,
+            &request,
+            SegmentPayloadCodec::Cobblestone256SegmentV1,
+        )
+        .unwrap();
+        let provisional = write.encryption().clone();
+        let provisional_subject = object_subject(&provisional, "object");
+        let plaintext = b"payload encrypted before terminal SSE-C rewrap";
+        let provisional_segment_subject = segment_subject(&provisional, "object", plaintext.len());
+        let ciphertext = write
+            .encrypt_authorized_segment(&provisional_segment_subject, 0, plaintext)
+            .unwrap();
+        let checksum = terminal_checksum();
+        let committed = write
+            .seal_committed_object_encryption(&provisional_subject, Some(&checksum))
+            .unwrap();
+        assert_eq!(
+            committed.key_binding(),
+            ObjectEncryptionKeyBinding::ObjectSubjectV2
+        );
+        let ObjectEncryption::SseCustomer(committed_state) = &committed else {
+            unreachable!()
+        };
+        let committed_subject = object_subject(&committed, "object");
+        assert_eq!(
+            decrypt_authorized_sse_customer_checksum(
+                &validator,
+                committed_state,
+                &request,
+                &committed_subject,
+            )
+            .unwrap(),
+            Some(checksum)
+        );
+        let committed_segment_subject = segment_subject(&committed, "object", plaintext.len());
+        let mut opened_payload = ciphertext.clone();
+        decrypt_authorized_sse_customer_segment_in_place(
+            &validator,
+            committed_state,
+            &request,
+            AuthorizedSegmentRead::new(
+                &committed_segment_subject,
+                SseCustomerSegmentScope::object(),
+                0,
+                plaintext.len(),
+            ),
+            &mut opened_payload,
+        )
+        .unwrap();
+        assert_eq!(opened_payload, plaintext);
+        assert!(decrypt_sse_customer_checksum(&validator, committed_state, &request).is_err());
+        let crossed_subject = object_subject(&committed, "crossed-object");
+        assert!(decrypt_authorized_sse_customer_checksum(
+            &validator,
+            committed_state,
+            &request,
+            &crossed_subject,
+        )
+        .is_err());
+        let crossed_segment_subject =
+            segment_subject(&committed, "crossed-object", plaintext.len());
+        let mut crossed_payload = ciphertext;
+        assert!(decrypt_authorized_sse_customer_segment_in_place(
+            &validator,
+            committed_state,
+            &request,
+            AuthorizedSegmentRead::new(
+                &crossed_segment_subject,
+                SseCustomerSegmentScope::object(),
+                0,
+                plaintext.len(),
+            ),
+            &mut crossed_payload,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn managed_terminal_binding_rewraps_and_opens_only_under_exact_object_subject() {
+        let provider = managed_key_provider();
+        let write = prepare_managed_encryption_write_with_payload_codec(
+            &provider,
+            SegmentPayloadCodec::Cobblestone256SegmentV1,
+        )
+        .unwrap();
+        let provisional = write.encryption().clone();
+        let provisional_subject = object_subject(&provisional, "object");
+        let plaintext = b"payload encrypted before terminal SSE-S3 rewrap";
+        let provisional_segment_subject = segment_subject(&provisional, "object", plaintext.len());
+        let ciphertext = write
+            .encrypt_authorized_segment(&provisional_segment_subject, 0, plaintext)
+            .unwrap();
+        let checksum = terminal_checksum();
+        let committed = write
+            .seal_committed_object_encryption(&provisional_subject, Some(&checksum))
+            .unwrap();
+        assert_eq!(
+            committed.key_binding(),
+            ObjectEncryptionKeyBinding::ObjectSubjectV2
+        );
+        let ObjectEncryption::SseS3(committed_state) = &committed else {
+            unreachable!()
+        };
+        let committed_subject = object_subject(&committed, "object");
+        assert_eq!(
+            decrypt_authorized_managed_encryption_checksum(
+                &provider,
+                committed_state,
+                &committed_subject,
+            )
+            .unwrap(),
+            Some(checksum)
+        );
+        let committed_segment_subject = segment_subject(&committed, "object", plaintext.len());
+        let mut opened_payload = ciphertext.clone();
+        decrypt_authorized_managed_encryption_segment_in_place(
+            &provider,
+            committed_state,
+            AuthorizedSegmentRead::new(
+                &committed_segment_subject,
+                SseCustomerSegmentScope::object(),
+                0,
+                plaintext.len(),
+            ),
+            &mut opened_payload,
+        )
+        .unwrap();
+        assert_eq!(opened_payload, plaintext);
+        assert!(decrypt_managed_encryption_checksum(&provider, committed_state).is_err());
+        let crossed_subject = object_subject(&committed, "crossed-object");
+        assert!(decrypt_authorized_managed_encryption_checksum(
+            &provider,
+            committed_state,
+            &crossed_subject,
+        )
+        .is_err());
+        let crossed_segment_subject =
+            segment_subject(&committed, "crossed-object", plaintext.len());
+        let mut crossed_payload = ciphertext;
+        assert!(decrypt_authorized_managed_encryption_segment_in_place(
+            &provider,
+            committed_state,
+            AuthorizedSegmentRead::new(
+                &crossed_segment_subject,
+                SseCustomerSegmentScope::object(),
+                0,
+                plaintext.len(),
+            ),
+            &mut crossed_payload,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1406,6 +1406,32 @@ Implementation update (2026-10-23, stable encryption-instance identity):
 - This is the durable prerequisite for the one-way terminal DEK rewrap. It does not yet change the
   legacy DEK-wrap/checksum AAD or perform the rewrap; those remain the next Phase 2 slice.
 
+Implementation update (2026-10-24, terminal object-subject binding foundation):
+
+- SSE-C state advances from v5 to v6 and SSE-S3 state from v3 to v4. Both add the explicit durable
+  `ObjectEncryptionKeyBinding` discriminator: `ProvisionalV1 = 1` retains the existing session-time
+  wrap/checksum AAD, while `ObjectSubjectV2 = 2` selects the canonical V2 wrap- and
+  checksum-purpose subjects. Unknown and zero tags fail closed.
+- Storage owns a one-way provisional-to-committed transition. It accepts only a subject minted from
+  the complete provisional encryption instance, preserves the stable encryption identity, payload
+  codec, segment nonce prefix, and key/validator identity, and replaces only the wrap nonce,
+  wrapped DEK, checksum nonce, and encrypted checksum bytes. Rebinding committed state is rejected.
+- SSE-C and managed write contexts can rewrap the same DEK with a fresh nonce under the exact
+  wrap-purpose subject and reseal checksum metadata under the corresponding checksum-purpose
+  subject. Subject-authorized readers dispatch DEK unwrap and checksum opening from the persisted
+  binding tag. Owner-local canaries encrypt a segment before terminal rewrap, decrypt the unchanged
+  ciphertext through the committed state, and reject a crossed committed segment subject; checksum
+  opening has the same exact-subject and subjectless-read coverage.
+- The independently self-describing nested-state bump leaves PG schema 9, metadata-command 11,
+  storage-RPC 27, canonical-state 8, and checkpoint 6 unchanged. Exact v5/v3 nested bytes and their
+  command, RPC, append-preparation, digest, and checkpoint composites remain immutable rejection
+  evidence beside appended v6/v4 current specimens.
+- This slice establishes the durable and cryptographic primitive only. Production terminal
+  publishers do not yet select `ObjectSubjectV2`; routing the exact storage-minted terminal subject
+  through PUT, POST, copy, UploadPart, UploadPartCopy, and multipart completion, and routing the
+  corresponding committed read subject through HEAD/GET/list/copy/restart/retained paths remain
+  open before the Phase 2 subject-binding checkbox can be closed.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

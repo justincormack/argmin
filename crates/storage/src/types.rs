@@ -1338,10 +1338,41 @@ pub(crate) enum ObjectEncryptionDecodeError {
     UnsupportedSseS3StateVersion { version: u8 },
     #[error("unsupported segment payload codec {codec}")]
     UnsupportedSegmentPayloadCodec { codec: u8 },
+    #[error("unsupported object-encryption key binding {binding}")]
+    UnsupportedObjectEncryptionKeyBinding { binding: u8 },
     #[error("invalid SSE-S3 checksum metadata length {declared} (remaining {remaining})")]
     InvalidSseS3ChecksumMetadataLength { declared: usize, remaining: usize },
     #[error("SSE-S3 empty checksum metadata requires a zero nonce")]
     NoncanonicalSseS3EmptyChecksumNonce,
+}
+
+/// Durable distinction between encryption state used while a write is still
+/// provisional and state cryptographically bound to its committed object
+/// identity.
+///
+/// The provisional form is required while a stream or multipart upload is in
+/// progress. It must be replaced exactly once at terminal publication. The
+/// committed form authenticates the storage-minted object subject as AEAD
+/// associated data for both the wrapped DEK and encrypted checksum metadata.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectEncryptionKeyBinding {
+    ProvisionalV1 = 1,
+    ObjectSubjectV2 = 2,
+}
+
+impl ObjectEncryptionKeyBinding {
+    const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::ProvisionalV1),
+            2 => Some(Self::ObjectSubjectV2),
+            _ => None,
+        }
+    }
 }
 
 /// Logical object-encryption state could not be represented by storage.
@@ -1351,6 +1382,10 @@ pub enum ObjectEncryptionStateError {
     EncryptedChecksumMetadataTooLong,
     #[error("empty encrypted checksum metadata requires a zero nonce")]
     NoncanonicalEmptyChecksumNonce,
+    #[error("object encryption subject does not match the provisional encryption state")]
+    ObjectEncryptionSubjectMismatch,
+    #[error("object encryption state is already bound to its committed object subject")]
+    ObjectEncryptionAlreadySubjectBound,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1715,6 +1750,7 @@ impl std::fmt::Debug for ChecksumEncryptionSubject<'_> {
 enum ObjectEncryptionImmutableBinding {
     SseCustomer {
         payload_codec: SegmentPayloadCodec,
+        key_binding: ObjectEncryptionKeyBinding,
         encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
         validator_key_id: u32,
         validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
@@ -1726,6 +1762,7 @@ enum ObjectEncryptionImmutableBinding {
     },
     SseS3 {
         payload_codec: SegmentPayloadCodec,
+        key_binding: ObjectEncryptionKeyBinding,
         encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
         wrapping_key_id: u32,
         wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
@@ -1739,6 +1776,7 @@ impl ObjectEncryptionImmutableBinding {
         match encryption {
             ObjectEncryption::SseCustomer(state) => Self::SseCustomer {
                 payload_codec: state.payload_codec(),
+                key_binding: state.key_binding(),
                 encryption_instance_id: *state.encryption_instance_id(),
                 validator_key_id: state.validator_key_id(),
                 validator_salt: *state.validator_salt(),
@@ -1750,6 +1788,7 @@ impl ObjectEncryptionImmutableBinding {
             },
             ObjectEncryption::SseS3(state) => Self::SseS3 {
                 payload_codec: state.payload_codec(),
+                key_binding: state.key_binding(),
                 encryption_instance_id: *state.encryption_instance_id(),
                 wrapping_key_id: state.wrapping_key_id(),
                 wrap_nonce: *state.wrap_nonce(),
@@ -2147,6 +2186,7 @@ impl std::fmt::Debug for SegmentEncryptionSubject {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerObjectState {
     payload_codec: SegmentPayloadCodec,
+    key_binding: ObjectEncryptionKeyBinding,
     encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
     validator_key_id: u32,
     validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
@@ -2163,6 +2203,7 @@ impl std::fmt::Debug for SseCustomerObjectState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseCustomerObjectState")
             .field("payload_codec", &self.payload_codec)
+            .field("key_binding", &self.key_binding)
             .field("validator_key_id", &self.validator_key_id)
             .field(
                 "encrypted_checksum_metadata_len",
@@ -2177,8 +2218,9 @@ impl std::fmt::Debug for SseCustomerObjectState {
 }
 
 impl SseCustomerObjectState {
-    const VERSION: u8 = 5;
+    const VERSION: u8 = 6;
     const FIXED_ENCODED_LEN: usize = 1
+        + 1
         + 1
         + OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN
         + 4
@@ -2210,6 +2252,7 @@ impl SseCustomerObjectState {
         encryption_instance_id[..SSE_C_WRAP_NONCE_LEN].copy_from_slice(&wrap_nonce);
         Self {
             payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
+            key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
             encryption_instance_id,
             validator_key_id,
             validator_salt,
@@ -2239,6 +2282,7 @@ impl SseCustomerObjectState {
     ) -> Self {
         Self {
             payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
+            key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
             encryption_instance_id,
             validator_key_id,
             validator_salt,
@@ -2301,6 +2345,11 @@ impl SseCustomerObjectState {
     }
 
     #[must_use]
+    pub const fn key_binding(&self) -> ObjectEncryptionKeyBinding {
+        self.key_binding
+    }
+
+    #[must_use]
     pub const fn encryption_instance_id(&self) -> &[u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN] {
         &self.encryption_instance_id
     }
@@ -2356,6 +2405,7 @@ impl SseCustomerObjectState {
         let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
         out.push(self.payload_codec.tag());
+        out.push(self.key_binding.tag());
         out.extend_from_slice(&self.encryption_instance_id);
         out.extend_from_slice(&self.validator_key_id.to_be_bytes());
         out.extend_from_slice(&self.validator_salt);
@@ -2390,8 +2440,13 @@ impl SseCustomerObjectState {
         let payload_codec = SegmentPayloadCodec::from_u8(bytes[1]).ok_or(
             ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: bytes[1] },
         )?;
+        let key_binding = ObjectEncryptionKeyBinding::from_u8(bytes[2]).ok_or(
+            ObjectEncryptionDecodeError::UnsupportedObjectEncryptionKeyBinding {
+                binding: bytes[2],
+            },
+        )?;
         let profile = SegmentPayloadProfile::new(ObjectEncryptionType::SseCustomer, payload_codec);
-        let mut cursor = 2;
+        let mut cursor = 3;
         let take = |cursor: &mut usize, len: usize| {
             let start = *cursor;
             let end = start + len;
@@ -2453,6 +2508,7 @@ impl SseCustomerObjectState {
 
         Ok(Self {
             payload_codec: profile.payload_codec(),
+            key_binding,
             encryption_instance_id,
             validator_key_id,
             validator_salt,
@@ -2471,6 +2527,7 @@ impl SseCustomerObjectState {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseS3ObjectState {
     payload_codec: SegmentPayloadCodec,
+    key_binding: ObjectEncryptionKeyBinding,
     encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
     wrapping_key_id: u32,
     wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
@@ -2484,6 +2541,7 @@ impl std::fmt::Debug for SseS3ObjectState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseS3ObjectState")
             .field("payload_codec", &self.payload_codec)
+            .field("key_binding", &self.key_binding)
             .field("wrapping_key_id", &self.wrapping_key_id)
             .field(
                 "encrypted_checksum_metadata_len",
@@ -2495,8 +2553,9 @@ impl std::fmt::Debug for SseS3ObjectState {
 }
 
 impl SseS3ObjectState {
-    const VERSION: u8 = 3;
+    const VERSION: u8 = 4;
     const FIXED_ENCODED_LEN: usize = 1
+        + 1
         + 1
         + OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN
         + 4
@@ -2522,6 +2581,7 @@ impl SseS3ObjectState {
         encryption_instance_id[..SSE_S3_WRAP_NONCE_LEN].copy_from_slice(&wrap_nonce);
         Self {
             payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
+            key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
             encryption_instance_id,
             wrapping_key_id,
             wrap_nonce,
@@ -2542,6 +2602,7 @@ impl SseS3ObjectState {
     ) -> Self {
         Self {
             payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
+            key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
             encryption_instance_id,
             wrapping_key_id,
             wrap_nonce,
@@ -2600,6 +2661,11 @@ impl SseS3ObjectState {
     }
 
     #[must_use]
+    pub const fn key_binding(&self) -> ObjectEncryptionKeyBinding {
+        self.key_binding
+    }
+
+    #[must_use]
     pub const fn encryption_instance_id(&self) -> &[u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN] {
         &self.encryption_instance_id
     }
@@ -2640,6 +2706,7 @@ impl SseS3ObjectState {
         let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
         out.push(self.payload_codec.tag());
+        out.push(self.key_binding.tag());
         out.extend_from_slice(&self.encryption_instance_id);
         out.extend_from_slice(&self.wrapping_key_id.to_be_bytes());
         out.extend_from_slice(&self.wrap_nonce);
@@ -2669,8 +2736,13 @@ impl SseS3ObjectState {
         let payload_codec = SegmentPayloadCodec::from_u8(bytes[1]).ok_or(
             ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: bytes[1] },
         )?;
+        let key_binding = ObjectEncryptionKeyBinding::from_u8(bytes[2]).ok_or(
+            ObjectEncryptionDecodeError::UnsupportedObjectEncryptionKeyBinding {
+                binding: bytes[2],
+            },
+        )?;
         let profile = SegmentPayloadProfile::new(ObjectEncryptionType::SseS3, payload_codec);
-        let mut cursor = 2;
+        let mut cursor = 3;
         let take = |cursor: &mut usize, len: usize| {
             let start = *cursor;
             let end = start + len;
@@ -2724,6 +2796,7 @@ impl SseS3ObjectState {
 
         Ok(Self {
             payload_codec: profile.payload_codec(),
+            key_binding,
             encryption_instance_id,
             wrapping_key_id,
             wrap_nonce,
@@ -2782,6 +2855,62 @@ impl ObjectEncryption {
     #[must_use]
     pub const fn payload_codec(&self) -> SegmentPayloadCodec {
         self.payload_profile().payload_codec()
+    }
+
+    #[must_use]
+    pub const fn key_binding(&self) -> ObjectEncryptionKeyBinding {
+        match self {
+            Self::SseCustomer(state) => state.key_binding(),
+            Self::SseS3(state) => state.key_binding(),
+        }
+    }
+
+    /// Replaces provisional DEK/checksum ciphertext with ciphertext bound to
+    /// the exact storage-minted committed-object subject.
+    ///
+    /// This transition is deliberately one-way. The subject must have been
+    /// minted from the complete provisional state, preventing a caller from
+    /// combining one write's identity with another write's encryption
+    /// material. All immutable segment-encryption fields remain unchanged.
+    pub fn bind_committed_object_ciphertexts(
+        &self,
+        subject: &ObjectEncryptionSubject,
+        wrap_nonce: [u8; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+        checksum_nonce: [u8; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+        encrypted_checksum_metadata: Vec<u8>,
+    ) -> Result<Self, ObjectEncryptionStateError> {
+        if self.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1 {
+            return Err(ObjectEncryptionStateError::ObjectEncryptionAlreadySubjectBound);
+        }
+        if !subject.matches_encryption(self) {
+            return Err(ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch);
+        }
+        if encrypted_checksum_metadata.is_empty()
+            && checksum_nonce != [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN]
+        {
+            return Err(ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce);
+        }
+        let encrypted_checksum_metadata =
+            EncryptedChecksumMetadata::try_new(encrypted_checksum_metadata)?;
+        Ok(match self {
+            Self::SseCustomer(state) => Self::SseCustomer(SseCustomerObjectState {
+                key_binding: ObjectEncryptionKeyBinding::ObjectSubjectV2,
+                wrap_nonce,
+                wrapped_dek,
+                checksum_nonce,
+                encrypted_checksum_metadata,
+                ..state.clone()
+            }),
+            Self::SseS3(state) => Self::SseS3(SseS3ObjectState {
+                key_binding: ObjectEncryptionKeyBinding::ObjectSubjectV2,
+                wrap_nonce,
+                wrapped_dek,
+                checksum_nonce,
+                encrypted_checksum_metadata,
+                ..state.clone()
+            }),
+        })
     }
 
     #[must_use]
@@ -9470,18 +9599,24 @@ mod tests {
         historical_customer_v4.extend_from_slice(&[6; 6]);
         historical_customer_v4.extend_from_slice(&[7; 12]);
         historical_customer_v4.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
-        let mut customer_golden = vec![5, SegmentPayloadCodec::SegmentAes256GcmV1.tag()];
-        customer_golden.extend_from_slice(&[4; 12]);
-        customer_golden.extend_from_slice(&[0; 4]);
-        customer_golden.extend_from_slice(&[0, 0, 0, 7]);
-        customer_golden.extend_from_slice(&[1; 16]);
-        customer_golden.extend_from_slice(&[2; 32]);
-        customer_golden.extend_from_slice(&[3; 16]);
-        customer_golden.extend_from_slice(&[4; 12]);
-        customer_golden.extend_from_slice(&[5; 48]);
-        customer_golden.extend_from_slice(&[6; 6]);
-        customer_golden.extend_from_slice(&[7; 12]);
-        customer_golden.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
+        let mut historical_customer_v5 = vec![5, SegmentPayloadCodec::SegmentAes256GcmV1.tag()];
+        historical_customer_v5.extend_from_slice(&[4; 12]);
+        historical_customer_v5.extend_from_slice(&[0; 4]);
+        historical_customer_v5.extend_from_slice(&[0, 0, 0, 7]);
+        historical_customer_v5.extend_from_slice(&[1; 16]);
+        historical_customer_v5.extend_from_slice(&[2; 32]);
+        historical_customer_v5.extend_from_slice(&[3; 16]);
+        historical_customer_v5.extend_from_slice(&[4; 12]);
+        historical_customer_v5.extend_from_slice(&[5; 48]);
+        historical_customer_v5.extend_from_slice(&[6; 6]);
+        historical_customer_v5.extend_from_slice(&[7; 12]);
+        historical_customer_v5.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
+        let mut customer_golden = vec![
+            6,
+            SegmentPayloadCodec::SegmentAes256GcmV1.tag(),
+            ObjectEncryptionKeyBinding::ProvisionalV1.tag(),
+        ];
+        customer_golden.extend_from_slice(&historical_customer_v5[2..]);
         assert_eq!(customer.encryption_type() as u8, 1);
         assert_eq!(customer.encode_state().unwrap(), customer_golden);
         assert!(matches!(
@@ -9498,6 +9633,23 @@ mod tests {
             ),
             Err(ObjectEncryptionDecodeError::UnsupportedSseCustomerStateVersion { version: 4 })
         ));
+        assert!(matches!(
+            ObjectEncryption::decode(
+                ObjectEncryptionType::SseCustomer,
+                Some(historical_customer_v5),
+            ),
+            Err(ObjectEncryptionDecodeError::UnsupportedSseCustomerStateVersion { version: 5 })
+        ));
+        for binding in [0, 3] {
+            let mut malformed = customer_golden.clone();
+            malformed[2] = binding;
+            assert!(matches!(
+                ObjectEncryption::decode(ObjectEncryptionType::SseCustomer, Some(malformed)),
+                Err(ObjectEncryptionDecodeError::UnsupportedObjectEncryptionKeyBinding {
+                    binding: actual,
+                }) if actual == binding
+            ));
+        }
         assert_eq!(
             ObjectEncryption::decode(
                 ObjectEncryptionType::from_u8(1).unwrap(),
@@ -9531,15 +9683,21 @@ mod tests {
         historical_managed_v2.extend_from_slice(&[12; 6]);
         historical_managed_v2.extend_from_slice(&[13; 12]);
         historical_managed_v2.extend_from_slice(&[0, 3, 14, 15, 16]);
-        let mut managed_golden = vec![3, SegmentPayloadCodec::Cobblestone256SegmentV1.tag()];
-        managed_golden.extend_from_slice(&[10; 12]);
-        managed_golden.extend_from_slice(&[0; 4]);
-        managed_golden.extend_from_slice(&[0, 0, 0, 9]);
-        managed_golden.extend_from_slice(&[10; 12]);
-        managed_golden.extend_from_slice(&[11; 48]);
-        managed_golden.extend_from_slice(&[12; 6]);
-        managed_golden.extend_from_slice(&[13; 12]);
-        managed_golden.extend_from_slice(&[0, 3, 14, 15, 16]);
+        let mut historical_managed_v3 = vec![3, SegmentPayloadCodec::Cobblestone256SegmentV1.tag()];
+        historical_managed_v3.extend_from_slice(&[10; 12]);
+        historical_managed_v3.extend_from_slice(&[0; 4]);
+        historical_managed_v3.extend_from_slice(&[0, 0, 0, 9]);
+        historical_managed_v3.extend_from_slice(&[10; 12]);
+        historical_managed_v3.extend_from_slice(&[11; 48]);
+        historical_managed_v3.extend_from_slice(&[12; 6]);
+        historical_managed_v3.extend_from_slice(&[13; 12]);
+        historical_managed_v3.extend_from_slice(&[0, 3, 14, 15, 16]);
+        let mut managed_golden = vec![
+            4,
+            SegmentPayloadCodec::Cobblestone256SegmentV1.tag(),
+            ObjectEncryptionKeyBinding::ProvisionalV1.tag(),
+        ];
+        managed_golden.extend_from_slice(&historical_managed_v3[2..]);
         assert_eq!(managed.encryption_type() as u8, 2);
         assert_eq!(managed.encode_state().unwrap(), managed_golden);
         assert!(matches!(
@@ -9550,6 +9708,20 @@ mod tests {
             ObjectEncryption::decode(ObjectEncryptionType::SseS3, Some(historical_managed_v2)),
             Err(ObjectEncryptionDecodeError::UnsupportedSseS3StateVersion { version: 2 })
         ));
+        assert!(matches!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseS3, Some(historical_managed_v3)),
+            Err(ObjectEncryptionDecodeError::UnsupportedSseS3StateVersion { version: 3 })
+        ));
+        for binding in [0, 3] {
+            let mut malformed = managed_golden.clone();
+            malformed[2] = binding;
+            assert!(matches!(
+                ObjectEncryption::decode(ObjectEncryptionType::SseS3, Some(malformed)),
+                Err(ObjectEncryptionDecodeError::UnsupportedObjectEncryptionKeyBinding {
+                    binding: actual,
+                }) if actual == binding
+            ));
+        }
         assert_eq!(
             ObjectEncryption::decode(
                 ObjectEncryptionType::from_u8(2).unwrap(),
@@ -9557,6 +9729,89 @@ mod tests {
             )
             .unwrap(),
             managed
+        );
+    }
+
+    #[test]
+    fn committed_object_ciphertext_binding_is_exact_and_one_way() {
+        let bucket = BucketName::try_from("subject-bound-bucket").unwrap();
+        let key = ObjectKey::try_from("path/to/object").unwrap();
+        let generation = GenerationId::new(19).unwrap();
+        let provisional = ObjectEncryption::SseS3(
+            SseS3ObjectState::new_with_encryption_instance_id(
+                [3; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
+                7,
+                [4; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [5; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [6; OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let subject =
+            ObjectEncryptionSubject::standard_object(11, &bucket, &key, generation, &provisional);
+        let committed = provisional
+            .bind_committed_object_ciphertexts(
+                &subject,
+                [7; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [8; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [9; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                vec![10, 11, 12],
+            )
+            .unwrap();
+        assert_eq!(
+            provisional.key_binding(),
+            ObjectEncryptionKeyBinding::ProvisionalV1
+        );
+        assert_eq!(
+            committed.key_binding(),
+            ObjectEncryptionKeyBinding::ObjectSubjectV2
+        );
+        assert_eq!(
+            committed.encryption_instance_id(),
+            provisional.encryption_instance_id()
+        );
+        assert_eq!(committed.payload_codec(), provisional.payload_codec());
+        assert_eq!(
+            committed
+                .bind_committed_object_ciphertexts(
+                    &subject,
+                    [13; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                    [14; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                    [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                    Vec::new(),
+                )
+                .unwrap_err(),
+            ObjectEncryptionStateError::ObjectEncryptionAlreadySubjectBound
+        );
+
+        let crossed_encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new_with_encryption_instance_id(
+                [23; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
+                7,
+                [4; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [5; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [6; OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let crossed_subject = ObjectEncryptionSubject::standard_object(
+            11,
+            &bucket,
+            &key,
+            generation,
+            &crossed_encryption,
+        );
+        assert_eq!(
+            provisional
+                .bind_committed_object_ciphertexts(
+                    &crossed_subject,
+                    [7; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                    [8; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                    [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                    Vec::new(),
+                )
+                .unwrap_err(),
+            ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch
         );
     }
 
