@@ -45,8 +45,10 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
-        let AuthorizedListObjectsV2 { bucket_info } =
-            self.authorize_list_objects_v2_on_admitted_route(admission, req)?;
+        let AuthorizedListObjectsV2 {
+            bucket_info,
+            bucket_incarnation_read_subject,
+        } = self.authorize_list_objects_v2_on_admitted_route(admission, req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -71,6 +73,7 @@ impl Coordinator {
             .active_object_metadata_scan(bucket)
             .map_err(super::map_store_failure)?
             .list_objects(
+                &bucket_incarnation_read_subject,
                 list_prefix.as_ref(),
                 delimiter,
                 list_start_after.as_ref(),
@@ -79,7 +82,7 @@ impl Coordinator {
             .map_err(Self::map_object_metadata_listing_failure)?;
 
         let mut objects: Vec<ListEntry> = Vec::new();
-        for obj in &listed.objects {
+        for (index, obj) in listed.objects.iter().enumerate() {
             let obj_key = obj.key();
             let record = obj
                 .as_live()
@@ -87,6 +90,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                listed.object_encryption_subject(index),
                 None,
             )?;
             objects.push(ListEntry {
@@ -143,8 +147,10 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
-        let AuthorizedListObjectVersions { bucket_info } =
-            self.authorize_list_object_versions_on_admitted_route(admission, req)?;
+        let AuthorizedListObjectVersions {
+            bucket_info,
+            bucket_incarnation_read_subject,
+        } = self.authorize_list_object_versions_on_admitted_route(admission, req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -166,6 +172,7 @@ impl Coordinator {
             .active_object_metadata_scan(bucket)
             .map_err(super::map_store_failure)?
             .list_object_versions(
+                &bucket_incarnation_read_subject,
                 list_prefix.as_ref(),
                 delimiter,
                 list_key_marker.as_ref(),
@@ -177,7 +184,7 @@ impl Coordinator {
         let mut versions: Vec<VersionEntry> = Vec::new();
         let mut last_key: Option<&ObjectKey> = None;
 
-        for obj in &listed.versions {
+        for (index, obj) in listed.versions.iter().enumerate() {
             let obj_key = obj.key();
             let is_latest = last_key.is_none_or(|k| k != obj_key);
             if is_latest {
@@ -189,6 +196,7 @@ impl Coordinator {
                     let system_metadata = self.deserialize_visible_system_metadata(
                         record.system_metadata_blob.as_ref(),
                         &record.encryption,
+                        listed.object_encryption_subject(index),
                         None,
                     )?;
                     (

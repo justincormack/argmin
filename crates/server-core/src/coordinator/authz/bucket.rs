@@ -1122,6 +1122,7 @@ impl Coordinator {
         }
         Ok(AuthorizedListObjectsV2 {
             bucket_info: bucket.bucket().clone(),
+            bucket_incarnation_read_subject: bucket.bucket_incarnation_read_subject().clone(),
         })
     }
 
@@ -1191,6 +1192,7 @@ impl Coordinator {
         }
         Ok(AuthorizedListObjectVersions {
             bucket_info: bucket.bucket().clone(),
+            bucket_incarnation_read_subject: bucket.bucket_incarnation_read_subject().clone(),
         })
     }
 

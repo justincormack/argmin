@@ -334,11 +334,13 @@ pub(super) struct AuthorizedListParts {
 #[derive(Debug)]
 pub(super) struct AuthorizedListObjectsV2 {
     pub(super) bucket_info: BucketSummary,
+    pub(super) bucket_incarnation_read_subject: storage::BucketIncarnationReadSubject,
 }
 
 #[derive(Debug)]
 pub(super) struct AuthorizedListObjectVersions {
     pub(super) bucket_info: BucketSummary,
+    pub(super) bucket_incarnation_read_subject: storage::BucketIncarnationReadSubject,
 }
 
 #[derive(Debug)]

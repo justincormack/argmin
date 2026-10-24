@@ -77,6 +77,7 @@ impl Coordinator {
             object_segments,
             multipart_parts,
             multipart_part_segments,
+            object_encryption_subject: _,
         } = snapshot;
         #[cfg(test)]
         maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
@@ -145,6 +146,7 @@ impl Coordinator {
             object_segments,
             multipart_parts,
             multipart_part_segments,
+            object_encryption_subject: _,
         } = snapshot;
         let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         match src_record.layout {
@@ -324,6 +326,7 @@ impl Coordinator {
                 src_record.generation_id,
                 &source_snapshot,
             )?;
+            let source_encryption_subject = source_snapshot.object_encryption_subject.clone();
             let source_snapshot = Self::take_authorized_copy_source_snapshot(source_snapshot)?;
             let body = self.copy_source_snapshot_to_read_handle(
                 &req.source.bucket,
@@ -337,6 +340,7 @@ impl Coordinator {
             let src_system_metadata = self.deserialize_visible_system_metadata(
                 src_record.system_metadata_blob.as_ref(),
                 &src_record.encryption,
+                source_encryption_subject.as_deref(),
                 source_sse_customer,
             )?;
 

@@ -1381,12 +1381,12 @@ impl super::StorageCluster {
     ) -> Result<ListedBucketObjects, ObjectPgActionError> {
         let bucket = scan.bucket;
         if max_keys == 0 {
-            return Ok(ListedBucketObjects {
-                objects: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_continuation_token: None,
-            });
+            return Ok(ListedBucketObjects::without_encryption_subjects(
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+            ));
         }
 
         let fetch_limit = max_keys.saturating_add(1);
@@ -1421,12 +1421,12 @@ impl super::StorageCluster {
             let next_continuation_token = is_truncated
                 .then(|| objects.last().map(|object| object.key().clone()))
                 .flatten();
-            return Ok(ListedBucketObjects {
+            return Ok(ListedBucketObjects::without_encryption_subjects(
                 objects,
-                common_prefixes: Vec::new(),
+                Vec::new(),
                 is_truncated,
                 next_continuation_token,
-            });
+            ));
         }
 
         let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
@@ -1586,16 +1586,16 @@ impl super::StorageCluster {
             refill_cursor(&mut cursors[cursor_index])?;
         }
 
-        Ok(ListedBucketObjects {
+        Ok(ListedBucketObjects::without_encryption_subjects(
             objects,
             common_prefixes,
             is_truncated,
-            next_continuation_token: if is_truncated {
+            if is_truncated {
                 next_continuation_token
             } else {
                 None
             },
-        })
+        ))
     }
 
     #[cfg(test)]
@@ -1632,13 +1632,13 @@ impl super::StorageCluster {
     ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
         let bucket = scan.bucket;
         if max_keys == 0 {
-            return Ok(ListedBucketObjectVersions {
-                versions: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_key_marker: None,
-                next_version_id_marker: None,
-            });
+            return Ok(ListedBucketObjectVersions::without_encryption_subjects(
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+                None,
+            ));
         }
 
         let fetch_limit = max_keys.saturating_add(1);
@@ -1824,17 +1824,17 @@ impl super::StorageCluster {
             refill_cursor(&mut cursors[cursor_index])?;
         }
 
-        Ok(ListedBucketObjectVersions {
+        Ok(ListedBucketObjectVersions::without_encryption_subjects(
             versions,
             common_prefixes,
             is_truncated,
-            next_key_marker: if is_truncated { next_key_marker } else { None },
-            next_version_id_marker: if is_truncated {
+            if is_truncated { next_key_marker } else { None },
+            if is_truncated {
                 next_version_id_marker
             } else {
                 None
             },
-        })
+        ))
     }
 
     #[cfg(test)]

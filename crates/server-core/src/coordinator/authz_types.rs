@@ -258,6 +258,27 @@ impl ActiveWriteEncryption {
         }
     }
 
+    pub(super) fn seal_committed_object_encryption(
+        &self,
+        subject: &storage::ObjectEncryptionSubject,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        match &self.kind {
+            ActiveWriteEncryptionKind::SseCustomer {
+                write: Some(write), ..
+            } => write.seal_committed_object_encryption(subject, checksum),
+            ActiveWriteEncryptionKind::Managed { write, .. } => {
+                write.seal_committed_object_encryption(subject, checksum)
+            }
+            ActiveWriteEncryptionKind::SseCustomer { write: None, .. } => {
+                Err(ServerError::InvalidRequest {
+                    reason: "SSE-C write context is required for terminal encryption binding"
+                        .to_string(),
+                })
+            }
+        }
+    }
+
     fn encrypt_authorized_segment(
         &self,
         subject: &storage::SegmentEncryptionSubject,

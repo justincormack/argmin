@@ -333,11 +333,8 @@ impl Coordinator {
                         let acl_grants =
                             Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
                         let public_read = Self::acl_grants_public_read(&acl_grants);
-                        let (system_metadata_blob, encryption) =
-                            Self::prepare_stored_system_metadata(
-                                &system_metadata,
-                                write_encryption,
-                            )?;
+                        let (system_metadata_blob, checksum) =
+                            Self::prepare_unsealed_stored_system_metadata(&system_metadata)?;
                         let generation_reservation = put_route
                             .reserve_generation(&proof)
                             .map_err(Coordinator::map_direct_put_failure)?;
@@ -349,6 +346,13 @@ impl Coordinator {
                             0,
                             req.data,
                         )?;
+                        let encryption = write_encryption.seal_committed_object_encryption(
+                            encryption_reservation.object_encryption_subject(),
+                            checksum.as_ref(),
+                        )?;
+                        let encryption_reservation = encryption_reservation
+                            .bind_committed_encryption(&encryption)
+                            .map_err(Coordinator::map_direct_put_failure)?;
 
                         let written_payload = put_route
                             .write_direct_object_segment_payload(

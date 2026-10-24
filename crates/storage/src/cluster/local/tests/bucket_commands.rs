@@ -412,6 +412,8 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
     let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let bucket_subject = crate::BucketFastPathInfo::cache_test_fixture(bucket.clone())
+        .bucket_incarnation_read_subject();
     let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let time = crate::clock::test_time_override_guard(1_000);
     let prepare_scan = || {
@@ -453,7 +455,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let object_error = object_admission
         .active_object_metadata_scan(&bucket)
         .unwrap()
-        .list_objects(None, None, None, 100)
+        .list_objects(&bucket_subject, None, None, None, 100)
         .unwrap_err();
     assert_eq!(
         object_error.kind(),
@@ -470,7 +472,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let version_error = version_admission
         .active_object_metadata_scan(&bucket)
         .unwrap()
-        .list_object_versions(None, None, None, None, 100)
+        .list_object_versions(&bucket_subject, None, None, None, None, 100)
         .unwrap_err();
     assert_eq!(
         version_error.kind(),

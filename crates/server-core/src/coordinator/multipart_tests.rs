@@ -6947,6 +6947,196 @@ fn sse_s3_checksum_metadata_persists_through_put_head_get_and_copy() {
 }
 
 #[test]
+fn committed_sse_s3_checksum_opens_through_exact_reads_copy_and_listings() {
+    let (provider, expected_checksum) = test_sse_s3_checksum_profile_inputs();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator_with_managed_key_provider(dir.path(), provider);
+    coord
+        .create_bucket_for_owner("default-owner", "source", false)
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "destination", false)
+        .unwrap();
+    let source_key = "obj";
+
+    let mut system_metadata = SystemMetadata::new();
+    system_metadata.set_checksum(
+        expected_checksum.algorithm(),
+        expected_checksum.checksum_type(),
+        expected_checksum.value().to_string(),
+    );
+    let payload = b"subject-bound-copy-payload";
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let authorized = coord
+        .prepare_put_object_write_with_storage_admission(
+            &admission,
+            &AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    "source",
+                    source_key,
+                    test_requester(),
+                    None,
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
+            },
+        )
+        .unwrap();
+    coord
+        .commit_put_object_write_with_storage_admission(
+            &admission,
+            &AuthorizedPutObjectCommitRequest {
+                data: payload,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &system_metadata,
+                cond: NO_WRITE,
+            },
+            &authorized,
+        )
+        .unwrap();
+    drop(admission);
+
+    {
+        let bucket = trusted_bucket_name("source");
+        let key = trusted_object_key(source_key);
+        let admission = coord.admit_storage_route_for_request().unwrap();
+        let bucket_snapshot = admission
+            .active_bucket_route(&bucket)
+            .unwrap()
+            .load_bucket_snapshot(storage::BucketSnapshotRequest::default())
+            .unwrap();
+        let loaded = admission
+            .active_object_payload_read_route(
+                &bucket,
+                &key,
+                None,
+                storage::ObjectReadSnapshotMode::FullPayloadLayout,
+                &bucket_snapshot.bucket_incarnation_read_subject(),
+            )
+            .unwrap()
+            .load_leased_object_read_snapshot_if(|_| Ok::<(), ()>(()))
+            .unwrap()
+            .unwrap();
+        let subject = loaded
+            .snapshot()
+            .object_encryption_subject
+            .as_deref()
+            .expect("authorized object snapshot must carry its encryption subject");
+        let live = loaded.snapshot().stored.as_live().unwrap();
+        assert_eq!(
+            live.encryption.key_binding(),
+            storage::ObjectEncryptionKeyBinding::ObjectSubjectV2
+        );
+        assert!(subject.matches_encryption(&live.encryption));
+    }
+
+    let get_request = GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner(
+            "source",
+            source_key,
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+    };
+    assert_eq!(
+        coord
+            .head_object(&get_request)
+            .unwrap()
+            .system_metadata
+            .checksum(),
+        Some(&expected_checksum)
+    );
+    let get = coord.get_object(&get_request).unwrap();
+    assert_eq!(get.system_metadata.checksum(), Some(&expected_checksum));
+    assert_eq!(get.body.read_all().unwrap(), payload);
+
+    let listed = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner("source", test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert_eq!(listed.objects.len(), 1);
+    assert_eq!(
+        listed.objects[0].checksum_algorithm,
+        Some(expected_checksum.algorithm())
+    );
+    assert_eq!(
+        listed.objects[0].checksum_type,
+        expected_checksum.checksum_type()
+    );
+
+    let versions = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("source", test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 1);
+    assert_eq!(
+        versions.versions[0].checksum_algorithm,
+        Some(expected_checksum.algorithm())
+    );
+    assert_eq!(
+        versions.versions[0].checksum_type,
+        expected_checksum.checksum_type()
+    );
+
+    let copy = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("source", source_key, None),
+            destination: object_request_with_expected_owner(
+                "destination",
+                "copy",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::managed(
+                ManagedEncryptionAlgorithm::Aes256,
+            ),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "destination",
+                "copy",
+                copy.version_id.into(),
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(copied.system_metadata.checksum(), Some(&expected_checksum));
+    assert_eq!(copied.body.read_all().unwrap(), payload);
+}
+
+#[test]
 fn current_encrypted_checksum_plaintext_v1_read_gate_requires_version_bump() {
     #[derive(Clone, Copy)]
     enum Profile {

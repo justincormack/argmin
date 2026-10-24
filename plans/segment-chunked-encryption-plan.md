@@ -1426,11 +1426,41 @@ Implementation update (2026-10-24, terminal object-subject binding foundation):
   storage-RPC 27, canonical-state 8, and checkpoint 6 unchanged. Exact v5/v3 nested bytes and their
   command, RPC, append-preparation, digest, and checkpoint composites remain immutable rejection
   evidence beside appended v6/v4 current specimens.
-- This slice establishes the durable and cryptographic primitive only. Production terminal
-  publishers do not yet select `ObjectSubjectV2`; routing the exact storage-minted terminal subject
-  through PUT, POST, copy, UploadPart, UploadPartCopy, and multipart completion, and routing the
-  corresponding committed read subject through HEAD/GET/list/copy/restart/retained paths remain
-  open before the Phase 2 subject-binding checkbox can be closed.
+- At this foundation point, production terminal publishers did not yet select `ObjectSubjectV2`;
+  routing the exact storage-minted terminal subject through PUT, POST, copy, UploadPart,
+  UploadPartCopy, and multipart completion, and routing the corresponding committed read subject
+  through HEAD/GET/list/copy/restart/retained paths remained open before the Phase 2
+  subject-binding checkbox could be closed.
+
+Implementation update (2026-10-24, buffered PUT and exact read subjects):
+
+- Buffered Direct PUT is the first production terminal publisher to select `ObjectSubjectV2`.
+  Metadata serialization and checksum extraction still occur before durable generation
+  reservation. Storage then mints the exact provisional object/segment subject, payload encryption
+  completes under that stable subject, the crypto owner rewraps the same DEK and seals checksum
+  metadata under the exact terminal purpose subjects, and the linear storage reservation consumes
+  the one-way provisional-to-committed transition before any shard acknowledgement or terminal
+  command can use the committed state. The transition preserves codec, encryption-instance,
+  validator/wrapping-key identity, salts, and segment nonce prefix and rejects crossed key material,
+  another encryption instance, and already-committed state.
+- Authoritative object snapshots now carry their exact storage-minted object subject alongside the
+  existing per-segment subjects. Both active and retained snapshot construction derive it from the
+  admitted bucket incarnation and exact stored bucket, key, generation, and encryption state.
+  HeadObject, GetObject, GetObjectAttributes, object metadata reads, and CopyObject source checksum
+  opening use that subject; committed state cannot fall back to the provisional subjectless reader.
+- Global object and version listings carry a private subject vector parallel to their returned
+  rows. The admitted bucket-incarnation subject must match the scan bucket, every returned row must
+  remain in that bucket, and live rows receive exact generation/encryption subjects before
+  server-core may open checksum metadata. Delete markers deliberately carry no encryption subject.
+- A production-path canary performs a managed buffered PUT with checksum metadata, proves the
+  durable state is `ObjectSubjectV2`, decrypts its payload and checksum through GetObject, opens the
+  checksum through HeadObject and both listing variants, and uses it as a CopyObject source before
+  reading the copied payload/checksum. Existing SSE-S3 and SSE-C Direct PUT round-trip and restart
+  canaries cover both key modes.
+- Streamed PutObject, POST Object, CopyObject destinations, UploadPart, UploadPartCopy, and
+  multipart completion still publish provisional binding. They must adopt the same terminal
+  transition before the Phase 2 write-path and subject-binding items can close; this slice does not
+  enable the Cobblestone writer profile by itself.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

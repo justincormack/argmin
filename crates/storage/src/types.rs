@@ -1797,6 +1797,67 @@ impl ObjectEncryptionImmutableBinding {
             },
         }
     }
+
+    fn is_committed_successor(&self, encryption: &ObjectEncryption) -> bool {
+        match (self, Self::from_encryption(encryption)) {
+            (
+                Self::SseCustomer {
+                    payload_codec,
+                    key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
+                    encryption_instance_id,
+                    validator_key_id,
+                    validator_salt,
+                    validator_hmac,
+                    wrap_salt,
+                    segment_nonce_prefix,
+                    ..
+                },
+                Self::SseCustomer {
+                    payload_codec: committed_payload_codec,
+                    key_binding: ObjectEncryptionKeyBinding::ObjectSubjectV2,
+                    encryption_instance_id: committed_encryption_instance_id,
+                    validator_key_id: committed_validator_key_id,
+                    validator_salt: committed_validator_salt,
+                    validator_hmac: committed_validator_hmac,
+                    wrap_salt: committed_wrap_salt,
+                    segment_nonce_prefix: committed_segment_nonce_prefix,
+                    ..
+                },
+            ) => {
+                *payload_codec == committed_payload_codec
+                    && *encryption_instance_id == committed_encryption_instance_id
+                    && *validator_key_id == committed_validator_key_id
+                    && *validator_salt == committed_validator_salt
+                    && *validator_hmac == committed_validator_hmac
+                    && *wrap_salt == committed_wrap_salt
+                    && *segment_nonce_prefix == committed_segment_nonce_prefix
+            }
+            (
+                Self::SseS3 {
+                    payload_codec,
+                    key_binding: ObjectEncryptionKeyBinding::ProvisionalV1,
+                    encryption_instance_id,
+                    wrapping_key_id,
+                    segment_nonce_prefix,
+                    ..
+                },
+                Self::SseS3 {
+                    payload_codec: committed_payload_codec,
+                    key_binding: ObjectEncryptionKeyBinding::ObjectSubjectV2,
+                    encryption_instance_id: committed_encryption_instance_id,
+                    wrapping_key_id: committed_wrapping_key_id,
+                    segment_nonce_prefix: committed_segment_nonce_prefix,
+                    ..
+                },
+            ) => {
+                *payload_codec == committed_payload_codec
+                    && *encryption_instance_id == committed_encryption_instance_id
+                    && *wrapping_key_id == committed_wrapping_key_id
+                    && *segment_nonce_prefix == committed_segment_nonce_prefix
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ObjectEncryptionSubject {
@@ -1859,6 +1920,22 @@ impl ObjectEncryptionSubject {
         self.encryption_instance_id == encryption.encryption_instance_id()
             && self.immutable_encryption_binding
                 == ObjectEncryptionImmutableBinding::from_encryption(encryption)
+    }
+
+    pub(crate) fn bind_committed_encryption(
+        mut self,
+        encryption: &ObjectEncryption,
+    ) -> Result<Self, ObjectEncryptionStateError> {
+        if self.encryption_instance_id != encryption.encryption_instance_id()
+            || !self
+                .immutable_encryption_binding
+                .is_committed_successor(encryption)
+        {
+            return Err(ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch);
+        }
+        self.immutable_encryption_binding =
+            ObjectEncryptionImmutableBinding::from_encryption(encryption);
+        Ok(self)
     }
 
     /// Derives the purpose-separated DEK-wrap subject from this exact object
@@ -2062,6 +2139,18 @@ impl SegmentEncryptionSubject {
             segment_index,
             logical_plaintext_len,
         }
+    }
+
+    pub(crate) fn object_subject(&self) -> &ObjectEncryptionSubject {
+        &self.object
+    }
+
+    pub(crate) fn bind_committed_encryption(
+        mut self,
+        encryption: &ObjectEncryption,
+    ) -> Result<Self, ObjectEncryptionStateError> {
+        self.object = self.object.bind_committed_encryption(encryption)?;
+        Ok(self)
     }
 
     /// Returns whether the supplied encryption state and segment geometry are
@@ -6224,6 +6313,10 @@ pub struct ObjectReadSnapshot {
     pub object_segments: Vec<ObjectPayloadSegment>,
     pub multipart_parts: Vec<ObjectReadMultipartPart>,
     pub multipart_part_segments: Vec<ObjectPayloadSegment>,
+    /// Exact storage-minted object subject for checksum and DEK-wrap reads.
+    /// Delete-marker and diagnostic snapshots without bucket-incarnation
+    /// provenance leave this absent.
+    pub object_encryption_subject: Option<Arc<ObjectEncryptionSubject>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -6373,6 +6466,7 @@ impl ObjectReadSnapshot {
                 object_segments: Vec::new(),
                 multipart_parts: Vec::new(),
                 multipart_part_segments: Vec::new(),
+                object_encryption_subject: None,
             });
         };
         let payload_profile = live.encryption.payload_profile();
@@ -6399,6 +6493,7 @@ impl ObjectReadSnapshot {
                     ObjectPayloadSegment::from_multipart_record(&subject, record, payload_profile)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            object_encryption_subject: None,
         })
     }
 
@@ -6406,17 +6501,25 @@ impl ObjectReadSnapshot {
         &mut self,
         bucket_incarnation_generation: u64,
     ) -> Result<(), &'static str> {
-        if self
-            .object_segments
-            .iter()
-            .chain(&self.multipart_part_segments)
-            .any(|segment| segment.encryption_subject.is_some())
+        if self.object_encryption_subject.is_some()
+            || self
+                .object_segments
+                .iter()
+                .chain(&self.multipart_part_segments)
+                .any(|segment| segment.encryption_subject.is_some())
         {
             return Err("object payload encryption subjects are already bound");
         }
         let Some(live) = self.stored.as_live() else {
             return Ok(());
         };
+        self.object_encryption_subject = Some(Arc::new(ObjectEncryptionSubject::standard_object(
+            bucket_incarnation_generation,
+            &live.bucket,
+            &live.key,
+            live.generation_id,
+            &live.encryption,
+        )));
         for segment in &mut self.object_segments {
             if segment.part_number().is_some() {
                 return Err("standard object payload contains a multipart segment");
@@ -6628,6 +6731,7 @@ pub struct ListedBucketObjects {
     pub common_prefixes: Vec<ObjectKey>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<ObjectKey>,
+    object_encryption_subjects: Vec<Option<Arc<ObjectEncryptionSubject>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -6637,6 +6741,98 @@ pub struct ListedBucketObjectVersions {
     pub is_truncated: bool,
     pub next_key_marker: Option<ObjectKey>,
     pub next_version_id_marker: Option<VersionId>,
+    object_encryption_subjects: Vec<Option<Arc<ObjectEncryptionSubject>>>,
+}
+
+impl ListedBucketObjects {
+    pub(crate) fn without_encryption_subjects(
+        objects: Vec<StoredObject>,
+        common_prefixes: Vec<ObjectKey>,
+        is_truncated: bool,
+        next_continuation_token: Option<ObjectKey>,
+    ) -> Self {
+        Self {
+            objects,
+            common_prefixes,
+            is_truncated,
+            next_continuation_token,
+            object_encryption_subjects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn bind_object_encryption_subjects(
+        &mut self,
+        bucket_subject: &BucketIncarnationReadSubject,
+    ) -> Result<(), &'static str> {
+        self.object_encryption_subjects =
+            mint_listed_object_encryption_subjects(&self.objects, bucket_subject)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn object_encryption_subject(&self, index: usize) -> Option<&ObjectEncryptionSubject> {
+        self.object_encryption_subjects
+            .get(index)
+            .and_then(Option::as_deref)
+    }
+}
+
+impl ListedBucketObjectVersions {
+    pub(crate) fn without_encryption_subjects(
+        versions: Vec<StoredObject>,
+        common_prefixes: Vec<ObjectKey>,
+        is_truncated: bool,
+        next_key_marker: Option<ObjectKey>,
+        next_version_id_marker: Option<VersionId>,
+    ) -> Self {
+        Self {
+            versions,
+            common_prefixes,
+            is_truncated,
+            next_key_marker,
+            next_version_id_marker,
+            object_encryption_subjects: Vec::new(),
+        }
+    }
+
+    pub(crate) fn bind_object_encryption_subjects(
+        &mut self,
+        bucket_subject: &BucketIncarnationReadSubject,
+    ) -> Result<(), &'static str> {
+        self.object_encryption_subjects =
+            mint_listed_object_encryption_subjects(&self.versions, bucket_subject)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn object_encryption_subject(&self, index: usize) -> Option<&ObjectEncryptionSubject> {
+        self.object_encryption_subjects
+            .get(index)
+            .and_then(Option::as_deref)
+    }
+}
+
+fn mint_listed_object_encryption_subjects(
+    objects: &[StoredObject],
+    bucket_subject: &BucketIncarnationReadSubject,
+) -> Result<Vec<Option<Arc<ObjectEncryptionSubject>>>, &'static str> {
+    objects
+        .iter()
+        .map(|stored| {
+            if stored.bucket() != &bucket_subject.bucket {
+                return Err("listed object does not match bucket-incarnation subject");
+            }
+            Ok(stored.as_live().map(|live| {
+                Arc::new(ObjectEncryptionSubject::standard_object(
+                    bucket_subject.bucket_incarnation_generation,
+                    &live.bucket,
+                    &live.key,
+                    live.generation_id,
+                    &live.encryption,
+                ))
+            }))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -9270,8 +9466,11 @@ mod tests {
         let mut snapshot =
             ObjectReadSnapshot::from_records(stored, vec![segment], vec![], vec![]).unwrap();
         assert!(snapshot.object_segments[0].encryption_subject().is_none());
+        assert!(snapshot.object_encryption_subject.is_none());
 
         snapshot.bind_payload_encryption_subjects(41).unwrap();
+        let object_subject = snapshot.object_encryption_subject.as_deref().unwrap();
+        assert!(object_subject.matches_encryption(&encryption));
         let expected = SegmentEncryptionSubject::standard_object(
             ObjectEncryptionSubject::standard_object(41, &bucket, &key, generation_id, &encryption),
             3,
@@ -9771,6 +9970,12 @@ mod tests {
             provisional.encryption_instance_id()
         );
         assert_eq!(committed.payload_codec(), provisional.payload_codec());
+        let committed_subject =
+            ObjectEncryptionSubject::standard_object(11, &bucket, &key, generation, &provisional)
+                .bind_committed_encryption(&committed)
+                .unwrap();
+        assert!(committed_subject.matches_encryption(&committed));
+        assert!(!committed_subject.matches_encryption(&provisional));
         assert_eq!(
             committed
                 .bind_committed_object_ciphertexts(
@@ -9810,6 +10015,45 @@ mod tests {
                     [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
                     Vec::new(),
                 )
+                .unwrap_err(),
+            ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch
+        );
+
+        let crossed_key_provisional = ObjectEncryption::SseS3(
+            SseS3ObjectState::new_with_encryption_instance_id(
+                [3; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN],
+                99,
+                [4; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [5; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [6; OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let crossed_key_subject = ObjectEncryptionSubject::standard_object(
+            11,
+            &bucket,
+            &key,
+            generation,
+            &crossed_key_provisional,
+        );
+        let crossed_key_committed = crossed_key_provisional
+            .bind_committed_object_ciphertexts(
+                &crossed_key_subject,
+                [7; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [8; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [9; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                vec![10, 11, 12],
+            )
+            .unwrap();
+        assert_eq!(
+            ObjectEncryptionSubject::standard_object(11, &bucket, &key, generation, &provisional,)
+                .bind_committed_encryption(&crossed_key_committed)
+                .unwrap_err(),
+            ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch
+        );
+        assert_eq!(
+            ObjectEncryptionSubject::standard_object(11, &bucket, &key, generation, &committed,)
+                .bind_committed_encryption(&committed)
                 .unwrap_err(),
             ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch
         );

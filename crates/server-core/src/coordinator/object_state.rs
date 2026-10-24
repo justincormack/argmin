@@ -3,16 +3,18 @@
 
 use checksum::{ChecksumAlgorithm, ChecksumType};
 use storage::{
-    ObjectEncryption, ObjectReadMultipartPart, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    ObjectEncryption, ObjectEncryptionSubject, ObjectReadMultipartPart, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob,
 };
 
 use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
 use crate::sse::{
+    decrypt_authorized_managed_encryption_checksum, decrypt_authorized_sse_customer_checksum,
     decrypt_managed_encryption_checksum, decrypt_sse_customer_checksum, SseCustomerRequest,
 };
-use crate::system_metadata::SystemMetadata;
+use crate::system_metadata::{ObjectChecksumMetadata, SystemMetadata};
 
 #[derive(Debug, Clone)]
 pub(super) struct SnapshottedMultipartPart {
@@ -72,12 +74,20 @@ impl Coordinator {
         system_metadata: &SystemMetadata,
         write_encryption: &ActiveWriteEncryption,
     ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
+        let (system_metadata_blob, checksum) =
+            Self::prepare_unsealed_stored_system_metadata(system_metadata)?;
+        let stored_encryption = write_encryption.seal_checksum_metadata(checksum.as_ref())?;
+        Ok((system_metadata_blob, stored_encryption))
+    }
+
+    pub(super) fn prepare_unsealed_stored_system_metadata(
+        system_metadata: &SystemMetadata,
+    ) -> Result<(SerializedSystemMetadataBlob, Option<ObjectChecksumMetadata>), ServerError> {
         let mut stored_system_metadata = system_metadata.clone();
         let checksum = stored_system_metadata.take_checksum();
-        let stored_encryption = write_encryption.seal_checksum_metadata(checksum.as_ref())?;
         Ok((
             SerializedSystemMetadataBlob::from(stored_system_metadata.serialize()?),
-            stored_encryption,
+            checksum,
         ))
     }
 
@@ -85,6 +95,7 @@ impl Coordinator {
         &self,
         system_metadata_blob: Option<&SerializedSystemMetadataBlob>,
         encryption: &ObjectEncryption,
+        encryption_subject: Option<&ObjectEncryptionSubject>,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<SystemMetadata, ServerError> {
         let mut system_metadata = Self::deserialize_system_metadata(system_metadata_blob)?;
@@ -100,9 +111,13 @@ impl Coordinator {
                             .ok_or(ServerError::InternalError {
                                 reason: "SSE-C validator key is not configured".to_string(),
                             })?;
-                    if let Some(checksum) =
-                        decrypt_sse_customer_checksum(validator, state, request)?
-                    {
+                    let checksum = match encryption_subject {
+                        Some(subject) => decrypt_authorized_sse_customer_checksum(
+                            validator, state, request, subject,
+                        )?,
+                        None => decrypt_sse_customer_checksum(validator, state, request)?,
+                    };
+                    if let Some(checksum) = checksum {
                         system_metadata.set_checksum(
                             checksum.algorithm(),
                             checksum.checksum_type(),
@@ -119,7 +134,13 @@ impl Coordinator {
                             .ok_or(ServerError::InternalError {
                                 reason: "SSE-S3 key provider is not configured".to_string(),
                             })?;
-                    if let Some(checksum) = decrypt_managed_encryption_checksum(provider, state)? {
+                    let checksum = match encryption_subject {
+                        Some(subject) => decrypt_authorized_managed_encryption_checksum(
+                            provider, state, subject,
+                        )?,
+                        None => decrypt_managed_encryption_checksum(provider, state)?,
+                    };
+                    if let Some(checksum) = checksum {
                         system_metadata.set_checksum(
                             checksum.algorithm(),
                             checksum.checksum_type(),

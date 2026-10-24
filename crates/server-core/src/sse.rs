@@ -1501,11 +1501,16 @@ pub(crate) fn test_encrypt_crossed_managed_segment(
             .ok_or(ServerError::InternalError {
                 reason: "managed wrapping key for object is not available".to_string(),
             })?;
+    let wrap_subject = input.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => MANAGED_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
         state.wrap_nonce(),
         state.wrapped_dek(),
-        MANAGED_WRAP_AAD,
+        wrap_aad,
         MANAGED_ENCRYPTION_LABEL,
     )?;
     encrypt_segment_with_dek_and_prefix(
@@ -1534,11 +1539,16 @@ pub(crate) fn test_encrypt_crossed_sse_customer_segment(
 ) -> Result<Vec<u8>, ServerError> {
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let wrap_subject = input.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => SSE_C_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
     let dek = unwrap_managed_dek(
         &kek,
         state.wrap_nonce(),
         state.wrapped_dek(),
-        SSE_C_WRAP_AAD,
+        wrap_aad,
         "SSE-C",
     )?;
     encrypt_segment_with_dek_and_prefix(

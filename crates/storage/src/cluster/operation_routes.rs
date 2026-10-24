@@ -328,6 +328,36 @@ impl DirectPutSegmentEncryptionReservation<'_> {
     pub fn encryption_subject(&self) -> &SegmentEncryptionSubject {
         &self.subject
     }
+
+    /// Returns the exact object-level subject from which this segment
+    /// authority was derived. Terminal DEK/checksum binding consumes this
+    /// identity before payload ownership is transferred to storage.
+    #[must_use]
+    pub fn object_encryption_subject(&self) -> &ObjectEncryptionSubject {
+        self.subject.object_subject()
+    }
+
+    /// Rebinds the staged-payload authority to the exact committed encryption
+    /// successor after the crypto layer has performed the one-way terminal
+    /// DEK/checksum transition.
+    pub fn bind_committed_encryption(
+        mut self,
+        encryption: &ObjectEncryption,
+    ) -> Result<Self, crate::DirectPutFailure> {
+        self.subject = self
+            .subject
+            .bind_committed_encryption(encryption)
+            .map_err(|error| {
+                crate::DirectPutFailure::from_object_pg_action(
+                    ObjectPgActionError::InvalidRequest {
+                        reason: format!(
+                            "direct PUT committed encryption does not match staged subject: {error}"
+                        ),
+                    },
+                )
+            })?;
+        Ok(self)
+    }
 }
 
 impl std::fmt::Debug for DirectPutSegmentEncryptionReservation<'_> {
@@ -2458,17 +2488,26 @@ impl ObjectMetadataScanRoute<'_> {
 impl ActiveObjectMetadataScan<'_> {
     pub fn list_objects(
         &self,
+        bucket_subject: &BucketIncarnationReadSubject,
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         continuation_token: Option<&ObjectKey>,
         max_keys: u32,
     ) -> Result<ListedBucketObjects, crate::ObjectMetadataListingFailure> {
+        if !bucket_subject.matches_bucket(&self.bucket) {
+            return Err(crate::ObjectMetadataListingFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "object listing subject does not match admitted bucket".to_string(),
+                },
+            ));
+        }
         let require_valid_route = || self.admission.require_valid_now_raw();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
             require_valid_route: &require_valid_route,
         };
-        self.admission
+        let mut listed = self
+            .admission
             .cluster
             .list_objects_for_bucket_with_route_validation(
                 &scan,
@@ -2477,23 +2516,43 @@ impl ActiveObjectMetadataScan<'_> {
                 continuation_token,
                 max_keys,
             )
-            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)
+            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)?;
+        listed
+            .bind_object_encryption_subjects(bucket_subject)
+            .map_err(|reason| {
+                crate::ObjectMetadataListingFailure::from_object_pg_action(
+                    ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                        reason: reason.to_string(),
+                    }),
+                )
+            })?;
+        Ok(listed)
     }
 
     pub fn list_object_versions(
         &self,
+        bucket_subject: &BucketIncarnationReadSubject,
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         key_marker: Option<&ObjectKey>,
         version_id_marker: Option<VersionId>,
         max_keys: u32,
     ) -> Result<ListedBucketObjectVersions, crate::ObjectMetadataListingFailure> {
+        if !bucket_subject.matches_bucket(&self.bucket) {
+            return Err(crate::ObjectMetadataListingFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "object-version listing subject does not match admitted bucket"
+                        .to_string(),
+                },
+            ));
+        }
         let require_valid_route = || self.admission.require_valid_now_raw();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
             require_valid_route: &require_valid_route,
         };
-        self.admission
+        let mut listed = self
+            .admission
             .cluster
             .list_object_versions_for_bucket_with_route_validation(
                 &scan,
@@ -2503,7 +2562,17 @@ impl ActiveObjectMetadataScan<'_> {
                 version_id_marker,
                 max_keys,
             )
-            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)
+            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)?;
+        listed
+            .bind_object_encryption_subjects(bucket_subject)
+            .map_err(|reason| {
+                crate::ObjectMetadataListingFailure::from_object_pg_action(
+                    ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                        reason: reason.to_string(),
+                    }),
+                )
+            })?;
+        Ok(listed)
     }
 
     pub fn list_multipart_uploads(

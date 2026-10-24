@@ -123,6 +123,7 @@ impl Coordinator {
             object_segments,
             multipart_parts,
             multipart_part_segments,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
@@ -152,6 +153,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -209,6 +211,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -328,6 +331,7 @@ impl Coordinator {
             object_segments,
             multipart_parts,
             multipart_part_segments,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
@@ -368,6 +372,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -492,6 +497,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -572,6 +578,7 @@ impl Coordinator {
             object_segments: _,
             multipart_parts,
             multipart_part_segments: _,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
@@ -623,6 +630,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -688,6 +696,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -754,6 +763,7 @@ impl Coordinator {
             object_segments: _,
             multipart_parts: _,
             multipart_part_segments: _,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
         #[cfg(test)]
         maybe_run_object_read_snapshot_hook(bucket, key);
@@ -797,6 +807,7 @@ impl Coordinator {
         let system_metadata = self.deserialize_visible_system_metadata(
             record.system_metadata_blob.as_ref(),
             &record.encryption,
+            object_encryption_subject.as_deref(),
             req.sse_customer,
         )?;
 
@@ -855,6 +866,7 @@ impl Coordinator {
             object_segments: _,
             multipart_parts,
             multipart_part_segments: _,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
@@ -876,6 +888,7 @@ impl Coordinator {
         let system_metadata = self.deserialize_visible_system_metadata(
             record.system_metadata_blob.as_ref(),
             &record.encryption,
+            object_encryption_subject.as_deref(),
             req.sse_customer,
         )?;
 
@@ -1020,6 +1033,7 @@ impl Coordinator {
             object_segments,
             multipart_parts,
             multipart_part_segments,
+            object_encryption_subject,
         } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
@@ -1104,6 +1118,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
@@ -1126,6 +1141,7 @@ impl Coordinator {
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
                 &record.encryption,
+                object_encryption_subject.as_deref(),
                 req.sse_customer,
             )?;
 
