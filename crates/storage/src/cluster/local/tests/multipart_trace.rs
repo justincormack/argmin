@@ -488,6 +488,27 @@ fn complete_multipart_trace_upload(
             &requested_parts,
         )
         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+    let bucket_snapshot = cluster
+        .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+    let bucket_subject = bucket_snapshot.bucket_incarnation_read_subject();
+    let object_subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_subject.bucket_incarnation_generation(),
+        bucket,
+        &upload.key,
+        upload_row.object_generation_id,
+        &upload_row.encryption,
+    );
+    let committed_encryption = upload_row
+        .encryption
+        .bind_committed_object_ciphertexts(
+            &object_subject,
+            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
     let size = upload.parts.iter().map(|part| part.size).sum();
     cluster
         .complete_multipart_upload_commit_serialized(crate::CompleteMultipartCommitRequest {
@@ -506,7 +527,7 @@ fn complete_multipart_trace_upload(
             metadata_blob: Some(upload_row.metadata_blob),
             system_metadata_blob: Some(upload_row.system_metadata_blob),
             object_lock: upload_row.object_lock,
-            encryption: upload_row.encryption,
+            encryption: committed_encryption,
             expected_stale_payload_source: completion_snapshot.stale_payload_source,
             expected_current_object_identity: completion_snapshot.current_object_identity,
             conditional_completion: false,

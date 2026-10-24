@@ -70,16 +70,6 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn prepare_stored_system_metadata(
-        system_metadata: &SystemMetadata,
-        write_encryption: &ActiveWriteEncryption,
-    ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
-        let (system_metadata_blob, checksum) =
-            Self::prepare_unsealed_stored_system_metadata(system_metadata)?;
-        let stored_encryption = write_encryption.seal_checksum_metadata(checksum.as_ref())?;
-        Ok((system_metadata_blob, stored_encryption))
-    }
-
     pub(super) fn prepare_unsealed_stored_system_metadata(
         system_metadata: &SystemMetadata,
     ) -> Result<(SerializedSystemMetadataBlob, Option<ObjectChecksumMetadata>), ServerError> {

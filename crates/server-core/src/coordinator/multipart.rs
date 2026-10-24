@@ -935,9 +935,11 @@ impl Coordinator {
                     val.clone(),
                 );
             }
-            let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
-                &system_metadata,
-                &multipart_write_encryption,
+            let (system_metadata_bytes, checksum) =
+                Self::prepare_unsealed_stored_system_metadata(&system_metadata)?;
+            let final_encryption = multipart_write_encryption.seal_multipart_terminal_encryption(
+                completion_snapshot.object_encryption_subject(),
+                checksum.as_ref(),
             )?;
             let managed_encryption = final_encryption.managed_encryption_algorithm();
 
@@ -953,8 +955,8 @@ impl Coordinator {
             let completion_result = match forced_commit_failure {
                 Some(error) => Err(error),
                 None => multipart_route.complete_multipart_upload_commit_serialized(
-                    completion_snapshot.into_commit_request(
-                        storage::CompleteMultipartCommitInput {
+                    completion_snapshot
+                        .into_commit_request(storage::CompleteMultipartCommitInput {
                             completion_fingerprint: multipart_completion_fingerprint(req.parts),
                             versioning: bucket_info.versioning,
                             size: total_size,
@@ -966,8 +968,8 @@ impl Coordinator {
                             )?,
                             encryption: final_encryption,
                             conditional_completion: !req.cond.is_empty(),
-                        },
-                    ),
+                        })
+                        .map_err(crate::sse::object_encryption_state_error)?,
                 ),
             };
             let completion_outcome = match completion_result {

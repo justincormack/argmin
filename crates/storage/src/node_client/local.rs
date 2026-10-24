@@ -5791,6 +5791,17 @@ impl LocalStorageNodeClient {
             }
             .into());
         }
+        if !complete.matches_durable_upload_encryption(
+            &upload,
+            request
+                .bucket_write_reservation
+                .bucket_incarnation_generation,
+        ) {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "multipart completion encryption does not match the durable upload subject"
+                    .to_string(),
+            });
+        }
         if complete.part_records.is_empty() {
             return Err(MetadataError::InvariantViolation {
                 context: "complete multipart command empty parts",

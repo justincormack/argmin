@@ -1271,9 +1271,27 @@
             assert_eq!(cleanup.upload, multipart_upload);
             (completion_snapshot, cleanup)
         });
+        let completion_subject = crate::ObjectEncryptionSubject::standard_object(
+            complete_multipart_proof.bucket_incarnation_generation,
+            &bucket,
+            &key,
+            multipart_upload.object_generation_id,
+            &multipart_upload.encryption,
+        );
+        let completion_encryption = multipart_upload
+            .encryption
+            .bind_committed_object_ciphertexts(
+                &completion_subject,
+                [0x73; 12],
+                [0x74; 48],
+                [0; 12],
+                Vec::new(),
+            )
+            .unwrap();
         let completion_snapshot = crate::AuthorizedMultipartCompletionSnapshot::new(
             completion_snapshot,
             multipart_upload.clone(),
+            completion_subject,
         );
         let completion_request =
             completion_snapshot.into_commit_request(crate::CompleteMultipartCommitInput {
@@ -1285,9 +1303,10 @@
                 etag_crc64: [0x72; 8],
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::tests::metadata_only_test_encryption(),
+                encryption: completion_encryption,
                 conditional_completion: false,
-            });
+            })
+            .unwrap();
         assert_eq!(
             completion_request.generation_id,
             multipart_upload.object_generation_id

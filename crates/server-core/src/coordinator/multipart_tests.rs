@@ -6558,6 +6558,18 @@ fn complete_multipart_sse_c_without_checksum_allows_missing_headers() {
     assert_eq!(complete.checksum_algorithm, None);
     assert_eq!(complete.checksum_type, None);
     assert_eq!(complete.checksum_value, None);
+    let persisted = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            VersionId::Null,
+        )
+        .unwrap();
+    assert!(
+        !persisted.is_object_subject_bound(),
+        "headerless SSE-C completion must retain the exact provisional upload wrap because the customer key is unavailable"
+    );
 }
 
 // ── Streaming upload session tests ──────────────────────────────────

@@ -1215,6 +1215,46 @@ impl<'admission> ActivePutObjectRoute<'admission> {
 }
 
 impl<'admission> ActiveMultipartObjectRoute<'admission> {
+    /// Bind a storage-loaded multipart upload to the authoritative bucket
+    /// incarnation used by this request before any terminal encryption is
+    /// prepared.
+    pub fn authorize_multipart_upload_completion(
+        &self,
+        candidate: crate::MultipartUploadCompletionCandidate,
+        bucket_incarnation: &BucketIncarnationReadSubject,
+    ) -> Result<
+        (
+            crate::AuthorizedMultipartUploadCompletion,
+            crate::MultipartUploadCompletionContext,
+        ),
+        crate::MultipartManagementFailure,
+    > {
+        self.admission
+            .require_valid_now_raw()
+            .map_err(ObjectPgActionError::from)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)?;
+        let upload = candidate.record();
+        if upload.bucket != self.bucket
+            || upload.key != self.key
+            || !bucket_incarnation.matches_bucket(&self.bucket)
+        {
+            return Err(crate::MultipartManagementFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "multipart completion authority does not match the admitted object route"
+                        .to_string(),
+                },
+            ));
+        }
+        let object_encryption_subject = ObjectEncryptionSubject::standard_object(
+            bucket_incarnation.bucket_incarnation_generation(),
+            &upload.bucket,
+            &upload.key,
+            upload.object_generation_id,
+            &upload.encryption,
+        );
+        Ok(candidate.into_authorized_completion(object_encryption_subject))
+    }
+
     fn load_stream_part_generation(
         &self,
         session_id: &SessionId,
@@ -2474,7 +2514,7 @@ impl ActiveMultipartObjectRoute<'_> {
         requested_part_numbers: &[u32],
     ) -> Result<crate::AuthorizedMultipartCompletionSnapshot, crate::MultipartCompletionFailure>
     {
-        let upload = authorized_upload.into_record();
+        let (upload, object_encryption_subject) = authorized_upload.into_record_and_subject();
         let internal_authorized_upload =
             AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
         let snapshot = self
@@ -2488,7 +2528,9 @@ impl ActiveMultipartObjectRoute<'_> {
             )
             .map_err(crate::MultipartCompletionFailure::from_object_pg_action)?;
         Ok(crate::AuthorizedMultipartCompletionSnapshot::new(
-            snapshot, upload,
+            snapshot,
+            upload,
+            object_encryption_subject,
         ))
     }
 

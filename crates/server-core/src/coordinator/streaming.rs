@@ -25,7 +25,8 @@ use crate::error::ServerError;
 #[cfg(not(any(test, feature = "test-utils")))]
 use crate::sse::{prepare_managed_encryption_write, prepare_sse_customer_write};
 use crate::sse::{
-    resume_managed_encryption_write, resume_sse_customer_write, validate_sse_customer_read,
+    resume_managed_encryption_write, resume_sse_customer_write,
+    validate_sse_customer_completion_replay, validate_sse_customer_read,
     ManagedEncryptionWriteContext, SseCustomerRequest, SseCustomerResponseHeaders,
     SseCustomerSegmentScope, SseCustomerWriteContext,
 };
@@ -433,6 +434,36 @@ impl Coordinator {
                     });
                 }
                 Ok(None)
+            }
+        }
+    }
+
+    pub(super) fn validate_multipart_completion_replay_encryption(
+        &self,
+        encryption: &ObjectEncryption,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<(), ServerError> {
+        match encryption {
+            ObjectEncryption::SseCustomer(state) => {
+                let Some(request) = sse_customer else {
+                    return Ok(());
+                };
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                validate_sse_customer_completion_replay(validator, state, request)
+            }
+            ObjectEncryption::SseS3(_) => {
+                if sse_customer.is_some() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers may not be used for a non-SSE-C multipart upload"
+                            .to_string(),
+                    });
+                }
+                Ok(())
             }
         }
     }

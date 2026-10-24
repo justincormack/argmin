@@ -3646,6 +3646,27 @@ impl super::StorageCluster {
                 }
             }
 
+            let upload = match multipart_lookup_route
+                .load_in_progress_multipart_upload(&upload_id)
+            {
+                Ok(upload) => upload,
+                Err(error) => {
+                    release_bucket_write_proof!()?;
+                    return Err(error);
+                }
+            };
+            if !req.matches_durable_upload_encryption(
+                &upload,
+                bucket_write_reservation.bucket_incarnation_generation,
+            ) {
+                release_bucket_write_proof!()?;
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason:
+                        "multipart completion encryption does not match the durable upload subject"
+                            .to_string(),
+                });
+            }
+
             if req.part_records.is_empty() {
                 release_bucket_write_proof!()?;
                 return Err(MetadataError::InvariantViolation {

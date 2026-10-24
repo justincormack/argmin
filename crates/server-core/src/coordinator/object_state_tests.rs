@@ -6243,26 +6243,74 @@ fn upload_part_and_read_cobblestone_object(
         },
     )
     .unwrap();
-    coord
-        .complete_multipart_upload(&CompleteMultipartUploadRequest {
-            upload: multipart_object_request_with_expected_owner(
-                "bucket",
-                key,
-                &upload.upload_id,
-                test_requester(),
-                None,
+    let completed_parts = [CompletePart {
+        part_number: 1,
+        etag: part.etag,
+        checksum: None,
+    }];
+    let completion = CompleteMultipartUploadRequest {
+        upload: multipart_object_request_with_expected_owner(
+            "bucket",
+            key,
+            &upload.upload_id,
+            test_requester(),
+            None,
+        ),
+        parts: &completed_parts,
+        claimed_checksum: None,
+        expected_object_size: Some(u64::try_from(payload.len()).unwrap()),
+        cond: NO_WRITE,
+        sse_customer,
+    };
+    coord.complete_multipart_upload(&completion).unwrap();
+    coord.complete_multipart_upload(&completion).expect(
+        "an exact completion replay must validate committed encryption without resuming a write",
+    );
+    if sse_customer.is_some() {
+        let wrong_sse_customer = crate::sse::SseCustomerRequest::new(
+            [1u8; crate::sse::SSE_C_CUSTOMER_KEY_LEN],
+            "wrong".to_string(),
+        );
+        let replay_error = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    key,
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &completed_parts,
+                claimed_checksum: None,
+                expected_object_size: Some(u64::try_from(payload.len()).unwrap()),
+                cond: NO_WRITE,
+                sse_customer: Some(&wrong_sse_customer),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                &replay_error,
+                ServerError::InvalidRequest { reason }
+                    if reason
+                        == "The provided encryption parameters did not match the ones used originally."
             ),
-            parts: &[CompletePart {
-                part_number: 1,
-                etag: part.etag,
-                checksum: None,
-            }],
-            claimed_checksum: None,
-            expected_object_size: Some(u64::try_from(payload.len()).unwrap()),
-            cond: NO_WRITE,
-            sse_customer,
-        })
+            "wrong-key completion replay must preserve completion's InvalidRequest mapping, got {replay_error:?}"
+        );
+    }
+
+    let persisted = coord
+        .storage_node()
+        .test_observe_object_payload_codec(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key(key),
+            VersionId::Null,
+        )
         .unwrap();
+    assert!(persisted.is_cobblestone_256_segment_v1());
+    assert!(
+        persisted.is_object_subject_bound(),
+        "multipart completion must bind DEK and checksum ciphertext to the exact object subject"
+    );
 
     let object = coord
         .get_object(&GetObjectRequest {

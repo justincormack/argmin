@@ -3065,6 +3065,23 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     assert_eq!(cleanup.upload, upload);
     assert_object_payload_decode!(wrong_multipart_abort_route.load_cleanup());
 
+    let encryption_subject = crate::ObjectEncryptionSubject::standard_object(
+        1,
+        &bucket,
+        &key,
+        upload.object_generation_id,
+        &upload.encryption,
+    );
+    let terminal_encryption = upload
+        .encryption
+        .bind_committed_object_ciphertexts(
+            &encryption_subject,
+            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
     let complete_request = CompleteMultipartCommitRequest {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -3081,7 +3098,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: metadata_only_test_encryption(),
+        encryption: terminal_encryption,
         expected_stale_payload_source: snapshot.stale_payload_source.clone(),
         expected_current_object_identity: snapshot.current_object_identity,
         conditional_completion: false,
@@ -6391,6 +6408,23 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         generation_id: GenerationId::new(3).unwrap(),
     };
     let part = test_multipart_part_record(upload_id.clone(), 1);
+    let encryption_subject = crate::ObjectEncryptionSubject::standard_object(
+        1,
+        &bucket,
+        &key,
+        upload.object_generation_id,
+        &upload.encryption,
+    );
+    let terminal_encryption = upload
+        .encryption
+        .bind_committed_object_ciphertexts(
+            &encryption_subject,
+            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
     let request = CompleteMultipartCommitRequest {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -6407,7 +6441,7 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: metadata_only_test_encryption(),
+        encryption: terminal_encryption,
         expected_stale_payload_source: None,
         expected_current_object_identity: Some(current_identity),
         conditional_completion: true,

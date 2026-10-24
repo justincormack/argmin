@@ -1544,10 +1544,16 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
         .unwrap();
     let authorized_list_parts =
         crate::AuthorizedMultipartUploadListParts::assume_authorized(upload.clone());
-    let authorized_completion =
-        crate::MultipartUploadCompletionCandidate::from_record(upload.clone())
-            .into_authorized_completion()
-            .0;
+    let bucket_incarnation = cluster
+        .load_bucket_snapshot(&bucket, crate::BucketSnapshotRequest::default())
+        .unwrap()
+        .bucket_incarnation_read_subject();
+    let crossed_bucket = crate::BucketName::try_from("crossed-bucket".to_string()).unwrap();
+    create_test_bucket(&cluster, &crossed_bucket);
+    let crossed_bucket_incarnation = cluster
+        .load_bucket_snapshot(&crossed_bucket, crate::BucketSnapshotRequest::default())
+        .unwrap()
+        .bucket_incarnation_read_subject();
 
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
@@ -1557,6 +1563,27 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let crossed_route = admission
         .active_multipart_object_route(&bucket, &crossed_key)
         .unwrap();
+    let crossed_bucket_error = crossed_route
+        .authorize_multipart_upload_completion(
+            crate::MultipartUploadCompletionCandidate::from_record(upload.clone()),
+            &crossed_bucket_incarnation,
+        )
+        .unwrap_err();
+    assert_eq!(
+        crossed_bucket_error.kind(),
+        crate::MultipartManagementFailureKind::InternalError
+    );
+    assert_eq!(
+        crossed_bucket_error.diagnostic_cause_label(),
+        "invalid_request"
+    );
+    let authorized_completion = crossed_route
+        .authorize_multipart_upload_completion(
+            crate::MultipartUploadCompletionCandidate::from_record(upload.clone()),
+            &bucket_incarnation,
+        )
+        .unwrap()
+        .0;
     assert_eq!(
         crossed_route
             .load_in_progress_multipart_upload(&upload_id)

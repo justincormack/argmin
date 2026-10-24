@@ -91,6 +91,55 @@ fn multipart_generation_subject_matches_only_its_completed_version() {
 }
 
 #[test]
+fn multipart_completion_rejects_provisional_encryption_before_object_command_allocation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (valid_request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "provisionalterminal");
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &valid_request.upload_id)
+        .unwrap();
+    let mut provisional_request = valid_request.clone();
+    provisional_request.encryption = upload.encryption;
+    let next_log_index_before = map.test_next_metadata_command_log_index(PgId::new(object_pg));
+
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(provisional_request)
+        .expect_err("provisional upload encryption must not authorize terminal publication");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::InvalidRequest { ref reason }
+            if reason == "multipart completion encryption does not match the durable upload subject"
+    ));
+    assert_eq!(
+        map.test_next_metadata_command_log_index(PgId::new(object_pg)),
+        next_log_index_before,
+        "rejected encryption must not allocate an object metadata command"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &valid_request.upload_id)
+        .expect("rejected encryption must preserve the multipart upload");
+
+    cluster
+        .complete_multipart_upload_commit_serialized(valid_request)
+        .expect("the rejected attempt must release its auxiliary reservation");
+}
+
+#[test]
 fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

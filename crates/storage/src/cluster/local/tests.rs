@@ -1304,6 +1304,27 @@ fn seed_streamed_multipart_completion_with_existing(
     let upload = cluster
         .load_in_progress_multipart_upload(bucket, key, &upload_id)
         .unwrap();
+    let bucket_snapshot = cluster
+        .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let bucket_subject = bucket_snapshot.bucket_incarnation_read_subject();
+    let object_subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_subject.bucket_incarnation_generation(),
+        bucket,
+        key,
+        upload.object_generation_id,
+        &upload.encryption,
+    );
+    let committed_encryption = upload
+        .encryption
+        .bind_committed_object_ciphertexts(
+            &object_subject,
+            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap();
     let (_shard_keys, part, mut expected_segment, _encrypted) = upload_streamed_test_multipart_part(
         cluster,
         bucket,
@@ -1333,7 +1354,7 @@ fn seed_streamed_multipart_completion_with_existing(
             metadata_blob: Some(upload.metadata_blob),
             system_metadata_blob: Some(upload.system_metadata_blob),
             object_lock: upload.object_lock,
-            encryption: upload.encryption,
+            encryption: committed_encryption,
             expected_stale_payload_source: None,
             expected_current_object_identity: None,
             conditional_completion: false,

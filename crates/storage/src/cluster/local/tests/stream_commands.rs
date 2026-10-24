@@ -8787,6 +8787,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     let upload = cluster
         .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
         .unwrap();
+    let upload_encryption = upload.encryption.clone();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -8799,7 +8800,12 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     // removes every copied segment payload when completion wins the slot.
     let first_payload = b"copied source segment one";
     let first_encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(first_payload, 2, 0);
-    assert_eq!(req.encryption, first_encrypted.encryption);
+    assert_eq!(upload_encryption, first_encrypted.encryption);
+    assert_eq!(
+        req.encryption.key_binding(),
+        crate::ObjectEncryptionKeyBinding::ObjectSubjectV2,
+        "completion must publish the committed successor of the provisional upload encryption"
+    );
     let first_segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
@@ -8811,7 +8817,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     let second_payload = b"copied source segment two";
     let second_encrypted =
         crate::tests::sse_s3_multipart_segment_test_fixture(second_payload, 2, 1);
-    assert_eq!(req.encryption, second_encrypted.encryption);
+    assert_eq!(upload_encryption, second_encrypted.encryption);
     let second_segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,

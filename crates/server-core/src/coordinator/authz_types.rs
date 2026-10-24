@@ -234,30 +234,6 @@ impl ActiveWriteEncryption {
         }
     }
 
-    pub(super) fn seal_checksum_metadata(
-        &self,
-        checksum: Option<&ObjectChecksumMetadata>,
-    ) -> Result<ObjectEncryption, ServerError> {
-        match &self.kind {
-            ActiveWriteEncryptionKind::SseCustomer {
-                write: Some(write), ..
-            } => write.seal_checksum_metadata(checksum),
-            ActiveWriteEncryptionKind::SseCustomer { state, write: None } => {
-                if checksum.is_none() {
-                    Ok(ObjectEncryption::SseCustomer(state.clone()))
-                } else {
-                    Err(ServerError::InvalidRequest {
-                        reason: "SSE-C headers are required when storing checksum metadata for this object"
-                            .to_string(),
-                    })
-                }
-            }
-            ActiveWriteEncryptionKind::Managed { write, .. } => {
-                write.seal_checksum_metadata(checksum)
-            }
-        }
-    }
-
     pub(super) fn seal_committed_object_encryption(
         &self,
         subject: &storage::ObjectEncryptionSubject,
@@ -276,6 +252,26 @@ impl ActiveWriteEncryption {
                         .to_string(),
                 })
             }
+        }
+    }
+
+    pub(super) fn seal_multipart_terminal_encryption(
+        &self,
+        subject: &storage::ObjectEncryptionSubject,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        match &self.kind {
+            ActiveWriteEncryptionKind::SseCustomer { state, write: None } if checksum.is_none() => {
+                Ok(ObjectEncryption::SseCustomer(state.clone()))
+            }
+            ActiveWriteEncryptionKind::SseCustomer { write: None, .. } => {
+                Err(ServerError::InvalidRequest {
+                    reason:
+                        "SSE-C headers are required when storing checksum metadata for this object"
+                            .to_string(),
+                })
+            }
+            _ => self.seal_committed_object_encryption(subject, checksum),
         }
     }
 

@@ -1487,6 +1487,43 @@ Implementation update (2026-10-24, streamed-object terminal subject binding):
   staged; CompleteMultipartUpload must perform the corresponding terminal object transition before
   the Phase 2 subject-binding and all-write-path items can close.
 
+Implementation update (2026-10-24, multipart terminal subject binding):
+
+- CompleteMultipartUpload now performs the same one-way terminal transition whenever the crypto
+  owner has the DEK-unwrapping authority required to do so. The admitted
+  multipart route combines the authoritative bucket-incarnation subject with the upload's durable,
+  non-recycling object generation and complete provisional encryption state, then transfers the
+  resulting opaque object subject in a non-cloneable completion capability. Server-core seals the
+  final DEK and checksum metadata only through that subject; the upload remains provisional while
+  parts are staged.
+- The authorized completion snapshot rejects a prepared encryption state that is not the committed
+  successor of its exact subject. Before any multipart barrier or object command is published, the
+  storage operation also compares the request with the currently durable upload and the acquired
+  bucket-incarnation reservation. The fresh command builder repeats that comparison while holding
+  the object-PG mutation lock, closing the authorization-to-construction race.
+- Same-PG crossed-route and crossed-bucket-incarnation canaries reject authority substitution. A
+  provisional terminal request is rejected without allocating an object metadata command or
+  changing the upload, and a following valid completion proves the auxiliary reservation was
+  released. Production SSE-S3 and SSE-C UploadPart canaries require the completed object to persist
+  `ObjectSubjectV2`, then decrypt its payload and sealed checksum through GetObject.
+- AWS permits an SSE-C CompleteMultipartUpload without repeating customer-key headers when no
+  checksum metadata must be sealed. The server cannot safely unwrap or rewrap the customer DEK in
+  that case. A narrowly typed storage rule therefore permits only the byte-for-byte exact
+  provisional SSE-C state already carried by that upload; managed encryption, SSE-C completion
+  with headers, crossed encryption, and altered provisional state cannot take this branch. The
+  existing AWS-facing semantic regression is retained, and an owner-local observation pins that
+  the exceptional completed object remains provisional.
+- Exact completion replay validates any supplied SSE-C headers with the completion/write-side
+  validator without reopening the DEK writer. This preserves CompleteMultipartUpload's
+  `InvalidRequest` response for a wrong customer key instead of changing replay to the read-side
+  `AccessDenied` mapping.
+- This uses the existing SSE-C v6/SSE-S3 v4 representation and therefore does not change a durable
+  encoding. All terminal publishers select `ObjectSubjectV2` except that AWS-required headerless
+  SSE-C completion case. Eliminating even that exception would require precomputing and durably
+  retaining an object-subject-wrapped DEK while the customer key is available; that is a separate
+  format/design slice, not permission to invent a key or change AWS behavior. Central generic
+  apply/recovery validation of both allowed terminal forms remains the next subject-binding slice.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

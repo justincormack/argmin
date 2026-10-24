@@ -105,7 +105,7 @@ impl<'a> AuthorizedSegmentRead<'a> {
     }
 }
 
-fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerError {
+pub(crate) fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerError {
     match error {
         ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong => {
             ServerError::InternalError {
@@ -1143,6 +1143,15 @@ fn validate_sse_customer_write(
         });
     }
     Ok(request.response_headers())
+}
+
+pub(crate) fn validate_sse_customer_completion_replay(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+) -> Result<(), ServerError> {
+    validate_sse_customer_write(validator, state, request)?;
+    Ok(())
 }
 
 fn sse_customer_validator_key_unavailable() -> ServerError {

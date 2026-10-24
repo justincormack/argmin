@@ -423,11 +423,9 @@ impl Coordinator {
                     &bucket_info,
                     replay.encryption().uses_sse_customer_headers(),
                 )?;
-                self.resume_write_encryption(
+                self.validate_multipart_completion_replay_encryption(
                     replay.encryption(),
                     req.sse_customer,
-                    SseCustomerSegmentScope::object(),
-                    false,
                 )?;
                 return Ok(AuthorizedCompleteMultipartUpload::Replay {
                     lifecycle,
@@ -482,7 +480,12 @@ impl Coordinator {
             false,
         )?;
 
-        let (upload, completion_context) = upload.into_authorized_completion();
+        let (upload, completion_context) = multipart_route
+            .authorize_multipart_upload_completion(
+                upload,
+                bucket_handle.bucket_incarnation_read_subject(),
+            )
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
         Ok(AuthorizedCompleteMultipartUpload::InProgress {
             bucket_info: bucket_info.into_inner(),
             lifecycle,

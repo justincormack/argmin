@@ -1952,6 +1952,26 @@ impl ObjectEncryptionSubject {
                 .is_committed_successor(encryption)
     }
 
+    /// Returns whether terminal multipart publication may persist `encryption`.
+    ///
+    /// CompleteMultipartUpload does not require repeated SSE-C headers when it
+    /// has no checksum metadata to seal. In that AWS-compatible case the
+    /// crypto owner cannot unwrap and rewrap the customer DEK, so storage may
+    /// retain only the exact provisional SSE-C state already persisted on the
+    /// upload. Every other terminal state must be the committed successor of
+    /// this subject.
+    pub(crate) fn authorizes_multipart_terminal_encryption(
+        &self,
+        upload_encryption: &ObjectEncryption,
+        terminal_encryption: &ObjectEncryption,
+    ) -> bool {
+        self.matches_committed_encryption(terminal_encryption)
+            || (matches!(upload_encryption, ObjectEncryption::SseCustomer(_))
+                && upload_encryption.key_binding() == ObjectEncryptionKeyBinding::ProvisionalV1
+                && terminal_encryption == upload_encryption
+                && self.matches_encryption(upload_encryption))
+    }
+
     /// Derives the purpose-separated DEK-wrap subject from this exact object
     /// identity.
     #[must_use]
@@ -7410,9 +7430,14 @@ impl MultipartUploadCompletionCandidate {
         &self.0.encryption
     }
 
+    pub(crate) fn record(&self) -> &MultipartUploadRecord {
+        &self.0
+    }
+
     #[must_use]
-    pub fn into_authorized_completion(
+    pub(crate) fn into_authorized_completion(
         self,
+        object_encryption_subject: ObjectEncryptionSubject,
     ) -> (
         AuthorizedMultipartUploadCompletion,
         MultipartUploadCompletionContext,
@@ -7423,7 +7448,10 @@ impl MultipartUploadCompletionCandidate {
             object_lock: self.0.object_lock,
         };
         (
-            AuthorizedMultipartUploadCompletion::assume_authorized(self.0),
+            AuthorizedMultipartUploadCompletion::assume_authorized(
+                self.0,
+                object_encryption_subject,
+            ),
             context,
         )
     }
@@ -7445,18 +7473,28 @@ impl std::fmt::Debug for MultipartUploadCompletionCandidate {
 /// fn require_clone<T: Clone>() {}
 /// require_clone::<AuthorizedMultipartUploadCompletion>();
 /// ```
-pub struct AuthorizedMultipartUploadCompletion(
-    MultipartUploadRecord,
-    LinearMultipartCapabilityMarker,
-);
+pub struct AuthorizedMultipartUploadCompletion {
+    upload: MultipartUploadRecord,
+    object_encryption_subject: ObjectEncryptionSubject,
+    _linear: LinearMultipartCapabilityMarker,
+}
 
 impl AuthorizedMultipartUploadCompletion {
-    pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
-        Self(upload, LinearMultipartCapabilityMarker)
+    pub(crate) fn assume_authorized(
+        upload: MultipartUploadRecord,
+        object_encryption_subject: ObjectEncryptionSubject,
+    ) -> Self {
+        Self {
+            upload,
+            object_encryption_subject,
+            _linear: LinearMultipartCapabilityMarker,
+        }
     }
 
-    pub(crate) fn into_record(self) -> MultipartUploadRecord {
-        self.0
+    pub(crate) fn into_record_and_subject(
+        self,
+    ) -> (MultipartUploadRecord, ObjectEncryptionSubject) {
+        (self.upload, self.object_encryption_subject)
     }
 }
 
@@ -7803,6 +7841,8 @@ struct MultipartCompletionCommitDefaults {
 pub struct AuthorizedMultipartCompletionSnapshot {
     snapshot: MultipartCompletionSnapshot,
     defaults: MultipartCompletionCommitDefaults,
+    upload_encryption: ObjectEncryption,
+    object_encryption_subject: ObjectEncryptionSubject,
     _linear: LinearMultipartCapabilityMarker,
 }
 
@@ -7810,9 +7850,11 @@ impl AuthorizedMultipartCompletionSnapshot {
     pub(crate) fn new(
         snapshot: MultipartCompletionSnapshot,
         upload: MultipartUploadRecord,
+        object_encryption_subject: ObjectEncryptionSubject,
     ) -> Self {
         Self {
             snapshot,
+            upload_encryption: upload.encryption.clone(),
             defaults: MultipartCompletionCommitDefaults {
                 owner: upload.owner,
                 acl_grants: upload.acl_grants,
@@ -7820,6 +7862,7 @@ impl AuthorizedMultipartCompletionSnapshot {
                 tags: upload.tags,
                 metadata_blob: upload.metadata_blob,
             },
+            object_encryption_subject,
             _linear: LinearMultipartCapabilityMarker,
         }
     }
@@ -7834,13 +7877,26 @@ impl AuthorizedMultipartCompletionSnapshot {
         self.snapshot.parts()
     }
 
+    /// Returns the exact completed-object subject under which the upload's
+    /// DEK and checksum metadata must be sealed.
     #[must_use]
+    pub fn object_encryption_subject(&self) -> &ObjectEncryptionSubject {
+        &self.object_encryption_subject
+    }
+
     pub fn into_commit_request(
         self,
         input: CompleteMultipartCommitInput,
-    ) -> CompleteMultipartCommitRequest {
-        self.snapshot
-            .into_commit_request_with_defaults(input, self.defaults)
+    ) -> Result<CompleteMultipartCommitRequest, ObjectEncryptionStateError> {
+        if !self
+            .object_encryption_subject
+            .authorizes_multipart_terminal_encryption(&self.upload_encryption, &input.encryption)
+        {
+            return Err(ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch);
+        }
+        Ok(self
+            .snapshot
+            .into_commit_request_with_defaults(input, self.defaults))
     }
 }
 
@@ -7936,6 +7992,27 @@ impl std::fmt::Debug for CompleteMultipartCommitRequest {
             .field("size", &self.size)
             .field("conditional_completion", &self.conditional_completion)
             .finish_non_exhaustive()
+    }
+}
+
+impl CompleteMultipartCommitRequest {
+    pub(crate) fn matches_durable_upload_encryption(
+        &self,
+        upload: &MultipartUploadRecord,
+        bucket_incarnation_generation: u64,
+    ) -> bool {
+        upload.bucket == self.bucket
+            && upload.key == self.key
+            && upload.upload_id == self.upload_id
+            && upload.object_generation_id == self.generation_id
+            && ObjectEncryptionSubject::standard_object(
+                bucket_incarnation_generation,
+                &self.bucket,
+                &self.key,
+                self.generation_id,
+                &upload.encryption,
+            )
+            .authorizes_multipart_terminal_encryption(&upload.encryption, &self.encryption)
     }
 }
 
@@ -9250,6 +9327,13 @@ mod tests {
                 .expect("CRC32 is a valid multipart checksum configuration"),
         );
         let upload_id = upload.upload_id.clone();
+        let object_encryption_subject = ObjectEncryptionSubject::standard_object(
+            1,
+            &upload.bucket,
+            &upload.key,
+            upload.object_generation_id,
+            &upload.encryption,
+        );
         let lookup = MultipartUploadCompletionLookup::from_management_lookup(
             MultipartUploadManagementLookup::InProgress(Box::new(upload)),
         );
@@ -9268,9 +9352,9 @@ mod tests {
             "MultipartUploadCompletionCandidate { .. }"
         );
 
-        let (authorized, context) = candidate.into_authorized_completion();
-        assert_eq!(authorized.0.upload_id, upload_id);
-        assert_eq!(authorized.0.key.as_str(), "private-durable-key");
+        let (authorized, context) = candidate.into_authorized_completion(object_encryption_subject);
+        assert_eq!(authorized.upload.upload_id, upload_id);
+        assert_eq!(authorized.upload.key.as_str(), "private-durable-key");
         assert_eq!(
             context.checksum_config().map(|config| config.algorithm()),
             Some(ChecksumAlgorithm::Crc32)
@@ -10071,6 +10155,29 @@ mod tests {
                 .unwrap_err(),
             ObjectEncryptionStateError::ObjectEncryptionSubjectMismatch
         );
+    }
+
+    #[test]
+    fn multipart_terminal_encryption_allows_only_exact_provisional_sse_c_exception() {
+        let bucket = BucketName::try_from("multipart-terminal-bucket").unwrap();
+        let key = ObjectKey::try_from("object").unwrap();
+        let generation = GenerationId::new(29).unwrap();
+        let provisional = ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+            7, [1; 16], [2; 32], [3; 16], [4; 12], [5; 48], [6; 6],
+        ));
+        let subject =
+            ObjectEncryptionSubject::standard_object(13, &bucket, &key, generation, &provisional);
+        assert!(subject.authorizes_multipart_terminal_encryption(&provisional, &provisional));
+
+        let crossed = ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+            7, [1; 16], [2; 32], [3; 16], [4; 12], [9; 48], [6; 6],
+        ));
+        assert!(!subject.authorizes_multipart_terminal_encryption(&provisional, &crossed));
+
+        let managed = ObjectEncryption::SseS3(SseS3ObjectState::new(7, [4; 12], [5; 48], [6; 6]));
+        let managed_subject =
+            ObjectEncryptionSubject::standard_object(13, &bucket, &key, generation, &managed);
+        assert!(!managed_subject.authorizes_multipart_terminal_encryption(&managed, &managed));
     }
 
     #[test]
