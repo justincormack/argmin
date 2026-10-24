@@ -850,13 +850,11 @@ Implementation update (2026-10-21):
   generation allocator advances. This supplied the complete storage-owned object identity used to
   mint the standard-object encryption subject without letting the coordinator assemble its fields.
 - The direct-PUT reservation now consumes that identity to mint a non-cloneable, opaque
-  `ObjectEncryptionSubject` before encryption. Its frozen V1 canonical encoding is binary,
+  `ObjectEncryptionSubject` before encryption. Its frozen V2 canonical encoding is binary,
   versioned, profile-tagged, length-prefixed, and binds the current profile, the encryption
-  instance, bucket incarnation, bucket, key, and reserved payload generation. The current
-  encryption instance identifier reuses the already-random, immutable, persisted 96-bit DEK-wrap
-  nonce; the later durable-profile slice may replace that representation only through an explicit
-  context-version decision. The identifier prefixes that nonce with the durable SSE-C/SSE-S3 mode
-  tag so even a deliberately repeated nonce cannot cross key modes. Exact encoding, malformed
+  instance, bucket incarnation, bucket, key, and reserved payload generation. The identifier
+  prefixes a persisted 128-bit encryption-instance value with the durable SSE-C/SSE-S3 mode tag so
+  even a deliberately repeated identity cannot cross key modes. Exact encoding, malformed
   encoding, and independently crossed-field fixtures pin the codec.
 - The opaque capability separately retains an exact binding to all immutable encryption material:
   wrapping/validator key identifiers and validator state where applicable, wrap salt and nonce,
@@ -1025,9 +1023,9 @@ Implementation update (2026-10-22, durable profile identity):
   canonical-state 7, and checkpoint 5 remained unchanged because their grammar contained a
   self-describing encryption-state blob. Append-only
   RPC, metadata-command, and checkpoint composites retain the previous SSE-C-v3/SSE-S3-v1 evidence
-  and pin the current SSE-C-v4/SSE-S3-v2 bytes. The exact historical append-preparation SSE-S3-v1
-  payload remains a rejection specimen beside the current v2 version-vector fixture. No predecessor
-  encryption-state reader was added.
+  and pin the then-current SSE-C-v4/SSE-S3-v2 bytes. The exact historical append-preparation
+  SSE-S3-v1 payload remains a rejection specimen beside the current v2 version-vector fixture. No
+  predecessor encryption-state reader was added.
 
 Implementation update (2026-10-22, integrity-witness construction boundary):
 
@@ -1385,6 +1383,28 @@ Implementation update (2026-10-23, purpose-separated object subjects):
   explicit provisional-session versus committed-object wrap binding, perform the one-way terminal
   rewrap/checksum seal for every write operation, and mint the corresponding read subject for HEAD,
   GET, listing, copy, restart, and retained-route paths before the open Phase 2 checkbox is closed.
+
+Implementation update (2026-10-23, stable encryption-instance identity):
+
+- SSE-C state advances from v4 to v5 and SSE-S3 state from v2 to v3. Both persist a dedicated
+  random 128-bit encryption-instance identity independently of the DEK-wrap nonce. Production
+  writers generate both values separately; the mode-tagged instance remains stable when terminal
+  publication later rewraps the same DEK with fresh nonce/ciphertext under the committed object
+  subject.
+- The owner-minted object subject and its immutable encryption binding consume that stable identity.
+  Crossed-instance tests hold wrap nonce, wrapping-key identity, wrapped DEK, nonce prefix, codec,
+  and logical object identity constant, proving the new field is independently enforced.
+- Expanding the mode-tagged encryption-instance identity from 13 to 17 bytes advances the separate
+  object-encryption-subject grammar from V1 to V2. Exact V1 object and purpose-subject bytes remain
+  rejection evidence, and the former V1 Cobblestone context/ciphertext vector remains decryptable
+  only in the owner-local evidence test. New V2 vectors are appended rather than replacing that
+  contract; production accepts and emits only V2.
+- The independently self-describing nested-state bump leaves PG schema 9, metadata-command 11,
+  canonical-state 8, metadata-checkpoint 6, and storage-RPC 27 unchanged. Exact former v4/v2 state,
+  metadata-command, RPC, append-preparation, canonical digest, and checkpoint evidence remains
+  immutable and rejection-only beside new v5/v3 current vectors.
+- This is the durable prerequisite for the one-way terminal DEK rewrap. It does not yet change the
+  legacy DEK-wrap/checksum AAD or perform the rewrap; those remain the next Phase 2 slice.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

@@ -13,10 +13,11 @@ use argmin_crypto::hmac::Sha256Key;
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
     ObjectEncryption, ObjectEncryptionStateError, SegmentEncryptionSubject, SegmentPayloadCodec,
-    SseCustomerObjectState, SseS3ObjectState, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
-    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
-    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
+    SseCustomerObjectState, SseS3ObjectState, OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN,
+    SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN,
+    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
+    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN,
+    SSE_S3_WRAP_NONCE_LEN,
 };
 
 use crate::error::ServerError;
@@ -655,6 +656,13 @@ fn prepare_sse_customer_write_with_payload_codec(
         reason: "failed to generate SSE-C wrap nonce".to_string(),
     })?;
 
+    let mut encryption_instance_id = [0u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN];
+    argmin_crypto::random::fill(&mut encryption_instance_id).map_err(|_| {
+        ServerError::InternalError {
+            reason: "failed to generate SSE-C encryption instance identity".to_string(),
+        }
+    })?;
+
     let mut dek = [0u8; SSE_C_DEK_LEN];
     argmin_crypto::random::fill(&mut dek).map_err(|_| ServerError::InternalError {
         reason: "failed to generate SSE-C object DEK".to_string(),
@@ -673,7 +681,8 @@ fn prepare_sse_customer_write_with_payload_codec(
     Ok(SseCustomerWriteContext {
         request: request.clone(),
         encryption: ObjectEncryption::SseCustomer(
-            SseCustomerObjectState::new(
+            SseCustomerObjectState::new_with_encryption_instance_id(
+                encryption_instance_id,
                 validator.key_id,
                 validator_salt,
                 validator_hmac,
@@ -756,6 +765,13 @@ fn prepare_managed_encryption_write_with_payload_codec(
         reason: "failed to generate managed wrap nonce".to_string(),
     })?;
 
+    let mut encryption_instance_id = [0u8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN];
+    argmin_crypto::random::fill(&mut encryption_instance_id).map_err(|_| {
+        ServerError::InternalError {
+            reason: "failed to generate managed encryption instance identity".to_string(),
+        }
+    })?;
+
     let mut dek = [0u8; SSE_C_DEK_LEN];
     argmin_crypto::random::fill(&mut dek).map_err(|_| ServerError::InternalError {
         reason: "failed to generate managed object DEK".to_string(),
@@ -778,7 +794,8 @@ fn prepare_managed_encryption_write_with_payload_codec(
 
     Ok(ManagedEncryptionWriteContext {
         encryption: ObjectEncryption::SseS3(
-            SseS3ObjectState::new(
+            SseS3ObjectState::new_with_encryption_instance_id(
+                encryption_instance_id,
                 wrapping_key.key_id,
                 wrap_nonce,
                 wrapped_dek,

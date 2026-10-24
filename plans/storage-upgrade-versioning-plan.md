@@ -52,14 +52,17 @@ Do not add a migration, alternate parser, version range, compatibility default, 
 fallback merely because it appears in this plan. Each becomes supported only when its own phase,
 tests, operator contract, and removal rule are complete.
 
-The current pre-upgrade baseline includes self-describing object-encryption state: SSE-C state v4
-and SSE-S3 state v2 each carry the independent `SegmentPayloadCodec` tag. Their containing PG
-schema, metadata-command, storage-RPC, canonical-digest, and checkpoint grammars did not change
-when that nested version advanced. Append-only composite fixtures retain the rejected predecessor
-state and the exact current bytes under each unchanged outer version. This is format evidence, not
+The current pre-upgrade baseline includes self-describing object-encryption state: SSE-C state v5
+and SSE-S3 state v3 each carry the independent `SegmentPayloadCodec` tag and a stable random
+128-bit encryption-instance identity distinct from the DEK-wrap nonce. Their containing PG schema,
+metadata-command, storage-RPC, canonical-digest, and checkpoint grammars did not change when those
+nested versions advanced. Append-only composite fixtures retain the rejected v4/v2 predecessor
+states and the exact current bytes under each unchanged outer version. This is format evidence, not
 an old-state compatibility reader; a future supported transition involving encrypted payloads must
 name both the outer carrier versions and the nested encryption/profile versions in its complete
-source and destination vectors.
+source and destination vectors. The independently versioned canonical object-encryption subject is
+currently V2; immutable V1 object, purpose, and Cobblestone context/ciphertext evidence remains
+beside V2, while production accepts only V2.
 
 ## Non-Goals
 
