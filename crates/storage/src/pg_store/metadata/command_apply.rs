@@ -931,6 +931,14 @@ impl PgStore {
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
+        if command.object.encryption.key_binding()
+            != ObjectEncryptionKeyBinding::ObjectSubjectV2
+        {
+            return Err(MetadataError::InvariantViolation {
+                context: "commit direct put command terminal encryption binding",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
         for segment in &command.segments {
             let stored_size = command
                 .object
@@ -1013,14 +1021,35 @@ impl PgStore {
                     && session.bucket == command.object.bucket
                     && session.key == command.object.key
                     && session.target == StreamUploadTarget::PutObject
-                    && session.state == StreamUploadState::InProgress
-                    && session
-                        .bucket_write_reservation
-                        .as_ref()
-                        .is_some_and(|proof| {
-                            proof.has_same_stable_identity(&command.bucket_write_reservation)
-                        }) =>
+                    && session.state == StreamUploadState::InProgress =>
             {
+                let subject = ObjectEncryptionSubject::standard_object(
+                    command
+                        .bucket_write_reservation
+                        .bucket_incarnation_generation,
+                    &command.object.bucket,
+                    &command.object.key,
+                    command.object.generation_id,
+                    &session.encryption,
+                );
+                if !subject.matches_committed_encryption(&command.object.encryption) {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "commit direct put command stream encryption mismatch",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
+                if !session
+                    .bucket_write_reservation
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        proof.has_same_stable_identity(&command.bucket_write_reservation)
+                    })
+                {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "commit direct put command stream reservation mismatch",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
                 Ok(())
             }
             Err(MetadataError::StreamSessionNotFound { .. }) if !requires_stream_session => Ok(()),
@@ -1178,6 +1207,22 @@ impl PgStore {
         &self,
         command: &CommitMultipartObjectCommand,
     ) -> Result<(), MetadataError> {
+        let terminal_binding_is_allowed = match &command.object.encryption {
+            ObjectEncryption::SseCustomer(state) => matches!(
+                state.key_binding(),
+                ObjectEncryptionKeyBinding::ProvisionalV1
+                    | ObjectEncryptionKeyBinding::ObjectSubjectV2
+            ),
+            ObjectEncryption::SseS3(state) => {
+                state.key_binding() == ObjectEncryptionKeyBinding::ObjectSubjectV2
+            }
+        };
+        if !terminal_binding_is_allowed {
+            return Err(MetadataError::InvariantViolation {
+                context: "commit multipart object command terminal encryption binding",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
         for segment in &command.selected_streaming_segments {
             let stored_size = command
                 .object
@@ -1204,6 +1249,31 @@ impl PgStore {
         }
         if self.multipart_object_command_already_applied(command)? {
             return Ok(());
+        }
+
+        let upload = self.get_multipart_upload(&command.upload_id)?;
+        let subject = ObjectEncryptionSubject::standard_object(
+            command
+                .bucket_write_reservation
+                .bucket_incarnation_generation,
+            &command.object.bucket,
+            &command.object.key,
+            command.object.generation_id,
+            &upload.encryption,
+        );
+        if command.bucket_write_reservation.bucket != command.object.bucket
+            || upload.bucket != command.object.bucket
+            || upload.key != command.object.key
+            || upload.object_generation_id != command.object.generation_id
+            || !subject.authorizes_multipart_terminal_encryption(
+                &upload.encryption,
+                &command.object.encryption,
+            )
+        {
+            return Err(MetadataError::InvariantViolation {
+                context: "commit multipart object command durable encryption binding",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
         }
 
         self.with_immediate_txn(

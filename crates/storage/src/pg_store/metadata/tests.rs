@@ -2341,6 +2341,13 @@ fn assert_commit_failure_recovers_for_metadata_mutator(
 }
 
 fn test_live_object(bucket: BucketName, key: ObjectKey, generation_id: u64) -> PutLiveObjectReq {
+    let generation_id = GenerationId::new(generation_id).unwrap();
+    let encryption = committed_metadata_test_encryption(
+        &metadata_only_test_encryption(),
+        &bucket,
+        &key,
+        generation_id,
+    );
     PutLiveObjectReq {
         bucket,
         key,
@@ -2348,17 +2355,36 @@ fn test_live_object(bucket: BucketName, key: ObjectKey, generation_id: u64) -> P
         owner: test_owner(),
         acl_grants: AclGrants::default(),
         public_read: false,
-        generation_id: GenerationId::new(generation_id).unwrap(),
+        generation_id,
         size: 64,
-        etag: ObjectEtag::single_part(generation_id),
+        etag: ObjectEtag::single_part(generation_id.get()),
         ec: EcShape { k: 2, m: 1 },
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: metadata_only_test_encryption(),
+        encryption,
     }
+}
+
+fn committed_metadata_test_encryption(
+    provisional: &ObjectEncryption,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+) -> ObjectEncryption {
+    let subject =
+        ObjectEncryptionSubject::standard_object(1, bucket, key, generation_id, provisional);
+    provisional
+        .bind_committed_object_ciphertexts(
+            &subject,
+            [0x31; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xB3; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap()
 }
 
 fn test_object_segment(
@@ -2492,6 +2518,8 @@ fn cobblestone_direct_put_apply_rejects_missing_or_crossed_shard_integrity_witho
         .into_iter()
         .filter(|(profile, _)| profile.requires_shard_integrity_witness())
     {
+        let encryption =
+            committed_metadata_test_encryption(&encryption, &bucket, &key, GenerationId::MIN);
         let (segment_crc64, shard_integrity) =
             test_segment_integrity_record(encryption.payload_codec(), 64, ec);
         let base_segment = ObjectSegmentRecord {
@@ -2597,11 +2625,19 @@ fn payload_profile_cross_product_survives_command_decode_apply_and_restart() {
     let ec = EcShape { k: 2, m: 1 };
     let logical_size = 64;
 
-    for (ordinal, (profile, encryption)) in test_encryption_profiles().into_iter().enumerate() {
+    for (ordinal, (profile, provisional_encryption)) in
+        test_encryption_profiles().into_iter().enumerate()
+    {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let bucket = trusted_bucket_name(format!("profile-restart-{ordinal}"));
         let key = trusted_object_key("object");
+        let encryption = committed_metadata_test_encryption(
+            &provisional_encryption,
+            &bucket,
+            &key,
+            GenerationId::MIN,
+        );
         let reservation_id = SessionId::try_from(format!("{:032}", ordinal + 1)).unwrap();
         let (segment_crc64, shard_integrity) =
             test_segment_integrity_record(profile.payload_codec(), logical_size, ec);
@@ -2726,7 +2762,7 @@ fn payload_profile_cross_product_survives_command_decode_apply_and_restart() {
             &bucket,
             &key,
             &reservation_id,
-            &encryption,
+            &provisional_encryption,
         );
         store.apply_metadata_command(&decoded).unwrap();
         drop(store);
@@ -5806,7 +5842,7 @@ fn checkpoint_with_every_object_encryption_carrier() -> MetadataCommandCheckpoin
             &StreamUploadCommandRecord::from(&StreamUploadRecord {
                 session_id,
                 bucket,
-                key,
+                key: key.clone(),
                 target: StreamUploadTarget::PutObject,
                 state: StreamUploadState::InProgress,
                 created_at: 123,
@@ -6839,7 +6875,7 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
         MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
             object: PutLiveObjectReq {
                 bucket: bucket.clone(),
-                key,
+                key: key.clone(),
                 version_id: VersionId::Null,
                 owner: OwnerIdentity::from_principal("owner"),
                 acl_grants: AclGrants::default(),
@@ -6853,7 +6889,12 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_test_encryption(
+                    &metadata_only_test_encryption(),
+                    &bucket,
+                    &key,
+                    GenerationId::MIN,
+                ),
             },
             segments: Vec::new(),
             generation_reservation_id: reservation_id.clone(),
@@ -9338,7 +9379,12 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_test_encryption(
+                    &metadata_only_test_encryption(),
+                    &bucket,
+                    &key,
+                    GenerationId::MIN,
+                ),
             },
             segments: Vec::new(),
             generation_reservation_id: replacement_reservation_id.clone(),
@@ -9464,7 +9510,12 @@ fn recovered_object_delete_commands_reject_mismatched_reclaim_roots_before_mutat
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_test_encryption(
+                    &metadata_only_test_encryption(),
+                    &bucket,
+                    &key,
+                    generation_id,
+                ),
             },
             segments: vec![live_segment],
             generation_reservation_id: reservation_id.clone(),
@@ -9690,6 +9741,87 @@ fn already_applied_direct_put_command_cleans_terminal_staging_on_apply() {
         store.get_object_generation_reservation(&bucket, &key, &reservation_id),
         Err(MetadataError::ObjectGenerationReservationNotFound { .. })
     ));
+}
+
+#[test]
+fn direct_put_command_apply_rejects_provisional_and_crossed_terminal_encryption_without_mutation() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("direct-put-provisional-terminal");
+    let key = trusted_object_key("object");
+    let reservation_id = SessionId::try_from("79".repeat(16)).unwrap();
+    let valid = direct_put_terminal_cleanup_command(&bucket, &key, &reservation_id);
+    let MetadataCommandPayload::CommitDirectPutObject(valid_command) = valid.payload() else {
+        unreachable!("test helper must build a direct PUT command");
+    };
+    let crossed_committed_encryption = match valid_command.object.encryption.clone() {
+        ObjectEncryption::SseS3(state) => ObjectEncryption::SseS3(
+            state.with_encryption_instance_id([0xE8; OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN]),
+        ),
+        ObjectEncryption::SseCustomer(_) => {
+            unreachable!("test helper must build managed encryption")
+        }
+    };
+
+    insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+    store.refresh_metadata_command_state_digest().unwrap();
+    let state_before = store.metadata_command_replica_state().unwrap();
+    for (case, encryption, expected_context) in [
+        (
+            "provisional terminal encryption",
+            metadata_only_test_encryption(),
+            "commit direct put command terminal encryption binding",
+        ),
+        (
+            "crossed committed encryption",
+            crossed_committed_encryption,
+            "commit direct put command stream encryption mismatch",
+        ),
+    ] {
+        let mut payload = valid.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(command) = &mut payload else {
+            unreachable!("test helper must build a direct PUT command");
+        };
+        command.object.encryption = encryption;
+        let malformed = MetadataCommandEnvelope::new(valid.id(), payload);
+        let error = store
+            .apply_metadata_command_and_record(0, &malformed)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                    context,
+                    ..
+                }) if context == expected_context
+            ),
+            "{case} failed at the wrong boundary: {error:?}"
+        );
+        assert_eq!(
+            store.metadata_command_replica_state().unwrap(),
+            state_before,
+            "{case} advanced the metadata command log"
+        );
+        assert!(
+            matches!(
+                store.get_object_version(&bucket, &key, VersionId::Null),
+                Err(MetadataError::ObjectNotFound)
+            ),
+            "{case} published an object"
+        );
+        assert_eq!(
+            store
+                .get_object_generation_reservation(&bucket, &key, &reservation_id)
+                .unwrap(),
+            GenerationId::MIN,
+            "{case} released the generation reservation"
+        );
+        assert_eq!(
+            store.get_stream_upload(&reservation_id).unwrap().encryption,
+            metadata_only_test_encryption(),
+            "{case} changed the durable stream session"
+        );
+    }
 }
 
 #[test]
@@ -9923,7 +10055,12 @@ fn direct_put_terminal_cleanup_command_with_write_sequence(
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: metadata_only_test_encryption(),
+                encryption: committed_metadata_test_encryption(
+                    &metadata_only_test_encryption(),
+                    bucket,
+                    key,
+                    GenerationId::MIN,
+                ),
             },
             segments: Vec::new(),
             generation_reservation_id: reservation_id.clone(),

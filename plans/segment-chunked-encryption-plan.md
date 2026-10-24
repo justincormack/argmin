@@ -1524,6 +1524,40 @@ Implementation update (2026-10-24, multipart terminal subject binding):
   format/design slice, not permission to invent a key or change AWS behavior. Central generic
   apply/recovery validation of both allowed terminal forms remains the next subject-binding slice.
 
+Implementation update (2026-10-24, central terminal binding enforcement):
+
+- The object-PG apply boundary now enforces terminal encryption shape before any command effect.
+  `CommitDirectPutObject` accepts only `ObjectSubjectV2`; a provisional Direct PUT or streamed-
+  object command is rejected before shard-witness validation, object mutation, session removal,
+  reservation release, or applied-log advancement. Because normal fanout, exact replay, pending-
+  slot draining, restart, and authorized recovery all converge through the same apply-and-record
+  boundary, none can reinterpret a malformed terminal command through a weaker path. Streamed
+  commands additionally reconstruct the exact subject from the durable provisional session,
+  command generation, and already-validated bucket-incarnation proof, rejecting a different
+  committed encryption instance even when its binding discriminator is otherwise valid. Buffered
+  Direct PUT has no durable session; its exact subject remains compiler-bound to the linear staged-
+  payload capability before command construction, while central apply independently pins the
+  terminal shape.
+- Fresh `CommitMultipartObject` application loads the exact durable upload and reconstructs the
+  storage-owned terminal object subject from the command's already-validated bucket-incarnation
+  reservation, upload bucket/key, non-recycling object generation, and complete upload encryption
+  instance. The terminal object must be that upload's exact committed successor. The sole allowed
+  provisional terminal shape is the byte-for-byte unchanged SSE-C upload state required by AWS's
+  headerless completion behavior; provisional SSE-S3 and crossed committed encryption fail closed.
+  Exact already-applied replay still requires the complete stored object image to match.
+- Direct and multipart adversarial apply tests begin with live reservation/session/upload state,
+  submit correctly checksummed malformed commands, and require exact non-mutation before applying
+  a valid canary. Storage state-machine and recovery fixtures now stage the same committed
+  encryption authority as production rather than relying on impossible provisional terminal
+  objects. Payload-bearing fixtures retain their actual test DEK and perform the same subject-bound
+  terminal rewrap as production; an owner-local canary unwraps that committed DEK and decrypts the
+  retained ciphertext. Synthetic wrapped bytes remain confined to explicitly metadata-only
+  fixtures. No durable encoding changed in this slice.
+- This closes central generic apply/replay/recovery enforcement for the two allowed terminal forms.
+  The remaining Phase 2 subject work is auditing any persisted read/restoration boundary that can
+  still admit a committed object without its exact storage-minted subject, followed by the
+  production Cobblestone writer-selection decision and benchmark gate.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

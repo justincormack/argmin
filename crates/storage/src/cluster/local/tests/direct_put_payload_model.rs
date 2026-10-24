@@ -211,15 +211,41 @@ impl Fixture {
         Ok(())
     }
 
-    fn prepared(&self, owner: usize) -> crate::PreparedDirectPutObjectCommit {
-        prepared_encrypted_direct_put(
+    fn committed_encryption(
+        &self,
+        owner: usize,
+        generation_id: crate::GenerationId,
+    ) -> crate::ObjectEncryption {
+        let snapshot = self
+            .cluster
+            .load_bucket_snapshot(&self.bucket, crate::BucketSnapshotRequest::default())
+            .unwrap();
+        committed_test_object_encryption_for_incarnation(
+            &self.encrypted[owner],
+            snapshot
+                .bucket_incarnation_read_subject()
+                .bucket_incarnation_generation(),
+            &self.bucket,
+            &self.key,
+            generation_id,
+        )
+    }
+
+    fn prepared(
+        &self,
+        owner: usize,
+        generation_id: crate::GenerationId,
+    ) -> crate::PreparedDirectPutObjectCommit {
+        let mut prepared = prepared_encrypted_direct_put(
             &self.cluster,
             &self.bucket,
             &self.key,
             crate::BucketVersioningState::Disabled,
             DATA[owner],
             &self.encrypted[owner],
-        )
+        );
+        prepared.encryption = self.committed_encryption(owner, generation_id);
+        prepared
     }
 
     fn install_matching_pending(
@@ -434,7 +460,7 @@ impl Fixture {
         route: &crate::ActivePutObjectRoute<'_>,
         payload: crate::DirectPutPayloadWrite<'_>,
     ) -> Result<MetadataCommandEnvelope, String> {
-        let prepared = self.prepared(owner);
+        let prepared = self.prepared(owner, payload.generation_id);
         self.leave_pending_with_prepared_after_inspection_failure(owner, route, payload, &prepared)
     }
 
@@ -517,10 +543,16 @@ fn replay(state: &State) -> Result<(), String> {
                     let generation = routes[owner]
                         .test_reserve_generation_with_id(&fixture.reservations[owner])
                         .map_err(diagnostic)?;
+                    let generation_id = generation.generation_id();
+                    let committed_encryption = fixture.committed_encryption(owner, generation_id);
+                    let encryption_reservation = generation
+                        .bind_encryption(&encrypted.encryption)
+                        .bind_standard_segment(encrypted.logical_size)
+                        .bind_committed_encryption(&committed_encryption)
+                        .map_err(diagnostic)?;
                     let payload = routes[owner]
-                        .write_direct_object_payload(
-                            generation.bind_encryption(&encrypted.encryption),
-                            encrypted.logical_size,
+                        .write_direct_object_segment_payload(
+                            encryption_reservation,
                             &encrypted.storage_bytes,
                         )
                         .map_err(diagnostic)?;
@@ -556,7 +588,8 @@ fn replay(state: &State) -> Result<(), String> {
                     1 - state.owner
                 };
                 let already_visible = ownership.contains(&Ownership::Visible);
-                let prepared = fixture.prepared(owner);
+                let prepared =
+                    fixture.prepared(owner, payloads[owner].as_ref().unwrap().generation_id);
                 let result = routes[owner]
                     .commit_direct_object(payloads[owner].take().unwrap(), &prepared, |snapshot| {
                         if snapshot.existing_etag.is_some() {

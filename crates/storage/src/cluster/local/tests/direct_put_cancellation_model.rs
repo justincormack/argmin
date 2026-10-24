@@ -123,10 +123,16 @@ fn replay(state: &State) -> Result<(), String> {
                     let generation = routes[actor]
                         .test_reserve_generation_with_id(&fixture.reservations[actor])
                         .map_err(diagnostic)?;
+                    let committed_encryption =
+                        fixture.committed_encryption(actor, generation.generation_id());
+                    let encryption_reservation = generation
+                        .bind_encryption(&encrypted.encryption)
+                        .bind_standard_segment(encrypted.logical_size)
+                        .bind_committed_encryption(&committed_encryption)
+                        .map_err(diagnostic)?;
                     let payload = routes[actor]
-                        .write_direct_object_payload(
-                            generation.bind_encryption(&encrypted.encryption),
-                            encrypted.logical_size,
+                        .write_direct_object_segment_payload(
+                            encryption_reservation,
                             &encrypted.storage_bytes,
                         )
                         .map_err(diagnostic)?;

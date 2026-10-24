@@ -1588,6 +1588,13 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
             },
         ));
 
+    let committed_stream_encryption = committed_stream_test_encryption(
+        &first_cluster,
+        &bucket,
+        &key,
+        &session_id,
+        &stream_encrypted,
+    );
     let calls_for_action = Arc::clone(&action_calls);
     let finalize = || {
         first_cluster.finalize_put_object_stream(
@@ -1613,7 +1620,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: stream_encrypted.encryption.clone(),
+                    encryption: committed_stream_encryption.clone(),
                 })
             },
         )
@@ -1984,6 +1991,8 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
         let crc64 = checksum::crc64::checksum(payload);
         let (encrypted, _) =
             stage_encrypted_put_object_stream_segment(&cluster, &bucket, &key, session_id, payload);
+        let committed_encryption =
+            committed_stream_test_encryption(&cluster, &bucket, &key, session_id, &encrypted);
         cluster
             .finalize_put_object_stream(&bucket, &key, session_id, encrypted.logical_size, |_| {
                 Ok::<_, ()>(crate::PreparedStreamPutCommit {
@@ -1997,7 +2006,7 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: encrypted.encryption.clone(),
+                    encryption: committed_encryption.clone(),
                 })
             })
             .unwrap()
@@ -2073,6 +2082,9 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
             Ok(())
         }));
 
+    let committed_encryption =
+        committed_stream_test_encryption(&cluster, &bucket, &key, &session_id, &encrypted);
+
     let outcome = cluster
         .finalize_put_object_stream(&bucket, &key, &session_id, encrypted.logical_size, |_| {
             Ok::<_, ()>(crate::PreparedStreamPutCommit {
@@ -2086,7 +2098,7 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: encrypted.encryption.clone(),
+                encryption: committed_encryption.clone(),
             })
         })
         .expect("definitive pre-publication contention must be retried")
@@ -2246,6 +2258,8 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
         .unwrap()
         .bucket_write_reservation
         .unwrap();
+    let committed_encryption =
+        committed_test_object_encryption(&encrypted, &proof, &bucket, &key, generation_id);
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -2272,7 +2286,7 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
                 metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: encrypted.encryption.clone(),
+                encryption: committed_encryption,
             },
             segments: vec![crate::ObjectSegmentRecord {
                 shard_integrity: None,
@@ -2818,6 +2832,13 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
         observed_stale_replica_deadline,
         "the regression must finalize while at least one replica retains the pre-heartbeat deadline"
     );
+    let committed_encryption = committed_metadata_only_stream_test_encryption(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        &crate::tests::metadata_only_test_encryption(),
+    );
 
     crate::clock::with_time_override(7_000, || {
         cluster
@@ -2833,7 +2854,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::tests::metadata_only_test_encryption(),
+                    encryption: committed_encryption.clone(),
                 })
             })
             .unwrap()

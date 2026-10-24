@@ -3691,6 +3691,25 @@
             )),
         );
         pg.apply_metadata_command_and_record(7, &reserve).unwrap();
+        let bucket_write_reservation =
+            test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let provisional_encryption = crate::tests::metadata_only_test_encryption();
+        let object_subject = crate::ObjectEncryptionSubject::standard_object(
+            bucket_write_reservation.bucket_incarnation_generation,
+            &bucket,
+            &key,
+            GenerationId::MIN,
+            &provisional_encryption,
+        );
+        let committed_encryption = provisional_encryption
+            .bind_committed_object_ciphertexts(
+                &object_subject,
+                [0x74; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+                [0xBA; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+                [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+                Vec::new(),
+            )
+            .unwrap();
         let replacement_live = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::new(1).unwrap(),
@@ -3714,14 +3733,14 @@
                     metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                     system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::tests::metadata_only_test_encryption(),
+                    encryption: committed_encryption,
                 },
                 segments: Vec::new(),
                 generation_reservation_id: reservation_id,
                 write_sequence: 2,
                 last_modified_millis: 124,
                 stale_payload: None,
-                bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
+                bucket_write_reservation,
             })),
         );
         pg.apply_metadata_command_and_record(7, &replacement_live)

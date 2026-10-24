@@ -140,6 +140,118 @@ fn multipart_completion_rejects_provisional_encryption_before_object_command_all
 }
 
 #[test]
+fn multipart_terminal_apply_rejects_provisional_and_crossed_committed_encryption() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "applybinding");
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &request.upload_id)
+        .unwrap();
+    let crossed_encryption = match request.encryption.clone() {
+        crate::ObjectEncryption::SseS3(state) => crate::ObjectEncryption::SseS3(
+            state.with_encryption_instance_id([0xE7; crate::OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN]),
+        ),
+        crate::ObjectEncryption::SseCustomer(_) => {
+            unreachable!("test helper must build managed encryption")
+        }
+    };
+    let pg_id = PgId::new(object_pg);
+    let (valid_command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_100);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(object_pg).unwrap();
+    let applied_log_before = pg
+        .metadata_command_replica_state()
+        .unwrap()
+        .applied_log_index;
+
+    for (case, encryption, expected_context) in [
+        (
+            "provisional managed encryption",
+            upload.encryption.clone(),
+            "commit multipart object command terminal encryption binding",
+        ),
+        (
+            "crossed committed encryption",
+            crossed_encryption,
+            "commit multipart object command durable encryption binding",
+        ),
+    ] {
+        let mut payload = valid_command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+            unreachable!("test helper must build a multipart completion command");
+        };
+        commit.object.encryption = encryption;
+        let malformed = MetadataCommandEnvelope::new(valid_command.id(), payload);
+        let error = pg
+            .apply_metadata_command_and_record(primary.node_id().as_u32(), &malformed)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::InvariantViolation { context, .. }
+                ) if context == expected_context
+            ),
+            "{case} failed at the wrong boundary: {error:?}"
+        );
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &request.upload_id)
+                .unwrap()
+                .encryption,
+            upload.encryption,
+            "{case} changed the durable upload"
+        );
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            applied_log_before,
+            "{case} advanced the command log"
+        );
+    }
+    drop(pg);
+
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &valid_command)
+        .expect("the exact object-subject-bound command must still apply");
+    let outcome = crate::CompleteMultipartCommitOutcome {
+        version_id: crate::VersionId::Null,
+        stale_payload_generation_id: None,
+        live_tags: request.tags.clone(),
+        live_size: request.size,
+        live_last_modified: 42_100,
+    };
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+}
+
+#[test]
 fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

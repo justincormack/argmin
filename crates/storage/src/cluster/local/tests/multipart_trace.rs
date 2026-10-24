@@ -499,16 +499,13 @@ fn complete_multipart_trace_upload(
         upload_row.object_generation_id,
         &upload_row.encryption,
     );
-    let committed_encryption = upload_row
-        .encryption
-        .bind_committed_object_ciphertexts(
-            &object_subject,
-            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
-            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
-            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
-            Vec::new(),
-        )
-        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(&[], 1, 0);
+    prop_assert_eq!(
+        &upload_row.encryption,
+        &encrypted.encryption,
+        "payload-bearing trace upload must retain the fixture encryption state"
+    );
+    let committed_encryption = encrypted.committed_encryption(&object_subject);
     let size = upload.parts.iter().map(|part| part.size).sum();
     cluster
         .complete_multipart_upload_commit_serialized(crate::CompleteMultipartCommitRequest {

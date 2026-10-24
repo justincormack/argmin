@@ -558,6 +558,18 @@ fn write_committed_direct_segment_for_with_versioning(
             &encrypted.storage_bytes,
         )
         .unwrap();
+    let bucket_snapshot = cluster
+        .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let bucket_subject = bucket_snapshot.bucket_incarnation_read_subject();
+    let object_subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_subject.bucket_incarnation_generation(),
+        bucket,
+        key,
+        generation_id,
+        &encrypted.encryption,
+    );
+    let committed_encryption = encrypted.committed_encryption(&object_subject);
     let commit_req = crate::CommitDirectPutObjectReq {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -574,7 +586,7 @@ fn write_committed_direct_segment_for_with_versioning(
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: encrypted.encryption.clone(),
+        encryption: committed_encryption,
         segment_index: 0,
         segment_crc64: encrypted.storage_crc64,
         segment_okh,
@@ -1061,6 +1073,13 @@ fn direct_put_commit_req_with_bucket_write_proof(
         checksum::crc64::checksum(fixture.payload),
         fixture.written.plaintext_crc64
     );
+    let encryption = committed_test_object_encryption(
+        &fixture.written.encrypted,
+        &bucket_write_reservation,
+        fixture.bucket,
+        fixture.key,
+        fixture.generation_id,
+    );
     crate::CommitDirectPutObjectReq {
         bucket: fixture.bucket.clone(),
         key: fixture.key.clone(),
@@ -1077,7 +1096,7 @@ fn direct_put_commit_req_with_bucket_write_proof(
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: fixture.written.encrypted.encryption.clone(),
+        encryption,
         segment_index: 0,
         segment_crc64: fixture.written.encrypted.storage_crc64,
         segment_okh: fixture.segment_okh,
@@ -1116,6 +1135,13 @@ fn encrypted_direct_put_commit_req_with_bucket_write_proof(
     fixture: EncryptedDirectPutCommitReqFixture<'_>,
     bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,
 ) -> crate::CommitDirectPutObjectReq {
+    let encryption = committed_test_object_encryption(
+        fixture.encrypted,
+        &bucket_write_reservation,
+        fixture.bucket,
+        fixture.key,
+        fixture.generation_id,
+    );
     crate::CommitDirectPutObjectReq {
         bucket: fixture.bucket.clone(),
         key: fixture.key.clone(),
@@ -1132,7 +1158,7 @@ fn encrypted_direct_put_commit_req_with_bucket_write_proof(
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: fixture.encrypted.encryption.clone(),
+        encryption,
         segment_index: 0,
         segment_crc64: fixture.encrypted.storage_crc64,
         segment_okh: fixture.segment_okh,
@@ -1140,6 +1166,113 @@ fn encrypted_direct_put_commit_req_with_bucket_write_proof(
         data_pg_id: fixture.written.data_pg_id,
         bucket_write_reservation,
     }
+}
+
+fn committed_test_object_encryption(
+    encrypted: &crate::tests::SseS3SegmentTestFixture,
+    bucket_write_reservation: &crate::metadata_command::BucketWriteReservationProof,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    generation_id: crate::GenerationId,
+) -> crate::ObjectEncryption {
+    committed_test_object_encryption_for_incarnation(
+        encrypted,
+        bucket_write_reservation.bucket_incarnation_generation,
+        bucket,
+        key,
+        generation_id,
+    )
+}
+
+fn committed_test_object_encryption_for_incarnation(
+    encrypted: &crate::tests::SseS3SegmentTestFixture,
+    bucket_incarnation_generation: u64,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    generation_id: crate::GenerationId,
+) -> crate::ObjectEncryption {
+    let subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_incarnation_generation,
+        bucket,
+        key,
+        generation_id,
+        &encrypted.encryption,
+    );
+    encrypted.committed_encryption(&subject)
+}
+
+fn committed_stream_test_encryption(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    session_id: &crate::SessionId,
+    encrypted: &crate::tests::SseS3SegmentTestFixture,
+) -> crate::ObjectEncryption {
+    let bucket_snapshot = cluster
+        .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let generation_id = cluster
+        .test_object_generation_reservation_for(bucket, key, session_id)
+        .unwrap();
+    let subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_snapshot
+            .bucket_incarnation_read_subject()
+            .bucket_incarnation_generation(),
+        bucket,
+        key,
+        generation_id,
+        &encrypted.encryption,
+    );
+    encrypted.committed_encryption(&subject)
+}
+
+fn committed_metadata_only_test_encryption_for_incarnation(
+    provisional: &crate::ObjectEncryption,
+    bucket_incarnation_generation: u64,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    generation_id: crate::GenerationId,
+) -> crate::ObjectEncryption {
+    let subject = crate::ObjectEncryptionSubject::standard_object(
+        bucket_incarnation_generation,
+        bucket,
+        key,
+        generation_id,
+        provisional,
+    );
+    provisional
+        .bind_committed_object_ciphertexts(
+            &subject,
+            [0x72; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+            [0xB8; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+            Vec::new(),
+        )
+        .unwrap()
+}
+
+fn committed_metadata_only_stream_test_encryption(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    session_id: &crate::SessionId,
+    provisional: &crate::ObjectEncryption,
+) -> crate::ObjectEncryption {
+    let bucket_snapshot = cluster
+        .load_bucket_snapshot(bucket, crate::BucketSnapshotRequest::default())
+        .unwrap();
+    let generation_id = cluster
+        .test_object_generation_reservation_for(bucket, key, session_id)
+        .unwrap();
+    committed_metadata_only_test_encryption_for_incarnation(
+        provisional,
+        bucket_snapshot
+            .bucket_incarnation_read_subject()
+            .bucket_incarnation_generation(),
+        bucket,
+        key,
+        generation_id,
+    )
 }
 
 fn assert_direct_put_metadata_on_acting_nodes(
@@ -1315,17 +1448,7 @@ fn seed_streamed_multipart_completion_with_existing(
         upload.object_generation_id,
         &upload.encryption,
     );
-    let committed_encryption = upload
-        .encryption
-        .bind_committed_object_ciphertexts(
-            &object_subject,
-            [0x51; crate::OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
-            [0xA2; crate::OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
-            [0; crate::OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
-            Vec::new(),
-        )
-        .unwrap();
-    let (_shard_keys, part, mut expected_segment, _encrypted) = upload_streamed_test_multipart_part(
+    let (_shard_keys, part, mut expected_segment, encrypted) = upload_streamed_test_multipart_part(
         cluster,
         bucket,
         key,
@@ -1334,6 +1457,7 @@ fn seed_streamed_multipart_completion_with_existing(
         [0xCD; 16],
         b"streamed completion",
     );
+    let committed_encryption = encrypted.committed_encryption(&object_subject);
 
     let selected_streaming_segment = expected_segment.clone();
     expected_segment.version_id = crate::VersionId::Null.to_u64();

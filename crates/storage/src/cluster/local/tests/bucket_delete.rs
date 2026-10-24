@@ -3166,6 +3166,13 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
     let generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &generation_reservation_id)
         .unwrap();
+    let committed_encryption = committed_test_object_encryption(
+        &encrypted,
+        &bucket_write_proof,
+        &bucket,
+        &key,
+        generation_id,
+    );
     let segment_okh = [71; 16];
     let written = cluster
         .write_direct_put_segment_payload_shards(
@@ -3193,7 +3200,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: encrypted.encryption.clone(),
+        encryption: committed_encryption,
         segment_index: 0,
         segment_crc64: encrypted.storage_crc64,
         segment_okh,

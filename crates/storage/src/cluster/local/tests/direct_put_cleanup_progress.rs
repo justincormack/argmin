@@ -98,18 +98,27 @@ fn cancellation_progress(
     ];
     let mut payloads = [None, None];
     let mut identities = [None, None];
-    let prepared = [fixture.prepared(0), fixture.prepared(1)];
-    for actor in 0..2 {
+    let generations = [
+        routes[0]
+            .test_reserve_generation_with_id(&fixture.reservations[0])
+            .map_err(diagnostic)?,
+        routes[1]
+            .test_reserve_generation_with_id(&fixture.reservations[1])
+            .map_err(diagnostic)?,
+    ];
+    let prepared = [
+        fixture.prepared(0, generations[0].generation_id()),
+        fixture.prepared(1, generations[1].generation_id()),
+    ];
+    for (actor, generation) in generations.into_iter().enumerate() {
         let encrypted = &fixture.encrypted[actor];
-        let generation = routes[actor]
-            .test_reserve_generation_with_id(&fixture.reservations[actor])
+        let encryption_reservation = generation
+            .bind_encryption(&encrypted.encryption)
+            .bind_standard_segment(encrypted.logical_size)
+            .bind_committed_encryption(&prepared[actor].encryption)
             .map_err(diagnostic)?;
         let payload = routes[actor]
-            .write_direct_object_payload(
-                generation.bind_encryption(&encrypted.encryption),
-                encrypted.logical_size,
-                &encrypted.storage_bytes,
-            )
+            .write_direct_object_segment_payload(encryption_reservation, &encrypted.storage_bytes)
             .map_err(diagnostic)?;
         fixture.record_payload_integrity(actor, &payload)?;
         identities[actor] = Some(direct_payload_test_identity(&payload));

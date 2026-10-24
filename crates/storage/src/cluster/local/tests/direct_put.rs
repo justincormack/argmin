@@ -2520,14 +2520,7 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     let expected_generation_id = generation_id.generation_id();
     let data = b"versioned direct PUT replica timeout";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
-    let payload = route
-        .write_direct_object_payload(
-            generation_id.bind_encryption(&fixture.encryption),
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
-        .unwrap();
-    let prepared = prepared_encrypted_direct_put(
+    let mut prepared = prepared_encrypted_direct_put(
         &cluster,
         &bucket,
         &key,
@@ -2535,6 +2528,22 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
         data,
         &fixture,
     );
+    let committed_encryption = committed_test_object_encryption(
+        &fixture,
+        &prepared.bucket_write_reservation,
+        &bucket,
+        &key,
+        expected_generation_id,
+    );
+    prepared.encryption = committed_encryption.clone();
+    let encryption_reservation = generation_id
+        .bind_encryption(&fixture.encryption)
+        .bind_standard_segment(fixture.logical_size)
+        .bind_committed_encryption(&committed_encryption)
+        .unwrap();
+    let payload = route
+        .write_direct_object_segment_payload(encryption_reservation, &fixture.storage_bytes)
+        .unwrap();
 
     let _serial = lock_metadata_command_apply_hook_test();
     let trailing_replica_attempts = Arc::new(AtomicUsize::new(0));
@@ -2686,14 +2695,7 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
     let expected_generation_id = generation_id.generation_id();
     let data = b"versioned direct PUT apply response loss";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
-    let payload = route
-        .write_direct_object_payload(
-            generation_id.bind_encryption(&fixture.encryption),
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
-        .unwrap();
-    let prepared = prepared_encrypted_direct_put(
+    let mut prepared = prepared_encrypted_direct_put(
         &cluster,
         &bucket,
         &key,
@@ -2701,6 +2703,22 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
         data,
         &fixture,
     );
+    let committed_encryption = committed_test_object_encryption(
+        &fixture,
+        &prepared.bucket_write_reservation,
+        &bucket,
+        &key,
+        expected_generation_id,
+    );
+    prepared.encryption = committed_encryption.clone();
+    let encryption_reservation = generation_id
+        .bind_encryption(&fixture.encryption)
+        .bind_standard_segment(fixture.logical_size)
+        .bind_committed_encryption(&committed_encryption)
+        .unwrap();
+    let payload = route
+        .write_direct_object_segment_payload(encryption_reservation, &fixture.storage_bytes)
+        .unwrap();
 
     let _serial = lock_metadata_command_apply_hook_test();
     let primary_response_lost = Arc::new(AtomicBool::new(false));
