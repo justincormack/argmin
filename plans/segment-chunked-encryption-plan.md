@@ -1731,6 +1731,22 @@ Implementation update (2026-10-25, authenticated selected-record range reads):
   interleavings at the coordinator layer, socket-level response semantics, and chunk-at-a-time
   full GET emission with fused physical CRC accounting remain next.
 
+Implementation update (2026-10-25, multipart and retained-route range boundaries):
+
+- The real SSE-S3 and SSE-C multipart canaries now upload and complete two Cobblestone parts. A
+  range spanning the part boundary must return the exact bytes while reading only the terminal
+  authenticated record of the first part segment, the first authenticated record of the second
+  part, and the two fixed headers. Stored-byte, decrypted-byte, and AEAD-record counters pin that
+  bounded work, so a whole-part or whole-segment fallback cannot satisfy the regression.
+- The coordinator retained-route canaries now create both full and cross-record Range GET bodies
+  before a data-PG move is published. After one old-route systematic shard is corrupted and the
+  storage nodes install the successor map, the range body must use its retained historical route,
+  discard the failed selected-record attempt, reconstruct through the durable witness, and return
+  only authenticated requested bytes. Independent SSE-S3 and SSE-C cases cover both key modes.
+- This slice closes multipart-part mapping and coordinator publication-interleaving coverage. Phase
+  4 remains open for socket-level committed-response failure semantics and chunk-at-a-time full GET
+  emission with fused physical CRC accounting.
+
 Exit: metrics and deterministic tests prove small encrypted ranges no longer read or decrypt whole
 segments on the healthy path.
 

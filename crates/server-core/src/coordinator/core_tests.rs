@@ -10426,12 +10426,35 @@ fn cobblestone_body_uses_retained_route_after_unix_data_pg_move(
             cond: NO_READ,
         })
         .unwrap();
+    let range_start = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN - 3) as u64;
+    let range_end = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 4) as u64;
+    let range_read = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                &bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range {
+                start: range_start,
+                end: range_end,
+            },
+            cond: NO_READ,
+        })
+        .unwrap();
 
-    // The old-route data shard is corrupted after the body has captured its
-    // exact subject and leases. The first read must use retained Unix routing,
-    // identify the bad shard from the durable witness, reconstruct, and then
-    // authenticate the Cobblestone records against that captured subject.
+    // The old-route data shard is corrupted after both bodies have captured
+    // their exact subjects and leases. The bounded range read must use retained
+    // Unix routing, discard its failed selected-record attempt, reconstruct from
+    // the durable witness, and authenticate against the captured subject.
     scenario.corrupt_and_advance_after_body_created().unwrap();
+    assert_eq!(
+        range_read.body.read_all().unwrap(),
+        payload[range_start as usize..=range_end as usize]
+    );
     assert_eq!(read.body.read_all().unwrap(), payload);
 
     scenario.finish().unwrap();

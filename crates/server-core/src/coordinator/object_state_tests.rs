@@ -6298,11 +6298,17 @@ fn upload_part_and_read_cobblestone_object(
     key: &str,
     sse_customer: Option<&crate::sse::SseCustomerRequest>,
 ) {
-    let payload_len =
+    let first_payload_len =
         INTERNAL_SEGMENT_SIZE + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37;
-    let payload: Vec<u8> = (0..payload_len)
+    let first_payload: Vec<u8> = (0..first_payload_len)
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect();
+    let second_payload: Vec<u8> = (0..(argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 23))
+        .map(|index| u8::try_from(index % 239).unwrap())
+        .collect();
+    let mut payload = Vec::with_capacity(first_payload.len() + second_payload.len());
+    payload.extend_from_slice(&first_payload);
+    payload.extend_from_slice(&second_payload);
     let encryption = match sse_customer {
         Some(request) => WriteEncryptionRequest::sse_customer(request),
         None => WriteEncryptionRequest::none(),
@@ -6335,7 +6341,7 @@ fn upload_part_and_read_cobblestone_object(
         "CreateMultipartUpload must persist the selected writer profile"
     );
 
-    let part = test_helpers::upload_part(
+    let first_part = test_helpers::upload_part(
         coord,
         &test_helpers::UploadPartRequest {
             upload: multipart_object_request_with_expected_owner(
@@ -6346,17 +6352,41 @@ fn upload_part_and_read_cobblestone_object(
                 None,
             ),
             part_number: 1,
-            data: &payload,
+            data: &first_payload,
             claimed_checksum: None,
             sse_customer,
         },
     )
     .unwrap();
-    let completed_parts = [CompletePart {
-        part_number: 1,
-        etag: part.etag,
-        checksum: None,
-    }];
+    let second_part = test_helpers::upload_part(
+        coord,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 2,
+            data: &second_payload,
+            claimed_checksum: None,
+            sse_customer,
+        },
+    )
+    .unwrap();
+    let completed_parts = [
+        CompletePart {
+            part_number: 1,
+            etag: first_part.etag,
+            checksum: None,
+        },
+        CompletePart {
+            part_number: 2,
+            etag: second_part.etag,
+            checksum: None,
+        },
+    ];
     let completion = CompleteMultipartUploadRequest {
         upload: multipart_object_request_with_expected_owner(
             "bucket",
@@ -6439,6 +6469,70 @@ fn upload_part_and_read_cobblestone_object(
         "multipart completion must seal checksum metadata under the upload encryption state"
     );
     assert_eq!(object.body.read_all().unwrap(), payload);
+
+    let start = first_payload.len() - 4;
+    let end = first_payload.len() + 3;
+    let before = observability::metrics_snapshot();
+    let range = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range {
+                start: start as u64,
+                end: end as u64,
+            },
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(range.body.read_all().unwrap(), payload[start..=end]);
+
+    let first_tail_len = first_payload.len() - INTERNAL_SEGMENT_SIZE;
+    let first_tail_layout =
+        argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+            first_tail_len as u64,
+        )
+        .unwrap();
+    let first_terminal_index = first_tail_layout.chunk_count() - 1;
+    let first_terminal = first_tail_layout
+        .ciphertext_range_for_chunk(first_terminal_index)
+        .unwrap();
+    let first_terminal_plaintext = first_tail_layout
+        .plaintext_range_for_chunk(first_terminal_index)
+        .unwrap();
+    let second_layout =
+        argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+            second_payload.len() as u64,
+        )
+        .unwrap();
+    let second_first = second_layout.ciphertext_range_for_chunk(0).unwrap();
+    let second_first_plaintext = second_layout.plaintext_range_for_chunk(0).unwrap();
+    let expected_stored = 2 * argmin_crypto::cobblestone::COBBLESTONE_HEADER_LEN as u64
+        + first_terminal.end
+        - first_terminal.start
+        + second_first.end
+        - second_first.start;
+    let after = observability::metrics_snapshot();
+    assert_eq!(
+        after.payload_read_stored_bytes_total - before.payload_read_stored_bytes_total,
+        expected_stored,
+        "a multipart-part boundary range must read one selected record from each part"
+    );
+    assert_eq!(
+        after.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        first_terminal_plaintext.end - first_terminal_plaintext.start + second_first_plaintext.end
+            - second_first_plaintext.start,
+        "multipart-part range decryption must include both complete authenticated records"
+    );
+    assert_eq!(
+        after.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        2
+    );
 }
 
 #[test]
