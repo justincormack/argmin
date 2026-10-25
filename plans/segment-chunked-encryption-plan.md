@@ -1762,6 +1762,18 @@ Implementation update (2026-10-25, committed raw-HTTP failure semantics):
   official-client incomplete-body canary and chunk-at-a-time full GET emission with fused physical
   CRC accounting remain open before Phase 4 is complete.
 
+Implementation update (2026-10-25, official-client incomplete-body semantics):
+
+- A pinned AWS Rust SDK canary now receives syntactically successful `200` and `206` responses
+  whose `Content-Length` bodies terminate after a nonempty authenticated-prefix analogue. In both
+  cases the SDK exposes the committed success metadata, but collecting its `ByteStream` returns the
+  transport's `UnexpectedEof`/`IncompleteBody` error rather than accepting the short payload.
+- Together with the real-server raw-socket canaries above, this establishes both sides of the
+  contract: Argmin terminates an already-committed response on a later integrity failure, and the
+  official client dependency used by this repository surfaces that termination as a body error for
+  both full and ranged GETs. Chunk-at-a-time full GET emission with fused physical CRC accounting
+  remains open before Phase 4 is complete.
+
 Exit: metrics and deterministic tests prove small encrypted ranges no longer read or decrypt whole
 segments on the healthy path.
 

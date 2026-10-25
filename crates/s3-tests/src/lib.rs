@@ -815,6 +815,35 @@ pub fn build_configured_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn client_for_incomplete_success_response(
+        response: &'static [u8],
+    ) -> (Client, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "AWS SDK disconnected before sending its request");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let client = build_client_with_ca(
+            &format!("http://{address}"),
+            server::TEST_ACCESS_KEY,
+            server::TEST_SECRET_KEY,
+            server::TEST_REGION,
+            None,
+        );
+        (client, server)
+    }
 
     #[test]
     fn stalled_stream_protection_uses_the_test_timeout_as_its_grace_period() {
@@ -824,5 +853,60 @@ mod tests {
         assert!(config.upload_enabled());
         assert!(config.download_enabled());
         assert_eq!(config.grace_period(), timeout);
+    }
+
+    #[test]
+    fn aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets() {
+        RT.block_on(async {
+            let (client, server) = client_for_incomplete_success_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
+            )
+            .await;
+            let output = client
+                .get_object()
+                .bucket("bucket")
+                .key("key")
+                .send()
+                .await
+                .expect("the SDK should expose committed success headers");
+            assert_eq!(output.content_length, Some(10));
+            let error = output
+                .body
+                .collect()
+                .await
+                .expect_err("the SDK must reject a short successful full-GET body");
+            let diagnostic = format!("{error:?}");
+            assert!(
+                diagnostic.contains("UnexpectedEof") && diagnostic.contains("IncompleteBody"),
+                "unexpected full-GET body error: {error:?}"
+            );
+            server.await.unwrap();
+
+            let (client, server) = client_for_incomplete_success_response(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Range: bytes 4-11/20\r\nConnection: close\r\n\r\nabc",
+            )
+            .await;
+            let output = client
+                .get_object()
+                .bucket("bucket")
+                .key("key")
+                .range("bytes=4-11")
+                .send()
+                .await
+                .expect("the SDK should expose committed partial-content headers");
+            assert_eq!(output.content_length, Some(8));
+            assert_eq!(output.content_range.as_deref(), Some("bytes 4-11/20"));
+            let error = output
+                .body
+                .collect()
+                .await
+                .expect_err("the SDK must reject a short successful ranged-GET body");
+            let diagnostic = format!("{error:?}");
+            assert!(
+                diagnostic.contains("UnexpectedEof") && diagnostic.contains("IncompleteBody"),
+                "unexpected ranged-GET body error: {error:?}"
+            );
+            server.await.unwrap();
+        });
     }
 }
