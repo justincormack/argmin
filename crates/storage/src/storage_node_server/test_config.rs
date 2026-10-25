@@ -14,7 +14,8 @@
         MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
         ObjectMutationMetadataNodeClient, ObjectPayloadLeaseKind, ObjectPayloadLeaseNodeClient,
         PlacedShardNodeClient, ShardReadHandleNodeClient,
-        RetainedBucketWriteReservationNodeClient, UnixStorageNodeClient,
+        RetainedBucketWriteReservationNodeClient, RetainedPlacedShardNodeClient,
+        UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::storage_rpc::StorageRpcWireErrorCode;
@@ -6284,6 +6285,82 @@
         drop(session);
         drop(client);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_tls_historical_shard_range_uses_retained_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let historical_route = config.pg_routes[0].clone();
+        let historical_epoch = historical_route.cluster_epoch;
+        let current_epoch = ClusterEpoch::new(historical_epoch.get() + 1).unwrap();
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.historical_pg_routes = vec![historical_route];
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let location = ShardLocation::new(
+            historical_epoch,
+            DataPgId::new_for_test(PgId::new(0)),
+            ShardIndex::new(0),
+            config.node_id,
+        );
+        let shard_key = test_shard_key(0);
+        let payload = b"authenticated historical range payload";
+        let expected_ack = server
+            ._node
+            .write_shard_file(location.data_pg_id().get(), &shard_key, payload)
+            .unwrap();
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            current_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let route = client
+            .open_retained_placed_shard_route(location, &shard_key)
+            .unwrap();
+        let mut selected = [0; 10];
+        let read_result = route
+            .read_placed_shard_range_for_historical_inspection_into(
+                expected_ack,
+                6,
+                &mut selected,
+            );
+        drop(route);
+        drop(client);
+        let serve_result = join.join().unwrap();
+        assert!(serve_result.is_ok(), "TLS server failed: {serve_result:?}");
+        if let Err(StoreError::StorageRpc { failure, .. }) = &read_result {
+            panic!(
+                "authenticated historical range failed with {:?}",
+                failure.wire_code()
+            );
+        }
+        read_result.unwrap();
+        assert_eq!(&selected, &payload[6..16]);
     }
 
     fn authenticated_skipped_transfer_destination_epoch_uses_current_marker(tcp: bool) {

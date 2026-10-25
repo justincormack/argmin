@@ -1197,6 +1197,55 @@ pub(super) struct LocalPlacedSegmentShardReader<'a> {
     subject: LocalPlacedSegmentShardSubject,
 }
 
+/// Storage-owned retained-route reader for one exact placed payload segment.
+///
+/// The reader derives every location and key from the reconstructed placement
+/// snapshot and refuses locations outside the node set protected by the
+/// retained object-payload lease.
+pub(super) struct LocalRetainedPlacedSegmentShardReader<'a> {
+    cluster_map: &'a LocalClusterMap,
+    subject: LocalPlacedSegmentShardSubject,
+    leased_node_ids: &'a BTreeSet<NodeId>,
+}
+
+impl LocalRetainedPlacedSegmentShardReader<'_> {
+    pub(super) fn location(&self, shard_index: usize) -> Option<ShardLocation> {
+        self.subject.location(shard_index)
+    }
+
+    pub(super) fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
+        self.subject.shard_key(shard_index)
+    }
+
+    pub(super) fn is_leased(&self, shard_index: usize) -> bool {
+        self.location(shard_index)
+            .is_some_and(|location| self.leased_node_ids.contains(&location.node_id()))
+    }
+
+    pub(super) fn read_range_into(
+        &self,
+        shard_index: usize,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        let (location, key) = self.subject.location_and_key(shard_index)?;
+        if !self.leased_node_ids.contains(&location.node_id()) {
+            return Err(self.subject.shard_subject_mismatch(format!(
+                "retained shard index {shard_index} is not protected by the object-payload lease"
+            )));
+        }
+        self.cluster_map
+            .read_payload_shard_range_for_historical_inspection_into(
+                location,
+                &key,
+                expected_ack,
+                offset,
+                dst,
+            )
+    }
+}
+
 impl<'a> LocalPlacedSegmentShardReader<'a> {
     pub(super) fn locations(&self) -> &[ShardLocation] {
         self.subject.locations()
@@ -6411,25 +6460,79 @@ impl LocalClusterMap {
                 state: route.state(),
             });
         }
+        Ok(LocalPlacedSegmentShardDeleter {
+            cluster_map: self,
+            subject: self.retained_placed_segment_shard_subject_for_route(
+                &route,
+                data_pg_id,
+                ec,
+                segment_okh,
+                segment_vid,
+            )?,
+            route_kind: LocalPlacedSegmentShardDeleteRouteKind::Retained,
+        })
+    }
+
+    pub(super) fn open_retained_placed_segment_shard_reader<'a>(
+        &'a self,
+        placement_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        leased_node_ids: &'a BTreeSet<NodeId>,
+    ) -> Result<LocalRetainedPlacedSegmentShardReader<'a>, StoreError> {
+        let route = self
+            .reconstructed_pg_route_at_epoch(data_pg_id.pg_id(), placement_epoch)
+            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "PG {} route for cluster epoch {} is not retained",
+                    data_pg_id.get(),
+                    placement_epoch.get()
+                ),
+            })?;
+        if route.cluster_epoch() != placement_epoch || route.state() != PgState::Active {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained placed-segment reader route does not match the payload placement"
+                    .to_string(),
+            });
+        }
+        Ok(LocalRetainedPlacedSegmentShardReader {
+            cluster_map: self,
+            subject: self.retained_placed_segment_shard_subject_for_route(
+                &route,
+                data_pg_id,
+                ec,
+                segment_okh,
+                segment_vid,
+            )?,
+            leased_node_ids,
+        })
+    }
+
+    fn retained_placed_segment_shard_subject_for_route(
+        &self,
+        route: &PgRouteSnapshot,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardSubject, StoreError> {
         let placement_key = super::segment_payload_placement_key(segment_okh, segment_vid);
         let locations = Self::place_payload_shards_for_pg_route(
-            placement_epoch,
+            route.cluster_epoch(),
             data_pg_id,
             ec,
             &placement_key,
             route.acting_set(),
         )
         .map_err(super::cluster_build_error_to_store)?;
-        Ok(LocalPlacedSegmentShardDeleter {
-            cluster_map: self,
-            subject: LocalPlacedSegmentShardSubject {
-                operation_epoch: placement_epoch,
-                data_pg_id,
-                segment_okh: *segment_okh,
-                segment_vid,
-                locations,
-            },
-            route_kind: LocalPlacedSegmentShardDeleteRouteKind::Retained,
+        Ok(LocalPlacedSegmentShardSubject {
+            operation_epoch: route.cluster_epoch(),
+            data_pg_id,
+            segment_okh: *segment_okh,
+            segment_vid,
+            locations,
         })
     }
 
@@ -6603,6 +6706,24 @@ impl LocalClusterMap {
             });
         }
         Ok(ack)
+    }
+
+    fn read_payload_shard_range_for_historical_inspection_into(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        self.retained_payload_shard_route(location, key)?
+            .read_placed_shard_range_for_historical_inspection_into(expected_ack, offset, dst)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })
     }
 
     #[cfg(test)]

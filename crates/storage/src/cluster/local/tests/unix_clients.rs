@@ -367,6 +367,18 @@ impl RetainedPlacedShardRoute for RecordingRetainedPlacedShardRoute {
         })
     }
 
+    fn read_placed_shard_range_for_historical_inspection_into(
+        &self,
+        _expected_ack: WriteAck,
+        _offset: u64,
+        _dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Io {
+            context: "recording shard client historical range read",
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
+
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
         Ok(())
     }
@@ -777,7 +789,7 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
 }
 
 #[test]
-fn unix_retained_read_reconstructs_with_historical_primary_down_and_corrupt_survivor() {
+fn unix_retained_range_falls_back_for_historical_shard_failures() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = trace_node_ids();
     let pg_ids = [0, 1, 2, 3];
@@ -991,11 +1003,6 @@ fn unix_retained_read_reconstructs_with_historical_primary_down_and_corrupt_surv
         std::os::unix::net::UnixStream::connect(&socket_paths[&unavailable_node]).is_err(),
         "the historical primary must be stopped before the retained read"
     );
-    let mut corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
-    assert!(!corrupt_bytes.is_empty());
-    corrupt_bytes[0] ^= 0xFF;
-    std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
-
     let outcome = cluster
         .load_leased_object_read_snapshot_if(
             &bucket,
@@ -1030,6 +1037,83 @@ fn unix_retained_read_reconstructs_with_historical_primary_down_and_corrupt_surv
         .retain_object_payload_read(leased_snapshot)
         .unwrap()
         .unwrap();
+
+    let intact_shard = std::fs::read(&corrupt_path).unwrap();
+    let shard_size = committed
+        .encrypted
+        .storage_bytes
+        .len()
+        .div_ceil(usize::from(ec_shape.k));
+    assert_eq!(intact_shard.len(), shard_size);
+    let range_start = corrupt_shard_index * shard_size;
+    let range_end = (range_start + 8).min(committed.encrypted.storage_bytes.len());
+    assert!(range_start < range_end);
+
+    let mut selected = Vec::new();
+    let outcome = retained
+        .read_segment_payload_stored_range_into(
+            &segment,
+            u64::try_from(range_start).unwrap()..u64::try_from(range_end).unwrap(),
+            &mut selected,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+    );
+    assert_eq!(
+        selected,
+        committed.encrypted.storage_bytes[range_start..range_end]
+    );
+
+    std::fs::remove_file(&corrupt_path).unwrap();
+    selected.extend_from_slice(b"discard missing-shard output");
+    let outcome = retained
+        .read_segment_payload_stored_range_into(
+            &segment,
+            u64::try_from(range_start).unwrap()..u64::try_from(range_end).unwrap(),
+            &mut selected,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired,
+        "a historical range NotFound response must request full EC fallback"
+    );
+    assert!(selected.is_empty());
+    let mut bytes = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
+
+    std::fs::write(&corrupt_path, &intact_shard).unwrap();
+    let mut short_shard = intact_shard.clone();
+    short_shard.pop().unwrap();
+    std::fs::write(&corrupt_path, short_shard).unwrap();
+    selected.extend_from_slice(b"discard length-invalid output");
+    let outcome = retained
+        .read_segment_payload_stored_range_into(
+            &segment,
+            u64::try_from(range_start).unwrap()..u64::try_from(range_end).unwrap(),
+            &mut selected,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired,
+        "a historical range ShardIntegrity response must request full EC fallback"
+    );
+    assert!(selected.is_empty());
+    let mut bytes = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
+
+    let mut corrupt_bytes = intact_shard;
+    corrupt_bytes[0] ^= 0xFF;
+    std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
     let mut bytes = Vec::new();
     retained
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
@@ -11901,7 +11985,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let server_thread = {
         let server = Arc::clone(&server);
         thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 server.accept_one().unwrap();
             }
         })
@@ -11918,6 +12002,16 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
 
     assert_eq!(observed, payload);
     assert_eq!(observed_ack, ack);
+    let mut observed_range = [0; 9];
+    map.read_payload_shard_range_for_historical_inspection_into(
+        location,
+        &shard_key,
+        ack,
+        4,
+        &mut observed_range,
+    )
+    .unwrap();
+    assert_eq!(&observed_range, &payload[4..13]);
     let shard_ack_route = map
         .metadata_pg_primary_node_for_retained_cleanup(historical_epoch, data_pg_id.pg_id())
         .unwrap()

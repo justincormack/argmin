@@ -86,7 +86,9 @@ fn systematic_range_read_requires_full_fallback(error: ShardIoError) -> Result<(
         &error,
         ShardIoError::Store {
             source: StoreError::StorageRpc {
-                operation: "decode read-handle shard range response",
+                operation:
+                    "decode read-handle shard range response"
+                    | "decode historical shard range response",
                 failure: StorageRpcErrorCode::PayloadDecode,
                 ..
             },
@@ -1217,6 +1219,39 @@ impl StorageCluster {
             segment.shard_integrity(),
             range,
             dst,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_read_retained_object_payload_segment_stored_range_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        request: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+        leased_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        let stored_size = u64::try_from(request.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds retained range coordinates".to_string(),
+            }
+        })?;
+        if range.start > range.end || range.end > stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "stored ciphertext range is outside the retained segment".to_string(),
+            });
+        }
+        self.require_current_payload_operation_epoch(request.data_pg_id)?;
+        let data_pg = self.validated_data_pg(PgId::new(request.data_pg_id))?;
+        self.try_read_placed_segment_systematic_range_at_placement_epoch_into(
+            placement_cluster_epoch,
+            data_pg,
+            request,
+            shard_integrity,
+            range,
+            dst,
+            leased_node_ids,
         )
     }
 
@@ -2913,6 +2948,102 @@ impl StorageCluster {
         if let Err(error) = read_handles.release() {
             dst.clear();
             return Err(shard_io_error_to_store(error));
+        }
+        Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_read_placed_segment_systematic_range_at_placement_epoch_into(
+        &self,
+        placement_epoch: ClusterEpoch,
+        data_pg: DataPgId,
+        req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+        leased_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        dst.clear();
+        let ranges = systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range)?;
+        let output_len = ranges
+            .last()
+            .map_or(0, |range| range.output_start + range.length);
+        if ranges.is_empty() {
+            return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
+        }
+        let Some(shard_integrity) = shard_integrity else {
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        };
+        let stored_size = u64::try_from(req.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds retained witness coordinates".to_string(),
+            }
+        })?;
+        if shard_integrity
+            .validate(req.ec, stored_size, req.segment_crc64)
+            .is_err()
+        {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "segment shard integrity witness does not match retained range-read geometry"
+                    .to_string(),
+            });
+        }
+
+        if req.data_pg_id != data_pg.get() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained systematic range authority does not match the segment data PG"
+                    .to_string(),
+            });
+        }
+        let reader = self.local_map.open_retained_placed_segment_shard_reader(
+            placement_epoch,
+            data_pg,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+            leased_node_ids,
+        )?;
+        dst.resize(output_len, 0);
+
+        for range in ranges {
+            let Some(location) = reader.location(range.shard_index) else {
+                dst.clear();
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            };
+            if !reader.is_leased(range.shard_index) {
+                dst.clear();
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
+            let Some(expected) = shard_integrity.expected_ack(range.shard_index) else {
+                dst.clear();
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "segment shard integrity witness omits retained systematic shard {}",
+                        range.shard_index
+                    ),
+                });
+            };
+            let shard_key = reader
+                .shard_key(range.shard_index)
+                .expect("retained systematic range has a derived key");
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+            {
+                dst.clear();
+                systematic_range_read_requires_full_fallback(error)?;
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
+            let output_end = range.output_start + range.length;
+            if let Err(error) = reader.read_range_into(
+                range.shard_index,
+                expected,
+                range.shard_offset,
+                &mut dst[range.output_start..output_end],
+            ) {
+                dst.clear();
+                systematic_range_read_requires_full_fallback(error)?;
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
         }
         Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
     }

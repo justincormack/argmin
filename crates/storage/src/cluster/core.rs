@@ -1982,6 +1982,37 @@ impl RetainedObjectPayloadRead {
             .map_err(ObjectReadFailure::from_store)
     }
 
+    /// Read one bounded range from the segment's exact retained placement.
+    ///
+    /// The result has the same authentication contract as the active-route
+    /// range primitive. A fallback outcome leaves `dst` empty and requires the
+    /// caller to use the complete witness-backed retained read.
+    pub fn read_segment_payload_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, ObjectReadFailure> {
+        if !self.contains_segment(segment) {
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "payload range read is outside the retained object snapshot"
+                        .to_string(),
+                },
+            ));
+        }
+        self.cluster
+            .try_read_retained_object_payload_segment_stored_range_into(
+                segment.placement_cluster_epoch(),
+                segment.stored_bytes_request(),
+                segment.shard_integrity(),
+                range,
+                dst,
+                &self.leased_node_ids,
+            )
+            .map_err(ObjectReadFailure::from_store)
+    }
+
     fn read_segment_payload_stored_bytes_into_raw(
         &self,
         segment: &ObjectPayloadSegment,

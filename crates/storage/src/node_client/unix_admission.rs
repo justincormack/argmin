@@ -516,6 +516,7 @@ pub(crate) fn storage_rpc_admission_class(
 
         StorageRpcMessageKind::ShardRead
         | StorageRpcMessageKind::ShardHistoricalRead
+        | StorageRpcMessageKind::ShardHistoricalReadRange
         | StorageRpcMessageKind::ShardReadRange
         | StorageRpcMessageKind::ReadHandlesAcquire
         | StorageRpcMessageKind::BucketDeleteReplicaHead

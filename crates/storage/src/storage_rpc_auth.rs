@@ -1480,7 +1480,8 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
             StorageRpcAuthorizedRoles::MAINTENANCE_ONLY
         }
 
-        StorageRpcMessageKind::ShardHistoricalRead => {
+        StorageRpcMessageKind::ShardHistoricalRead
+        | StorageRpcMessageKind::ShardHistoricalReadRange => {
             StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE
         }
 
@@ -1856,6 +1857,7 @@ mod tests {
 
     const FOREGROUND_RETAINED_PAYLOAD_READ_WORKFLOW: &[StorageRpcMessageKind] = &[
         StorageRpcMessageKind::ShardHistoricalRead,
+        StorageRpcMessageKind::ShardHistoricalReadRange,
         StorageRpcMessageKind::ObjectPayloadReclaimExists,
     ];
 
@@ -2664,7 +2666,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 171, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 172, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

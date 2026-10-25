@@ -179,6 +179,38 @@ impl UnixStorageNodeClient {
         })
     }
 
+    pub(crate) fn read_placed_shard_range_for_historical_inspection_into(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcShardReadRangeRequest {
+            location: location.into(),
+            shard_key: key.clone(),
+            expected_ack,
+            offset,
+            length: u64::try_from(dst.len()).map_err(|_| {
+                self.rpc_payload_error(
+                    "encode historical shard range request",
+                    "range length exceeds u64".to_string(),
+                )
+            })?,
+        };
+        let payload = encode_shard_read_range_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode historical shard range request", error.to_string())
+        })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ShardHistoricalReadRange, payload)?;
+        let data = decode_shard_read_range_response(&response, dst.len()).map_err(|error| {
+            self.rpc_payload_error("decode historical shard range response", error.to_string())
+        })?;
+        dst.copy_from_slice(&data);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn read_placed_shard_range(
         &self,
@@ -1193,6 +1225,22 @@ impl RetainedPlacedShardRoute for UnixRetainedPlacedShardRoute<'_> {
             self.client,
             self.location,
             &self.key,
+        )
+    }
+
+    fn read_placed_shard_range_for_historical_inspection_into(
+        &self,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::read_placed_shard_range_for_historical_inspection_into(
+            self.client,
+            self.location,
+            &self.key,
+            expected_ack,
+            offset,
+            dst,
         )
     }
 

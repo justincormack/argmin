@@ -1500,6 +1500,36 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
     assert_eq!(bytes, committed.encrypted.storage_bytes);
+    let mut selected = Vec::new();
+    let outcome = retained
+        .read_segment_payload_stored_range_into(&segment, 2..10, &mut selected)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+    );
+    assert_eq!(selected, committed.encrypted.storage_bytes[2..10]);
+    let malformed_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            Err(StoreError::StorageRpc {
+                node_id: location.node_id().as_u32(),
+                operation: "decode historical shard range response",
+                failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "injected malformed retained range response",
+                ),
+            })
+        }));
+    selected.extend_from_slice(b"discard this");
+    let outcome = retained
+        .read_segment_payload_stored_range_into(&segment, 2..10, &mut selected)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired
+    );
+    assert!(selected.is_empty());
+    drop(malformed_guard);
     assert!(retained.covers_complete_object_payload_layout(
         &bucket,
         &key,
@@ -1545,6 +1575,110 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let debug = format!("{error:?}");
     assert!(!debug.contains("payload read is outside"));
     assert!(!debug.contains("PayloadShardSetMismatch"));
+    let error = retained
+        .read_segment_payload_stored_range_into(&crossed, 0..1, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+}
+
+#[test]
+fn retained_object_payload_range_read_falls_back_after_systematic_node_loss() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("retained-systematic-range-fallback-bucket");
+    let key = crate::tests::object_key("retained-systematic-range-fallback-key");
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"retained systematic range falls back through the leased parity subset",
+    );
+    let systematic_location = cluster
+        .segment_payload_shard_locations(
+            committed.written.data_pg_id,
+            committed.written.ec,
+            &committed.segment_okh,
+            committed.generation_id,
+        )
+        .unwrap()[0];
+
+    drop(cluster);
+    let mut map = Arc::try_unwrap(map).expect("test owns the only local map reference");
+    let unavailable_node_id = systematic_location.node_id();
+    let inner = Arc::clone(
+        map.node(unavailable_node_id)
+            .unwrap()
+            .object_payload_lease_client(),
+    );
+    map.replace_object_payload_lease_client_for_tests(
+        unavailable_node_id,
+        Arc::new(PayloadLeaseUnavailableClient {
+            inner,
+            failure: PayloadLeaseUnavailableFailure::Transport,
+            attempts: None,
+            recovered: None,
+        }),
+    );
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+        )
+        .unwrap();
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot().object_segments[0].clone();
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = route
+        .retain_object_payload_read(leased_snapshot)
+        .unwrap()
+        .expect("live object should retain payload authority");
+
+    let mut selected = b"discard this".to_vec();
+    let outcome = retained
+        .read_segment_payload_stored_range_into(&segment, 0..8, &mut selected)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired
+    );
+    assert!(selected.is_empty());
+
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let observed_unavailable = Arc::clone(&unavailable);
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            if location.node_id() == unavailable_node_id {
+                observed_unavailable.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+    let mut recovered = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut recovered)
+        .unwrap();
+    assert_eq!(recovered, committed.encrypted.storage_bytes);
+    assert!(
+        !unavailable.load(Ordering::SeqCst),
+        "complete fallback must not read an unleased shard location"
+    );
 }
 
 #[test]

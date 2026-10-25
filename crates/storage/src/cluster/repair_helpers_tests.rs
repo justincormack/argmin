@@ -654,7 +654,10 @@ fn is_recoverable_remote_shard_read_error(
 ) -> bool {
     matches!(
         operation,
-        "shard read" | "shard read range" | "shard historical read"
+        "shard read"
+            | "shard read range"
+            | "shard historical read"
+            | "shard historical read range"
     ) && matches!(
         code,
         StorageRpcErrorCode::NotFound | StorageRpcErrorCode::ShardIntegrity
@@ -994,7 +997,12 @@ mod reissue_decision_tests {
 
     #[test]
     fn placed_segment_read_recovers_remote_shard_read_damage_errors() {
-        for operation in ["shard read", "shard read range", "shard historical read"] {
+        for operation in [
+            "shard read",
+            "shard read range",
+            "shard historical read",
+            "shard historical read range",
+        ] {
             for (code, message) in [
                 (StorageRpcErrorCode::NotFound, "not found".to_string()),
                 (

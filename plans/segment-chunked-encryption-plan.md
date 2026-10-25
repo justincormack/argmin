@@ -1,7 +1,7 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phases 0 and 1 complete; Phase 2 integrated; Phase 3 in progress; production
-writer selection and benchmark gate remain)
+Status: In progress (Phases 0 through 3 complete; Phase 4 is next; production writer selection and
+benchmark gate remain)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -1653,10 +1653,39 @@ Implementation update (2026-10-25, current-route systematic mapping):
   response after partial assembly, a Unix disconnect after read-handle acquisition (including the
   failed release on the same connection), and missing-selected-shard fallback followed by
   successful full witness-backed reconstruction.
-- This is still not connected to an S3 response. Historical placement currently returns the
-  explicit fallback outcome rather than resampling the active route. Remaining Phase 3 work is an
-  exact retained-route range capability, retained node-loss coverage, and the complete
-  malformed/authentication fallback integration that Phase 4 will consume.
+- At this slice boundary the primitive was not connected to an S3 response, and historical
+  placement returned the explicit fallback outcome rather than resampling the active route. The
+  exact retained-route range capability and retained node-loss coverage landed in the following
+  slice; profile authentication remains intentionally owned by Phase 4.
+
+Implementation update (2026-10-25, retained-route systematic ranges):
+
+- `RetainedObjectPayloadRead` now exposes the same exhaustive stored-ciphertext range outcome as
+  the active capability. It binds the request to an exact snapshot segment, reconstructed PG route,
+  placement-derived shard keys, and the node subset protected by its retained deletion-exclusion
+  lease. The storage-owned retained reader is the only caller of the raw historical range helper;
+  parent cluster code cannot pair arbitrary locations and keys.
+- Historical range reads use a distinct `ShardHistoricalReadRange` RPC kind. They do not weaken the
+  active route's session-bound `ShardReadRange` check and do not change the frozen whole-shard
+  historical-read grammar. The storage node revalidates the exact retained route and complete-file
+  acknowledgement geometry before descriptor-based positioned IO. Frontend, storage-node, and
+  maintenance authorization inventories classify the new kind explicitly.
+- Missing systematic lease owners, node loss, malformed authenticated responses, invalid lengths,
+  and other recoverable shard failures clear all selected bytes and return
+  `FullSegmentFallbackRequired`. The complete retained read then reconstructs solely from the
+  still-leased shard subset through the durable integrity witness; the partial path never reaches
+  an unleased location.
+- Owner-local tests cover exact-subject rejection, malformed-response clearing, systematic-node
+  loss followed by successful parity reconstruction, installed Unix historical `NotFound` and
+  length-invalid `ShardIntegrity` responses followed by successful full EC reconstruction,
+  historical routing after an epoch transition, and authenticated TLS historical range framing
+  and authorization.
+- No partial ciphertext is exposed to S3 yet. Phase 4 owns profile authentication, translation
+  from S3 plaintext ranges to Cobblestone records, and the authentication-failure-to-complete-read
+  fallback before response exposure.
+
+Phase 3 exit is satisfied: healthy active and retained systematic reads perform bounded disk and
+network IO, while degraded or suspect cases retain the complete witness-backed recovery path.
 
 Exit: requesting a bounded ciphertext range causes bounded disk and network IO in healthy and
 systematic profiles, while every degraded or suspect case remains correct through the full-segment

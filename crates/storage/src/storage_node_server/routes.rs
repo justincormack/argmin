@@ -3760,6 +3760,34 @@ impl StorageNodeRetainedShardInspectionRoute<'_> {
             .read_shard_file(self.location.data_pg_id().get(), self.shard_key)
             .map_err(StorageNodeDataRouteError::Store)
     }
+
+    fn read_range(
+        &self,
+        expected_ack: WriteAck,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, StorageNodeDataRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        let length = usize::try_from(length).map_err(|_| {
+            StorageNodeDataRouteError::Store(StoreError::PayloadShardSetMismatch {
+                reason: "historical payload shard range length exceeds addressable memory"
+                    .to_string(),
+            })
+        })?;
+        let mut payload = vec![0; length];
+        self.handler
+            .node
+            .read_shard_file_range_into(
+                self.location.data_pg_id().get(),
+                self.shard_key,
+                expected_ack,
+                offset,
+                &mut payload,
+            )
+            .map_err(StorageNodeDataRouteError::Store)?;
+        Ok(payload)
+    }
 }
 
 impl StorageNodeRetainedReadHandleReleaseRoute<'_> {

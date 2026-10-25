@@ -2102,7 +2102,7 @@ impl StorageNodeConnectionHandler {
         request: &'a StorageRpcHistoricalShardReadRequest,
         operation: &'static str,
     ) -> Result<StorageNodeRetainedShardInspectionRoute<'a>, StorageRpcErrorResponse> {
-        let pg_id = self.validate_retained_shard_route(
+        self.retained_shard_inspection_route_for_subject(
             route_permit,
             request.location.node_id,
             request.location.cluster_epoch,
@@ -2110,20 +2110,42 @@ impl StorageNodeConnectionHandler {
             request.location.shard_index,
             &request.shard_key,
             operation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retained_shard_inspection_route_for_subject<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        raw_pg_id: PgId,
+        shard_index: ShardIndex,
+        shard_key: &'a ShardKey,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedShardInspectionRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_shard_route(
+            route_permit,
+            node_id,
+            cluster_epoch,
+            raw_pg_id,
+            shard_index,
+            shard_key,
+            operation,
         )?;
         Ok(StorageNodeRetainedShardInspectionRoute {
             handler: self,
             route_permit,
-            node_id: request.location.node_id,
-            route_cluster_epoch: request.location.cluster_epoch,
-            raw_pg_id: request.location.pg_id,
+            node_id,
+            route_cluster_epoch: cluster_epoch,
+            raw_pg_id,
             location: ShardLocation::new(
-                request.location.cluster_epoch,
+                cluster_epoch,
                 pg_id,
-                request.location.shard_index,
-                request.location.node_id,
+                shard_index,
+                node_id,
             ),
-            shard_key: &request.shard_key,
+            shard_key,
         })
     }
 

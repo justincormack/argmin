@@ -255,7 +255,10 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardHistoricalRead => {
             STORAGE_RPC_MAX_HISTORICAL_SHARD_READ_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ShardReadRange => STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardReadRange
+        | StorageRpcMessageKind::ShardHistoricalReadRange => {
+            STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardAckLoad
         | StorageRpcMessageKind::ShardAckHistoricalLoad

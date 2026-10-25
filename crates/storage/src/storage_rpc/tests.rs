@@ -4284,6 +4284,11 @@ mod tests {
                 STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::ShardHistoricalReadRange,
+                STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::ShardDelete,
                 STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,

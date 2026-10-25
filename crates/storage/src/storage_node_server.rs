@@ -368,8 +368,8 @@ use crate::{
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord,
     LifecycleSweepRoot, MultipartUploadRecord, NodeId, ObjectKey, ObjectPayloadReclaimClaimRecord,
     ObjectPayloadReclaimKind, ObjectPgActionError, PayloadReclaimRoot,
-    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardIndex, ShardKey,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
 use crate::{BucketFastPathIdentity, BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
@@ -867,6 +867,7 @@ impl StorageNodeConnectionHandler {
                         | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
                         | StorageRpcMessageKind::ReadHandlesRelease
                         | StorageRpcMessageKind::ShardHistoricalRead
+                        | StorageRpcMessageKind::ShardHistoricalReadRange
                         | StorageRpcMessageKind::ShardDelete
                         | StorageRpcMessageKind::ShardAckHistoricalLoad
                         | StorageRpcMessageKind::ShardAckDelete
@@ -1862,6 +1863,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ShardHistoricalRead => {
                 match decode_historical_shard_read_request(&frame.payload) {
                     Ok(request) => self.shard_historical_read_response(route_permit, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ShardHistoricalReadRange => {
+                match decode_shard_read_range_request(&frame.payload) {
+                    Ok(request) => self.shard_historical_read_range_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6376,6 +6386,38 @@ impl StorageNodeConnectionHandler {
             Ok(payload) => encode_storage_rpc_success_response(
                 &encode_historical_shard_read_response(&payload)?,
             ),
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
+        };
+        Ok(response)
+    }
+
+    fn shard_historical_read_range_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcShardReadRangeRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.retained_shard_inspection_route_for_subject(
+            route_permit,
+            request.location.node_id,
+            request.location.cluster_epoch,
+            request.location.pg_id,
+            request.location.shard_index,
+            &request.shard_key,
+            "historical shard range inspection",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.read_range(request.expected_ack, request.offset, request.length)
+        {
+            Ok(payload) => {
+                encode_storage_rpc_success_response(&encode_shard_read_range_response(&payload))
+            }
             Err(StorageNodeDataRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)?
             }

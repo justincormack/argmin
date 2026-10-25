@@ -1278,6 +1278,16 @@ pub(crate) trait RetainedPlacedShardRoute: Send {
         Ok(ack)
     }
 
+    /// Read a bounded range from the exact retained placement. The expected
+    /// acknowledgement binds the complete immutable shard geometry, while the
+    /// caller remains responsible for authenticating the selected ciphertext.
+    fn read_placed_shard_range_for_historical_inspection_into(
+        &self,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError>;
+
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError>;
 }
 

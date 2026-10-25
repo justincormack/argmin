@@ -177,6 +177,7 @@ pub(crate) enum StorageRpcMessageKind {
     ShardHistoricalRead = 142,
     PlacedSegmentShardBackfillExists = 143,
     ShardAckHistoricalLoad = 144,
+    ShardHistoricalReadRange = 175,
 }
 
 /// Opaque diagnostic identifying a failure reported by a storage node.
@@ -329,6 +330,7 @@ impl StorageRpcMessageKind {
             Self::ShardRepairWrite => "shard repair write",
             Self::ShardRead => "shard read",
             Self::ShardHistoricalRead => "shard historical read",
+            Self::ShardHistoricalReadRange => "shard historical read range",
             Self::ShardReadRange => "shard read range",
             Self::ShardDelete => "shard delete",
             Self::ReadHandlesAcquire => "read handles acquire",
@@ -730,6 +732,7 @@ impl StorageRpcMessageKind {
             142 => Ok(Self::ShardHistoricalRead),
             143 => Ok(Self::PlacedSegmentShardBackfillExists),
             144 => Ok(Self::ShardAckHistoricalLoad),
+            175 => Ok(Self::ShardHistoricalReadRange),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
