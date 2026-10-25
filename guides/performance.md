@@ -153,6 +153,18 @@ entered repair fallback. The range row is the key Phase 0 result: returning
 codec measurements must retain these exact workload and environment fields and
 compare both throughput and work counters, not throughput alone.
 
+The completed Cobblestone reader changes the expected work shape when that
+profile is selected. A healthy full GET can expose its first 16 KiB plaintext
+record after reading only the fixed header and first encrypted record; it does
+not check out or fill the 8 MiB segment buffer. It calculates each systematic
+shard CRC incrementally from the same ciphertext ranges and reads only the
+small final EC-padding suffix needed to finish the physical witness. The final
+plaintext-bearing record is retained until that check completes. Phase 5 must
+record a clean-worktree benchmark after the production writer decision and
+compare its TTFB, buffer, CRC, stored-byte, and completion counters against the
+historical table above; the implementation canary is not a substitute for that
+reference run.
+
 For historical context, benchmark protocol `payload_read_v1` on clean revision
 `964de9ca4e90f5bb94ad9929a0c3a3933dce6082` reported 109.335 full GET requests/s
 and 342.586 range GET requests/s. It measured only aggregate completion

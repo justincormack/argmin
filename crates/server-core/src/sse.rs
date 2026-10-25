@@ -119,6 +119,129 @@ pub(crate) struct AuthorizedCobblestoneSegmentRangeRead {
     selection: Cobblestone256SelectedRange,
 }
 
+/// Incremental, subject-bound opener for one complete Cobblestone segment.
+///
+/// The caller obtains the next exact stored-ciphertext range from this value,
+/// reads it through storage's sequential physical-integrity capability, and
+/// returns those bytes to [`Self::authenticate_next`]. No plaintext from a
+/// failing record is returned. The final record is not sufficient to complete
+/// a response until the storage capability has also validated every physical
+/// systematic-shard byte.
+pub(crate) struct AuthorizedCobblestoneSegmentStreamRead {
+    opener: Cobblestone256StreamOpener,
+    layout: Cobblestone256MessageLayout,
+    header_authenticated: bool,
+    next_chunk: u64,
+    plaintext_len: usize,
+    authenticated_plaintext_len: usize,
+    label: &'static str,
+}
+
+impl AuthorizedCobblestoneSegmentStreamRead {
+    #[must_use]
+    pub(crate) fn next_ciphertext_range(&self) -> Option<Range<u64>> {
+        if !self.header_authenticated {
+            return Some(0..COBBLESTONE_HEADER_LEN as u64);
+        }
+        if self.next_chunk >= self.layout.chunk_count() {
+            return None;
+        }
+        self.layout.ciphertext_range_for_chunk(self.next_chunk).ok()
+    }
+
+    pub(crate) fn authenticate_next(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, ServerError> {
+        let expected = self
+            .next_ciphertext_range()
+            .ok_or_else(|| ServerError::InternalError {
+                reason: format!(
+                    "received trailing ciphertext for {} Cobblestone segment",
+                    self.label
+                ),
+            })?;
+        let expected_len = usize::try_from(expected.end - expected.start).map_err(|_| {
+            ServerError::InternalError {
+                reason: format!("{} Cobblestone record length is invalid", self.label),
+            }
+        })?;
+        if ciphertext.len() != expected_len {
+            return Err(ServerError::InternalError {
+                reason: format!(
+                    "{} Cobblestone record length {} did not match expected {}",
+                    self.label,
+                    ciphertext.len(),
+                    expected_len
+                ),
+            });
+        }
+
+        let mut plaintext = Vec::new();
+        if self.header_authenticated {
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                aead_records: 1,
+                ..observability::PayloadReadMetricDelta::default()
+            });
+        }
+        self.opener
+            .update(ciphertext, &mut plaintext)
+            .map_err(|_| ServerError::InternalError {
+                reason: format!("failed to decrypt {} Cobblestone segment", self.label),
+            })?;
+        if self.header_authenticated {
+            self.next_chunk += 1;
+            self.authenticated_plaintext_len = self
+                .authenticated_plaintext_len
+                .checked_add(plaintext.len())
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: format!(
+                        "decrypted {} Cobblestone segment length overflowed",
+                        self.label
+                    ),
+                })?;
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                decrypted_bytes: u64::try_from(plaintext.len()).unwrap_or(u64::MAX),
+                ..observability::PayloadReadMetricDelta::default()
+            });
+        } else {
+            self.header_authenticated = true;
+            debug_assert!(plaintext.is_empty());
+        }
+        Ok(plaintext)
+    }
+
+    #[must_use]
+    pub(crate) fn input_complete(&self) -> bool {
+        self.header_authenticated && self.next_chunk == self.layout.chunk_count()
+    }
+
+    /// Reports whether the next record is the mandatory authenticated empty
+    /// terminal record for an exact chunk-multiple message.
+    #[must_use]
+    pub(crate) fn next_record_is_empty_terminal(&self) -> bool {
+        if !self.header_authenticated || self.next_chunk >= self.layout.chunk_count() {
+            return false;
+        }
+        self.layout
+            .plaintext_range_for_chunk(self.next_chunk)
+            .is_ok_and(|range| range.is_empty())
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), ServerError> {
+        if !self.input_complete() || self.authenticated_plaintext_len != self.plaintext_len {
+            return Err(ServerError::InternalError {
+                reason: format!(
+                    "decrypted {} Cobblestone segment length {} did not match expected {}",
+                    self.label, self.authenticated_plaintext_len, self.plaintext_len
+                ),
+            });
+        }
+        self.opener
+            .finish()
+            .map_err(|_| ServerError::InternalError {
+                reason: format!("failed to finish {} Cobblestone segment", self.label),
+            })
+    }
+}
+
 impl AuthorizedCobblestoneSegmentRangeRead {
     #[must_use]
     pub(crate) fn header_range(&self) -> Range<u64> {
@@ -1094,6 +1217,45 @@ pub(crate) fn prepare_authorized_managed_encryption_segment_range(
     prepare_authorized_cobblestone_segment_range(&dek, read, plaintext_range)
 }
 
+pub(crate) fn prepare_authorized_managed_encryption_segment_stream(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    read: AuthorizedSegmentRead<'_>,
+) -> Result<AuthorizedCobblestoneSegmentStreamRead, ServerError> {
+    let encryption = ObjectEncryption::SseS3(state.clone());
+    if state.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1
+        || !read.subject.matches_encryption_and_geometry(
+            &encryption,
+            read.segment_index,
+            read.plaintext_len as u64,
+        )
+    {
+        return Err(ServerError::InternalError {
+            reason: "managed Cobblestone stream does not match its storage-minted read subject"
+                .to_string(),
+        });
+    }
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => MANAGED_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    prepare_authorized_cobblestone_segment_stream(&dek, read, MANAGED_ENCRYPTION_LABEL)
+}
+
 #[cfg(test)]
 fn decrypt_managed_encryption_segment_in_place(
     provider: &impl ManagedKeyProvider,
@@ -1353,6 +1515,72 @@ pub(crate) fn prepare_authorized_sse_customer_segment_range(
         "SSE-C",
     )?;
     prepare_authorized_cobblestone_segment_range(&dek, read, plaintext_range)
+}
+
+pub(crate) fn prepare_authorized_sse_customer_segment_stream(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    read: AuthorizedSegmentRead<'_>,
+) -> Result<AuthorizedCobblestoneSegmentStreamRead, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let encryption = ObjectEncryption::SseCustomer(state.clone());
+    if state.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1
+        || !read.subject.matches_encryption_and_geometry(
+            &encryption,
+            read.segment_index,
+            read.plaintext_len as u64,
+        )
+    {
+        return Err(ServerError::InternalError {
+            reason: "SSE-C Cobblestone stream does not match its storage-minted read subject"
+                .to_string(),
+        });
+    }
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => SSE_C_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        "SSE-C",
+    )?;
+    prepare_authorized_cobblestone_segment_stream(&dek, read, "SSE-C")
+}
+
+fn prepare_authorized_cobblestone_segment_stream(
+    dek: &[u8; SSE_C_DEK_LEN],
+    read: AuthorizedSegmentRead<'_>,
+    label: &'static str,
+) -> Result<AuthorizedCobblestoneSegmentStreamRead, ServerError> {
+    let failure = || ServerError::InternalError {
+        reason: format!("invalid {label} Cobblestone segment geometry"),
+    };
+    let layout = Cobblestone256MessageLayout::from_plaintext_len(read.plaintext_len as u64)
+        .map_err(|_| failure())?;
+    let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} Cobblestone segment opening key"),
+    })?;
+    let opener = Cobblestone256StreamOpener::new(
+        key,
+        read.subject.payload_aead_context(),
+        layout.ciphertext_len(),
+    )
+    .map_err(|_| failure())?;
+    Ok(AuthorizedCobblestoneSegmentStreamRead {
+        opener,
+        layout,
+        header_authenticated: false,
+        next_chunk: 0,
+        plaintext_len: read.plaintext_len,
+        authenticated_plaintext_len: 0,
+        label,
+    })
 }
 
 fn prepare_authorized_cobblestone_segment_range(

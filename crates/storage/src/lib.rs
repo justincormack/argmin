@@ -101,13 +101,14 @@ pub use cluster::{
     LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, ObjectPayloadRangeReadOutcome, PreparedStandaloneEmbeddedTopology,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
-    RetainedStreamUploadCleanup, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    ObjectPayloadFullSegmentRead, ObjectPayloadFullSegmentReadOutcome, ObjectPayloadLease,
+    ObjectPayloadRangeReadOutcome, PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey,
+    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
+    StorageCluster, StorageClusterRouteAdmission, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshError,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 pub use control_plane_client_bootstrap::{
     control_plane_clock_recovery_socket_path, ControlPlaneAdminClientBootstrap,
@@ -2598,6 +2599,7 @@ pub mod test_support {
     #[derive(Clone, Copy)]
     enum TestObjectPayloadShardRole {
         FirstData,
+        LastData,
         FirstParity,
         LastParity,
     }
@@ -2612,6 +2614,12 @@ pub mod test_support {
         })?;
         let shard_index = match role {
             TestObjectPayloadShardRole::FirstData => 0,
+            TestObjectPayloadShardRole::LastData => {
+                segment.ec_k.checked_sub(1).ok_or_else(|| StoreError::Io {
+                    context: "select object payload shard fault",
+                    source: std::io::Error::other("captured payload has no data shard"),
+                })?
+            }
             TestObjectPayloadShardRole::FirstParity => segment.ec_k,
             TestObjectPayloadShardRole::LastParity => segment
                 .ec_k
@@ -2933,6 +2941,22 @@ pub mod test_support {
             cluster,
             snapshot,
             TestObjectPayloadShardRole::FirstData,
+        )
+        .map_err(TestStorageFailure::from_store)
+    }
+
+    /// Corrupts the final systematic shard of storage's first payload segment
+    /// without exposing its physical index. This is useful for proving that a
+    /// full response may release earlier authenticated records before a later
+    /// systematic read enters reconstruction.
+    pub fn inject_object_payload_last_data_shard_corruption(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
+        inject_object_payload_shard_corruption_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::LastData,
         )
         .map_err(TestStorageFailure::from_store)
     }

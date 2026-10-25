@@ -10,8 +10,9 @@ use std::time::Duration;
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
     BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey,
-    ObjectPayloadRangeReadOutcome, ProcessLocalRegistryKey, SegmentPayloadCodec, StorageCluster,
-    StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState, VersionId,
+    ObjectPayloadFullSegmentRead, ObjectPayloadRangeReadOutcome, ProcessLocalRegistryKey,
+    SegmentPayloadCodec, StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission,
+    UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -25,7 +26,9 @@ use crate::sse::{
     decrypt_authorized_managed_encryption_segment_in_place,
     decrypt_authorized_sse_customer_segment_in_place,
     prepare_authorized_managed_encryption_segment_range,
-    prepare_authorized_sse_customer_segment_range, AuthorizedSegmentRead, SseCustomerRequest,
+    prepare_authorized_managed_encryption_segment_stream,
+    prepare_authorized_sse_customer_segment_range, prepare_authorized_sse_customer_segment_stream,
+    AuthorizedCobblestoneSegmentStreamRead, AuthorizedSegmentRead, SseCustomerRequest,
     SseCustomerSegmentScope,
 };
 
@@ -1091,6 +1094,83 @@ impl ReadRuntime {
             &mut buf,
         )?;
         Ok(buf.into_shared())
+    }
+
+    /// Prepares the exact crypto and storage capabilities needed to stream a
+    /// complete Cobblestone segment one authenticated record at a time.
+    /// Crypto prerequisites are resolved before the first partial shard read.
+    pub(super) fn begin_checked_segment_payload_stream(
+        &self,
+        segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
+        sse_customer_request: Option<&SseCustomerRequest>,
+    ) -> Result<
+        (
+            ObjectPayloadFullSegmentRead,
+            AuthorizedCobblestoneSegmentStreamRead,
+        ),
+        ServerError,
+    > {
+        if segment.encryption.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1 {
+            return Err(ServerError::InternalError {
+                reason: "incremental payload stream requires the Cobblestone profile".to_string(),
+            });
+        }
+        let encryption_subject = segment
+            .storage_segment
+            .encryption_subject()
+            .ok_or_else(|| ServerError::InternalError {
+                reason: "payload segment is missing its storage-minted encryption subject"
+                    .to_string(),
+            })?;
+        let segment_scope = part_number.map_or(Ok(SseCustomerSegmentScope::object()), |part| {
+            SseCustomerSegmentScope::multipart_part(part)
+        })?;
+        let authorized = AuthorizedSegmentRead::new(
+            encryption_subject,
+            segment_scope,
+            segment.segment_index(),
+            segment.size() as usize,
+        );
+        let crypto = match &segment.encryption {
+            ObjectEncryption::SseCustomer(state) => {
+                let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
+                    reason: "SSE-C headers are required for this object".to_string(),
+                })?;
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                prepare_authorized_sse_customer_segment_stream(
+                    validator, state, request, authorized,
+                )?
+            }
+            ObjectEncryption::SseS3(state) => {
+                let provider =
+                    self.managed_key_provider
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-S3 key provider is not configured".to_string(),
+                        })?;
+                prepare_authorized_managed_encryption_segment_stream(provider, state, authorized)?
+            }
+        };
+        let physical = match &self.storage {
+            ReadStorage::Active(active) => active.begin_full_segment_read(&segment.storage_segment),
+            ReadStorage::Retained(retained) => {
+                retained.begin_full_segment_read(&segment.storage_segment)
+            }
+            ReadStorage::Cluster(_) => {
+                return Err(ServerError::InternalError {
+                    reason: "payload stream was not prepared with lease-bound authority"
+                        .to_string(),
+                });
+            }
+        }
+        .map_err(super::map_object_read_failure)?;
+        Ok((physical, crypto))
     }
 
     /// Read and authenticate one logical subrange of a Cobblestone segment.

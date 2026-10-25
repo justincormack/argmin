@@ -1358,6 +1358,161 @@ fn active_object_payload_range_read_maps_only_intersecting_systematic_shards() {
 }
 
 #[test]
+fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular_ranges() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("sequential-full-segment-bucket");
+    let key = crate::tests::object_key("sequential-full-segment-key");
+    let payload = (0..70_001)
+        .map(|index| (index % usize::from(u8::MAX)) as u8)
+        .collect::<Vec<_>>();
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, &payload);
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments[0].clone();
+    let active = Arc::new(
+        cluster
+            .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+            .unwrap(),
+    );
+
+    let crossed = segment.with_test_segment_index(segment.segment_index() + 1);
+    let error = match active.begin_full_segment_read(&crossed) {
+        Ok(_) => panic!("crossed segment unexpectedly received full-read authority"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+
+    let mut reader = active.begin_full_segment_read(&segment).unwrap();
+    let stored_size = committed.encrypted.storage_bytes.len();
+    let mut assembled = Vec::with_capacity(stored_size);
+    let mut start = 0usize;
+    let widths = [1usize, 16_383, 2, 19_997, 31];
+    let mut width_index = 0usize;
+    while start < stored_size {
+        let end = (start + widths[width_index % widths.len()]).min(stored_size);
+        let mut selected = Vec::new();
+        let outcome = reader
+            .read_next_stored_range_into(
+                u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+                &mut selected,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+        );
+        assembled.extend_from_slice(&selected);
+        start = end;
+        width_index += 1;
+    }
+    assert_eq!(assembled, committed.encrypted.storage_bytes);
+    assert_eq!(
+        reader.finish().unwrap(),
+        crate::ObjectPayloadFullSegmentReadOutcome::Complete
+    );
+}
+
+#[test]
+fn sequential_full_segment_read_validates_physical_padding_before_completion() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("sequential-padding-bucket");
+    let key = crate::tests::object_key("sequential-padding-key");
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"ciphertext geometry deliberately leaves EC padding",
+    );
+    let stored_size = committed.encrypted.storage_bytes.len();
+    let data_shards = usize::from(committed.written.ec.k);
+    let shard_size = stored_size.div_ceil(data_shards);
+    let padding_size = shard_size * data_shards - stored_size;
+    assert_ne!(padding_size, 0, "fixture must exercise physical EC padding");
+
+    let last_systematic_index = data_shards - 1;
+    let shard_path = cluster
+        .test_payload_shard_file_path(
+            committed.written.data_pg_id,
+            committed.written.ec,
+            &committed.segment_okh,
+            committed.generation_id,
+            u8::try_from(last_systematic_index).unwrap(),
+        )
+        .unwrap();
+    let mut physical_shard = std::fs::read(&shard_path).unwrap();
+    assert_eq!(physical_shard.len(), shard_size);
+    physical_shard[shard_size - 1] ^= 0x80;
+    std::fs::write(&shard_path, physical_shard).unwrap();
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments[0].clone();
+    let active = Arc::new(
+        cluster
+            .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+            .unwrap(),
+    );
+    let mut reader = active.begin_full_segment_read(&segment).unwrap();
+    let mut selected = Vec::new();
+    assert_eq!(
+        reader
+            .read_next_stored_range_into(0..u64::try_from(stored_size).unwrap(), &mut selected,)
+            .unwrap(),
+        crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+    );
+    assert_eq!(
+        selected, committed.encrypted.storage_bytes,
+        "padding corruption must not alter the logical ciphertext range"
+    );
+    assert_eq!(
+        reader.finish().unwrap(),
+        crate::ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired,
+        "completion must validate the padding bytes included in the physical shard CRC"
+    );
+}
+
+#[test]
 fn active_object_payload_range_read_requests_full_fallback_without_exposing_partial_bytes() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
@@ -1491,7 +1646,7 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     }
     let (_, snapshot, leased_snapshot) = outcome.into_parts();
     assert!(leased_snapshot.test_shares_snapshot(&snapshot));
-    let mut retained = route
+    let retained = route
         .retain_object_payload_read(leased_snapshot)
         .unwrap()
         .expect("live object should retain payload authority");
@@ -1509,6 +1664,32 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
         crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
     );
     assert_eq!(selected, committed.encrypted.storage_bytes[2..10]);
+    let retained = Arc::new(retained);
+    let mut full_reader = retained.begin_full_segment_read(&segment).unwrap();
+    let mut streamed = Vec::new();
+    let stored_size = committed.encrypted.storage_bytes.len();
+    let midpoint = stored_size / 2;
+    for range in [0..midpoint, midpoint..stored_size] {
+        let mut chunk = Vec::new();
+        assert_eq!(
+            full_reader
+                .read_next_stored_range_into(
+                    u64::try_from(range.start).unwrap()..u64::try_from(range.end).unwrap(),
+                    &mut chunk,
+                )
+                .unwrap(),
+            crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+        );
+        streamed.extend_from_slice(&chunk);
+    }
+    assert_eq!(streamed, committed.encrypted.storage_bytes);
+    assert_eq!(
+        full_reader.finish().unwrap(),
+        crate::ObjectPayloadFullSegmentReadOutcome::Complete
+    );
+    let mut retained = Arc::try_unwrap(retained).unwrap_or_else(|_| {
+        panic!("completed full-segment reader must release retained authority")
+    });
     let malformed_guard =
         cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
             Err(StoreError::StorageRpc {

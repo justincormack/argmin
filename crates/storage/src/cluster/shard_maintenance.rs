@@ -9,6 +9,67 @@ struct SystematicShardRange {
     length: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SystematicShardPadding {
+    shard_index: usize,
+    shard_offset: u64,
+    length: usize,
+    expected_ack: WriteAck,
+}
+
+fn systematic_shard_padding(
+    req: SegmentStoredBytesRequest,
+    integrity: &crate::types::SegmentShardIntegrityRecord,
+    context: &str,
+) -> Result<Option<SystematicShardPadding>, StoreError> {
+    let stored_size = u64::try_from(req.stored_size).map_err(|_| {
+        StoreError::PayloadShardSetMismatch {
+            reason: format!("stored segment size exceeds {context} padding coordinates"),
+        }
+    })?;
+    integrity
+        .validate(req.ec, stored_size, req.segment_crc64)
+        .map_err(|error| StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read has an invalid integrity witness: {error}"),
+        })?;
+    let shard_index = usize::from(req.ec.k).checked_sub(1).ok_or_else(|| {
+        StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read requires a systematic shard"),
+        }
+    })?;
+    let expected_ack = integrity.expected_ack(shard_index).ok_or_else(|| {
+        StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read witness omits the final systematic shard"),
+        }
+    })?;
+    let shard_start = expected_ack
+        .stored_size
+        .checked_mul(shard_index as u64)
+        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read shard offset overflowed"),
+        })?;
+    let shard_offset = stored_size.checked_sub(shard_start).ok_or_else(|| {
+        StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read geometry is invalid"),
+        }
+    })?;
+    let length = expected_ack
+        .stored_size
+        .checked_sub(shard_offset)
+        .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+            reason: format!("{context} padding read exceeds the final systematic shard"),
+        })?;
+    let length = usize::try_from(length).map_err(|_| StoreError::PayloadShardSetMismatch {
+        reason: format!("{context} padding size exceeds platform limits"),
+    })?;
+    Ok((length != 0).then_some(SystematicShardPadding {
+        shard_index,
+        shard_offset,
+        length,
+        expected_ack,
+    }))
+}
+
 fn systematic_shard_ranges_for_segment_range(
     stored_size: usize,
     data_shards: u8,
@@ -2952,6 +3013,72 @@ impl StorageCluster {
         Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
     }
 
+    /// Reads the EC-padding suffix of the final systematic shard while the
+    /// caller retains the exact active payload authority. The bytes are not
+    /// part of the logical stored segment, but they are part of the physical
+    /// shard checksum and therefore must be observed before a sequential read
+    /// can attest that every systematic shard matched its durable witness.
+    fn read_object_payload_segment_systematic_padding_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let req = segment.stored_bytes_request();
+        if segment.placement_cluster_epoch() != self.operation_epoch() {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "active padding read does not match the segment placement epoch"
+                    .to_string(),
+            });
+        }
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
+        let Some(integrity) = segment.shard_integrity() else {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "active padding read requires a shard integrity witness".to_string(),
+            });
+        };
+        dst.clear();
+        let Some(padding) = systematic_shard_padding(req, integrity, "active")? else {
+            return Ok(());
+        };
+
+        let reader = self.current_placed_segment_shard_reader(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+        )?;
+        let mut read_handles = reader
+            .acquire_read_handles(std::iter::once(padding.shard_index))
+            .map_err(shard_io_error_to_store)?;
+        let location = read_handles
+            .location(padding.shard_index)
+            .expect("leased final systematic shard has a location");
+        let shard_key = read_handles
+            .shard_key(padding.shard_index)
+            .expect("leased final systematic shard has a derived key");
+        if let Err(error) = self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+        {
+            let release = release_systematic_range_read_handles_after_failure(&mut read_handles);
+            let error = shard_io_error_to_store(error);
+            release?;
+            return Err(error);
+        }
+        dst.resize(padding.length, 0);
+        if let Err(error) = read_handles.read_range_into(
+            padding.shard_index,
+            padding.expected_ack,
+            padding.shard_offset,
+            dst.as_mut_slice(),
+        ) {
+            dst.clear();
+            let release = release_systematic_range_read_handles_after_failure(&mut read_handles);
+            let error = shard_io_error_to_store(error);
+            release?;
+            return Err(error);
+        }
+        read_handles.release().map_err(shard_io_error_to_store)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_read_placed_segment_systematic_range_at_placement_epoch_into(
         &self,
@@ -3046,6 +3173,63 @@ impl StorageCluster {
             }
         }
         Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
+    }
+
+    /// Retained-route counterpart to
+    /// [`Self::read_object_payload_segment_systematic_padding_into`].
+    fn read_retained_object_payload_segment_systematic_padding_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        leased_node_ids: &BTreeSet<NodeId>,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let req = segment.stored_bytes_request();
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
+        let Some(integrity) = segment.shard_integrity() else {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained padding read requires a shard integrity witness".to_string(),
+            });
+        };
+        dst.clear();
+        let Some(padding) = systematic_shard_padding(req, integrity, "retained")? else {
+            return Ok(());
+        };
+
+        let reader = self.local_map.open_retained_placed_segment_shard_reader(
+            segment.placement_cluster_epoch(),
+            data_pg,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+            leased_node_ids,
+        )?;
+        let Some(location) = reader.location(padding.shard_index) else {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained padding read has no final systematic shard location".to_string(),
+            });
+        };
+        if !reader.is_leased(padding.shard_index) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained padding read is not protected by the payload lease".to_string(),
+            });
+        }
+        let shard_key = reader
+            .shard_key(padding.shard_index)
+            .expect("retained final systematic shard has a derived key");
+        self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+            .map_err(shard_io_error_to_store)?;
+        dst.resize(padding.length, 0);
+        if let Err(error) = reader.read_range_into(
+            padding.shard_index,
+            padding.expected_ack,
+            padding.shard_offset,
+            dst.as_mut_slice(),
+        ) {
+            dst.clear();
+            return Err(shard_io_error_to_store(error));
+        }
+        Ok(())
     }
 
     fn try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(

@@ -21620,6 +21620,96 @@ fn cobblestone_range_authentication_failure_uses_full_witness_reconstruction() {
 }
 
 #[test]
+fn cobblestone_full_read_streams_authenticated_prefix_before_late_reconstruction() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let mut coord = setup_ec_fault_injection_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data: Vec<u8> = (0..2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "cobblestone-late-corrupt",
+                test_requester(),
+                None,
+            ),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-late-corrupt");
+    storage::test_support::inject_object_payload_last_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "cobblestone-late-corrupt",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let before = observability::metrics_snapshot();
+    let mut body = object.body;
+    let first = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("first authenticated record must be available before the later fault");
+    assert_eq!(
+        first.as_ref(),
+        &data[..argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN]
+    );
+    let after_first = observability::metrics_snapshot();
+    assert_eq!(
+        after_first.payload_read_repair_fallback_total, before.payload_read_repair_fallback_total,
+        "the first response chunk must not wait for later-shard recovery"
+    );
+
+    let mut actual = first.as_ref().to_vec();
+    while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE).unwrap() {
+        actual.extend_from_slice(chunk.as_ref());
+    }
+    assert_eq!(actual, data);
+    let after = observability::metrics_snapshot();
+    assert_eq!(
+        after.payload_read_repair_fallback_total,
+        before.payload_read_repair_fallback_total + 1,
+        "the later corrupted systematic shard must enter full witness reconstruction"
+    );
+    assert!(
+        after.payload_read_reconstructed_bytes_total
+            > before.payload_read_reconstructed_bytes_total
+    );
+}
+
+#[test]
 fn ec_range_get_with_missing_shard() {
     if !backend_supports_parity_recovery() {
         return;

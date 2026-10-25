@@ -377,6 +377,16 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 | live PG metadata transfer | durable control-plane transfer proof plus destination-PG SQLite commits across the destination acting set, with the exact imported proof verified before reporting completion; the exported artifact is transient and restart re-exports it from retained source authority |
 | authority-clock recovery | replacement clock checkpoint and directory entry durable before restored serving authority is acknowledged |
 
+The shard `WriteAck` set persisted with each new-profile segment is also the
+read-time physical-integrity authority. A healthy complete read hashes the
+systematic shard bytes—including the real trailing EC padding—as those bytes
+cross the storage boundary, compares every result with that immutable witness,
+and validates their existing CRC composition against the stored segment
+checksum. It does not depend on mutable acknowledgement rows and does not add a
+second scan over an assembled ciphertext buffer. Range reads authenticate the
+selected encrypted records instead; they enter complete witness-backed
+reconstruction when a selected physical range is unavailable or suspect.
+
 ## Known gaps and required follow-up
 
 ### DUR-3: shard unlink durability classification

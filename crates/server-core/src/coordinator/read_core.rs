@@ -7,7 +7,9 @@ use std::sync::Arc;
 use storage::ObjectPayloadLease;
 use storage::{
     ActiveObjectPayloadRead, BucketName, GenerationId, ObjectEncryption, ObjectKey,
-    ObjectPayloadSegment, ObjectReadMultipartPart, RetainedObjectPayloadRead, StorageCluster,
+    ObjectPayloadFullSegmentRead, ObjectPayloadFullSegmentReadOutcome,
+    ObjectPayloadRangeReadOutcome, ObjectPayloadSegment, ObjectReadMultipartPart,
+    RetainedObjectPayloadRead, SegmentPayloadCodec, StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -16,7 +18,10 @@ use super::payload::{PayloadBufferPool, SharedPayloadBuffer};
 use super::test_hooks::maybe_run_object_segments_first_segment_hook;
 use super::TRACE_TARGET;
 use crate::error::ServerError;
-use crate::sse::{SseCustomerRequest, SseCustomerValidatorConfig, StaticManagedKeyProvider};
+use crate::sse::{
+    AuthorizedCobblestoneSegmentStreamRead, SseCustomerRequest, SseCustomerValidatorConfig,
+    StaticManagedKeyProvider,
+};
 
 #[derive(Debug, Clone)]
 pub struct ReadChunk {
@@ -90,10 +95,25 @@ pub(super) struct SegmentListReader {
     segments: Vec<SegmentSliceRecord>,
     next_segment_index: usize,
     loaded_segment: Option<(Arc<SharedPayloadBuffer>, usize, usize)>,
+    streaming_segment: Option<StreamingFullSegment>,
     sse_customer_request: Option<SseCustomerRequest>,
     verification: SegmentListVerification,
     verified_size: usize,
     verified_crc64: checksum::crc64::Hasher,
+}
+
+struct StreamingFullSegment {
+    slice: SegmentSliceRecord,
+    physical: Option<ObjectPayloadFullSegmentRead>,
+    crypto: AuthorizedCobblestoneSegmentStreamRead,
+    plaintext_released: usize,
+    terminal_plaintext: Option<Vec<u8>>,
+}
+
+enum StreamingFullSegmentStep {
+    Plaintext(Vec<u8>),
+    Complete(Vec<u8>),
+    FullSegmentFallbackRequired,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +203,7 @@ impl SegmentListReader {
             segments,
             next_segment_index: 0,
             loaded_segment: None,
+            streaming_segment: None,
             sse_customer_request,
             verification: SegmentListVerification::StoredSegmentCrcOnly,
             verified_size: 0,
@@ -206,6 +227,7 @@ impl SegmentListReader {
             segments,
             next_segment_index: 0,
             loaded_segment: None,
+            streaming_segment: None,
             sse_customer_request,
             verification: SegmentListVerification::FullPayloadCrc {
                 expected_size,
@@ -231,6 +253,7 @@ impl SegmentListReader {
             segments: vec![],
             next_segment_index: 0,
             loaded_segment: Some((Arc::new(SharedPayloadBuffer::from_unpooled(data)), 0, len)),
+            streaming_segment: None,
             sse_customer_request: None,
             verification: SegmentListVerification::StoredSegmentCrcOnly,
             verified_size: 0,
@@ -241,6 +264,80 @@ impl SegmentListReader {
     #[cfg(test)]
     pub(super) fn test_loaded_segment_is_none(&self) -> bool {
         self.loaded_segment.is_none()
+    }
+
+    fn record_verified_plaintext(&mut self, plaintext: &[u8]) {
+        if matches!(
+            self.verification,
+            SegmentListVerification::FullPayloadCrc { .. }
+        ) {
+            self.verified_size += plaintext.len();
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                crc_bytes: u64::try_from(plaintext.len()).unwrap_or(u64::MAX),
+                ..observability::PayloadReadMetricDelta::default()
+            });
+            self.verified_crc64.update(plaintext);
+        }
+    }
+
+    fn advance_streaming_segment(
+        streaming: &mut StreamingFullSegment,
+    ) -> Result<StreamingFullSegmentStep, ServerError> {
+        loop {
+            let Some(range) = streaming.crypto.next_ciphertext_range() else {
+                return Err(ServerError::InternalError {
+                    reason: "Cobblestone stream exhausted without terminal physical validation"
+                        .to_string(),
+                });
+            };
+            let mut ciphertext = Vec::new();
+            let outcome = streaming
+                .physical
+                .as_mut()
+                .expect("streaming segment retains physical authority until completion")
+                .read_next_stored_range_into(range, &mut ciphertext)
+                .map_err(super::map_object_read_failure)?;
+            if outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
+                return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired);
+            }
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                stored_bytes: u64::try_from(ciphertext.len()).unwrap_or(u64::MAX),
+                ..observability::PayloadReadMetricDelta::default()
+            });
+            let plaintext = match streaming.crypto.authenticate_next(&ciphertext) {
+                Ok(plaintext) => plaintext,
+                Err(_) => return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired),
+            };
+            if streaming.crypto.input_complete() {
+                if streaming.crypto.finish().is_err() {
+                    return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired);
+                }
+                let physical = streaming
+                    .physical
+                    .take()
+                    .expect("streaming segment finishes physical authority exactly once");
+                let mut terminal_plaintext =
+                    streaming.terminal_plaintext.take().unwrap_or_default();
+                terminal_plaintext.extend_from_slice(&plaintext);
+                return match physical.finish().map_err(super::map_object_read_failure)? {
+                    ObjectPayloadFullSegmentReadOutcome::Complete => {
+                        Ok(StreamingFullSegmentStep::Complete(terminal_plaintext))
+                    }
+                    ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired => {
+                        Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired)
+                    }
+                };
+            }
+            if plaintext.is_empty() {
+                continue;
+            }
+            if streaming.crypto.next_record_is_empty_terminal() {
+                debug_assert!(streaming.terminal_plaintext.is_none());
+                streaming.terminal_plaintext = Some(plaintext);
+                continue;
+            }
+            return Ok(StreamingFullSegmentStep::Plaintext(plaintext));
+        }
     }
 
     pub(super) fn next_chunk(
@@ -266,6 +363,60 @@ impl SegmentListReader {
                     return Ok(Some(out));
                 }
                 self.loaded_segment = None;
+            }
+
+            if let Some(mut streaming) = self.streaming_segment.take() {
+                match Self::advance_streaming_segment(&mut streaming)? {
+                    StreamingFullSegmentStep::Plaintext(plaintext) => {
+                        streaming.plaintext_released += plaintext.len();
+                        self.record_verified_plaintext(&plaintext);
+                        let end = plaintext.len();
+                        self.loaded_segment = Some((
+                            Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)),
+                            0,
+                            end,
+                        ));
+                        self.streaming_segment = Some(streaming);
+                    }
+                    StreamingFullSegmentStep::Complete(plaintext) => {
+                        self.record_verified_plaintext(&plaintext);
+                        let end = plaintext.len();
+                        self.loaded_segment = Some((
+                            Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)),
+                            0,
+                            end,
+                        ));
+                        #[cfg(test)]
+                        if self.next_segment_index == 1 {
+                            maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
+                        }
+                    }
+                    StreamingFullSegmentStep::FullSegmentFallbackRequired => {
+                        let data = self.runtime.read_checked_segment_payload(
+                            &streaming.slice.payload,
+                            streaming.slice.part_number,
+                            self.sse_customer_request.as_ref(),
+                        )?;
+                        if data.len() != streaming.slice.payload.size() as usize
+                            || streaming.plaintext_released > data.len()
+                        {
+                            return Err(ServerError::InternalError {
+                                reason:
+                                    "Cobblestone fallback returned inconsistent plaintext geometry"
+                                        .to_string(),
+                            });
+                        }
+                        let start = streaming.plaintext_released;
+                        self.record_verified_plaintext(&data[start..]);
+                        let end = data.len();
+                        self.loaded_segment = Some((data, start, end));
+                        #[cfg(test)]
+                        if self.next_segment_index == 1 {
+                            maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
+                        }
+                    }
+                }
+                continue;
             }
 
             if self.next_segment_index >= self.segments.len() {
@@ -365,6 +516,25 @@ impl SegmentListReader {
 
             let is_partial_segment =
                 slice.start_offset != 0 || slice.end_offset != slice.payload.size() as usize;
+            if !is_partial_segment
+                && slice.payload.encryption.payload_codec()
+                    == SegmentPayloadCodec::Cobblestone256SegmentV1
+            {
+                let (physical, crypto) = self.runtime.begin_checked_segment_payload_stream(
+                    &slice.payload,
+                    slice.part_number,
+                    self.sse_customer_request.as_ref(),
+                )?;
+                self.next_segment_index += 1;
+                self.streaming_segment = Some(StreamingFullSegment {
+                    slice,
+                    physical: Some(physical),
+                    crypto,
+                    plaintext_released: 0,
+                    terminal_plaintext: None,
+                });
+                continue;
+            }
             let (data, loaded_start, loaded_end) = if is_partial_segment {
                 self.runtime.read_checked_segment_payload_range(
                     &slice.payload,
@@ -380,17 +550,7 @@ impl SegmentListReader {
                 )?;
                 (data, slice.start_offset, slice.end_offset)
             };
-            if matches!(
-                self.verification,
-                SegmentListVerification::FullPayloadCrc { .. }
-            ) {
-                self.verified_size += data.len();
-                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                    crc_bytes: u64::try_from(data.len()).unwrap_or(u64::MAX),
-                    ..observability::PayloadReadMetricDelta::default()
-                });
-                self.verified_crc64.update(data.as_ref());
-            }
+            self.record_verified_plaintext(data.as_ref());
             self.next_segment_index += 1;
             self.loaded_segment = Some((data, loaded_start, loaded_end));
             #[cfg(test)]

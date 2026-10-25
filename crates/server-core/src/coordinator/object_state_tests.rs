@@ -5669,7 +5669,11 @@ fn bucket_encryption_defaults_to_sse_s3() {
 }
 
 fn direct_cobblestone_payload() -> Vec<u8> {
-    (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37))
+    // An exact chunk multiple requires Cobblestone's authenticated empty
+    // terminal record. The full-read production canaries therefore pin that
+    // the incremental response path consumes the terminal record without
+    // manufacturing an empty response chunk or skipping physical completion.
+    (0..(2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN))
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect()
 }
@@ -5926,6 +5930,64 @@ fn assert_cobblestone_object(
         "the production PUT/GET path must seal and reopen checksum metadata"
     );
     assert_eq!(object.body.read_all().unwrap(), payload);
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let before = observability::metrics_snapshot();
+    let mut body = object.body;
+    let first = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("nonempty Cobblestone object must produce a first authenticated record");
+    let after_first = observability::metrics_snapshot();
+    assert_eq!(
+        first.as_ref(),
+        &payload[..argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN],
+        "a full GET must expose its first authenticated record without buffering the segment"
+    );
+    let expected_first_stored = (argmin_crypto::cobblestone::COBBLESTONE_HEADER_LEN
+        + argmin_crypto::cobblestone::COBBLESTONE_FULL_ENCRYPTED_CHUNK_LEN)
+        as u64;
+    assert_eq!(
+        after_first.payload_read_stored_bytes_total - before.payload_read_stored_bytes_total,
+        expected_first_stored,
+        "time to first byte must require only the header and first encrypted record"
+    );
+    assert_eq!(
+        after_first.payload_read_crc_bytes_total - before.payload_read_crc_bytes_total,
+        expected_first_stored + argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN as u64,
+        "CRC work must contain the fused physical ciphertext pass and the independent client-visible payload checksum"
+    );
+    assert_eq!(
+        after_first.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN as u64
+    );
+    assert_eq!(
+        after_first.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        1
+    );
+    assert_eq!(
+        after_first.payload_read_buffer_checkouts_total
+            - before.payload_read_buffer_checkouts_total,
+        0,
+        "the healthy chunked path must not check out an 8 MiB segment buffer"
+    );
+    let mut streamed = first.as_ref().to_vec();
+    while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE).unwrap() {
+        streamed.extend_from_slice(chunk.as_ref());
+    }
+    assert_eq!(streamed, payload);
 }
 
 fn put_and_read_direct_cobblestone_object(

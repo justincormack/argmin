@@ -552,6 +552,27 @@ capability releases its leases and schedules reclaim when required. Thus
 server-core cannot retain one lease while reading bytes through an unrelated
 cluster handle, and no source-level caller inventory is needed for this path.
 
+Complete Cobblestone reads use a second opaque state nested under either
+payload capability. The state accepts only contiguous ciphertext ranges from
+offset zero and privately maps those bytes back to the systematic shards whose
+deletion-exclusion leases are held. It updates each shard's CRC as bytes are
+read, consumes the actual EC-padding suffix from the final systematic shard,
+and completes only when every resulting size and CRC matches the segment's
+durable integrity witness and their systematic composition matches the stored
+segment checksum. EC geometry, shard identities, hash state, and completion
+authority never cross into server-core.
+
+Server-core couples that state to the subject-bound incremental Cobblestone
+opener. It may expose each successfully authenticated non-final record while
+later records are still unread. The final plaintext-bearing record is held
+until physical completion; for exact chunk multiples this also means consuming
+the authenticated empty terminal record first. If a later systematic range or
+physical witness check fails, the existing complete reconstruction path
+resumes after the exact plaintext prefix already emitted. An unrecoverable
+failure exposes no bytes from the failing record and terminates an already
+committed response. The historical whole-segment encrypted codec continues to
+use its whole-segment authentication unit.
+
 `ObjectPayloadLease::release` is the current active token release path. It must
 release against the actual storage-node sessions captured at acquisition time
 and must not depend on the frontend's current cluster epoch or runtime-map

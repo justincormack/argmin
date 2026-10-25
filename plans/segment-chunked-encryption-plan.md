@@ -1,7 +1,7 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phases 0 through 3 complete; Phase 4 is next; production writer selection and
-benchmark gate remain)
+Status: In progress (Phases 0 through 4 complete; Phase 5 production writer selection and benchmark
+gate remain)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -1773,6 +1773,40 @@ Implementation update (2026-10-25, official-client incomplete-body semantics):
   official client dependency used by this repository surfaces that termination as a body error for
   both full and ranged GETs. Chunk-at-a-time full GET emission with fused physical CRC accounting
   remains open before Phase 4 is complete.
+
+Implementation update (2026-10-25, incremental full GET and fused physical validation):
+
+- Storage now owns an opaque sequential full-segment reader bound to the exact active or retained
+  payload capability and segment descriptor. It accepts only nonempty contiguous stored ranges
+  beginning at offset zero, keeps the systematic-shard geometry and identities private, and folds
+  every returned ciphertext byte into the corresponding shard CRC state as it crosses the storage
+  boundary. Completion reads the real trailing EC-padding suffix from the final systematic shard,
+  compares every complete shard with the durable witness, and validates the existing systematic
+  CRC composition against the logical stored-segment CRC. It does not rescan an assembled 8 MiB
+  ciphertext buffer.
+- The coordinator prepares the exact SSE-C or SSE-S3 DEK, storage-minted segment subject, scope,
+  and incremental Cobblestone opener before the first partial shard read. A healthy full GET reads
+  the fixed header and then one complete encrypted record at a time, authenticates each record in
+  private scratch, and exposes its 16 KiB plaintext immediately. It neither checks out the pooled
+  whole-segment buffer nor constructs a second full plaintext `Vec`.
+- The final plaintext-bearing record remains withheld until the physical reader completes. For an
+  exact chunk-multiple message, the preceding nonempty record remains withheld while the required
+  authenticated empty terminal record and physical validation complete. A late missing,
+  malformed, corrupt, or witness-mismatched systematic read enters the established complete
+  reconstruction path and resumes at the exact plaintext prefix already emitted, so recovery does
+  not duplicate bytes. A failure that remains unrecoverable retains the already-established
+  committed-response transport-abort behavior and never exposes bytes from the failing record.
+- Metrics now demonstrate the first full-GET response chunk after only the Cobblestone header and
+  first encrypted record have been read and CRC-processed. The independent client-visible payload
+  checksum continues to account for its own plaintext pass. Canaries require zero whole-segment
+  buffer checkouts on that healthy first-chunk path, cover both key modes, exact-multiple terminal
+  framing, active and retained authorities, irregular ranges crossing systematic boundaries,
+  padding-only corruption, and a later systematic corruption that emits one authenticated record
+  before full witness-backed reconstruction returns the remaining plaintext.
+
+Phase 4 exit is satisfied: healthy encrypted ranges and complete reads both operate at
+authenticated-record granularity, while physical shard validation, reconstruction, repair, and
+pre-/post-commit failure semantics remain intact.
 
 Exit: metrics and deterministic tests prove small encrypted ranges no longer read or decrypt whole
 segments on the healthy path.
