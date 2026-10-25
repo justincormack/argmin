@@ -1226,6 +1226,137 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
 }
 
 #[test]
+fn unix_systematic_range_disconnect_after_acquisition_preserves_full_fallback() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1)];
+    let pg_id = PgId::new(0);
+    let data_pg_id = DataPgId::new_for_test(pg_id);
+    let epoch = ClusterEpoch::INITIAL;
+    let ec_shape = EcShape { k: 1, m: 1 };
+    let bucket = BucketName::new("unix-range-disconnect-bucket").unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    let segment_okh = [41; 16];
+    let socket_path = tmp.path().join("sockets").join("range-disconnect.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+
+    let map = Arc::new(
+        LocalClusterMap::open(
+            &tmp.path().join("frontend"),
+            &node_ids,
+            &[pg_id.get()],
+            ec_shape,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"range read disconnect must retain complete reconstruction fallback",
+    );
+    let generation_id = committed.generation_id;
+    let systematic_location = committed.locations[0];
+    drop(cluster);
+    let mut map = match Arc::try_unwrap(map) {
+        Ok(map) => map,
+        Err(_) => panic!("committed test cluster retained its local map"),
+    };
+    map.replace_shard_read_handle_client_for_tests(
+        systematic_location.node_id(),
+        Arc::new(UnixStorageNodeClient::new(
+            systematic_location.node_id(),
+            epoch,
+            socket_path.clone(),
+        )),
+    );
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments[0].clone();
+    let active = cluster
+        .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+        .unwrap();
+
+    let server = Arc::new(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id: systematic_location.node_id(),
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("disconnecting-storage-node"),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch: epoch,
+                state: PgState::Active,
+                primary_node_id: node_ids[0],
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: node_ids.to_vec(),
+            }],
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap(),
+    );
+    let shard_key = ShardKey::new(&segment_okh, generation_id.get(), 0);
+    let server_ack = server
+        .test_storage_node()
+        .write_shard_file(
+            data_pg_id.get(),
+            &shard_key,
+            &committed.encrypted.storage_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        server_ack,
+        segment.shard_integrity().unwrap().expected_ack(0).unwrap()
+    );
+    server.set_response_frame_test_hook(Arc::new(|kind, _response| {
+        if kind == crate::storage_rpc::StorageRpcMessageKind::ShardReadRange {
+            panic!("disconnect after read-handle acquisition");
+        }
+    }));
+    let serving = Arc::clone(&server);
+    let join = thread::spawn(move || serving.accept_one());
+
+    let mut selected = b"must be cleared".to_vec();
+    let outcome = active
+        .read_segment_payload_stored_range_into(&segment, 0..8, &mut selected)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired
+    );
+    assert!(selected.is_empty());
+    assert!(
+        join.join().is_err(),
+        "the storage node must disconnect after acquiring the exact read handle"
+    );
+    drop(server);
+
+    let mut recovered = Vec::new();
+    active
+        .read_segment_payload_stored_bytes_into(&segment, &mut recovered)
+        .unwrap();
+    assert_eq!(recovered, committed.encrypted.storage_bytes);
+}
+
+#[test]
 fn unix_object_payload_lease_release_reuses_the_session_connection() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(0);

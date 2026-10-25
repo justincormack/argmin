@@ -1239,6 +1239,192 @@ fn active_object_payload_read_binds_its_subject_segments_and_lease() {
 }
 
 #[test]
+fn active_object_payload_range_read_maps_only_intersecting_systematic_shards() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("systematic-range-bucket");
+    let key = crate::tests::object_key("systematic-range-key");
+    let payload = (0..257).map(|index| index as u8).collect::<Vec<_>>();
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, &payload);
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments[0].clone();
+    let active = cluster
+        .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+        .unwrap();
+
+    let shard_size = committed
+        .encrypted
+        .storage_bytes
+        .len()
+        .div_ceil(usize::from(committed.written.ec.k));
+    assert!(shard_size > 4);
+    let start = shard_size - 3;
+    let end = shard_size + 5;
+    assert!(end < committed.encrypted.storage_bytes.len());
+
+    let read_indices = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&read_indices);
+    let _guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(location.shard_index().get());
+            Ok(())
+        }));
+    let mut selected = Vec::new();
+    let outcome = active
+        .read_segment_payload_stored_range_into(
+            &segment,
+            u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+            &mut selected,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
+    );
+    assert_eq!(selected, committed.encrypted.storage_bytes[start..end]);
+    assert_eq!(
+        *read_indices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        vec![0, 1],
+        "the healthy range path must lease and read only intersecting systematic shards"
+    );
+
+    let crossed = segment.with_test_segment_index(segment.segment_index() + 1);
+    let error = active
+        .read_segment_payload_stored_range_into(&crossed, 0..1, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+
+    drop(_guard);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = Arc::clone(&attempts);
+    let _failure_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            if observed_attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(StoreError::StorageRpc {
+                    node_id: location.node_id().as_u32(),
+                    operation: "decode read-handle shard range response",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected malformed second systematic range response",
+                    ),
+                });
+            }
+            Ok(())
+        }));
+    selected.extend_from_slice(b"stale output");
+    let outcome = active
+        .read_segment_payload_stored_range_into(
+            &segment,
+            u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+            &mut selected,
+        )
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired
+    );
+    assert!(
+        selected.is_empty(),
+        "a later range failure must discard bytes assembled from earlier shards"
+    );
+}
+
+#[test]
+fn active_object_payload_range_read_requests_full_fallback_without_exposing_partial_bytes() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("systematic-range-fallback-bucket");
+    let key = crate::tests::object_key("systematic-range-fallback-key");
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"selected systematic range falls back to complete witness recovery",
+    );
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments[0].clone();
+    let active = cluster
+        .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+        .unwrap();
+
+    let shard_path = cluster
+        .test_payload_shard_file_path(
+            committed.written.data_pg_id,
+            committed.written.ec,
+            &committed.segment_okh,
+            committed.generation_id,
+            0,
+        )
+        .unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+
+    let mut selected = b"must be cleared".to_vec();
+    let outcome = active
+        .read_segment_payload_stored_range_into(&segment, 0..8, &mut selected)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired
+    );
+    assert!(selected.is_empty());
+
+    let mut recovered = Vec::new();
+    active
+        .read_segment_payload_stored_bytes_into(&segment, &mut recovered)
+        .unwrap();
+    assert_eq!(recovered, committed.encrypted.storage_bytes);
+}
+
+#[test]
 fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let tmp = test_util::tempdir();
     let map = Arc::new(

@@ -1,8 +1,120 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SystematicShardRange {
+    shard_index: usize,
+    shard_offset: u64,
+    output_start: usize,
+    length: usize,
+}
+
+fn systematic_shard_ranges_for_segment_range(
+    stored_size: usize,
+    data_shards: u8,
+    range: std::ops::Range<u64>,
+) -> Result<Vec<SystematicShardRange>, StoreError> {
+    if data_shards == 0 {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "systematic range mapping requires at least one data shard".to_string(),
+        });
+    }
+    let stored_size_u64 = u64::try_from(stored_size).map_err(|_| {
+        StoreError::PayloadShardSetMismatch {
+            reason: "stored segment size exceeds systematic range coordinates".to_string(),
+        }
+    })?;
+    if range.start > range.end || range.end > stored_size_u64 {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: "stored ciphertext range is outside the segment".to_string(),
+        });
+    }
+    if range.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let shard_size = stored_size_u64.div_ceil(u64::from(data_shards));
+    let mut ranges = Vec::new();
+    let mut segment_offset = range.start;
+    let mut output_start = 0usize;
+    while segment_offset < range.end {
+        let shard_index_u64 = segment_offset / shard_size;
+        let shard_index = usize::try_from(shard_index_u64).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "systematic shard index exceeds platform limits".to_string(),
+            }
+        })?;
+        if shard_index >= usize::from(data_shards) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "stored ciphertext range maps outside systematic data shards".to_string(),
+            });
+        }
+        let shard_start = shard_index_u64.checked_mul(shard_size).ok_or_else(|| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "systematic shard start overflowed".to_string(),
+            }
+        })?;
+        let shard_end = shard_start.checked_add(shard_size).ok_or_else(|| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "systematic shard end overflowed".to_string(),
+            }
+        })?;
+        let end = range.end.min(shard_end);
+        let length = usize::try_from(end - segment_offset).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "systematic shard range length exceeds platform limits".to_string(),
+            }
+        })?;
+        ranges.push(SystematicShardRange {
+            shard_index,
+            shard_offset: segment_offset - shard_start,
+            output_start,
+            length,
+        });
+        output_start = output_start.checked_add(length).ok_or_else(|| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "systematic range output offset overflowed".to_string(),
+            }
+        })?;
+        segment_offset = end;
+    }
+    Ok(ranges)
+}
+
+fn systematic_range_read_requires_full_fallback(error: ShardIoError) -> Result<(), StoreError> {
+    if matches!(
+        &error,
+        ShardIoError::Store {
+            source: StoreError::StorageRpc {
+                operation: "decode read-handle shard range response",
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            },
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    placed_segment_recoverable_shard_error(error).map(|_| ())
+}
+
+fn release_systematic_range_read_handles_after_failure(
+    read_handles: &mut LocalPlacedSegmentShardReadHandles<'_>,
+) -> Result<(), StoreError> {
+    let Err(error) = read_handles.release() else {
+        return Ok(());
+    };
+    let error = shard_io_error_to_store(error);
+    if error.storage_node_failure_class()
+        == Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
 #[cfg(test)]
-mod systematic_data_shard_crc_tests {
+mod systematic_data_shard_tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -51,7 +163,93 @@ mod systematic_data_shard_crc_tests {
         ));
     }
 
+    #[test]
+    fn systematic_range_mapping_splits_only_at_data_shard_boundaries() {
+        assert_eq!(
+            systematic_shard_ranges_for_segment_range(25, 4, 5..23).unwrap(),
+            vec![
+                SystematicShardRange {
+                    shard_index: 0,
+                    shard_offset: 5,
+                    output_start: 0,
+                    length: 2,
+                },
+                SystematicShardRange {
+                    shard_index: 1,
+                    shard_offset: 0,
+                    output_start: 2,
+                    length: 7,
+                },
+                SystematicShardRange {
+                    shard_index: 2,
+                    shard_offset: 0,
+                    output_start: 9,
+                    length: 7,
+                },
+                SystematicShardRange {
+                    shard_index: 3,
+                    shard_offset: 0,
+                    output_start: 16,
+                    length: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn systematic_range_mapping_rejects_invalid_geometry_and_padding() {
+        assert!(systematic_shard_ranges_for_segment_range(8, 0, 0..1).is_err());
+        assert!(systematic_shard_ranges_for_segment_range(
+            8,
+            2,
+            std::ops::Range { start: 7, end: 6 },
+        )
+        .is_err());
+        assert!(systematic_shard_ranges_for_segment_range(8, 2, 0..9).is_err());
+        assert_eq!(
+            systematic_shard_ranges_for_segment_range(8, 2, 8..8).unwrap(),
+            Vec::new()
+        );
+    }
+
     proptest! {
+        #[test]
+        fn systematic_range_mapping_reassembles_exact_segment_bytes(
+            payload in prop::collection::vec(any::<u8>(), 1..4096),
+            data_shards in 1u8..=16,
+            first in any::<usize>(),
+            second in any::<usize>(),
+        ) {
+            let first = first % (payload.len() + 1);
+            let second = second % (payload.len() + 1);
+            let (start, end) = if first <= second {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let padded_size = payload.len().div_ceil(usize::from(data_shards))
+                * usize::from(data_shards);
+            let shard_size = padded_size / usize::from(data_shards);
+            let mut padded = payload.clone();
+            padded.resize(padded_size, 0);
+            let ranges = systematic_shard_ranges_for_segment_range(
+                payload.len(),
+                data_shards,
+                u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+            )
+            .unwrap();
+            let mut selected = vec![0; end - start];
+            for range in ranges {
+                let shard_start = range.shard_index * shard_size;
+                let input_start = shard_start + usize::try_from(range.shard_offset).unwrap();
+                let input_end = input_start + range.length;
+                let output_end = range.output_start + range.length;
+                selected[range.output_start..output_end]
+                    .copy_from_slice(&padded[input_start..input_end]);
+            }
+            prop_assert_eq!(selected.as_slice(), &payload[start..end]);
+        }
+
         #[test]
         fn composed_systematic_shard_evidence_matches_whole_segment_crc(
             payload in prop::collection::vec(any::<u8>(), 1..4096),
@@ -989,6 +1187,37 @@ impl StorageCluster {
             dst,
         )
         .map_err(ObjectReadFailure::from_store)
+    }
+
+    fn try_read_object_payload_segment_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        let request = segment.stored_bytes_request();
+        let stored_size = u64::try_from(request.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds range coordinates".to_string(),
+            }
+        })?;
+        if range.start > range.end || range.end > stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "stored ciphertext range is outside the segment".to_string(),
+            });
+        }
+        if segment.placement_cluster_epoch() != self.operation_epoch() {
+            dst.clear();
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        }
+
+        self.require_current_payload_operation_epoch(request.data_pg_id)?;
+        self.try_read_placed_segment_systematic_range_into(
+            request,
+            segment.shard_integrity(),
+            range,
+            dst,
+        )
     }
 
     #[cfg(test)]
@@ -2588,6 +2817,104 @@ impl StorageCluster {
             schedule_repair_on_recovery,
             temporarily_unavailable,
         )
+    }
+
+    fn try_read_placed_segment_systematic_range_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        dst.clear();
+        let ranges = systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range)?;
+        let output_len = ranges
+            .last()
+            .map_or(0, |range| range.output_start + range.length);
+        if ranges.is_empty() {
+            return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
+        }
+        let Some(shard_integrity) = shard_integrity else {
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        };
+        let stored_size = u64::try_from(req.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds witness coordinates".to_string(),
+            }
+        })?;
+        if shard_integrity
+            .validate(req.ec, stored_size, req.segment_crc64)
+            .is_err()
+        {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "segment shard integrity witness does not match range-read geometry"
+                    .to_string(),
+            });
+        }
+
+        let reader = self.current_placed_segment_shard_reader(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+        )?;
+        let shard_indices = ranges.iter().map(|range| range.shard_index);
+        let mut read_handles = match reader.acquire_read_handles(shard_indices) {
+            Ok(read_handles) => read_handles,
+            Err(error) => {
+                systematic_range_read_requires_full_fallback(error)?;
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
+        };
+        dst.resize(output_len, 0);
+
+        for range in ranges {
+            let Some(expected) = shard_integrity.expected_ack(range.shard_index) else {
+                dst.clear();
+                read_handles.release().map_err(shard_io_error_to_store)?;
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "segment shard integrity witness omits systematic shard {}",
+                        range.shard_index
+                    ),
+                });
+            };
+            let location = read_handles
+                .location(range.shard_index)
+                .expect("leased systematic range is inside installed placement");
+            let shard_key = read_handles
+                .shard_key(range.shard_index)
+                .expect("leased systematic range has a derived key");
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+            {
+                dst.clear();
+                let fallback = systematic_range_read_requires_full_fallback(error);
+                let release = release_systematic_range_read_handles_after_failure(&mut read_handles);
+                fallback?;
+                release?;
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
+            let output_end = range.output_start + range.length;
+            if let Err(error) = read_handles.read_range_into(
+                range.shard_index,
+                expected,
+                range.shard_offset,
+                &mut dst[range.output_start..output_end],
+            ) {
+                dst.clear();
+                let fallback = systematic_range_read_requires_full_fallback(error);
+                let release = release_systematic_range_read_handles_after_failure(&mut read_handles);
+                fallback?;
+                release?;
+                return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            }
+        }
+        if let Err(error) = read_handles.release() {
+            dst.clear();
+            return Err(shard_io_error_to_store(error));
+        }
+        Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
     }
 
     fn try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(

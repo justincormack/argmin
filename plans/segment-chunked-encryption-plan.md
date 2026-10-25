@@ -1632,6 +1632,32 @@ Implementation update (2026-10-24, leased positioned shard ranges):
   systematic ciphertext-coordinate mapping, authenticated/malformed-response fallback to the
   complete witness path, and retained-route and node-loss coverage.
 
+Implementation update (2026-10-25, current-route systematic mapping):
+
+- Storage now maps an ordered canonical ciphertext range across the contiguous systematic data
+  shards using the segment's exact stored length and `k`. A range crossing a shard boundary is
+  split into the minimal ordered set of per-shard offsets and lengths; EC padding is never
+  addressable as segment ciphertext.
+- `ActiveObjectPayloadRead` binds the operation to one of its exact snapshot segments before
+  entering that mapper. The mapper requires the durable shard-integrity witness, validates it
+  against the complete segment geometry, acquires read handles only for the intersecting
+  systematic shard indices, and assembles the returned bytes in canonical segment order.
+- The API returns an exhaustive outcome that distinguishes unauthenticated ciphertext from a
+  required complete-segment fallback. A missing, unavailable, malformed, or length-invalid
+  selected shard clears all partially assembled bytes and requests fallback; it never exposes a
+  short partial result or attempts parity-range reconstruction. The caller must authenticate a
+  successful result at the profile boundary and use the existing complete read after either this
+  fallback outcome or an authentication failure.
+- Owner-local tests pin non-divisible shard geometry, boundary splitting, invalid and padding
+  ranges, exact intersecting-shard selection, output ordering, a malformed authenticated range
+  response after partial assembly, a Unix disconnect after read-handle acquisition (including the
+  failed release on the same connection), and missing-selected-shard fallback followed by
+  successful full witness-backed reconstruction.
+- This is still not connected to an S3 response. Historical placement currently returns the
+  explicit fallback outcome rather than resampling the active route. Remaining Phase 3 work is an
+  exact retained-route range capability, retained node-loss coverage, and the complete
+  malformed/authentication fallback integration that Phase 4 will consume.
+
 Exit: requesting a bounded ciphertext range causes bounded disk and network IO in healthy and
 systematic profiles, while every degraded or suspect case remains correct through the full-segment
 fallback.

@@ -1813,6 +1813,18 @@ pub struct ActiveObjectPayloadRead {
     lease: Mutex<Option<ObjectPayloadLease>>,
 }
 
+/// Outcome of attempting one bounded stored-ciphertext read.
+///
+/// The selected bytes have not been authenticated by the payload codec. A
+/// caller may consume [`Self::UnauthenticatedCiphertext`] only at the
+/// profile-owned authentication boundary. Every other outcome requires the
+/// existing complete-segment validation and reconstruction path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectPayloadRangeReadOutcome {
+    UnauthenticatedCiphertext,
+    FullSegmentFallbackRequired,
+}
+
 impl ActiveObjectPayloadRead {
     fn matches_subject(
         &self,
@@ -1857,6 +1869,33 @@ impl ActiveObjectPayloadRead {
         }
         self.cluster
             .read_object_payload_segment_stored_bytes_into(segment, dst)
+    }
+
+    /// Read one bounded range of a segment's canonical stored ciphertext.
+    ///
+    /// This is a physical-read primitive, not an integrity decision. A
+    /// successful result contains unauthenticated ciphertext which must not be
+    /// exposed before the selected payload profile authenticates it. When the
+    /// healthy systematic path is unavailable, the caller must discard `dst`
+    /// and use [`Self::read_segment_payload_stored_bytes_into`] so the existing
+    /// witness-validation and reconstruction path remains authoritative.
+    pub fn read_segment_payload_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, ObjectReadFailure> {
+        if !self.contains_segment(segment) {
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "payload range read is outside the active lease-bound segment set"
+                        .to_string(),
+                },
+            ));
+        }
+        self.cluster
+            .try_read_object_payload_segment_stored_range_into(segment, range, dst)
+            .map_err(ObjectReadFailure::from_store)
     }
 }
 

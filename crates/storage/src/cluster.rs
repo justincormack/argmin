@@ -20,8 +20,8 @@ pub use local::{
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 use local::{
-    LocalClusterRuntimeState, LocalPlacedSegmentShardReader, LocalRouteMapLeaseSnapshot,
-    MetadataCommandRecoveryAdmission, MetadataCommandRecoveryGuard,
+    LocalClusterRuntimeState, LocalPlacedSegmentShardReadHandles, LocalPlacedSegmentShardReader,
+    LocalRouteMapLeaseSnapshot, MetadataCommandRecoveryAdmission, MetadataCommandRecoveryGuard,
     MetadataCommandRecoveryResolution, MetadataCommandRecoveryRootDisposition,
 };
 pub use request_ops::leased_object_snapshot::{
