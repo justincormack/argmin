@@ -1372,7 +1372,10 @@ fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular
     let cluster = current_cluster(&map);
     let bucket = crate::tests::bucket_name("sequential-full-segment-bucket");
     let key = crate::tests::object_key("sequential-full-segment-key");
-    let payload = (0..70_001)
+    // Exceed the bounded read-ahead window so a codec-sized request must
+    // straddle two physical fetches rather than accidentally relying on one
+    // oversized buffer.
+    let payload = (0..2_200_001)
         .map(|index| (index % usize::from(u8::MAX)) as u8)
         .collect::<Vec<_>>();
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, &payload);
@@ -1403,6 +1406,13 @@ fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular
     };
     assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
 
+    let physical_reads = Arc::new(AtomicUsize::new(0));
+    let observed_physical_reads = Arc::clone(&physical_reads);
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |_, _| {
+            observed_physical_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
     let mut reader = active.begin_full_segment_read(&segment).unwrap();
     let stored_size = committed.encrypted.storage_bytes.len();
     let mut assembled = Vec::with_capacity(stored_size);
@@ -1425,8 +1435,24 @@ fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular
         assembled.extend_from_slice(&selected);
         start = end;
         width_index += 1;
+        if width_index == 1 {
+            assert_eq!(
+                physical_reads.load(Ordering::SeqCst),
+                1,
+                "the first response unit must not incur read-ahead latency"
+            );
+            reader.enable_bounded_read_ahead_after_first_authenticated_record();
+        }
     }
     assert_eq!(assembled, committed.encrypted.storage_bytes);
+    assert!(
+        width_index > physical_reads.load(Ordering::SeqCst),
+        "bounded read-ahead must amortize physical reads across logical ranges"
+    );
+    assert!(
+        physical_reads.load(Ordering::SeqCst) <= usize::from(committed.written.ec.k) + 2,
+        "the first exact read and two bounded windows must amortize systematic shard reads"
+    );
     assert_eq!(
         reader.finish().unwrap(),
         crate::ObjectPayloadFullSegmentReadOutcome::Complete

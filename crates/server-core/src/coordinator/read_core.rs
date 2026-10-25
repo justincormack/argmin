@@ -300,11 +300,7 @@ impl SegmentListReader {
             if outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
                 return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired);
             }
-            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                stored_bytes: u64::try_from(ciphertext.len()).unwrap_or(u64::MAX),
-                ..observability::PayloadReadMetricDelta::default()
-            });
-            let plaintext = match streaming.crypto.authenticate_next(&ciphertext) {
+            let plaintext = match streaming.crypto.authenticate_next(ciphertext) {
                 Ok(plaintext) => plaintext,
                 Err(_) => return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired),
             };
@@ -336,6 +332,11 @@ impl SegmentListReader {
                 streaming.terminal_plaintext = Some(plaintext);
                 continue;
             }
+            streaming
+                .physical
+                .as_mut()
+                .expect("nonterminal stream retains physical authority")
+                .enable_bounded_read_ahead_after_first_authenticated_record();
             return Ok(StreamingFullSegmentStep::Plaintext(plaintext));
         }
     }

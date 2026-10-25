@@ -149,7 +149,10 @@ impl AuthorizedCobblestoneSegmentStreamRead {
         self.layout.ciphertext_range_for_chunk(self.next_chunk).ok()
     }
 
-    pub(crate) fn authenticate_next(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, ServerError> {
+    pub(crate) fn authenticate_next(
+        &mut self,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, ServerError> {
         let expected = self
             .next_ciphertext_range()
             .ok_or_else(|| ServerError::InternalError {
@@ -174,18 +177,18 @@ impl AuthorizedCobblestoneSegmentStreamRead {
             });
         }
 
-        let mut plaintext = Vec::new();
         if self.header_authenticated {
             observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
                 aead_records: 1,
                 ..observability::PayloadReadMetricDelta::default()
             });
         }
-        self.opener
-            .update(ciphertext, &mut plaintext)
-            .map_err(|_| ServerError::InternalError {
-                reason: format!("failed to decrypt {} Cobblestone segment", self.label),
-            })?;
+        let plaintext =
+            self.opener
+                .open_next_owned(ciphertext)
+                .map_err(|_| ServerError::InternalError {
+                    reason: format!("failed to decrypt {} Cobblestone segment", self.label),
+                })?;
         if self.header_authenticated {
             self.next_chunk += 1;
             self.authenticated_plaintext_len = self

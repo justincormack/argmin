@@ -619,6 +619,66 @@ impl Cobblestone256StreamOpener {
         Ok(())
     }
 
+    /// Authenticate one exact protocol unit while reusing its owned input
+    /// allocation for plaintext.
+    ///
+    /// The first call must contain only the fixed header; later calls must
+    /// each contain exactly the next complete encrypted record. Ownership is
+    /// consumed so a provider which writes plaintext before reporting a tag
+    /// failure cannot expose the modified buffer to the caller.
+    pub fn open_next_owned(&mut self, mut ciphertext: Vec<u8>) -> Result<Vec<u8>, CryptoError> {
+        if self.failed || self.finished || !self.pending.is_empty() {
+            return self.fail();
+        }
+
+        if self.opener.is_none() {
+            if self.consumed != 0 || ciphertext.len() != COBBLESTONE_HEADER_LEN {
+                return self.fail();
+            }
+            let input_key = self.input_key.take().ok_or(CryptoError)?;
+            let opener =
+                Cobblestone256Opener::from_header(&input_key, &self.context, ciphertext.as_slice())
+                    .map_err(|_| {
+                        self.failed = true;
+                        CryptoError
+                    })?;
+            self.opener = Some(opener);
+            self.consumed = COBBLESTONE_HEADER_LEN as u64;
+            ciphertext.clear();
+            return Ok(ciphertext);
+        }
+
+        let range = self
+            .layout
+            .ciphertext_range_for_chunk(self.next_chunk)
+            .map_err(|_| {
+                self.failed = true;
+                CryptoError
+            })?;
+        let expected_len = usize::try_from(range.end - range.start).map_err(|_| CryptoError)?;
+        if self.consumed != range.start || ciphertext.len() != expected_len {
+            return self.fail();
+        }
+        let plaintext_len = match self.opener.as_ref().ok_or(CryptoError)?.open_chunk(
+            self.layout,
+            self.next_chunk,
+            ciphertext.as_mut_slice(),
+        ) {
+            Ok(plaintext) => plaintext.len(),
+            Err(_) => {
+                self.failed = true;
+                return Err(CryptoError);
+            }
+        };
+        self.consumed = range.end;
+        self.next_chunk = self.next_chunk.checked_add(1).ok_or_else(|| {
+            self.failed = true;
+            CryptoError
+        })?;
+        ciphertext.truncate(plaintext_len);
+        Ok(ciphertext)
+    }
+
     pub fn finish(&mut self) -> Result<(), CryptoError> {
         if self.failed
             || self.finished
@@ -746,6 +806,61 @@ mod tests {
         }
         opener.finish().unwrap();
         assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn owned_exact_record_streaming_reuses_record_allocations() {
+        let plaintext = vec![0x5a; COBBLESTONE_CHUNK_LEN * 2];
+        let ciphertext = seal(&key(), [0x25; COBBLESTONE_SALT_LEN], b"owned", &plaintext).unwrap();
+        let layout =
+            Cobblestone256MessageLayout::from_ciphertext_len(ciphertext.len() as u64).unwrap();
+        let mut opener =
+            Cobblestone256StreamOpener::new(key(), b"owned", ciphertext.len() as u64).unwrap();
+        assert!(opener
+            .open_next_owned(ciphertext[..COBBLESTONE_HEADER_LEN].to_vec())
+            .unwrap()
+            .is_empty());
+        let mut opened = Vec::new();
+        for chunk in 0..layout.chunk_count() {
+            let range = layout.ciphertext_range_for_chunk(chunk).unwrap();
+            let start = usize::try_from(range.start).unwrap();
+            let end = usize::try_from(range.end).unwrap();
+            opened.extend_from_slice(
+                &opener
+                    .open_next_owned(ciphertext[start..end].to_vec())
+                    .unwrap(),
+            );
+        }
+        opener.finish().unwrap();
+        assert_eq!(opened, plaintext);
+
+        let mut corrupted = ciphertext;
+        *corrupted.last_mut().unwrap() ^= 1;
+        let mut failing =
+            Cobblestone256StreamOpener::new(key(), b"owned", corrupted.len() as u64).unwrap();
+        failing
+            .open_next_owned(corrupted[..COBBLESTONE_HEADER_LEN].to_vec())
+            .unwrap();
+        for chunk in 0..layout.chunk_count() - 1 {
+            let range = layout.ciphertext_range_for_chunk(chunk).unwrap();
+            failing
+                .open_next_owned(
+                    corrupted[usize::try_from(range.start).unwrap()
+                        ..usize::try_from(range.end).unwrap()]
+                        .to_vec(),
+                )
+                .unwrap();
+        }
+        let final_range = layout
+            .ciphertext_range_for_chunk(layout.chunk_count() - 1)
+            .unwrap();
+        assert!(failing
+            .open_next_owned(
+                corrupted[usize::try_from(final_range.start).unwrap()
+                    ..usize::try_from(final_range.end).unwrap()]
+                    .to_vec(),
+            )
+            .is_err());
     }
 
     #[test]

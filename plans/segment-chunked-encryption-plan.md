@@ -1826,6 +1826,41 @@ segments on the healthy path.
 Exit: the format choice is evidence-based and every enabled writer has a supported reader,
 recovery path, and durability/versioning story.
 
+Implementation update (2026-10-25, bounded sequential read-ahead and preliminary local 4+2
+evidence):
+
+- The first Phase 5 exploratory run exposed that the otherwise-correct incremental reader issued
+  one storage range operation for every 16 KiB authenticated record. A 16 MiB full GET therefore
+  performed 1,026 AEAD-record reads and achieved only 6.831 requests/s, even though its 4 KiB range
+  path achieved 1,152.478 requests/s. This was storage/RPC setup amplification rather than an
+  inherent requirement of the format.
+- The storage-owned sequential capability now reads the header and first record exactly, preserving
+  record-granular TTFB, then enables an explicit 2 MiB bounded ciphertext read-ahead window. Extra
+  bytes remain inside the opaque physical-read capability until requested by the codec. Physical
+  CRC state and stored-byte metrics advance when bytes actually cross the storage boundary. The
+  implementation handles codec records which straddle two read-ahead windows and never recreates
+  the former 8 MiB whole-segment buffer.
+- The exact-record crypto boundary now consumes an owned ciphertext `Vec` and reuses that allocation
+  for authenticated plaintext. On authentication failure the potentially modified provider buffer
+  is dropped inside the crypto boundary and cannot be returned to the caller. This removes an
+  additional ciphertext-to-pending copy and plaintext allocation/copy for every record without
+  weakening the no-failing-record-plaintext contract.
+- On the same AMD Ryzen 7 255, Ring, HTTP, local 4+2 exploratory setup as the Phase 0 baseline, the
+  optimized Cobblestone path reached a median 88.515 full GET requests/s (1.417 GiB/s), 1.012 ms
+  body TTFB, and 11.148 ms completion p50. The 4 KiB range reached 1,273.550 requests/s with
+  0.758 ms TTFB. Metrics reported the expected 1,026 AEAD records per 16 MiB request, exact stored
+  and shard bytes, zero reconstruction/fallback, and zero whole-segment buffer activity.
+- Relative to the clean legacy baseline (135.833 full GET requests/s, 3.288 ms body TTFB,
+  7.320 ms completion p50, and 348.836 range requests/s), this preliminary result trades about 35%
+  sequential request throughput and 52% completion latency for about 3.25x faster first-byte
+  delivery and 3.65x higher small-range request throughput. These runs used an intentionally dirty
+  temporary writer selection and are diagnostic evidence, not a reproducible reference result.
+- Production writer selection therefore remains `SegmentAes256GcmV1`. Phase 5 still requires a
+  clean, explicitly selected codec benchmark matrix for local 1+0, local redundant EC, and
+  multihost/degraded configurations before making the writer decision. The benchmark mechanism
+  must identify the authoritative persisted codec without exposing general storage test hooks to
+  the AWS-facing test harness.
+
 ### Optional follow-up: Partial EC reconstruction
 
 This is not part of the initial completion path. Start it only if Phase 3/4 production-like metrics
