@@ -485,7 +485,7 @@ Connection: close\r\n\r\n",
         )
     }
 
-    fn put_test_object(frontend: &HttpFrontend, bucket: &str, key: &str, data: &'static [u8]) {
+    fn put_test_object(frontend: &HttpFrontend, bucket: &str, key: &str, data: &[u8]) {
         frontend
             .coordinator
             .put_object(&crate::coordinator::PutObjectRequest {
@@ -1230,6 +1230,138 @@ Connection: close\r\n\r\n",
         assert!(
             persisted_codec.is_object_subject_bound(),
             "promoted PUT finalization must bind DEK and checksum ciphertext to the exact object subject"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cobblestone_integrity_failures_abort_committed_socket_responses() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend_with_payload_codec(
+            tmp.path(),
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        );
+        let bucket = "cobblestone-socket-failure-bucket";
+        create_test_bucket(&frontend, bucket);
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let range_key = "range";
+        let range_payload =
+            vec![b'r'; 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37];
+        put_test_object(&frontend, bucket, range_key, &range_payload);
+        let range_snapshot = frontend
+            .test_storage_cluster
+            .test_capture_object_payload(
+                &storage::BucketName::try_from(bucket.to_string()).unwrap(),
+                &storage::ObjectKey::try_from(range_key.to_string()).unwrap(),
+                s3_types::VersionId::Null,
+            )
+            .unwrap();
+        storage::test_support::inject_object_payload_first_segment_corruptions_beyond_parity(
+            &frontend.test_storage_cluster,
+            &range_snapshot,
+        )
+        .unwrap();
+
+        let range_value = format!(
+            "bytes={}-{}",
+            argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN - 3,
+            argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 4
+        );
+        let range_uri = format!("/{bucket}/{range_key}");
+        let signed_range = sign_headers(
+            "GET",
+            &range_uri,
+            &addr,
+            b"",
+            &[("range", &range_value)],
+        );
+        let range_request = format!(
+            "GET {range_uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Range: {range_value}\r\n\
+Connection: close\r\n\r\n",
+            signed_range.authorization, signed_range.amz_date, signed_range.amz_content_sha256,
+        );
+        let range_response =
+            send_raw_http_request_until_transport_end(&addr, &range_request, &[]);
+        let (range_headers, range_body) = split_raw_http_response(&range_response);
+        assert!(
+            range_headers.starts_with("HTTP/1.1 206"),
+            "{range_headers}"
+        );
+        assert_eq!(response_content_length(range_headers), 8);
+        assert!(
+            range_body.is_empty(),
+            "a failed selected-record read exposed plaintext after response commitment"
+        );
+
+        let full_key = "full";
+        let full_payload = vec![
+            b'f';
+            crate::coordinator::INTERNAL_SEGMENT_SIZE
+                + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+                + 37
+        ];
+        let full_uri = format!("/{bucket}/{full_key}");
+        let signed_put = sign_streaming_headers("PUT", &full_uri, &addr, full_payload.len(), &[]);
+        let aws_chunked = build_signed_chunked_body(&signed_put, &full_payload);
+        let put_request = format!(
+            "PUT {full_uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\r\n",
+            signed_put.authorization,
+            signed_put.amz_date,
+            signed_put.amz_content_sha256,
+            full_payload.len()
+        );
+        let mut put_body = format!("{:x}\r\n", aws_chunked.len()).into_bytes();
+        put_body.extend_from_slice(&aws_chunked);
+        put_body.extend_from_slice(b"\r\n0\r\n\r\n");
+        let put_response = send_raw_http_request(&addr, &put_request, &put_body);
+        assert!(put_response.starts_with("HTTP/1.1 200"), "{put_response}");
+
+        let full_snapshot = frontend
+            .test_storage_cluster
+            .test_capture_object_payload(
+                &storage::BucketName::try_from(bucket.to_string()).unwrap(),
+                &storage::ObjectKey::try_from(full_key.to_string()).unwrap(),
+                s3_types::VersionId::Null,
+            )
+            .unwrap();
+        assert_eq!(full_snapshot.segment_count(), 2);
+        storage::test_support::inject_object_payload_last_segment_losses_beyond_parity(
+            &frontend.test_storage_cluster,
+            &full_snapshot,
+        )
+        .unwrap();
+
+        let signed_get = sign_headers("GET", &full_uri, &addr, b"", &[]);
+        let get_request = format!(
+            "GET {full_uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+            signed_get.authorization, signed_get.amz_date, signed_get.amz_content_sha256,
+        );
+        let full_response = send_raw_http_request_until_transport_end(&addr, &get_request, &[]);
+        let (full_headers, full_body) = split_raw_http_response(&full_response);
+        assert!(full_headers.starts_with("HTTP/1.1 200"), "{full_headers}");
+        assert_eq!(response_content_length(full_headers), full_payload.len());
+        assert_eq!(
+            full_body,
+            &full_payload[..crate::coordinator::INTERNAL_SEGMENT_SIZE],
+            "the transport must expose only the complete authenticated prefix before the later segment failure"
         );
     }
 
@@ -2905,6 +3037,53 @@ Connection: close\r\n\r\n",
         stream.write_all(request.as_bytes()).unwrap();
         stream.write_all(body).unwrap();
         read_http_response(&mut stream, Duration::from_secs(5))
+    }
+
+    fn send_raw_http_request_until_transport_end(
+        addr: &str,
+        request: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) => {}
+            Err(error) => panic!("response transport did not terminate promptly: {error:?}"),
+        }
+        response
+    }
+
+    fn split_raw_http_response(response: &[u8]) -> (&str, &[u8]) {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response must contain complete HTTP headers");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("test response headers must be UTF-8");
+        (headers, &response[header_end + 4..])
+    }
+
+    fn response_content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("response must declare Content-Length")
     }
 
     fn send_presigned_streaming_request(

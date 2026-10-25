@@ -1747,6 +1747,21 @@ Implementation update (2026-10-25, multipart and retained-route range boundaries
   4 remains open for socket-level committed-response failure semantics and chunk-at-a-time full GET
   emission with fused physical CRC accounting.
 
+Implementation update (2026-10-25, committed raw-HTTP failure semantics):
+
+- A raw-socket Cobblestone Range GET canary now makes the selected segment unrecoverable with
+  storage-owned opaque corruption evidence. The server commits the normal `206` headers and exact
+  `Content-Length`, but selected-record authentication/fallback emits no plaintext and terminates
+  the transport with an incomplete body rather than appending XML or reporting a successful short
+  response.
+- A complementary promoted-PUT canary publishes two Cobblestone segments, makes only the final
+  segment unrecoverable through an opaque beyond-parity loss scenario, and issues a raw full GET.
+  The response commits normal `200` headers, emits exactly the complete authenticated first segment,
+  then closes short of the declared object length. No bytes from the failing segment are exposed.
+- These canaries pin the server/Hyper behavior on both sides of first-byte commitment. The
+  official-client incomplete-body canary and chunk-at-a-time full GET emission with fused physical
+  CRC accounting remain open before Phase 4 is complete.
+
 Exit: metrics and deterministic tests prove small encrypted ranges no longer read or decrypt whole
 segments on the healthy path.
 

@@ -2728,6 +2728,111 @@ pub mod test_support {
         Ok(TestObjectPayloadShardFaultSet { faults })
     }
 
+    /// Makes storage's final payload segment unrecoverable without exposing
+    /// its physical EC shape or shard identities.
+    ///
+    /// This is a semantic failure scenario for higher-layer streaming-response
+    /// tests: every earlier segment remains readable, while the final segment
+    /// has one more missing data shard than its parity can reconstruct.
+    pub fn inject_object_payload_last_segment_losses_beyond_parity(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .last()
+            .ok_or_else(|| StoreError::Io {
+                context: "select final object payload segment losses",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let loss_count = segment
+            .ec_m
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Io {
+                context: "select final object payload segment losses",
+                source: std::io::Error::other("payload parity count overflow"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if loss_count > segment.ec_k {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select final object payload segment losses",
+                source: std::io::Error::other(
+                    "payload has no data-shard loss set beyond its parity tolerance",
+                ),
+            }));
+        }
+
+        let mut faults = Vec::with_capacity(usize::from(loss_count));
+        for shard_index in 0..loss_count {
+            let fault = TestObjectPayloadShardFault {
+                snapshot: snapshot.clone(),
+                segment_index: segment.segment_index,
+                shard_index,
+            };
+            cluster
+                .test_inject_object_payload_shard_loss(
+                    &fault.snapshot,
+                    fault.segment_index,
+                    fault.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
+            faults.push(fault);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
+    /// Corrupts enough data shards in storage's first payload segment to make
+    /// authenticated range fallback unrecoverable, without changing any shard
+    /// lengths or exposing physical shard identities.
+    pub fn inject_object_payload_first_segment_corruptions_beyond_parity(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select first object payload segment corruptions",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let corruption_count = segment
+            .ec_m
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Io {
+                context: "select first object payload segment corruptions",
+                source: std::io::Error::other("payload parity count overflow"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if corruption_count > segment.ec_k {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select first object payload segment corruptions",
+                source: std::io::Error::other(
+                    "payload has no data-shard corruption set beyond its parity tolerance",
+                ),
+            }));
+        }
+
+        let mut faults = Vec::with_capacity(usize::from(corruption_count));
+        for shard_index in 0..corruption_count {
+            let fault = TestObjectPayloadShardFault {
+                snapshot: snapshot.clone(),
+                segment_index: segment.segment_index,
+                shard_index,
+            };
+            cluster
+                .test_inject_object_payload_shard_corruption(
+                    &fault.snapshot,
+                    fault.segment_index,
+                    fault.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
+            faults.push(fault);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
     /// Schedules the requested number of data-shard repair wakes for storage's
     /// first payload segment without exposing their physical identities.
     pub fn schedule_object_payload_data_shard_repair_wakes(
