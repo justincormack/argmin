@@ -682,7 +682,13 @@ impl Clone for HttpFrontend {
 
 enum S3HyperBodyState {
     Buffered(Option<Bytes>),
-    Streaming(mpsc::Receiver<Result<Bytes, ServerError>>),
+    Streaming(StreamingHyperBodyState),
+}
+
+struct StreamingHyperBodyState {
+    rx: mpsc::Receiver<Result<Bytes, ServerError>>,
+    resume_worker_after_first_frame: Option<std::sync::mpsc::Sender<()>>,
+    first_frame_returned: bool,
 }
 
 #[derive(Clone)]
@@ -886,6 +892,7 @@ impl S3HyperBody {
     ) -> Self {
         let worker_trace = trace.worker_context();
         let (tx, rx) = mpsc::channel(2);
+        let (resume_worker_tx, resume_worker_rx) = std::sync::mpsc::channel();
         tokio::task::spawn_blocking(move || {
             let _trace = observability::AttachedTrace::new(worker_trace);
             observability::trace_scope!(
@@ -895,11 +902,18 @@ impl S3HyperBody {
                 read_chunk_size
             );
             let mut body = body;
+            let mut first_frame = true;
             loop {
                 match body.next_chunk(read_chunk_size) {
                     Ok(Some(chunk)) => {
                         if tx.blocking_send(Ok(Bytes::from_owner(chunk))).is_err() {
                             break;
+                        }
+                        if first_frame {
+                            first_frame = false;
+                            if resume_worker_rx.recv().is_err() {
+                                break;
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -912,7 +926,11 @@ impl S3HyperBody {
         });
 
         Self {
-            state: S3HyperBodyState::Streaming(rx),
+            state: S3HyperBodyState::Streaming(StreamingHyperBodyState {
+                rx,
+                resume_worker_after_first_frame: Some(resume_worker_tx),
+                first_frame_returned: false,
+            }),
             trace: Some(trace),
             _inflight_requests_guard: inflight_requests_guard,
             _permit: permit,
@@ -950,27 +968,35 @@ impl Body for S3HyperBody {
                     Poll::Ready(None)
                 }
             },
-            S3HyperBodyState::Streaming(rx) => match Pin::new(rx).poll_recv(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    if let Some(trace) = this.trace.as_mut() {
-                        trace.record_bytes(bytes.len());
+            S3HyperBodyState::Streaming(streaming) => {
+                if streaming.first_frame_returned {
+                    if let Some(resume) = streaming.resume_worker_after_first_frame.take() {
+                        let _ = resume.send(());
                     }
-                    Poll::Ready(Some(Ok(Frame::data(bytes))))
                 }
-                Poll::Ready(Some(Err(err))) => {
-                    if let Some(trace) = this.trace.as_mut() {
-                        trace.emit_error(&err);
+                match Pin::new(&mut streaming.rx).poll_recv(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        streaming.first_frame_returned = true;
+                        if let Some(trace) = this.trace.as_mut() {
+                            trace.record_bytes(bytes.len());
+                        }
+                        Poll::Ready(Some(Ok(Frame::data(bytes))))
                     }
-                    Poll::Ready(Some(Err(err)))
-                }
-                Poll::Ready(None) => {
-                    if let Some(trace) = this.trace.as_mut() {
-                        trace.emit_finish("complete");
+                    Poll::Ready(Some(Err(err))) => {
+                        if let Some(trace) = this.trace.as_mut() {
+                            trace.emit_error(&err);
+                        }
+                        Poll::Ready(Some(Err(err)))
                     }
-                    Poll::Ready(None)
+                    Poll::Ready(None) => {
+                        if let Some(trace) = this.trace.as_mut() {
+                            trace.emit_finish("complete");
+                        }
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
                 }
-                Poll::Pending => Poll::Pending,
-            },
+            }
         }
     }
 

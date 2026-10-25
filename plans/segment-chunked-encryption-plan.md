@@ -1846,8 +1846,8 @@ evidence):
   additional ciphertext-to-pending copy and plaintext allocation/copy for every record without
   weakening the no-failing-record-plaintext contract.
 - On the same AMD Ryzen 7 255, Ring, HTTP, local 4+2 exploratory setup as the Phase 0 baseline, the
-  optimized Cobblestone path reached a median 88.515 full GET requests/s (1.417 GiB/s), 1.012 ms
-  body TTFB, and 11.148 ms completion p50. The 4 KiB range reached 1,273.550 requests/s with
+  optimized Cobblestone path reached a median 88.515 full GET requests/s (1,416.240 MiB/s),
+  1.012 ms body TTFB, and 11.148 ms completion p50. The 4 KiB range reached 1,273.550 requests/s with
   0.758 ms TTFB. Metrics reported the expected 1,026 AEAD records per 16 MiB request, exact stored
   and shard bytes, zero reconstruction/fallback, and zero whole-segment buffer activity.
 - Relative to the clean legacy baseline (135.833 full GET requests/s, 3.288 ms body TTFB,
@@ -1855,6 +1855,27 @@ evidence):
   sequential request throughput and 52% completion latency for about 3.25x faster first-byte
   delivery and 3.65x higher small-range request throughput. These runs used an intentionally dirty
   temporary writer selection and are diagnostic evidence, not a reproducible reference result.
+- Paired `perf` profiles isolated the remaining sequential gap. Across matching 128-read runs,
+  Cobblestone used approximately 15.34 billion sampled cycles versus 8.26 billion for the legacy
+  profile, but its AES-GCM work was approximately 1.03 billion versus 0.87 billion cycles. The
+  incremental AEAD cost therefore explained only about 2% of the excess. The dominant new costs
+  were one response/channel handoff per authenticated record, copying each 16 KiB record out of
+  the read-ahead window, and repeated integrity-witness validation at each physical range read.
+  A matching 64-read counter run observed 83,848 context switches for the per-record response
+  shape versus 19,297 for legacy, an excess of roughly 1,009 per request and almost exactly the
+  number of authenticated records in the 16 MiB response.
+- Full reads now return the first authenticated record immediately and coalesce later authenticated
+  records into at most 2 MiB response buffers. The cap matches the storage read-ahead bound and
+  does not recreate the former 8 MiB segment buffer. The blocking body worker also waits until
+  Hyper has consumed the first frame before computing the first coalesced buffer, preventing that
+  work from competing with first-byte delivery. A deterministic reader regression pins the first
+  16 KiB response followed by the 2 MiB coalesced response; the existing late-corruption regression
+  proves that authenticated-but-unexposed records are discarded before full-segment fallback.
+- In the same five-sample exploratory local 4+2 benchmark, coalescing raised median full GET
+  throughput to 106.862 requests/s (1,709.784 MiB/s) and reduced completion p50 to 9.099 ms. Body TTFB
+  remained record-granular at 1.112 ms, and the 4 KiB range path remained independent at
+  1,250.753 requests/s with 0.769 ms TTFB. This recovers about 21% throughput over the preceding
+  88.515 requests/s Cobblestone result while retaining its first-byte and range advantages.
 - Production writer selection therefore remains `SegmentAes256GcmV1`. Phase 5 still requires a
   clean, explicitly selected codec benchmark matrix for local 1+0, local redundant EC, and
   multihost/degraded configurations before making the writer decision. The benchmark mechanism

@@ -6099,6 +6099,87 @@ fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
 }
 
 #[test]
+fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_records() {
+    let tmp = test_util::tempdir();
+    let mut coord = setup_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let payload_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+        + super::read_core::AUTHENTICATED_READ_COALESCE_BYTES
+        + 37;
+    let payload = (0..payload_len)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "coalesced-read",
+                test_requester(),
+                None,
+            ),
+            data: &payload,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "coalesced-read",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let mut body = object.body;
+    let first = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("first authenticated record");
+    assert_eq!(
+        first.len(),
+        argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+    );
+    assert_eq!(first.as_ref(), &payload[..first.len()]);
+
+    let second = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("coalesced authenticated records");
+    assert_eq!(
+        second.len(),
+        super::read_core::AUTHENTICATED_READ_COALESCE_BYTES
+    );
+    assert_eq!(
+        second.as_ref(),
+        &payload[first.len()..first.len() + second.len()]
+    );
+
+    let mut streamed = first.as_ref().to_vec();
+    streamed.extend_from_slice(second.as_ref());
+    while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE).unwrap() {
+        streamed.extend_from_slice(chunk.as_ref());
+    }
+    assert_eq!(streamed, payload);
+}
+
+#[test]
 fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
     let mut coord = setup_coordinator_with_sse_c(tmp.path());

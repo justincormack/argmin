@@ -110,6 +110,13 @@ struct StreamingFullSegment {
     terminal_plaintext: Option<Vec<u8>>,
 }
 
+/// Bound authenticated plaintext retained after the first response record.
+///
+/// The first record is still returned immediately for low TTFB. Subsequent
+/// records are coalesced only up to the storage read-ahead window, avoiding
+/// both per-record response handoffs and the former whole-segment buffer.
+pub(super) const AUTHENTICATED_READ_COALESCE_BYTES: usize = 2 * 1024 * 1024;
+
 enum StreamingFullSegmentStep {
     Plaintext(Vec<u8>),
     Complete(Vec<u8>),
@@ -282,7 +289,15 @@ impl SegmentListReader {
 
     fn advance_streaming_segment(
         streaming: &mut StreamingFullSegment,
+        target_size: usize,
     ) -> Result<StreamingFullSegmentStep, ServerError> {
+        let first_response_record = streaming.plaintext_released == 0;
+        let coalesce_limit = target_size.clamp(1, AUTHENTICATED_READ_COALESCE_BYTES);
+        let mut authenticated = if first_response_record {
+            Vec::new()
+        } else {
+            Vec::with_capacity(coalesce_limit)
+        };
         loop {
             let Some(range) = streaming.crypto.next_ciphertext_range() else {
                 return Err(ServerError::InternalError {
@@ -315,9 +330,14 @@ impl SegmentListReader {
                 let mut terminal_plaintext =
                     streaming.terminal_plaintext.take().unwrap_or_default();
                 terminal_plaintext.extend_from_slice(&plaintext);
+                if authenticated.capacity() == 0 {
+                    authenticated = terminal_plaintext;
+                } else {
+                    authenticated.extend_from_slice(&terminal_plaintext);
+                }
                 return match physical.finish().map_err(super::map_object_read_failure)? {
                     ObjectPayloadFullSegmentReadOutcome::Complete => {
-                        Ok(StreamingFullSegmentStep::Complete(terminal_plaintext))
+                        Ok(StreamingFullSegmentStep::Complete(authenticated))
                     }
                     ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired => {
                         Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired)
@@ -337,7 +357,14 @@ impl SegmentListReader {
                 .as_mut()
                 .expect("nonterminal stream retains physical authority")
                 .enable_bounded_read_ahead_after_first_authenticated_record();
-            return Ok(StreamingFullSegmentStep::Plaintext(plaintext));
+            if authenticated.capacity() == 0 {
+                authenticated = plaintext;
+            } else {
+                authenticated.extend_from_slice(&plaintext);
+            }
+            if first_response_record || authenticated.len() >= coalesce_limit {
+                return Ok(StreamingFullSegmentStep::Plaintext(authenticated));
+            }
         }
     }
 
@@ -367,7 +394,7 @@ impl SegmentListReader {
             }
 
             if let Some(mut streaming) = self.streaming_segment.take() {
-                match Self::advance_streaming_segment(&mut streaming)? {
+                match Self::advance_streaming_segment(&mut streaming, target_size)? {
                     StreamingFullSegmentStep::Plaintext(plaintext) => {
                         streaming.plaintext_released += plaintext.len();
                         self.record_verified_plaintext(&plaintext);
