@@ -21520,6 +21520,83 @@ fn ec_corrupt_one_data_shard_recovery() {
 }
 
 #[test]
+fn cobblestone_range_authentication_failure_uses_full_witness_reconstruction() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let mut coord = setup_ec_fault_injection_coordinator(tmp.path());
+    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data: Vec<u8> = (0..2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "cobblestone-range-corrupt",
+                test_requester(),
+                None,
+            ),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-range-corrupt");
+    storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
+
+    let start = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN - 3) as u64;
+    let end = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 4) as u64;
+    let metrics_before = observability::metrics_snapshot();
+    let object = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "cobblestone-range-corrupt",
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range { start, end },
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        object.body.read_all().unwrap(),
+        data[start as usize..=end as usize]
+    );
+    let metrics_after = observability::metrics_snapshot();
+    assert_eq!(
+        metrics_after.payload_read_repair_fallback_total,
+        metrics_before.payload_read_repair_fallback_total + 1,
+        "failed selected-record authentication must enter the full witness-backed path"
+    );
+    assert!(
+        metrics_after.payload_read_reconstructed_bytes_total
+            > metrics_before.payload_read_reconstructed_bytes_total
+    );
+}
+
+#[test]
 fn ec_range_get_with_missing_shard() {
     if !backend_supports_parity_recovery() {
         return;

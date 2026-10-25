@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
+use std::ops::Range;
 
 use argmin_crypto::aead::Aes256GcmKey;
 use argmin_crypto::cobblestone::{
-    self, Cobblestone256Key, Cobblestone256MessageLayout, Cobblestone256StreamOpener,
-    COBBLESTONE_HEADER_LEN, COBBLESTONE_SALT_LEN,
+    self, Cobblestone256Key, Cobblestone256MessageLayout, Cobblestone256Opener,
+    Cobblestone256SelectedRange, Cobblestone256StreamOpener, COBBLESTONE_HEADER_LEN,
+    COBBLESTONE_SALT_LEN,
 };
 use argmin_crypto::hmac::Sha256Key;
 #[cfg(test)]
@@ -102,6 +104,66 @@ impl<'a> AuthorizedSegmentRead<'a> {
             segment_index,
             plaintext_len,
         }
+    }
+}
+
+/// Prepared key and immutable geometry for one authenticated Cobblestone
+/// segment range.
+///
+/// Construction validates the storage-minted segment subject and unwraps the
+/// exact object DEK before any partial shard IO occurs. The caller may expose
+/// only the plaintext returned by [`Self::authenticate`].
+pub(crate) struct AuthorizedCobblestoneSegmentRangeRead {
+    key: Cobblestone256Key,
+    payload_aead_context: Vec<u8>,
+    selection: Cobblestone256SelectedRange,
+}
+
+impl AuthorizedCobblestoneSegmentRangeRead {
+    #[must_use]
+    pub(crate) fn header_range(&self) -> Range<u64> {
+        self.selection.header_range()
+    }
+
+    #[must_use]
+    pub(crate) fn ciphertext_range(&self) -> Range<u64> {
+        self.selection.ciphertext_range()
+    }
+
+    /// Authenticate every selected record in private scratch and return only
+    /// the requested plaintext subrange. Authentication failure deliberately
+    /// carries no partial plaintext so the caller can retry through the full
+    /// witness-backed read path.
+    pub(crate) fn authenticate(
+        self,
+        header: &[u8],
+        selected_ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ()> {
+        let opener =
+            Cobblestone256Opener::from_header(&self.key, &self.payload_aead_context, header)
+                .map_err(|_| ())?;
+        opener
+            .open_selected_range_with_observers(
+                &self.selection,
+                selected_ciphertext,
+                || {
+                    observability::record_payload_read_metrics(
+                        observability::PayloadReadMetricDelta {
+                            aead_records: 1,
+                            ..observability::PayloadReadMetricDelta::default()
+                        },
+                    );
+                },
+                |plaintext_len| {
+                    observability::record_payload_read_metrics(
+                        observability::PayloadReadMetricDelta {
+                            decrypted_bytes: u64::try_from(plaintext_len).unwrap_or(u64::MAX),
+                            ..observability::PayloadReadMetricDelta::default()
+                        },
+                    );
+                },
+            )
+            .map_err(|_| ())
     }
 }
 
@@ -992,6 +1054,46 @@ pub(crate) fn decrypt_authorized_managed_encryption_segment_in_place(
     )
 }
 
+pub(crate) fn prepare_authorized_managed_encryption_segment_range(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    read: AuthorizedSegmentRead<'_>,
+    plaintext_range: Range<u64>,
+) -> Result<AuthorizedCobblestoneSegmentRangeRead, ServerError> {
+    let encryption = ObjectEncryption::SseS3(state.clone());
+    if state.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1
+        || !read.subject.matches_encryption_and_geometry(
+            &encryption,
+            read.segment_index,
+            read.plaintext_len as u64,
+        )
+    {
+        return Err(ServerError::InternalError {
+            reason: "managed Cobblestone range does not match its storage-minted read subject"
+                .to_string(),
+        });
+    }
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id())
+            .ok_or(ServerError::InternalError {
+                reason: "managed wrapping key for object is not available".to_string(),
+            })?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => MANAGED_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        MANAGED_ENCRYPTION_LABEL,
+    )?;
+    prepare_authorized_cobblestone_segment_range(&dek, read, plaintext_range)
+}
+
 #[cfg(test)]
 fn decrypt_managed_encryption_segment_in_place(
     provider: &impl ManagedKeyProvider,
@@ -1214,6 +1316,66 @@ pub(crate) fn decrypt_authorized_sse_customer_segment_in_place(
             label: "SSE-C",
         },
     )
+}
+
+pub(crate) fn prepare_authorized_sse_customer_segment_range(
+    validator: &SseCustomerValidatorConfig,
+    state: &SseCustomerObjectState,
+    request: &SseCustomerRequest,
+    read: AuthorizedSegmentRead<'_>,
+    plaintext_range: Range<u64>,
+) -> Result<AuthorizedCobblestoneSegmentRangeRead, ServerError> {
+    validate_sse_customer_read(validator, state, request)?;
+    let encryption = ObjectEncryption::SseCustomer(state.clone());
+    if state.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1
+        || !read.subject.matches_encryption_and_geometry(
+            &encryption,
+            read.segment_index,
+            read.plaintext_len as u64,
+        )
+    {
+        return Err(ServerError::InternalError {
+            reason: "SSE-C Cobblestone range does not match its storage-minted read subject"
+                .to_string(),
+        });
+    }
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
+    let wrap_subject = read.subject.dek_wrap_subject();
+    let wrap_aad = match state.key_binding() {
+        ObjectEncryptionKeyBinding::ProvisionalV1 => SSE_C_WRAP_AAD,
+        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
+    };
+    let dek = unwrap_managed_dek(
+        &kek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
+        wrap_aad,
+        "SSE-C",
+    )?;
+    prepare_authorized_cobblestone_segment_range(&dek, read, plaintext_range)
+}
+
+fn prepare_authorized_cobblestone_segment_range(
+    dek: &[u8; SSE_C_DEK_LEN],
+    read: AuthorizedSegmentRead<'_>,
+    plaintext_range: Range<u64>,
+) -> Result<AuthorizedCobblestoneSegmentRangeRead, ServerError> {
+    let failure = || ServerError::InternalError {
+        reason: "invalid Cobblestone segment range geometry".to_string(),
+    };
+    let layout = Cobblestone256MessageLayout::from_plaintext_len(read.plaintext_len as u64)
+        .map_err(|_| failure())?;
+    let selection = layout
+        .select_plaintext_range(plaintext_range)
+        .map_err(|_| failure())?;
+    let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
+        reason: "failed to create Cobblestone segment range opening key".to_string(),
+    })?;
+    Ok(AuthorizedCobblestoneSegmentRangeRead {
+        key,
+        payload_aead_context: read.subject.payload_aead_context().to_vec(),
+        selection,
+    })
 }
 
 #[cfg(test)]

@@ -5977,6 +5977,52 @@ fn put_and_read_direct_cobblestone_object(
     assert_cobblestone_object(coord, key, sse_customer, &payload);
 }
 
+fn assert_direct_cobblestone_range_reads_only_selected_records(
+    coord: &Coordinator,
+    key: &str,
+    sse_customer: Option<&crate::sse::SseCustomerRequest>,
+) {
+    let payload = direct_cobblestone_payload();
+    let start = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN - 3) as u64;
+    let end = (argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 4) as u64;
+    let before = observability::metrics_snapshot();
+    let object = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range { start, end },
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        object.body.read_all().unwrap(),
+        payload[start as usize..=end as usize]
+    );
+
+    let after = observability::metrics_snapshot();
+    assert_eq!(
+        after.payload_read_stored_bytes_total - before.payload_read_stored_bytes_total,
+        (argmin_crypto::cobblestone::COBBLESTONE_HEADER_LEN
+            + 2 * argmin_crypto::cobblestone::COBBLESTONE_FULL_ENCRYPTED_CHUNK_LEN) as u64,
+        "a cross-chunk range must read only the fixed header and two complete records"
+    );
+    assert_eq!(
+        after.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        (2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN) as u64,
+        "decryption work must count complete authenticated records, not returned bytes"
+    );
+    assert_eq!(
+        after.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        2
+    );
+}
+
 #[test]
 fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
@@ -5987,6 +6033,7 @@ fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
         .unwrap();
 
     put_and_read_direct_cobblestone_object(&coord, "managed", None);
+    assert_direct_cobblestone_range_reads_only_selected_records(&coord, "managed", None);
 }
 
 #[test]
@@ -6001,6 +6048,7 @@ fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let request = test_sse_customer_request();
 
     put_and_read_direct_cobblestone_object(&coord, "customer", Some(&request));
+    assert_direct_cobblestone_range_reads_only_selected_records(&coord, "customer", Some(&request));
 }
 
 #[test]
@@ -6156,6 +6204,67 @@ fn stream_put_and_read_cobblestone_object(
         "stream finalization must seal checksum metadata under the session encryption state"
     );
     assert_eq!(object.body.read_all().unwrap(), payload);
+
+    let start = first.len() - 4;
+    let end = first.len() + 3;
+    let before = observability::metrics_snapshot();
+    let range = coord
+        .get_object_range(&GetObjectRangeRequest {
+            sse_customer,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            range: ByteRange::Range {
+                start: start as u64,
+                end: end as u64,
+            },
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(range.body.read_all().unwrap(), payload[start..=end]);
+    let first_layout = argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+        first.len() as u64,
+    )
+    .unwrap();
+    let first_terminal = first_layout
+        .ciphertext_range_for_chunk(first_layout.chunk_count() - 1)
+        .unwrap();
+    let first_terminal_index = first_layout.chunk_count() - 1;
+    let first_terminal_plaintext = first_layout
+        .plaintext_range_for_chunk(first_terminal_index)
+        .unwrap();
+    let second_layout =
+        argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+            second.len() as u64
+        )
+        .unwrap();
+    let second_first = second_layout.ciphertext_range_for_chunk(0).unwrap();
+    let second_first_plaintext = second_layout.plaintext_range_for_chunk(0).unwrap();
+    let expected_stored = 2 * argmin_crypto::cobblestone::COBBLESTONE_HEADER_LEN as u64
+        + first_terminal.end
+        - first_terminal.start
+        + second_first.end
+        - second_first.start;
+    let after = observability::metrics_snapshot();
+    assert_eq!(
+        after.payload_read_stored_bytes_total - before.payload_read_stored_bytes_total,
+        expected_stored,
+        "a cross-segment range must read one selected record from each segment"
+    );
+    assert_eq!(
+        after.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        2
+    );
+    assert_eq!(
+        after.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        first_terminal_plaintext.end - first_terminal_plaintext.start + second_first_plaintext.end
+            - second_first_plaintext.start,
+        "cross-segment decryption work must include both complete authenticated records"
+    );
 }
 
 #[test]

@@ -111,6 +111,22 @@ pub struct Cobblestone256MessageLayout {
     terminal_ciphertext_len: usize,
 }
 
+/// Canonical mapping from one nonempty plaintext range to the minimal
+/// contiguous set of Cobblestone ciphertext records which authenticate it.
+///
+/// The message header is deliberately separate: callers read and verify it
+/// once, then fetch [`Self::ciphertext_range`] from the systematic payload.
+/// This type carries the complete message layout so it cannot be paired with
+/// chunk coordinates derived from another persisted segment geometry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Cobblestone256SelectedRange {
+    layout: Cobblestone256MessageLayout,
+    plaintext_range: Range<u64>,
+    first_chunk: u64,
+    last_chunk: u64,
+    ciphertext_range: Range<u64>,
+}
+
 impl Cobblestone256MessageLayout {
     pub fn from_ciphertext_len(ciphertext_len: u64) -> Result<Self, CryptoError> {
         let body_len = ciphertext_len
@@ -211,6 +227,65 @@ impl Cobblestone256MessageLayout {
             .checked_sub(AES_GCM_TAG_LEN as u64)
             .ok_or(CryptoError)?;
         Ok(start..start.checked_add(plaintext_length).ok_or(CryptoError)?)
+    }
+
+    /// Map a nonempty plaintext range to the minimal complete encrypted
+    /// records needed to authenticate it.
+    pub fn select_plaintext_range(
+        self,
+        plaintext_range: Range<u64>,
+    ) -> Result<Cobblestone256SelectedRange, CryptoError> {
+        if plaintext_range.start >= plaintext_range.end || plaintext_range.end > self.plaintext_len
+        {
+            return Err(CryptoError);
+        }
+        let first_chunk = plaintext_range.start / COBBLESTONE_CHUNK_LEN as u64;
+        let last_chunk = (plaintext_range.end - 1) / COBBLESTONE_CHUNK_LEN as u64;
+        let first_ciphertext = self.ciphertext_range_for_chunk(first_chunk)?;
+        let last_ciphertext = self.ciphertext_range_for_chunk(last_chunk)?;
+        Ok(Cobblestone256SelectedRange {
+            layout: self,
+            plaintext_range,
+            first_chunk,
+            last_chunk,
+            ciphertext_range: first_ciphertext.start..last_ciphertext.end,
+        })
+    }
+}
+
+impl Cobblestone256SelectedRange {
+    /// The fixed message header which must be commitment-verified before any
+    /// selected chunk is opened.
+    #[must_use]
+    pub const fn header_range(&self) -> Range<u64> {
+        0..COBBLESTONE_HEADER_LEN as u64
+    }
+
+    /// Minimal contiguous ciphertext span containing every complete selected
+    /// encrypted record, excluding the separately read header.
+    #[must_use]
+    pub fn ciphertext_range(&self) -> Range<u64> {
+        self.ciphertext_range.clone()
+    }
+
+    #[must_use]
+    pub fn plaintext_range(&self) -> Range<u64> {
+        self.plaintext_range.clone()
+    }
+
+    #[must_use]
+    pub const fn first_chunk(&self) -> u64 {
+        self.first_chunk
+    }
+
+    #[must_use]
+    pub const fn last_chunk(&self) -> u64 {
+        self.last_chunk
+    }
+
+    #[must_use]
+    pub const fn selected_chunk_count(&self) -> u64 {
+        self.last_chunk - self.first_chunk + 1
     }
 }
 
@@ -337,6 +412,112 @@ impl Cobblestone256Opener {
         }
         let nonce = nonce_for_chunk(self.base_nonce, chunk_index)?;
         self.key.open_in_place(nonce, &[], ciphertext_and_tag)
+    }
+
+    /// Authenticate the complete records selected by `selection` and return
+    /// exactly its requested plaintext bytes.
+    ///
+    /// Authentication happens in private scratch buffers. If any selected
+    /// record fails, no plaintext from an earlier record is returned to the
+    /// caller.
+    pub fn open_selected_range(
+        &self,
+        selection: &Cobblestone256SelectedRange,
+        selected_ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.open_selected_range_with_observers(selection, selected_ciphertext, || {}, |_| {})
+    }
+
+    /// Authenticate a selected range while reporting AEAD attempts and
+    /// successfully authenticated plaintext at their exact boundaries.
+    ///
+    /// `before_open` runs immediately before each record-open attempt;
+    /// `after_open` runs only after successful authentication and receives
+    /// that complete record's plaintext length. Neither observer receives
+    /// plaintext or key material, and plaintext is still returned only after
+    /// every selected record succeeds.
+    pub fn open_selected_range_with_observers(
+        &self,
+        selection: &Cobblestone256SelectedRange,
+        selected_ciphertext: &[u8],
+        mut before_open: impl FnMut(),
+        mut after_open: impl FnMut(usize),
+    ) -> Result<Vec<u8>, CryptoError> {
+        let expected_len = usize::try_from(
+            selection
+                .ciphertext_range
+                .end
+                .checked_sub(selection.ciphertext_range.start)
+                .ok_or(CryptoError)?,
+        )
+        .map_err(|_| CryptoError)?;
+        if selected_ciphertext.len() != expected_len {
+            return Err(CryptoError);
+        }
+
+        let first_plaintext = selection
+            .layout
+            .plaintext_range_for_chunk(selection.first_chunk)?;
+        let last_plaintext = selection
+            .layout
+            .plaintext_range_for_chunk(selection.last_chunk)?;
+        let authenticated_len = usize::try_from(
+            last_plaintext
+                .end
+                .checked_sub(first_plaintext.start)
+                .ok_or(CryptoError)?,
+        )
+        .map_err(|_| CryptoError)?;
+        let mut authenticated = Vec::with_capacity(authenticated_len);
+
+        for chunk_index in selection.first_chunk..=selection.last_chunk {
+            let absolute = selection.layout.ciphertext_range_for_chunk(chunk_index)?;
+            let start = usize::try_from(
+                absolute
+                    .start
+                    .checked_sub(selection.ciphertext_range.start)
+                    .ok_or(CryptoError)?,
+            )
+            .map_err(|_| CryptoError)?;
+            let end = usize::try_from(
+                absolute
+                    .end
+                    .checked_sub(selection.ciphertext_range.start)
+                    .ok_or(CryptoError)?,
+            )
+            .map_err(|_| CryptoError)?;
+            let mut encrypted_chunk = selected_ciphertext
+                .get(start..end)
+                .ok_or(CryptoError)?
+                .to_vec();
+            before_open();
+            let plaintext = self.open_chunk(selection.layout, chunk_index, &mut encrypted_chunk)?;
+            after_open(plaintext.len());
+            authenticated.extend_from_slice(plaintext);
+        }
+
+        let selected_start = usize::try_from(
+            selection
+                .plaintext_range
+                .start
+                .checked_sub(first_plaintext.start)
+                .ok_or(CryptoError)?,
+        )
+        .map_err(|_| CryptoError)?;
+        let selected_end = usize::try_from(
+            selection
+                .plaintext_range
+                .end
+                .checked_sub(first_plaintext.start)
+                .ok_or(CryptoError)?,
+        )
+        .map_err(|_| CryptoError)?;
+        if authenticated.get(selected_start..selected_end).is_none() {
+            return Err(CryptoError);
+        }
+        authenticated.copy_within(selected_start..selected_end, 0);
+        authenticated.truncate(selected_end - selected_start);
+        Ok(authenticated)
     }
 }
 
@@ -626,6 +807,132 @@ mod tests {
         *bad_tag.last_mut().unwrap() ^= 1;
         assert!(opener.open_chunk(layout, 0, &mut bad_tag).is_err());
         assert!(bad_tag.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn selected_plaintext_ranges_map_to_minimal_complete_records() {
+        let plaintext_len = (COBBLESTONE_CHUNK_LEN * 2 + 17) as u64;
+        let layout = Cobblestone256MessageLayout::from_plaintext_len(plaintext_len).unwrap();
+
+        for invalid in [
+            0..0,
+            Range { start: 9, end: 3 },
+            plaintext_len..plaintext_len,
+            0..plaintext_len + 1,
+        ] {
+            assert!(layout.select_plaintext_range(invalid).is_err());
+        }
+
+        let first = layout.select_plaintext_range(10..20).unwrap();
+        assert_eq!(first.header_range(), 0..COBBLESTONE_HEADER_LEN as u64);
+        assert_eq!(first.plaintext_range(), 10..20);
+        assert_eq!(first.first_chunk(), 0);
+        assert_eq!(first.last_chunk(), 0);
+        assert_eq!(first.selected_chunk_count(), 1);
+        assert_eq!(
+            first.ciphertext_range(),
+            layout.ciphertext_range_for_chunk(0).unwrap()
+        );
+
+        let crossing = layout
+            .select_plaintext_range(
+                (COBBLESTONE_CHUNK_LEN - 3) as u64..(COBBLESTONE_CHUNK_LEN + 5) as u64,
+            )
+            .unwrap();
+        assert_eq!(crossing.first_chunk(), 0);
+        assert_eq!(crossing.last_chunk(), 1);
+        assert_eq!(crossing.selected_chunk_count(), 2);
+        assert_eq!(
+            crossing.ciphertext_range(),
+            layout.ciphertext_range_for_chunk(0).unwrap().start
+                ..layout.ciphertext_range_for_chunk(1).unwrap().end
+        );
+
+        let terminal = layout
+            .select_plaintext_range(plaintext_len - 4..plaintext_len)
+            .unwrap();
+        assert_eq!(terminal.first_chunk(), 2);
+        assert_eq!(terminal.last_chunk(), 2);
+        assert_eq!(
+            terminal.ciphertext_range(),
+            layout.ciphertext_range_for_chunk(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_multiple_range_does_not_select_empty_terminal_record() {
+        let plaintext_len = (COBBLESTONE_CHUNK_LEN * 2) as u64;
+        let layout = Cobblestone256MessageLayout::from_plaintext_len(plaintext_len).unwrap();
+        assert_eq!(layout.chunk_count(), 3);
+
+        let selection = layout
+            .select_plaintext_range(plaintext_len - 1..plaintext_len)
+            .unwrap();
+        assert_eq!(selection.first_chunk(), 1);
+        assert_eq!(selection.last_chunk(), 1);
+        assert_eq!(
+            selection.ciphertext_range(),
+            layout.ciphertext_range_for_chunk(1).unwrap()
+        );
+        assert_eq!(
+            layout
+                .plaintext_range_for_chunk(layout.chunk_count() - 1)
+                .unwrap(),
+            plaintext_len..plaintext_len
+        );
+    }
+
+    #[test]
+    fn selected_range_authenticates_every_record_before_returning_plaintext() {
+        let plaintext: Vec<u8> = (0..COBBLESTONE_CHUNK_LEN * 2 + 17)
+            .map(|index| index as u8)
+            .collect();
+        let ciphertext = seal(
+            &key(),
+            [0xa1; COBBLESTONE_SALT_LEN],
+            b"selected-range",
+            &plaintext,
+        )
+        .unwrap();
+        let layout =
+            Cobblestone256MessageLayout::from_plaintext_len(plaintext.len() as u64).unwrap();
+        let requested = (COBBLESTONE_CHUNK_LEN - 3) as u64..(COBBLESTONE_CHUNK_LEN + 5) as u64;
+        let selection = layout.select_plaintext_range(requested.clone()).unwrap();
+        let encrypted = &ciphertext[selection.ciphertext_range().start as usize
+            ..selection.ciphertext_range().end as usize];
+        let opener = Cobblestone256Opener::from_header(
+            &key(),
+            b"selected-range",
+            &ciphertext[..COBBLESTONE_HEADER_LEN],
+        )
+        .unwrap();
+
+        assert_eq!(
+            opener.open_selected_range(&selection, encrypted).unwrap(),
+            plaintext[requested.start as usize..requested.end as usize]
+        );
+        assert!(opener
+            .open_selected_range(&selection, &encrypted[..encrypted.len() - 1])
+            .is_err());
+
+        let mut corrupted = encrypted.to_vec();
+        *corrupted.last_mut().unwrap() ^= 1;
+        let attempts = std::cell::Cell::new(0_u64);
+        let authenticated_bytes = std::cell::Cell::new(0_usize);
+        assert!(opener
+            .open_selected_range_with_observers(
+                &selection,
+                &corrupted,
+                || attempts.set(attempts.get() + 1),
+                |length| authenticated_bytes.set(authenticated_bytes.get() + length),
+            )
+            .is_err());
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(authenticated_bytes.get(), COBBLESTONE_CHUNK_LEN);
+
+        let mut bad_header = ciphertext[..COBBLESTONE_HEADER_LEN].to_vec();
+        bad_header[COBBLESTONE_SALT_LEN] ^= 1;
+        assert!(Cobblestone256Opener::from_header(&key(), b"selected-range", &bad_header).is_err());
     }
 
     #[test]

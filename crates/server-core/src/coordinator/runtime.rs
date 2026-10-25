@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
 use storage::{
-    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ProcessLocalRegistryKey,
-    StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState,
-    VersionId,
+    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey,
+    ObjectPayloadRangeReadOutcome, ProcessLocalRegistryKey, SegmentPayloadCodec, StorageCluster,
+    StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -23,7 +23,9 @@ use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS}
 use crate::error::ServerError;
 use crate::sse::{
     decrypt_authorized_managed_encryption_segment_in_place,
-    decrypt_authorized_sse_customer_segment_in_place, AuthorizedSegmentRead, SseCustomerRequest,
+    decrypt_authorized_sse_customer_segment_in_place,
+    prepare_authorized_managed_encryption_segment_range,
+    prepare_authorized_sse_customer_segment_range, AuthorizedSegmentRead, SseCustomerRequest,
     SseCustomerSegmentScope,
 };
 
@@ -1089,6 +1091,151 @@ impl ReadRuntime {
             &mut buf,
         )?;
         Ok(buf.into_shared())
+    }
+
+    /// Read and authenticate one logical subrange of a Cobblestone segment.
+    ///
+    /// A healthy systematic path returns only the selected plaintext. Every
+    /// degraded, malformed, or unauthenticated partial result is discarded
+    /// and retried through the existing complete witness-backed read. The
+    /// tuple offsets identify the requested bytes within the returned buffer:
+    /// they are `0..len` for the partial fast path and the original range for
+    /// a complete-segment fallback.
+    pub(super) fn read_checked_segment_payload_range(
+        &self,
+        segment: &SegmentPayloadRecord,
+        part_number: Option<u32>,
+        sse_customer_request: Option<&SseCustomerRequest>,
+        plaintext_range: std::ops::Range<usize>,
+    ) -> Result<(Arc<SharedPayloadBuffer>, usize, usize), ServerError> {
+        let full_fallback = || {
+            self.read_checked_segment_payload(segment, part_number, sse_customer_request)
+                .map(|payload| (payload, plaintext_range.start, plaintext_range.end))
+        };
+        if segment.encryption.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1 {
+            return full_fallback();
+        }
+
+        let encryption_subject = segment
+            .storage_segment
+            .encryption_subject()
+            .ok_or_else(|| ServerError::InternalError {
+                reason: "payload segment is missing its storage-minted encryption subject"
+                    .to_string(),
+            })?;
+        let segment_scope = part_number.map_or(Ok(SseCustomerSegmentScope::object()), |part| {
+            SseCustomerSegmentScope::multipart_part(part)
+        })?;
+        let authorized = AuthorizedSegmentRead::new(
+            encryption_subject,
+            segment_scope,
+            segment.segment_index(),
+            segment.size() as usize,
+        );
+        let plaintext_range_u64 = u64::try_from(plaintext_range.start)
+            .ok()
+            .zip(u64::try_from(plaintext_range.end).ok())
+            .map(|(start, end)| start..end)
+            .ok_or_else(|| ServerError::InternalError {
+                reason: "Cobblestone segment range exceeds supported geometry".to_string(),
+            })?;
+        let prepared = match &segment.encryption {
+            ObjectEncryption::SseCustomer(state) => {
+                let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
+                    reason: "SSE-C headers are required for this object".to_string(),
+                })?;
+                let validator =
+                    self.sse_c_validator
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-C validator key is not configured".to_string(),
+                        })?;
+                prepare_authorized_sse_customer_segment_range(
+                    validator,
+                    state,
+                    request,
+                    authorized,
+                    plaintext_range_u64,
+                )?
+            }
+            ObjectEncryption::SseS3(state) => {
+                let provider =
+                    self.managed_key_provider
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-S3 key provider is not configured".to_string(),
+                        })?;
+                prepare_authorized_managed_encryption_segment_range(
+                    provider,
+                    state,
+                    authorized,
+                    plaintext_range_u64,
+                )?
+            }
+        };
+
+        let mut header = Vec::new();
+        let header_outcome = self.read_segment_payload_stored_range_into(
+            segment,
+            prepared.header_range(),
+            &mut header,
+        )?;
+        if header_outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
+            return full_fallback();
+        }
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            stored_bytes: u64::try_from(header.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+
+        let mut selected_ciphertext = Vec::new();
+        let selected_outcome = self.read_segment_payload_stored_range_into(
+            segment,
+            prepared.ciphertext_range(),
+            &mut selected_ciphertext,
+        )?;
+        if selected_outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
+            return full_fallback();
+        }
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            stored_bytes: u64::try_from(selected_ciphertext.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+
+        let Ok(plaintext) = prepared.authenticate(&header, &selected_ciphertext) else {
+            return full_fallback();
+        };
+        let end = plaintext.len();
+        Ok((
+            Arc::new(SharedPayloadBuffer::from_unpooled(plaintext)),
+            0,
+            end,
+        ))
+    }
+
+    fn read_segment_payload_stored_range_into(
+        &self,
+        segment: &SegmentPayloadRecord,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, ServerError> {
+        match &self.storage {
+            ReadStorage::Active(active) => {
+                active.read_segment_payload_stored_range_into(&segment.storage_segment, range, dst)
+            }
+            ReadStorage::Retained(retained) => retained.read_segment_payload_stored_range_into(
+                &segment.storage_segment,
+                range,
+                dst,
+            ),
+            ReadStorage::Cluster(_) => {
+                return Err(ServerError::InternalError {
+                    reason: "payload range read was not prepared with lease-bound authority"
+                        .to_string(),
+                });
+            }
+        }
+        .map_err(super::map_object_read_failure)
     }
 
     fn decrypt_segment_if_needed_in_place(

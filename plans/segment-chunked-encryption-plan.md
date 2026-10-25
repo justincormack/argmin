@@ -1701,6 +1701,36 @@ fallback.
   the logical segment CRC from validated systematic-shard CRCs, and remove only the redundant
   second checksum pass over the assembled encrypted payload.
 
+Implementation update (2026-10-25, authenticated selected-record range reads):
+
+- The crypto profile now owns an immutable mapping from a nonempty logical plaintext range to the
+  fixed message header and minimal contiguous set of complete Cobblestone records. It rejects
+  empty, reversed, and out-of-bounds ranges; exact-multiple messages do not unnecessarily select
+  their empty authenticated terminal record for a range ending at the last plaintext byte.
+- Selected records authenticate in private scratch, and the opener returns exactly the requested
+  plaintext only after every selected record succeeds. A later selected-record failure therefore
+  cannot expose plaintext from an earlier selected record. AEAD attempts are counted immediately
+  before each record open, while decrypted bytes are counted immediately after each successful
+  record authentication. Metrics therefore retain successfully authenticated prefix work if a
+  later selected record fails and report complete-record amplification rather than returned bytes.
+- The coordinator prepares the exact storage-minted segment subject, SSE mode, DEK, logical
+  geometry, and multipart scope before issuing partial IO. Both SSE-S3 and SSE-C use the same
+  authorized profile boundary. The healthy active or retained path reads only the header and
+  selected ciphertext records and gives the body reader a buffer containing only the requested
+  logical bytes.
+- Any systematic-range fallback, malformed response, header-commitment failure, or selected-tag
+  failure discards the partial bytes and invokes the existing complete witness-backed read,
+  reconstruction, repair scheduling, and full-profile authentication path. No partial ciphertext
+  or plaintext crosses into the response body during that retry decision.
+- Crypto tests pin single-record, cross-record, terminal, exact-multiple, malformed-length,
+  commitment, and later-record authentication behavior. Production-path canaries cover bounded
+  cross-record reads for SSE-S3 and SSE-C, a range crossing two stream-put segments, and a corrupt
+  systematic shard whose selected-record authentication fails before the full EC reconstruction
+  returns the correct range.
+- This slice does not complete Phase 4. Multipart-part boundary ranges, retained-route publication
+  interleavings at the coordinator layer, socket-level response semantics, and chunk-at-a-time
+  full GET emission with fused physical CRC accounting remain next.
+
 Exit: metrics and deterministic tests prove small encrypted ranges no longer read or decrypt whole
 segments on the healthy path.
 

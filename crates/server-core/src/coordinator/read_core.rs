@@ -363,11 +363,23 @@ impl SegmentListReader {
                 }
             }
 
-            let data = self.runtime.read_checked_segment_payload(
-                &slice.payload,
-                slice.part_number,
-                self.sse_customer_request.as_ref(),
-            )?;
+            let is_partial_segment =
+                slice.start_offset != 0 || slice.end_offset != slice.payload.size() as usize;
+            let (data, loaded_start, loaded_end) = if is_partial_segment {
+                self.runtime.read_checked_segment_payload_range(
+                    &slice.payload,
+                    slice.part_number,
+                    self.sse_customer_request.as_ref(),
+                    slice.start_offset..slice.end_offset,
+                )?
+            } else {
+                let data = self.runtime.read_checked_segment_payload(
+                    &slice.payload,
+                    slice.part_number,
+                    self.sse_customer_request.as_ref(),
+                )?;
+                (data, slice.start_offset, slice.end_offset)
+            };
             if matches!(
                 self.verification,
                 SegmentListVerification::FullPayloadCrc { .. }
@@ -380,7 +392,7 @@ impl SegmentListReader {
                 self.verified_crc64.update(data.as_ref());
             }
             self.next_segment_index += 1;
-            self.loaded_segment = Some((data, slice.start_offset, slice.end_offset));
+            self.loaded_segment = Some((data, loaded_start, loaded_end));
             #[cfg(test)]
             if self.next_segment_index == 1 {
                 maybe_run_object_segments_first_segment_hook(&self.bucket, &self.key);
