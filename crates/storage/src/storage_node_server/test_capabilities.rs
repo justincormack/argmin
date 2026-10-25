@@ -3928,6 +3928,18 @@
         .unwrap();
         node.write_shard_file(location.data_pg_id().get(), &shard_key, &payload)
             .unwrap();
+        // Damage bytes outside the selected range after capturing the durable
+        // acknowledgement. A real positioned read must still return the
+        // selected bytes; the later profile authenticator decides whether
+        // those bytes are safe to expose.
+        let mut corrupted_outside_range = payload.clone();
+        corrupted_outside_range[0] ^= 0x80;
+        node.write_shard_file(
+            location.data_pg_id().get(),
+            &shard_key,
+            &corrupted_outside_range,
+        )
+        .unwrap();
         drop(node);
         let request = StorageRpcShardReadRangeRequest {
             location: location.into(),

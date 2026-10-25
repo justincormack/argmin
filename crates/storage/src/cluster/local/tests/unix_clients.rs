@@ -2403,11 +2403,12 @@ impl crate::node_client::ShardReadHandleRoute for RecordingReadHandleRoute {
 }
 
 impl crate::node_client::ShardReadHandleLease for RecordingReadHandleLease {
-    fn read_placed_shard_into(
+    fn read_placed_shard_range_into(
         &mut self,
         _location: ShardLocation,
         _key: &ShardKey,
         _expected_ack: WriteAck,
+        _offset: u64,
         _dst: &mut [u8],
     ) -> Result<(), StoreError> {
         Err(StoreError::RouteCapabilitySubjectMismatch {

@@ -154,6 +154,11 @@ const STORAGE_RPC_MAX_HISTORICAL_SHARD_READ_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN + 8 + 8;
+/// A single positioned read is bounded independently of the generic frame
+/// limit. This admits every current segment shard (including 1+0 encrypted
+/// geometry) while preventing an authenticated peer from requesting an
+/// attacker-sized allocation from a fabricated acknowledgement.
+pub(crate) const STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN: u64 = 16 * 1024 * 1024;
 const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
     + STORAGE_RPC_MAX_READ_OPERATION_ID_LEN
     + 4

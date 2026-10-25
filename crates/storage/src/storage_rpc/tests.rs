@@ -3192,9 +3192,24 @@ mod tests {
             encode_shard_read_range_request(&StorageRpcShardReadRangeRequest {
                 offset: payload.len() as u64,
                 length: 1,
-                ..request
+                ..request.clone()
             }),
             Err(StorageRpcPayloadError::ShardWriteSizeMismatch { .. })
+        ));
+        assert!(matches!(
+            encode_shard_read_range_request(&StorageRpcShardReadRangeRequest {
+                expected_ack: WriteAck {
+                    stored_size: STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN + 1,
+                    crc64: 0,
+                },
+                offset: 0,
+                length: STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN + 1,
+                ..request
+            }),
+            Err(StorageRpcPayloadError::ShardWriteSizeMismatch {
+                expected: STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN,
+                actual,
+            }) if actual == STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN + 1
         ));
     }
 

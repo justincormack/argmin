@@ -1,7 +1,7 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phases 0 and 1 complete; Phase 2 integrated, production writer selection and
-benchmark gate remain)
+Status: In progress (Phases 0 and 1 complete; Phase 2 integrated; Phase 3 in progress; production
+writer selection and benchmark gate remain)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -15,8 +15,10 @@ Argmin currently encrypts each internal payload segment as one AES-256-GCM recor
 standard-object and multipart-part payloads use an 8 MiB internal segment size, so a small range
 read can require reading, assembling, and authenticating an entire segment. The storage layer also
 validates complete shard bytes against durable CRC64 acknowledgements before returning the segment.
-This remains true even though a shard-range RPC exists: that RPC currently reads and hashes the
-whole shard before slicing the requested range.
+The S3 read path still has that whole-segment behavior. The first Phase 3 slice has replaced the
+storage-node range RPC's former read-and-hash-whole-shard implementation with exact leased,
+positioned IO, but no bytes from that partial primitive are exposed to S3 before Phase 4 adds
+profile authentication and fallback.
 
 The C2SP [chunked-encryption specification](https://c2sp.org/chunked-encryption) defines
 authenticated streaming and random-access encryption with a predictable plaintext/ciphertext
@@ -506,9 +508,11 @@ Add a production range-read operation that:
 7. releases each plaintext chunk only after the key commitment and that chunk's tag verify under
    the exact segment subject.
 
-The current range RPC's whole-shard CRC-before-slice behavior must not be reused and relabelled as
-partial IO. Its protocol should carry an exact leased shard subject, offset, length, and bounded
-response size. The storage node validates offset arithmetic and file bounds before IO.
+The retired range RPC's whole-shard CRC-before-slice behavior must not return under another name.
+The Phase 3 protocol carries an exact leased shard subject, offset, length, and bounded response
+size. The storage node validates offset arithmetic, the complete file length against the durable
+acknowledgement, and file bounds before positioned IO. A partial response does not claim to have
+validated the whole-file CRC; the caller must authenticate it under the selected payload profile.
 
 If any required systematic range cannot be read exactly, or if the assembled chunk does not
 authenticate, abandon the partial result and enter the full-segment path below. The initial reader
@@ -759,11 +763,13 @@ Implementation update (2026-10-17):
 - Repair fallback counts each healthy systematic read that enters the full-shard recovery path.
   Physical shard and CRC counters deliberately include fallback rereads and repeated validation,
   so they expose work amplification rather than merely restating the logical response size.
-- The current-path inventory confirms that local systematic reads validate each shard CRC and
+- At the Phase 0 baseline, the current-path inventory confirmed that local systematic reads validate each shard CRC and
   compose the segment CRC without rescanning the assembled segment. Unix/TLS full-shard reads
-  through the production read-handle path use the range RPC with the complete shard range: the
-  storage node validates the whole-shard CRC once, then the authenticated transport carries the
-  selected bytes. Historical inspection computes the acknowledgement at the storage node and
+  through the production read-handle path used the range RPC with the complete shard range: the
+  storage node validated the whole-shard CRC once, then the authenticated transport carried the
+  selected bytes. Phase 3 moves that full-read CRC validation to the capability-owning caller so
+  the same transport can perform genuine positioned reads without pretending a partial response
+  proves the whole-file checksum. Historical inspection computes the acknowledgement at the storage node and
   validates it again at the receiver. The test-only full-shard RPC also validates during
   handler processing, response encoding, and response decoding. The counters intentionally expose
   each pass actually taken.
@@ -1601,6 +1607,30 @@ format tests, but the new profile is not yet selected solely for an unmeasured r
 - Route every missing, unavailable, malformed, or unauthenticated required range into the existing
   full-segment witness-validation and reconstruction path.
 - Preserve retained-route operation across publication and node-loss scenarios.
+
+Implementation update (2026-10-24, leased positioned shard ranges):
+
+- `ShardReadHandleLease` now owns the only production current-route partial-shard primitive. Both
+  embedded and Unix/TLS implementations require the exact acquired `(ShardLocation, ShardKey)`;
+  released, foreign, or unleased subjects fail before storage access. The placed-segment wrapper
+  additionally retains the exact leased shard-index subset and refuses reads outside it.
+- The storage node opens the immutable shard file, requires its complete length to equal the
+  durable acknowledgement, validates checked `offset + length` bounds, and uses descriptor-based
+  positioned IO. A separate 16 MiB per-request cap admits every current segment-shard geometry but
+  rejects fabricated attacker-sized lengths before allocation. It records only the bytes actually
+  read. The RPC handler no longer reads or CRCs the entire shard before slicing a response.
+- Complete reads use the same range primitive with `offset = 0`, then validate the durable CRC64
+  at the capability-owning caller. This preserves full-read integrity and metrics while allowing a
+  genuine partial call to defer integrity to the profile authenticator. Exact response-length
+  decoding remains fail-closed on both Unix and authenticated TLS transports.
+- Local and authenticated-TLS canaries exercise successful bounded ranges. An installed-server
+  regression changes a byte outside the requested range after capturing the acknowledgement and
+  proves the selected bytes are read independently; the existing full-read canary still rejects
+  acknowledgement corruption. Storage-engine tests pin checked range bounds and complete-file
+  length validation.
+- This primitive is intentionally not yet connected to an S3 response. Remaining Phase 3 work is
+  systematic ciphertext-coordinate mapping, authenticated/malformed-response fallback to the
+  complete witness path, and retained-route and node-loss coverage.
 
 Exit: requesting a bounded ciphertext range causes bounded disk and network IO in healthy and
 systematic profiles, while every degraded or suspect case remains correct through the full-segment

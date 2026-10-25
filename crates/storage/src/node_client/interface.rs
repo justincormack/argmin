@@ -1288,6 +1288,38 @@ pub(crate) trait ShardReadHandleLease: Send {
         key: &ShardKey,
         expected_ack: WriteAck,
         dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        if dst.len() as u64 != expected_ack.stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "read-handle shard buffer size does not match expected acknowledgement"
+                    .to_string(),
+            });
+        }
+        self.read_placed_shard_range_into(location, key, expected_ack, 0, dst)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        let actual_crc = checksum::crc64::checksum(dst);
+        if actual_crc != expected_ack.crc64 {
+            return Err(StoreError::IntegrityError {
+                expected: expected_ack.crc64,
+                actual: actual_crc,
+            });
+        }
+        Ok(())
+    }
+
+    /// Read a bounded range through the exact retained deletion-exclusion
+    /// lease. This validates framing and complete-file length, but deliberately
+    /// does not claim whole-shard CRC validation for partial bytes.
+    fn read_placed_shard_range_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
     ) -> Result<(), StoreError>;
 
     fn release(&mut self) -> Result<(), StoreError>;

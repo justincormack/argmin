@@ -404,10 +404,15 @@ fn local_shard_read_handle_route_is_bound_to_exact_batch() {
         .read_placed_shard_into(location, &key, expected_ack, &mut read)
         .unwrap();
     assert_eq!(read, payload);
+    let mut range = [0u8; 7];
+    lease
+        .read_placed_shard_range_into(location, &key, expected_ack, 6, &mut range)
+        .unwrap();
+    assert_eq!(&range, b"read-ha");
     let foreign_key = ShardKey::new(&[0x35; 16], 15, 0);
     assert!(matches!(
         lease
-            .read_placed_shard_into(location, &foreign_key, expected_ack, &mut read)
+            .read_placed_shard_range_into(location, &foreign_key, expected_ack, 0, &mut range)
             .unwrap_err(),
         StoreError::RouteCapabilitySubjectMismatch {
             operation: "read placed shard through read-handle lease",
@@ -416,7 +421,7 @@ fn local_shard_read_handle_route_is_bound_to_exact_batch() {
     lease.release().unwrap();
     assert!(matches!(
         lease
-            .read_placed_shard_into(location, &key, expected_ack, &mut read)
+            .read_placed_shard_range_into(location, &key, expected_ack, 0, &mut range)
             .unwrap_err(),
         StoreError::RouteCapabilitySubjectMismatch {
             operation: "read placed shard through released read-handle lease",

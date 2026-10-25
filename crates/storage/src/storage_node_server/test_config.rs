@@ -6248,6 +6248,17 @@
             .read_placed_shard_into_for_test(location, &shard_key, expected_ack, &mut read)
             .unwrap();
         assert_eq!(read, payload);
+        let mut range = [0u8; 7];
+        session
+            .read_placed_shard_range_into_for_test(
+                location,
+                &shard_key,
+                expected_ack,
+                8,
+                &mut range,
+            )
+            .unwrap();
+        assert_eq!(&range, b"bound s");
 
         session.release_read_handles("exact-read").unwrap();
         let released_full_error = session

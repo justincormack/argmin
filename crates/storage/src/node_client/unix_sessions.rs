@@ -381,6 +381,48 @@ impl UnixStorageNodeReadHandleSession {
             self.rpc_payload_error("decode read-handle shard read response", error.to_string())
         })?;
         dst.copy_from_slice(&data);
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        let actual_crc = checksum::crc64::checksum(dst);
+        if actual_crc != expected_ack.crc64 {
+            return Err(StoreError::IntegrityError {
+                expected: expected_ack.crc64,
+                actual: actual_crc,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_placed_shard_range_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        let request = StorageRpcShardReadRangeRequest {
+            location: location.into(),
+            shard_key: key.clone(),
+            expected_ack,
+            offset,
+            length: u64::try_from(dst.len()).map_err(|_| {
+                self.rpc_payload_error(
+                    "read shard range through read-handle session",
+                    "range length exceeds u64".to_string(),
+                )
+            })?,
+        };
+        let payload = encode_shard_read_range_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode read-handle shard range request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardReadRange, payload)?;
+        let data = decode_shard_read_range_response(&response, dst.len()).map_err(|error| {
+            self.rpc_payload_error("decode read-handle shard range response", error.to_string())
+        })?;
+        dst.copy_from_slice(&data);
         Ok(())
     }
 
@@ -393,6 +435,18 @@ impl UnixStorageNodeReadHandleSession {
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
         self.read_placed_shard_into(location, key, expected_ack, dst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_placed_shard_range_into_for_test(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        self.read_placed_shard_range_into(location, key, expected_ack, offset, dst)
     }
 
     #[cfg(test)]
@@ -2875,11 +2929,12 @@ impl Drop for UnixObjectPayloadLease {
 }
 
 impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
-    fn read_placed_shard_into(
+    fn read_placed_shard_range_into(
         &mut self,
         location: crate::cluster::ShardLocation,
         key: &ShardKey,
         expected_ack: WriteAck,
+        offset: u64,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
         if self.released {
@@ -2897,7 +2952,7 @@ impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
             });
         }
         self.session
-            .read_placed_shard_into(location, key, expected_ack, dst)
+            .read_placed_shard_range_into(location, key, expected_ack, offset, dst)
     }
 
     fn release(&mut self) -> Result<(), StoreError> {

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::num::NonZeroU64;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1954,6 +1955,118 @@ impl SharedStorageNode {
         }
     }
 
+    /// Read an exact byte range from an immutable shard file without first
+    /// materializing the complete shard.
+    ///
+    /// The durable acknowledgement remains the authority for the complete
+    /// file length. Partial reads cannot validate its whole-file CRC; their
+    /// caller must authenticate the returned ciphertext before exposing it.
+    pub(crate) fn read_shard_file_range_into(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::read_shard_file_range_into",
+            "pg_id={} shard={} offset={} bytes={}",
+            pg_id,
+            key,
+            offset,
+            dst.len()
+        );
+        let range_len =
+            u64::try_from(dst.len()).map_err(|_| StoreError::PayloadShardSetMismatch {
+                reason: "payload shard range length exceeds u64".to_string(),
+            })?;
+        let range_end =
+            offset
+                .checked_add(range_len)
+                .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                    reason: "payload shard range end overflowed".to_string(),
+                })?;
+        if range_end > expected_ack.stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "payload shard range exceeds expected acknowledgement size".to_string(),
+            });
+        }
+
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
+        let file = fs::File::open(&shard_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return StoreError::NotFound;
+            }
+            StoreError::Io {
+                context: "open shard file range",
+                source,
+            }
+        })?;
+        let actual_size = file
+            .metadata()
+            .map_err(|source| StoreError::Io {
+                context: "inspect shard file range",
+                source,
+            })?
+            .len();
+        if actual_size != expected_ack.stored_size {
+            // A suspect range leaves the partial path. Read the complete file
+            // so the durable integrity error contains truthful physical
+            // evidence and remote callers receive the normal ShardIntegrity
+            // classification used by reconstruction.
+            let mut hasher = checksum::crc64::Hasher::new();
+            let mut read_offset = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            while read_offset < actual_size {
+                let remaining = actual_size - read_offset;
+                let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+                    .expect("bounded shard diagnostic read length fits usize");
+                let read = file
+                    .read_at(&mut buffer[..wanted], read_offset)
+                    .map_err(|source| StoreError::Io {
+                        context: "read suspect shard file",
+                        source,
+                    })?;
+                if read == 0 {
+                    return Err(StoreError::Io {
+                        context: "read suspect shard file",
+                        source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                    });
+                }
+                hasher.update(&buffer[..read]);
+                read_offset += read as u64;
+            }
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                shard_bytes: actual_size,
+                crc_bytes: actual_size,
+                ..observability::PayloadReadMetricDelta::default()
+            });
+            return Err(StoreError::ShardAckMismatch {
+                shard: key.clone(),
+                expected_size: expected_ack.stored_size,
+                expected_crc: expected_ack.crc64,
+                actual_size,
+                actual_crc: hasher.finalize(),
+            });
+        }
+        file.read_exact_at(dst, offset)
+            .map_err(|source| StoreError::Io {
+                context: "read shard file range",
+                source,
+            })?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            shard_bytes: range_len,
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        Ok(())
+    }
+
     /// Delete a shard file directly without mutating the PG shard metadata row.
     pub(crate) fn delete_shard_file(&self, pg_id: u32, key: &ShardKey) -> Result<(), StoreError> {
         observability::trace_scope!(
@@ -3811,6 +3924,48 @@ mod tests {
         let mut buf = [0u8; 5];
         node.read_shard_file_into(0, &key, &mut buf).unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn shared_node_read_shard_file_range_is_positioned_and_size_bound() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let key = crate::types::ShardKey::new(&[0xBD; 16], 7, 0);
+        let payload = b"positioned shard payload";
+        node.write_shard_file(0, &key, payload).unwrap();
+
+        let mut range = [0u8; 10];
+        let expected_ack = WriteAck {
+            stored_size: payload.len() as u64,
+            crc64: checksum::crc64::checksum(payload),
+        };
+        node.read_shard_file_range_into(0, &key, expected_ack, 5, &mut range)
+            .unwrap();
+        assert_eq!(&range, b"ioned shar");
+
+        assert!(matches!(
+            node.read_shard_file_range_into(
+                0,
+                &key,
+                expected_ack,
+                payload.len() as u64 - 1,
+                &mut [0u8; 2],
+            ),
+            Err(StoreError::PayloadShardSetMismatch { .. })
+        ));
+        assert!(matches!(
+            node.read_shard_file_range_into(
+                0,
+                &key,
+                WriteAck {
+                    stored_size: payload.len() as u64 + 1,
+                    crc64: expected_ack.crc64,
+                },
+                0,
+                &mut [0u8; 1],
+            ),
+            Err(StoreError::ShardAckMismatch { .. })
+        ));
     }
 
     #[test]

@@ -1095,11 +1095,12 @@ impl LocalShardReadHandleSet {
         Ok(())
     }
 
-    fn read_placed_shard_into(
+    fn read_placed_shard_range_into(
         &mut self,
         location: ShardLocation,
         key: &ShardKey,
         expected: WriteAck,
+        offset: u64,
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
         let lease = self
@@ -1112,11 +1113,11 @@ impl LocalShardReadHandleSet {
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: location.cluster_epoch(),
                 source: StoreError::RouteCapabilitySubjectMismatch {
-                    operation: "read shard without a retained node read-handle session",
+                    operation: "read shard range without a retained node read-handle session",
                 },
             })?;
         lease
-            .read_placed_shard_into(location, key, expected, dst)
+            .read_placed_shard_range_into(location, key, expected, offset, dst)
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
@@ -1319,9 +1320,52 @@ impl LocalPlacedSegmentShardReadHandles<'_> {
                 "shard index {shard_index} is not protected by this read-handle set"
             )));
         }
+        if dst.len() as u64 != expected.stored_size {
+            return Err(self.reader.subject.shard_subject_mismatch(
+                "full shard buffer size does not match expected acknowledgement".to_string(),
+            ));
+        }
+        self.read_range_into(shard_index, expected, 0, dst)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        let actual_crc = checksum::crc64::checksum(dst);
+        if actual_crc != expected.crc64 {
+            return Err(ShardIoError::Store {
+                node_id: self
+                    .reader
+                    .location(shard_index)
+                    .map_or(0, |location| location.node_id().as_u32()),
+                pg_id: self.reader.subject.data_pg_id.get(),
+                cluster_epoch: self.reader.subject.operation_epoch,
+                source: StoreError::IntegrityError {
+                    expected: expected.crc64,
+                    actual: actual_crc,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    /// Read a bounded ciphertext range from one of the exactly leased shard
+    /// locations. The caller must authenticate the selected profile record
+    /// before releasing any bytes.
+    pub(super) fn read_range_into(
+        &mut self,
+        shard_index: usize,
+        expected: WriteAck,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        if !self.leased_shard_indices.contains(&shard_index) {
+            return Err(self.reader.subject.shard_subject_mismatch(format!(
+                "shard index {shard_index} is not protected by this read-handle set"
+            )));
+        }
         let (location, key) = self.reader.subject.location_and_key(shard_index)?;
         self.read_handles
-            .read_placed_shard_into(location, &key, expected, dst)
+            .read_placed_shard_range_into(location, &key, expected, offset, dst)
     }
 
     pub(super) fn release(&mut self) -> Result<(), ShardIoError> {

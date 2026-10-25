@@ -616,6 +616,10 @@ fn placed_segment_recoverable_shard_error(
             ..
         }
         | ShardIoError::Store {
+            source: StoreError::ShardAckMismatch { .. },
+            ..
+        }
+        | ShardIoError::Store {
             source:
                 StoreError::StorageRpcShardDeleteInProgress {
                     operation: "read handles acquire",

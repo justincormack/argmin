@@ -2722,6 +2722,12 @@ fn validate_shard_read_range(
     offset: u64,
     length: u64,
 ) -> Result<(), StorageRpcPayloadError> {
+    if length > STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN {
+        return Err(StorageRpcPayloadError::ShardWriteSizeMismatch {
+            expected: STORAGE_RPC_MAX_SHARD_READ_RANGE_DATA_LEN,
+            actual: length,
+        });
+    }
     let end = offset
         .checked_add(length)
         .ok_or(StorageRpcPayloadError::ShardWriteSizeMismatch {

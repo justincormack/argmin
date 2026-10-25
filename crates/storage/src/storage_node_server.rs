@@ -6444,32 +6444,10 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = session.require_active_read_handle(route.location, &request.shard_key) {
             return encode_storage_rpc_error_response(&error);
         }
-        let response = match route.read() {
+        let response = match route.read_range(request.expected_ack, request.offset, request.length)
+        {
             Ok(payload) => {
-                let actual_size = payload.len() as u64;
-                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                    crc_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
-                    ..observability::PayloadReadMetricDelta::default()
-                });
-                let actual_crc = checksum::crc64::checksum(&payload);
-                if actual_size != request.expected_ack.stored_size
-                    || actual_crc != request.expected_ack.crc64
-                {
-                    encode_storage_rpc_error_response(&store_error_response(
-                        StoreError::ShardAckMismatch {
-                            shard: request.shard_key,
-                            expected_size: request.expected_ack.stored_size,
-                            expected_crc: request.expected_ack.crc64,
-                            actual_size,
-                            actual_crc,
-                        },
-                    ))?
-                } else {
-                    let start = request.offset as usize;
-                    let end = start + request.length as usize;
-                    let payload = encode_shard_read_range_response(&payload[start..end]);
-                    encode_storage_rpc_success_response(&payload)
-                }
+                encode_storage_rpc_success_response(&encode_shard_read_range_response(&payload))
             }
             Err(StorageNodeDataRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)?
