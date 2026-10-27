@@ -119,6 +119,50 @@ local EC shape, and the authoritatively observed durable payload profile. The
 selection seam is benchmark-only; ordinary test-server and production
 constructors retain the production writer default.
 
+### Clean local payload-codec comparison
+
+The `payload_read_v3` local reference matrix was recorded on 2026-10-27 from clean source revision
+`51e1aeb26ad2ec6a57584b9652b145670dcd2723` with the default workload settings. The environment
+was Rust `1.98.1`, Linux `6.12.113+deb13-amd64`, an AMD Ryzen 7 255 with Radeon 780M Graphics,
+Ring, the `x86_64-avx512-vpclmulqdq` CRC64 backend, the Ring SHA-256 backend, and the
+`x86_64-avx512` EC backend. Every run independently observed that the durable codec matched the
+requested profile and that the AWS-visible encryption mode was SSE-S3 AES256.
+
+Each shape was measured twice in opposite profile order. The cells below show the median from the
+legacy-then-Cobblestone pass followed by the median from the Cobblestone-then-legacy pass. The
+sample range covers all ten samples across both passes.
+
+| EC | Operation | Whole-segment median req/s (A / B) | Sample range | Cobblestone median req/s (A / B) | Sample range |
+|---|---|---:|---:|---:|---:|
+| 1+0 | Full GET | 112.407 / 110.267 | 109.553-117.953 | 176.534 / 183.901 | 170.214-186.995 |
+| 1+0 | 4 KiB Range GET | 395.094 / 381.320 | 374.257-399.048 | 5,592.835 / 5,517.068 | 4,985.086-6,321.061 |
+| 4+2 | Full GET | 96.556 / 104.870 | 93.796-109.465 | 164.862 / 165.418 | 162.875-167.822 |
+| 4+2 | 4 KiB Range GET | 283.236 / 318.713 | 246.548-339.706 | 1,224.011 / 1,248.799 | 1,108.153-1,322.803 |
+
+| EC | Operation | Whole-segment body TTFB p50 (A / B) | Cobblestone body TTFB p50 (A / B) | Whole-segment completion p50 (A / B) | Cobblestone completion p50 (A / B) |
+|---|---|---:|---:|---:|---:|
+| 1+0 | Full GET | 2.985 / 3.040 ms | 0.431 / 0.435 ms | 8.760 / 9.071 ms | 5.680 / 5.334 ms |
+| 1+0 | 4 KiB Range GET | 2.524 / 2.594 ms | 0.158 / 0.166 ms | 2.525 / 2.595 ms | 0.158 / 0.166 ms |
+| 4+2 | Full GET | 3.702 / 3.511 ms | 1.057 / 1.064 ms | 10.187 / 9.380 ms | 6.005 / 6.002 ms |
+| 4+2 | 4 KiB Range GET | 3.053 / 3.031 ms | 0.761 / 0.755 ms | 3.054 / 3.033 ms | 0.762 / 0.756 ms |
+
+The work counters were shape-independent and stable across both passes. Values below are per
+request; neither profile reconstructed data or entered repair fallback.
+
+| Profile | Operation | Logical bytes | Stored/shard bytes | Decrypted bytes | AEAD records | CRC bytes | Buffer checkouts |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Whole-segment | Full GET | 16,777,216 | 16,777,248 | 16,777,216 | 2 | 33,554,464 | 2 |
+| Whole-segment | 4 KiB Range GET | 4,096 | 8,388,624 | 8,388,608 | 1 | 8,388,624 | 1 |
+| Cobblestone | Full GET | 16,777,216 | 16,793,744 | 16,777,216 | 1,026 | 33,570,960 | 0 |
+| Cobblestone | 4 KiB Range GET | 4,096 | 16,456 | 16,384 | 1 | 0 | 0 |
+
+Across the two orderings, Cobblestone increased full-read throughput by 57-67% on 1+0 and 58-71%
+on 4+2. Full-read body TTFB fell by about 86% on 1+0 and 70-71% on 4+2, while completion p50 fell
+by 35-41% and 36-41%, respectively. The 4 KiB range improved by 14.2-14.5x on 1+0 and 3.9-4.3x on
+4+2, while reading roughly 16 KiB instead of a complete 8 MiB segment. These clean local results
+remove the earlier sequential-throughput concern, but they do not replace the remaining multihost
+and degraded-read measurements required before changing the production writer default.
+
 ### Whole-segment encrypted-read baseline
 
 The `payload_read_v2` Phase 0 reference run was recorded on 2026-10-21 from clean source revision

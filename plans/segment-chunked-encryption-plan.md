@@ -1955,9 +1955,25 @@ Implementation update (2026-10-27, clean local benchmark selection):
   records both values. The AWS-visible `AES256` HeadObject response remains an independent S3-mode
   check rather than being misused as internal-codec evidence. No general storage test-hook feature
   or mutation surface is exposed to the AWS-facing harness.
-- The runner continues to reject reference results from a dirty worktree. Clean paired local
-  `1+0` and `4+2` results therefore follow after this harness slice is committed. Multihost and
-  degraded-read cases remain separate Phase 5 work before the writer decision.
+- The runner continues to reject reference results from a dirty worktree. The clean paired local
+  `1+0` and `4+2` results below were therefore measured only after the harness slice was committed.
+  Multihost and degraded-read cases remain separate Phase 5 work before the writer decision.
+- The clean Ring reference matrix was recorded from revision
+  `51e1aeb26ad2ec6a57584b9652b145670dcd2723` in both profile orderings. On local `1+0`,
+  Cobblestone delivered 176.534/183.901 median full GET requests/s versus 112.407/110.267 for the
+  whole-segment codec, with 0.431/0.435 ms versus 2.985/3.040 ms body TTFB. Its 4 KiB range path
+  delivered 5,592.835/5,517.068 requests/s versus 395.094/381.320 while reading 16,456 bytes rather
+  than 8,388,624 bytes per request.
+- On local `4+2`, Cobblestone delivered 164.862/165.418 median full GET requests/s versus
+  96.556/104.870, with 1.057/1.064 ms versus 3.702/3.511 ms body TTFB. Its 4 KiB range path delivered
+  1,224.011/1,248.799 requests/s versus 283.236/318.713. No measured case reconstructed data or
+  entered repair fallback, and every run authoritatively observed its requested durable codec.
+  The complete environment, latency, work-counter, and sample-range evidence is recorded in
+  `guides/performance.md`.
+- Clean local evidence now favors Cobblestone for both sequential and range-heavy healthy reads;
+  the optimized path no longer pays the sequential regression seen in the early exploratory
+  implementation. Production writer selection remains `SegmentAes256GcmV1` until the Phase 5
+  multihost and degraded-read measurements are complete.
 
 ### Optional follow-up: Partial EC reconstruction
 
