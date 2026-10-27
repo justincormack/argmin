@@ -2030,10 +2030,27 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
   range TTFB. Cobblestone measured 160.098 MiB/s and 3.784 ms range TTFB while healthy, then
   60.151 MiB/s and 89.399 ms after falling back to full-segment reconstruction. These exploratory
   runs validate the corrected scenario and are not reference performance evidence.
-- The authoritative clean, paired multihost matrix remains the final Phase 5 measurement before
-  the production writer decision. It must use the normal workload, both profile orderings, the
-  same hosts and EC shape, and the clean-tree reference guard documented in
+- The authoritative clean, paired multihost matrix is complete at revision
+  `d31f43d3ca854968fa2b27fd7c59a5bc6220dd73`. It used the normal 16 MiB workload, four hosts,
+  `2+1` EC, both profile orderings, and the clean-tree/current-source-release reference guard.
+  Every degraded pass removed the exact systematic-shard node, waited for all current routes to
+  recover through the spare host, and then reconstructed from the original retained epoch-13
+  placement. Full results, environment, artifact digests, and run IDs are recorded in
   `guides/performance.md`.
+- In the two healthy placements, Cobblestone delivered 8.131/10.527 median full GET requests/s
+  versus 6.398/5.202 for the whole-segment codec, with approximately 4 ms rather than 59-77 ms
+  body TTFB. Its targeted 4 KiB range delivered 239.022/223.464 requests/s versus
+  17.135/13.351. These results confirm the healthy range and first-byte benefit over production
+  TLS/TCP storage paths, as well as the clean local result that sequential reads no longer regress.
+- With the selected systematic shard unavailable, Cobblestone's deliberate full-segment
+  reconstruction fallback delivered 4.218/4.230 median full GET requests/s versus 4.952/4.884,
+  and 11.417/10.932 targeted range requests/s versus 12.597/12.834. The 9-15% degraded penalty is
+  the measured cost of deferring partial EC reconstruction. Full-read TTFB depended on which
+  systematic span was missing: loss of shard zero required reconstruction before the first byte,
+  while loss of shard one still allowed the first authenticated plaintext span to be emitted.
+- Phase 5 measurement is complete. Production writer selection remains
+  `SegmentAes256GcmV1`; changing it to Cobblestone is now a separate evidence-based format decision,
+  not unfinished benchmark work.
 
 ### Optional follow-up: Partial EC reconstruction
 

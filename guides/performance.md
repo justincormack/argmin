@@ -175,6 +175,52 @@ placement, and the healthy and degraded client measurements. External multihost 
 truthfully inferred from one distributed process. The clean local matrix owns exact work-counter
 comparisons; this matrix owns network-visible throughput, latency, TTFB, and degraded-read cost.
 
+#### Clean multihost payload-codec comparison
+
+The `payload_read_v3` multihost reference matrix was recorded on 2026-10-27 from clean source
+revision `d31f43d3ca854968fa2b27fd7c59a5bc6220dd73` with the default 16 MiB object, 4 warmups,
+16 full reads, 64 range reads, and 5 samples. It used four hosts, `2+1` EC, 16 PGs, Rust `1.98.1`,
+Linux `6.12.113+deb13-amd64`, an AMD Ryzen 7 255 with Radeon 780M Graphics, Ring, the
+`x86_64-avx512-vpclmulqdq` CRC64 backend, and the `x86_64-avx512` EC backend. The runner-built
+server and client SHA-256 digests were respectively
+`a7dbeca9e19a00390308ee0928a4c2c8eac3c4260c307d8a770533a8cc64fa94` and
+`f1ae0021f40b2a8f2f4974fd18f860f5ab3543cfdd77f922286c14b6c415ca9b`.
+
+Each profile was measured once in each ordering. A is the legacy-then-Cobblestone pass; B is the
+Cobblestone-then-legacy pass. Each degraded measurement stopped an exact systematic-shard node,
+waited for all current routes to recover through the spare host, and then read the original
+epoch-13 placement through retained-route reconstruction. The range was a 4 KiB interval inside
+the unavailable systematic shard.
+
+| State | Operation | Whole-segment median req/s (A / B) | Sample range | Cobblestone median req/s (A / B) | Sample range |
+|---|---|---:|---:|---:|---:|
+| Healthy | Full GET | 6.398 / 5.202 | 5.179-6.435 | 8.131 / 10.527 | 8.057-10.642 |
+| Healthy | 4 KiB Range GET | 17.135 / 13.351 | 13.256-17.254 | 239.022 / 223.464 | 215.916-257.023 |
+| Missing systematic shard | Full GET | 4.952 / 4.884 | 4.734-5.096 | 4.218 / 4.230 | 4.091-4.316 |
+| Missing systematic shard | 4 KiB Range GET | 12.597 / 12.834 | 12.453-12.888 | 11.417 / 10.932 | 10.017-11.682 |
+
+| State | Operation | Whole-segment body TTFB p50 (A / B) | Cobblestone body TTFB p50 (A / B) | Whole-segment completion p50 (A / B) | Cobblestone completion p50 (A / B) |
+|---|---|---:|---:|---:|---:|
+| Healthy | Full GET | 59.593 / 77.495 ms | 4.482 / 4.093 ms | 156.752 / 193.312 ms | 122.364 / 94.568 ms |
+| Healthy | 4 KiB Range GET | 58.912 / 76.090 ms | 4.100 / 4.192 ms | 58.914 / 76.092 ms | 4.128 / 4.215 ms |
+| Missing systematic shard | Full GET | 81.702 / 80.057 ms | 93.261 / 5.637 ms | 201.728 / 201.216 ms | 231.785 / 235.670 ms |
+| Missing systematic shard | 4 KiB Range GET | 79.953 / 73.587 ms | 84.778 / 92.819 ms | 79.955 / 73.589 ms | 84.782 / 92.822 ms |
+
+For healthy reads, Cobblestone improved full-read throughput by 27% and 102% in the two placements
+and improved the targeted 4 KiB range by 13.9x and 16.7x. Its healthy body TTFB was about 4 ms,
+versus 59-77 ms for whole-segment authentication. Once the selected systematic shard was absent,
+the current Cobblestone implementation deliberately fell back to full-segment EC reconstruction:
+full-read throughput was 13-15% lower and targeted-range throughput 9-15% lower than the legacy
+codec. This is the documented cost of deferring partial EC reconstruction, not a failure of the
+healthy partial-read path.
+
+The degraded Cobblestone full-read TTFB difference between A and B is placement-dependent. A lost
+systematic shard zero, so reconstruction preceded the first plaintext. B lost systematic shard one,
+allowing authenticated chunks from the surviving first plaintext span to be emitted before later
+reconstruction. Whole-segment authentication cannot make that early release. The four successful
+run IDs were `20261027T155826Z-766601-32179`, `20261027T160218Z-768854-17042`,
+`20261027T160547Z-770509-3621`, and `20261027T160925Z-772266-12063`.
+
 ### Clean local payload-codec comparison
 
 The `payload_read_v3` local reference matrix was recorded on 2026-10-27 from clean source revision
@@ -216,8 +262,9 @@ Across the two orderings, Cobblestone increased full-read throughput by 57-67% o
 on 4+2. Full-read body TTFB fell by about 86% on 1+0 and 70-71% on 4+2, while completion p50 fell
 by 35-41% and 36-41%, respectively. The 4 KiB range improved by 14.2-14.5x on 1+0 and 3.9-4.3x on
 4+2, while reading roughly 16 KiB instead of a complete 8 MiB segment. These clean local results
-remove the earlier sequential-throughput concern, but they do not replace the remaining multihost
-and degraded-read measurements required before changing the production writer default.
+remove the earlier sequential-throughput concern. The clean multihost and degraded-read matrix
+above supplies the remaining performance evidence; changing the production writer default remains
+a separate explicit decision.
 
 ### Whole-segment encrypted-read baseline
 
