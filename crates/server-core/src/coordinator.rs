@@ -23,7 +23,6 @@ use s3_types::{
 };
 #[cfg(test)]
 use storage::ObjectLockState;
-#[cfg(any(test, feature = "test-utils"))]
 use storage::SegmentPayloadCodec;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig};
@@ -467,8 +466,7 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     managed_key_provider: Option<StaticManagedKeyProvider>,
-    #[cfg(any(test, feature = "test-utils"))]
-    test_new_payload_codec: SegmentPayloadCodec,
+    new_payload_codec: SegmentPayloadCodec,
     _reclaim_sweeper: Arc<ReclaimSweeper>,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
     _shard_repair_sweeper: Arc<ShardRepairSweeper>,

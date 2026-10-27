@@ -18,8 +18,15 @@ const MIB: usize = 1024 * 1024;
 struct Config {
     payload_profile: PayloadReadBenchmarkProfile,
     ec_shape: PayloadReadBenchmarkEcShape,
+    endpoint: Option<String>,
+    pg_count: Option<u32>,
+    existing_bucket: Option<String>,
+    existing_key: Option<String>,
+    keep_object: bool,
+    setup_only: bool,
     object_size: usize,
     range_size: usize,
+    range_start: Option<usize>,
     warmup_iters: usize,
     full_iters: usize,
     range_iters: usize,
@@ -30,8 +37,15 @@ impl Config {
     fn parse() -> Result<Self, String> {
         let mut payload_profile = None;
         let mut ec_shape = None;
+        let mut endpoint = None;
+        let mut pg_count = None;
+        let mut existing_bucket = None;
+        let mut existing_key = None;
+        let mut keep_object = false;
+        let mut setup_only = false;
         let mut object_size = 16 * MIB;
         let mut range_size = 4 * 1024;
+        let mut range_start = None;
         let mut warmup_iters = 4;
         let mut full_iters = 16;
         let mut range_iters = 64;
@@ -58,6 +72,8 @@ impl Config {
                     let value = args.next().ok_or("missing value for --ec-shape")?;
                     ec_shape = Some(match value.as_str() {
                         "1+0" => PayloadReadBenchmarkEcShape::OnePlusZero,
+                        "2+1" => PayloadReadBenchmarkEcShape::TwoPlusOne,
+                        "3+1" => PayloadReadBenchmarkEcShape::ThreePlusOne,
                         "4+2" => PayloadReadBenchmarkEcShape::FourPlusTwo,
                         _ => {
                             return Err(format!(
@@ -67,12 +83,32 @@ impl Config {
                         }
                     });
                 }
+                "--endpoint" => {
+                    endpoint = Some(args.next().ok_or("missing value for --endpoint")?);
+                }
+                "--pg-count" => {
+                    let value = parse_usize(&mut args, "--pg-count")?;
+                    pg_count =
+                        Some(u32::try_from(value).map_err(|_| "--pg-count does not fit in u32")?);
+                }
+                "--existing-bucket" => {
+                    existing_bucket =
+                        Some(args.next().ok_or("missing value for --existing-bucket")?);
+                }
+                "--existing-key" => {
+                    existing_key = Some(args.next().ok_or("missing value for --existing-key")?);
+                }
+                "--keep-object" => keep_object = true,
+                "--setup-only" => setup_only = true,
                 "--object-mib" => {
                     let mib = parse_usize(&mut args, "--object-mib")?;
                     object_size = mib.checked_mul(MIB).ok_or("--object-mib is too large")?;
                 }
                 "--range-bytes" => {
                     range_size = parse_usize(&mut args, "--range-bytes")?;
+                }
+                "--range-start" => {
+                    range_start = Some(parse_usize(&mut args, "--range-start")?);
                 }
                 "--warmup-iters" => {
                     warmup_iters = parse_usize(&mut args, "--warmup-iters")?;
@@ -98,8 +134,11 @@ impl Config {
         if object_size <= 8 * MIB {
             return Err("--object-mib must be greater than 8 to exercise multiple segments".into());
         }
-        let range_start = object_size / 2 + 1024;
-        if range_size == 0 || range_size > object_size - range_start {
+        let effective_range_start = range_start.unwrap_or(object_size / 2 + 1024);
+        if range_size == 0
+            || effective_range_start >= object_size
+            || range_size > object_size - effective_range_start
+        {
             return Err(
                 "--range-bytes must fit between the benchmark range start and object end".into(),
             );
@@ -107,11 +146,27 @@ impl Config {
         if full_iters == 0 || range_iters == 0 || samples == 0 {
             return Err("iteration and sample counts must be greater than zero".into());
         }
+        if endpoint.is_some() && pg_count.is_none() {
+            return Err("--pg-count is required with --endpoint".into());
+        }
+        if existing_bucket.is_some() != existing_key.is_some() {
+            return Err("--existing-bucket and --existing-key must be supplied together".into());
+        }
+        if existing_bucket.is_some() && endpoint.is_none() {
+            return Err("--existing-bucket is valid only with --endpoint".into());
+        }
         Ok(Self {
             payload_profile,
             ec_shape,
+            endpoint,
+            pg_count,
+            existing_bucket,
+            existing_key,
+            keep_object,
+            setup_only,
             object_size,
             range_size,
+            range_start,
             warmup_iters,
             full_iters,
             range_iters,
@@ -122,7 +177,9 @@ impl Config {
     fn usage() -> String {
         "usage: payload_read_bench --payload-profile \
          <segment-aes-256-gcm-v1|cobblestone-256-segment-v1> \
-         --ec-shape <1+0|4+2> [--object-mib N] [--range-bytes N] \
+         --ec-shape <1+0|2+1|3+1|4+2> [--endpoint URL --pg-count N] [--keep-object] \
+         [--existing-bucket NAME --existing-key KEY] \
+         [--setup-only] [--object-mib N] [--range-bytes N] [--range-start N] \
          [--warmup-iters N] [--full-iters N] [--range-iters N] [--samples N]"
             .to_string()
     }
@@ -193,7 +250,7 @@ impl ReadWork {
 #[derive(Debug)]
 struct Sample {
     elapsed: Duration,
-    work: ReadWork,
+    work: Option<ReadWork>,
     request_timings: Vec<RequestTiming>,
 }
 
@@ -341,7 +398,10 @@ async fn measure_case(
     let mut samples = Vec::with_capacity(config.samples);
     for _ in 0..config.samples {
         let mut request_timings = Vec::with_capacity(iterations);
-        let before = observability::metrics_snapshot();
+        let before = config
+            .endpoint
+            .is_none()
+            .then(observability::metrics_snapshot);
         let started = Instant::now();
         for _ in 0..iterations {
             let (body_len, timing) = read_and_time(client, bucket, key, kind).await;
@@ -349,10 +409,13 @@ async fn measure_case(
             request_timings.push(timing);
         }
         let elapsed = started.elapsed();
-        let after = observability::metrics_snapshot();
+        let work = before.map(|before| {
+            let after = observability::metrics_snapshot();
+            ReadWork::between(&before, &after)
+        });
         samples.push(Sample {
             elapsed,
-            work: ReadWork::between(&before, &after),
+            work,
             request_timings,
         });
     }
@@ -367,31 +430,38 @@ async fn measure_case(
             nearest_rank_percentile(&sample.request_timings, 50, |timing| timing.body_ttfb);
         let complete_p50 =
             nearest_rank_percentile(&sample.request_timings, 50, |timing| timing.complete);
-        println!(
+        let timing = format!(
             "sample case={case_name} operation={} index={} iterations={iterations} \
              elapsed_ms={:.3} requests_s={requests_per_second:.3} logical_mib_s={logical_mib_per_second:.3} \
-             headers_p50_ms={:.3} body_ttfb_p50_ms={:.3} complete_p50_ms={:.3} \
-             logical_bytes={} stored_bytes={} shard_bytes={} reconstructed_bytes={} \
-             decrypted_bytes={} aead_records={} crc_bytes={} buffer_checkouts={} \
-             buffer_allocations={} buffer_allocated_bytes={} repair_fallbacks={}",
+             headers_p50_ms={:.3} body_ttfb_p50_ms={:.3} complete_p50_ms={:.3}",
             kind.name(),
             index + 1,
             duration_ms(sample.elapsed),
             duration_ms(headers_p50),
             duration_ms(body_ttfb_p50),
             duration_ms(complete_p50),
-            sample.work.logical_bytes,
-            sample.work.stored_bytes,
-            sample.work.shard_bytes,
-            sample.work.reconstructed_bytes,
-            sample.work.decrypted_bytes,
-            sample.work.aead_records,
-            sample.work.crc_bytes,
-            sample.work.buffer_checkouts,
-            sample.work.buffer_allocations,
-            sample.work.buffer_allocated_bytes,
-            sample.work.repair_fallbacks,
         );
+        if let Some(work) = sample.work {
+            println!(
+                "{timing} work_metrics_available=true logical_bytes={} stored_bytes={} \
+                 shard_bytes={} reconstructed_bytes={} decrypted_bytes={} aead_records={} \
+                 crc_bytes={} buffer_checkouts={} buffer_allocations={} \
+                 buffer_allocated_bytes={} repair_fallbacks={}",
+                work.logical_bytes,
+                work.stored_bytes,
+                work.shard_bytes,
+                work.reconstructed_bytes,
+                work.decrypted_bytes,
+                work.aead_records,
+                work.crc_bytes,
+                work.buffer_checkouts,
+                work.buffer_allocations,
+                work.buffer_allocated_bytes,
+                work.repair_fallbacks,
+            );
+        } else {
+            println!("{timing} work_metrics_available=false");
+        }
     }
 
     let mut rates = samples
@@ -455,48 +525,86 @@ async fn put_benchmark_object(client: &Client, bucket: &str, key: &str, payload:
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = Config::parse()?;
-    let server = s3_tests::TestServer::start_http_for_payload_read_benchmark(
-        config.payload_profile,
-        config.ec_shape,
-    )
-    .await;
-    let client = s3_tests::build_client_with_ca(
-        server.endpoint(),
-        TEST_ACCESS_KEY,
-        TEST_SECRET_KEY,
-        TEST_REGION,
-        None,
-    );
-
-    let encrypted_bucket = s3_tests::unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&encrypted_bucket)
-        .send()
-        .await
-        .map_err(|error| format!("create encrypted bucket: {error}"))?;
+    let server = if config.endpoint.is_none() {
+        Some(
+            s3_tests::TestServer::start_http_for_payload_read_benchmark(
+                config.payload_profile,
+                config.ec_shape,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .or_else(|| server.as_ref().map(s3_tests::TestServer::endpoint))
+        .expect("local benchmark server or external endpoint");
+    let external_credentials = config
+        .endpoint
+        .as_ref()
+        .map(|_| {
+            Ok::<_, String>((
+                std::env::var("AWS_ACCESS_KEY_ID")
+                    .map_err(|_| "AWS_ACCESS_KEY_ID is required with --endpoint")?,
+                std::env::var("AWS_SECRET_ACCESS_KEY")
+                    .map_err(|_| "AWS_SECRET_ACCESS_KEY is required with --endpoint")?,
+                std::env::var("AWS_REGION").unwrap_or_else(|_| TEST_REGION.to_string()),
+            ))
+        })
+        .transpose()?;
+    let (access_key, secret_key, region) = external_credentials
+        .as_ref()
+        .map(|(access_key, secret_key, region)| {
+            (access_key.as_str(), secret_key.as_str(), region.as_str())
+        })
+        .unwrap_or((TEST_ACCESS_KEY, TEST_SECRET_KEY, TEST_REGION));
+    let client = s3_tests::build_client_with_ca(endpoint, access_key, secret_key, region, None);
 
     let payload = (0..config.object_size)
         .map(|index| (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u8)
         .collect::<Vec<_>>();
-    let key = "payload-read-benchmark";
-    put_benchmark_object(&client, &encrypted_bucket, key, &payload).await;
+    let (encrypted_bucket, key, created_object) = match (
+        config.existing_bucket.as_ref(),
+        config.existing_key.as_ref(),
+    ) {
+        (Some(bucket), Some(key)) => (bucket.clone(), key.clone(), false),
+        (None, None) => {
+            let bucket = s3_tests::unique_bucket();
+            client
+                .create_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
+                .map_err(|error| format!("create encrypted bucket: {error}"))?;
+            let key = "payload-read-benchmark".to_string();
+            put_benchmark_object(&client, &bucket, &key, &payload).await;
+            (bucket, key, true)
+        }
+        _ => unreachable!("configuration validates the existing object pair"),
+    };
 
     let persisted_profile = server
-        .observe_payload_read_benchmark_profile(&encrypted_bucket, key)
-        .map_err(|error| format!("observe durable benchmark payload profile: {error}"))?;
-    if persisted_profile != config.payload_profile {
+        .as_ref()
+        .map(|server| {
+            server
+                .observe_payload_read_benchmark_profile(&encrypted_bucket, &key)
+                .map_err(|error| format!("observe durable benchmark payload profile: {error}"))
+        })
+        .transpose()?;
+    if persisted_profile.is_some_and(|profile| profile != config.payload_profile) {
         return Err(format!(
             "benchmark requested payload profile {} but durable object recorded {}",
             config.payload_profile.as_str(),
-            persisted_profile.as_str()
+            persisted_profile.expect("checked present").as_str()
         ));
     }
 
     let encrypted_head = client
         .head_object()
         .bucket(&encrypted_bucket)
-        .key(key)
+        .key(&key)
         .send()
         .await
         .map_err(|error| format!("HEAD encrypted object: {error}"))?;
@@ -507,7 +615,7 @@ async fn main() -> Result<(), String> {
         return Err("encrypted benchmark object is not SSE-S3 AES256".into());
     }
 
-    let range_start = config.object_size / 2 + 1024;
+    let range_start = config.range_start.unwrap_or(config.object_size / 2 + 1024);
     let range_end = range_start + config.range_size - 1;
     let range = ReadKind::Range {
         start: range_start,
@@ -516,13 +624,35 @@ async fn main() -> Result<(), String> {
     println!("benchmark=payload_read_v3");
     println!("body_ttfb_definition=request_start_to_first_nonempty_sdk_body_bytes");
     println!("latency_percentile_method=nearest_rank");
+    println!(
+        "deployment={}",
+        if server.is_some() {
+            "local"
+        } else {
+            "external"
+        }
+    );
     println!("transport=http");
+    println!("endpoint={endpoint}");
     println!("ec_shape={}", config.ec_shape.as_str());
     println!(
         "requested_payload_profile={}",
         config.payload_profile.as_str()
     );
-    println!("persisted_payload_profile={}", persisted_profile.as_str());
+    println!(
+        "persisted_payload_profile={}",
+        persisted_profile
+            .map(PayloadReadBenchmarkProfile::as_str)
+            .unwrap_or("external-verification-required")
+    );
+    println!(
+        "work_metrics_source={}",
+        if server.is_some() {
+            "benchmark-process"
+        } else {
+            "unavailable"
+        }
+    );
     println!("crc64_backend={}", checksum::crc64::backend_name());
     println!("sha256_backend={}", checksum::sha256::backend_name());
     println!("ec_backend={}", ec::backend_name());
@@ -535,13 +665,32 @@ async fn main() -> Result<(), String> {
     println!("full_iters={}", config.full_iters);
     println!("range_iters={}", config.range_iters);
     println!("samples={}", config.samples);
+    println!("benchmark_bucket={encrypted_bucket}");
+    println!("benchmark_key={key}");
+    if let Some(pg_count) = config.pg_count {
+        let pg_ids = (0..pg_count).collect::<Vec<_>>();
+        let topology = storage::PgTopology::new(&pg_ids)
+            .map_err(|error| format!("construct benchmark PG topology: {error}"))?;
+        println!(
+            "benchmark_metadata_pg={}",
+            topology.object_pg(&encrypted_bucket, &key)
+        );
+    }
+    println!("benchmark_object_created={created_object}");
+
+    if config.setup_only {
+        println!("benchmark_setup_only=true");
+        println!("benchmark_object_retained=true");
+        return Ok(());
+    }
+    println!("benchmark_setup_only=false");
 
     measure_case(
         &config,
         &client,
         "sse_s3_aes256",
         &encrypted_bucket,
-        key,
+        &key,
         &payload,
         ReadKind::Full,
     )
@@ -551,13 +700,19 @@ async fn main() -> Result<(), String> {
         &client,
         "sse_s3_aes256",
         &encrypted_bucket,
-        key,
+        &key,
         &payload,
         range,
     )
     .await;
 
-    s3_tests::delete_all_and_bucket(&client, &encrypted_bucket, &[key.to_string()]).await;
+    if config.keep_object {
+        println!("benchmark_object_retained=true");
+    } else {
+        s3_tests::delete_all_and_bucket(&client, &encrypted_bucket, std::slice::from_ref(&key))
+            .await;
+        println!("benchmark_object_retained=false");
+    }
     Ok(())
 }
 

@@ -926,7 +926,7 @@ pub fn prepare_sse_customer_write(
     )
 }
 
-fn prepare_sse_customer_write_with_payload_codec(
+pub(crate) fn prepare_sse_customer_write_with_payload_codec(
     validator: &SseCustomerValidatorConfig,
     request: &SseCustomerRequest,
     payload_codec: SegmentPayloadCodec,
@@ -990,15 +990,6 @@ fn prepare_sse_customer_write_with_payload_codec(
     })
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn test_prepare_sse_customer_write_with_payload_codec(
-    validator: &SseCustomerValidatorConfig,
-    request: &SseCustomerRequest,
-    payload_codec: SegmentPayloadCodec,
-) -> Result<SseCustomerWriteContext, ServerError> {
-    prepare_sse_customer_write_with_payload_codec(validator, request, payload_codec)
-}
-
 pub(crate) fn resume_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
@@ -1052,7 +1043,7 @@ pub fn prepare_managed_encryption_write(
     )
 }
 
-fn prepare_managed_encryption_write_with_payload_codec(
+pub(crate) fn prepare_managed_encryption_write_with_payload_codec(
     provider: &impl ManagedKeyProvider,
     payload_codec: SegmentPayloadCodec,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
@@ -1105,14 +1096,6 @@ fn prepare_managed_encryption_write_with_payload_codec(
         wrapping_key: *wrapping_key.wrapping_key(),
         segment_scope: SseCustomerSegmentScope::object(),
     })
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn test_prepare_managed_encryption_write_with_payload_codec(
-    provider: &impl ManagedKeyProvider,
-    payload_codec: SegmentPayloadCodec,
-) -> Result<ManagedEncryptionWriteContext, ServerError> {
-    prepare_managed_encryption_write_with_payload_codec(provider, payload_codec)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -3835,6 +3835,32 @@ fn unix_storage_node_client_admission_settings(
     }
 }
 
+#[cfg(feature = "payload-codec-benchmark")]
+const PAYLOAD_CODEC_BENCHMARK_ENV: &str = "ARGMIN_BENCHMARK_NEW_PAYLOAD_CODEC";
+
+#[cfg(feature = "payload-codec-benchmark")]
+fn parse_payload_codec_benchmark_selection(
+    value: &str,
+) -> Result<storage::SegmentPayloadCodec, String> {
+    match value {
+        "segment-aes-256-gcm-v1" => Ok(storage::SegmentPayloadCodec::SegmentAes256GcmV1),
+        "cobblestone-256-segment-v1" => {
+            Ok(storage::SegmentPayloadCodec::Cobblestone256SegmentV1)
+        }
+        _ => Err(format!(
+            "{PAYLOAD_CODEC_BENCHMARK_ENV} must be segment-aes-256-gcm-v1 or cobblestone-256-segment-v1"
+        )),
+    }
+}
+
+#[cfg(feature = "payload-codec-benchmark")]
+fn new_payload_codec_for_frontend() -> Result<storage::SegmentPayloadCodec, String> {
+    let value = std::env::var(PAYLOAD_CODEC_BENCHMARK_ENV).map_err(|_| {
+        format!("{PAYLOAD_CODEC_BENCHMARK_ENV} is required by this benchmark build")
+    })?;
+    parse_payload_codec_benchmark_selection(&value)
+}
+
 async fn run_frontend_server(
     config: ServerConfig,
     host_id: String,
@@ -3879,6 +3905,11 @@ async fn run_frontend_server(
     let frontend_runtime_map_refresh_status = frontend_runtime_map_refresh_loop
         .as_ref()
         .map(storage::StorageClusterRuntimeMapRefreshLoop::status_handle);
+    #[cfg(feature = "payload-codec-benchmark")]
+    let new_payload_codec = new_payload_codec_for_frontend().unwrap_or_else(|error| {
+        eprintln!("invalid payload codec benchmark selection: {error}");
+        std::process::exit(1);
+    });
 
     // Build frontend pool sharing the same storage cluster and identity-provider handles.
     let identity_provider = auth::IdentityProvider::in_memory(build_credential_store(&config))
@@ -3888,6 +3919,18 @@ async fn run_frontend_server(
         });
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
+        #[cfg(feature = "payload-codec-benchmark")]
+        let coordinator =
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_and_payload_codec(
+                handles.foreground_route.clone(),
+                handles.maintenance_route.clone(),
+                config.region.clone(),
+                sse_c_validator.clone(),
+                managed_key_provider.clone(),
+                background_worker_mode,
+                new_payload_codec,
+            );
+        #[cfg(not(feature = "payload-codec-benchmark"))]
         let coordinator =
             Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode(
                 handles.foreground_route.clone(),

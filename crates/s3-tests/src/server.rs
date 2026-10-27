@@ -120,6 +120,8 @@ impl PayloadReadBenchmarkProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayloadReadBenchmarkEcShape {
     OnePlusZero,
+    TwoPlusOne,
+    ThreePlusOne,
     FourPlusTwo,
 }
 
@@ -129,6 +131,8 @@ impl PayloadReadBenchmarkEcShape {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OnePlusZero => "1+0",
+            Self::TwoPlusOne => "2+1",
+            Self::ThreePlusOne => "3+1",
             Self::FourPlusTwo => "4+2",
         }
     }
@@ -136,6 +140,8 @@ impl PayloadReadBenchmarkEcShape {
     const fn storage_shape(self) -> storage::EcShape {
         match self {
             Self::OnePlusZero => storage::EcShape { k: 1, m: 0 },
+            Self::TwoPlusOne => storage::EcShape { k: 2, m: 1 },
+            Self::ThreePlusOne => storage::EcShape { k: 3, m: 1 },
             Self::FourPlusTwo => storage::EcShape { k: 4, m: 2 },
         }
     }

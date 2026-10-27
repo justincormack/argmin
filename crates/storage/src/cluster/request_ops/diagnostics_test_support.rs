@@ -1,6 +1,11 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) struct ObjectPayloadPlacementDiagnosticDataRoute {
+    route: crate::control_plane::PgRouteSnapshot,
+    data_pg: DataPgId,
+}
+
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_default_payload_ec_scratch_allocation_count(&self) -> usize {
@@ -68,6 +73,50 @@ impl super::StorageCluster {
         key: &ObjectKey,
         expected_pgs: Option<(u32, u32)>,
     ) -> ObjectPayloadPlacementDiagnostic {
+        self.object_payload_placement_diagnostic_for_expected_pgs_with_data_route_resolver(
+            bucket,
+            key,
+            expected_pgs,
+            |pg_id, cluster_epoch| {
+                self.object_payload_placement_diagnostic_data_route_at_epoch(
+                    pg_id,
+                    cluster_epoch,
+                )
+            },
+        )
+    }
+
+    pub(crate) fn object_payload_placement_diagnostic_data_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<ObjectPayloadPlacementDiagnosticDataRoute, String> {
+        let route = self
+            .reconstructed_pg_route_at_epoch(pg_id, cluster_epoch)
+            .map_err(|error| error.to_string())?;
+        self.object_payload_placement_diagnostic_data_route(route)
+    }
+
+    pub(crate) fn object_payload_placement_diagnostic_data_route(
+        &self,
+        route: crate::control_plane::PgRouteSnapshot,
+    ) -> Result<ObjectPayloadPlacementDiagnosticDataRoute, String> {
+        let data_pg = self
+            .validated_data_pg(route.pg_id())
+            .map_err(|error| error.to_string())?;
+        Ok(ObjectPayloadPlacementDiagnosticDataRoute { route, data_pg })
+    }
+
+    pub(crate) fn object_payload_placement_diagnostic_for_expected_pgs_with_data_route_resolver(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_pgs: Option<(u32, u32)>,
+        mut resolve_data_route: impl FnMut(
+            PgId,
+            ClusterEpoch,
+        ) -> Result<ObjectPayloadPlacementDiagnosticDataRoute, String>,
+    ) -> ObjectPayloadPlacementDiagnostic {
         if let Some((expected_metadata_pg, _)) = expected_pgs {
             let actual_metadata_pg = self.object_metadata_pg_id(bucket, key);
             if actual_metadata_pg != expected_metadata_pg {
@@ -84,7 +133,7 @@ impl super::StorageCluster {
             |_| Ok::<(), std::convert::Infallible>(()),
         ) {
             Ok(Ok(outcome)) => match outcome.snapshot.payload_placement_diagnostic() {
-                Ok(text) => {
+                Ok(mut text) => {
                     if let Some((_, expected_data_pg)) = expected_pgs {
                         if outcome.snapshot.object_segments.iter().any(|segment| {
                             segment.stored_bytes_request().data_pg_id != expected_data_pg
@@ -92,6 +141,99 @@ impl super::StorageCluster {
                             return ObjectPayloadPlacementDiagnostic::mismatch(format!(
                                 "object payload placement mismatch: expected_data_pg={expected_data_pg}\n{text}"
                             ));
+                        }
+                    }
+                    let metadata_pg_id = self.object_metadata_pg_id(bucket, key);
+                    let Some(metadata_route) = self.local_pg_route(PgId::new(metadata_pg_id)) else {
+                        return ObjectPayloadPlacementDiagnostic::conflict(format!(
+                            "object payload placement unavailable: missing_metadata_pg_route pg_id={metadata_pg_id}\n{text}"
+                        ));
+                    };
+                    use std::fmt::Write as _;
+                    writeln!(
+                        text,
+                        "metadata_pg_route pg_id={} cluster_epoch={} primary_node_id={} acting_set={}",
+                        metadata_pg_id,
+                        metadata_route.cluster_epoch().get(),
+                        metadata_route.primary_node_id().as_u32(),
+                        metadata_route
+                            .acting_set()
+                            .iter()
+                            .map(|node_id| node_id.as_u32().to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                    .expect("writing to a String cannot fail");
+                    let mut rendered_routes = std::collections::BTreeSet::new();
+                    for segment in &outcome.snapshot.object_segments {
+                        let request = segment.stored_bytes_request();
+                        let data_pg_id = request.data_pg_id;
+                        let cluster_epoch = segment.placement_cluster_epoch();
+                        let resolved = match resolve_data_route(PgId::new(data_pg_id), cluster_epoch)
+                        {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                return ObjectPayloadPlacementDiagnostic::conflict(format!(
+                                    "object payload placement unavailable: missing_data_pg_route pg_id={data_pg_id} cluster_epoch={} cause={}\n{text}",
+                                    cluster_epoch.get(),
+                                    error
+                                ));
+                            }
+                        };
+                        let ObjectPayloadPlacementDiagnosticDataRoute { route, data_pg } = resolved;
+                        if route.pg_id() != PgId::new(data_pg_id)
+                            || route.cluster_epoch() != cluster_epoch
+                        {
+                            return ObjectPayloadPlacementDiagnostic::conflict(format!(
+                                "object payload placement unavailable: crossed_data_pg_route expected_pg_id={data_pg_id} expected_cluster_epoch={} actual_pg_id={} actual_cluster_epoch={}\n{text}",
+                                cluster_epoch.get(),
+                                route.pg_id().get(),
+                                route.cluster_epoch().get()
+                            ));
+                        }
+                        if rendered_routes.insert((data_pg_id, cluster_epoch.get())) {
+                            writeln!(
+                                text,
+                                "data_pg_route pg_id={} cluster_epoch={} primary_node_id={} acting_set={}",
+                                data_pg_id,
+                                cluster_epoch.get(),
+                                route.primary_node_id().as_u32(),
+                                route
+                                    .acting_set()
+                                    .iter()
+                                    .map(|node_id| node_id.as_u32().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                            .expect("writing to a String cannot fail");
+                        }
+                        let placement_key = super::segment_payload_placement_key(
+                            &request.segment_okh,
+                            request.segment_vid,
+                        );
+                        let locations = match self.place_payload_shards_for_pg_route_snapshot(
+                            &route,
+                            data_pg,
+                            request.ec,
+                            &placement_key,
+                        ) {
+                            Ok(locations) => locations,
+                            Err(error) => {
+                                return ObjectPayloadPlacementDiagnostic::conflict(format!(
+                                    "object payload placement unavailable: invalid_shard_placement segment_index={} cause={error}\n{text}",
+                                    segment.segment_index()
+                                ));
+                            }
+                        };
+                        for location in locations {
+                            writeln!(
+                                text,
+                                "segment_shard_location segment_index={} shard_index={} node_id={}",
+                                segment.segment_index(),
+                                location.shard_index().get(),
+                                location.node_id().as_u32()
+                            )
+                            .expect("writing to a String cannot fail");
                         }
                     }
                     ObjectPayloadPlacementDiagnostic::success(text)

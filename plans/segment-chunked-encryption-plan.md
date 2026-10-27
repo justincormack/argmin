@@ -1975,6 +1975,42 @@ Implementation update (2026-10-27, clean local benchmark selection):
   implementation. Production writer selection remains `SegmentAes256GcmV1` until the Phase 5
   multihost and degraded-read measurements are complete.
 
+Implementation update (2026-10-27, multihost and degraded-read benchmark harness):
+
+- The payload benchmark client now supports a caller-supplied S3 endpoint, exact existing-object
+  reuse, and setup-only object creation. Local runs continue to report authoritative process-local
+  work counters. External runs explicitly report `work_metrics_available=false` instead of
+  emitting misleading zero deltas for work performed by remote frontend and storage processes.
+- `uat-multihost-raft` has a dedicated release-only payload benchmark mode for redundant `2+1` or
+  `3+1` EC. The server's benchmark feature requires an exact immutable writer selection before
+  coordinator construction; builds without that feature remain pinned to
+  `SegmentAes256GcmV1`. The runner records source and binary identities and reports a reference run
+  only for a clean tree with runner-built current-source release server and client binaries. Dirty,
+  debug, and unverified prebuilt artifacts are explicitly exploratory.
+- A storage-owned diagnostic verifies the object's durable codec and resolves its exact metadata
+  and data routes plus the storage-computed shard-index-to-node mapping for every segment.
+  Data-route resolution obtains an independently scoped runtime-map snapshot for each data PG and
+  can reconstruct retained placement epochs; it does not assume that a metadata-PG-scoped snapshot
+  contains unrelated data-PG routes, or that acting-set order is shard-index order. An
+  unsorted-acting-set regression pins the distinction.
+- The runner selects a segment-zero systematic shard from that exact placement whose node is not
+  the object's metadata primary, chooses a 4 KiB range in the middle of that shard's plaintext span
+  in the first full segment, and uses the same object and range for healthy and degraded samples.
+  It stops only the selected storage service, then restarts it and requires the complete deployment
+  to recover.
+- Reduced dirty-worktree validation passed end to end for both profiles over three hosts and
+  production TLS/TCP routes with `2+1` EC. These results validate the harness rather than the
+  writer choice. With a 9 MiB object and deliberately tiny sample counts, Cobblestone measured
+  17.844 healthy and 8.481 degraded full GET requests/s, plus 306.954 healthy and 12.185 degraded
+  range requests/s. The whole-segment profile measured 9.859 healthy and 9.354 degraded full GET
+  requests/s, plus 16.964 healthy and 12.963 degraded range requests/s. Cobblestone healthy range
+  TTFB was 3.136 ms, while its degraded range necessarily entered full-segment reconstruction and
+  measured 82.974 ms; this is the expected cost of deferring partial EC reconstruction.
+- The authoritative clean, paired multihost matrix remains the final Phase 5 measurement before
+  the production writer decision. It must use the normal workload, both profile orderings, the
+  same hosts and EC shape, and the clean-tree reference guard documented in
+  `guides/performance.md`.
+
 ### Optional follow-up: Partial EC reconstruction
 
 This is not part of the initial completion path. Start it only if Phase 3/4 production-like metrics

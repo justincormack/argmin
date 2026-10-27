@@ -22,6 +22,10 @@ Options:
   --addresses ADDRS      Matching advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
   --binary PATH          Deploy a prebuilt argmin-s3 binary; standard target paths build it
   --client-binary PATH   Use a prebuilt UAT client; standard target paths build it
+  --benchmark-binary PATH
+                         Use a prebuilt payload-read benchmark client
+  --payload-read-benchmark PROFILE
+                         Run healthy and missing-shard read measurements for PROFILE
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
   --lifecycle-root PATH  Private lifecycle registry (default: XDG state directory)
@@ -351,6 +355,14 @@ hosts_explicit=0
 [[ -z "${ARGMIN_MULTIHOST_RAFT_HOSTS+x}" ]] || hosts_explicit=1
 binary=""
 client_binary=""
+benchmark_binary=""
+payload_read_benchmark_profile=""
+payload_read_benchmark_source_worktree=""
+payload_read_benchmark_reference_run=""
+payload_read_benchmark_server_provenance=""
+payload_read_benchmark_client_provenance=""
+payload_read_benchmark_server_current_source_release=0
+payload_read_benchmark_client_current_source_release=0
 release=0
 remote_root="${ARGMIN_MULTIHOST_RAFT_REMOTE_ROOT:-/home/argmin-test/argmin-soak}"
 remote_root_explicit=0
@@ -403,6 +415,16 @@ while (($# > 0)); do
         --client-binary)
             [[ $# -ge 2 ]] || die "--client-binary requires a value"
             client_binary="$2"
+            shift 2
+            ;;
+        --benchmark-binary)
+            [[ $# -ge 2 ]] || die "--benchmark-binary requires a value"
+            benchmark_binary="$2"
+            shift 2
+            ;;
+        --payload-read-benchmark)
+            [[ $# -ge 2 ]] || die "--payload-read-benchmark requires a value"
+            payload_read_benchmark_profile="$2"
             shift 2
             ;;
         --release)
@@ -558,6 +580,27 @@ if ((start_cluster)); then
     [[ -z "$client_binary" ]] ||
         die "--start-cluster does not use --client-binary"
 fi
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    case "$payload_read_benchmark_profile" in
+        segment-aes-256-gcm-v1|cobblestone-256-segment-v1) ;;
+        *)
+            die "--payload-read-benchmark requires segment-aes-256-gcm-v1 or cobblestone-256-segment-v1"
+            ;;
+    esac
+    ((release == 1)) || die "--payload-read-benchmark requires --release"
+    ((start_cluster == 0 && startup_only == 0 && quantitative == 0)) ||
+        die "--payload-read-benchmark cannot be combined with another run mode"
+    [[ -z "$client_binary" ]] ||
+        die "--payload-read-benchmark uses --benchmark-binary, not --client-binary"
+    if [[ -z "$(git status --porcelain --untracked-files=normal)" ]]; then
+        payload_read_benchmark_source_worktree="clean"
+    else
+        [[ "${ALLOW_DIRTY_BENCHMARK:-0}" == "1" ]] ||
+            die "reference payload-read benchmarks require a clean worktree; commit or stash the changes, or set ALLOW_DIRTY_BENCHMARK=1 for an exploratory non-reference run"
+        payload_read_benchmark_source_worktree="dirty"
+    fi
+    payload_read_benchmark_reference_run="false"
+fi
 case "$storage_profile" in
     persistent|volatile-test) ;;
     *) die "--storage-profile must be persistent or volatile-test" ;;
@@ -600,6 +643,10 @@ done
 ec_total_shards=$((ec_data_shards + ec_parity_shards))
 ((ec_total_shards <= host_count)) ||
     die "EC $ec_data_shards+$ec_parity_shards requires $ec_total_shards hosts, but only $host_count were supplied"
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    [[ "$ec_data_shards+$ec_parity_shards" == "2+1" || "$ec_data_shards+$ec_parity_shards" == "3+1" ]] ||
+        die "--payload-read-benchmark requires EC 2+1 or 3+1"
+fi
 validate_route_rotation
 for address in "${addresses[@]}"; do
     [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
@@ -614,12 +661,15 @@ if [[ -n "$host_fault_driver" ]]; then
 fi
 
 declare -A machine_id_hosts=()
-declare -a server_build=() client_build=()
+declare -a server_build=() client_build=() benchmark_build=()
 
 if [[ -z "$binary" ]]; then
     server_build=(cargo build -p argmin-s3 --bin argmin-s3)
     if ((release)); then
         server_build=(cargo build --release -p argmin-s3 --bin argmin-s3)
+        if [[ -n "$payload_read_benchmark_profile" ]]; then
+            payload_read_benchmark_server_current_source_release=1
+        fi
     fi
 elif [[ "$binary" != /* ]]; then
     binary="$ROOT/$binary"
@@ -627,13 +677,33 @@ fi
 case "$binary" in
     "$ROOT/target/debug/argmin-s3")
         server_build=(cargo build -p argmin-s3 --bin argmin-s3)
+        payload_read_benchmark_server_current_source_release=0
         ;;
     "$ROOT/target/release/argmin-s3")
         server_build=(cargo build --release -p argmin-s3 --bin argmin-s3)
+        if [[ -n "$payload_read_benchmark_profile" ]]; then
+            payload_read_benchmark_server_current_source_release=1
+        fi
         ;;
 esac
+if [[ -n "$payload_read_benchmark_profile" && ${#server_build[@]} -ne 0 ]]; then
+    server_build+=(--features payload-codec-benchmark)
+fi
 
-if ((start_cluster == 0)) && [[ -z "$client_binary" ]]; then
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    if [[ -z "$benchmark_binary" ]]; then
+        benchmark_build=(cargo build --release -p s3-tests --features payload-read-bench --bin payload_read_bench)
+        payload_read_benchmark_client_current_source_release=1
+    elif [[ "$benchmark_binary" != /* ]]; then
+        benchmark_binary="$ROOT/$benchmark_binary"
+    fi
+    case "$benchmark_binary" in
+        "$ROOT/target/release/payload_read_bench")
+            benchmark_build=(cargo build --release -p s3-tests --features payload-read-bench --bin payload_read_bench)
+            payload_read_benchmark_client_current_source_release=1
+            ;;
+    esac
+elif ((start_cluster == 0)) && [[ -z "$client_binary" ]]; then
     client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
     if ((release)); then
         client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
@@ -650,7 +720,25 @@ case "$client_binary" in
         ;;
 esac
 
-if ((${#server_build[@]} != 0 || ${#client_build[@]} != 0)); then
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    if ((payload_read_benchmark_server_current_source_release)); then
+        payload_read_benchmark_server_provenance="current-source-release"
+    else
+        payload_read_benchmark_server_provenance="unverified-prebuilt-or-nonrelease"
+    fi
+    if ((payload_read_benchmark_client_current_source_release)); then
+        payload_read_benchmark_client_provenance="current-source-release"
+    else
+        payload_read_benchmark_client_provenance="unverified-prebuilt-or-nonrelease"
+    fi
+    if [[ "$payload_read_benchmark_source_worktree" == "clean" ]] &&
+        ((payload_read_benchmark_server_current_source_release)) &&
+        ((payload_read_benchmark_client_current_source_release)); then
+        payload_read_benchmark_reference_run="true"
+    fi
+fi
+
+if ((${#server_build[@]} != 0 || ${#client_build[@]} != 0 || ${#benchmark_build[@]} != 0)); then
     command -v cargo >/dev/null 2>&1 || die "cargo is required to build the UAT binaries"
     command -v jq >/dev/null 2>&1 || die "jq is required to locate Cargo-built UAT binaries"
 fi
@@ -665,7 +753,13 @@ fi
 if ((${#client_build[@]} != 0)); then
     build_cargo_binary client_binary uat_pg_backfill_smoke "${client_build[@]}"
 fi
-if ((start_cluster == 0)); then
+if ((${#benchmark_build[@]} != 0)); then
+    build_cargo_binary benchmark_binary payload_read_bench "${benchmark_build[@]}"
+fi
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    [[ -x "$benchmark_binary" ]] ||
+        die "payload-read benchmark binary is not executable: $benchmark_binary"
+elif ((start_cluster == 0)); then
     [[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
 fi
 
@@ -831,6 +925,22 @@ trap cleanup EXIT INT TERM
 echo "== argmin-s3 multihost Raft and data-plane soak =="
 echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count ec=$ec_data_shards+$ec_parity_shards retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only start_cluster=$start_cluster quantitative=$quantitative sustained_seconds=$sustained_seconds"
 echo "binary=$binary client_binary=$client_binary remote_run=$remote_run"
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    echo "source_worktree=$payload_read_benchmark_source_worktree"
+    echo "reference_run=$payload_read_benchmark_reference_run"
+    echo "server_build_provenance=$payload_read_benchmark_server_provenance"
+    echo "benchmark_client_build_provenance=$payload_read_benchmark_client_provenance"
+    echo "source_revision=$(git rev-parse HEAD)"
+    echo "rustc=$(rustc --version)"
+    echo "kernel=$(uname -srmo)"
+    echo "client_cpu_arch=$(uname -m)"
+    if [[ -r /proc/cpuinfo ]]; then
+        benchmark_cpu_model="$(awk -F: '/^(model name|Hardware|Processor)[[:space:]]*:/ { value=$2; sub(/^[[:space:]]+/, "", value); print value; exit }' /proc/cpuinfo)"
+    else
+        benchmark_cpu_model=""
+    fi
+    echo "client_cpu_model=${benchmark_cpu_model:-unknown}"
+fi
 if [[ -n "$host_fault_driver" ]]; then
     echo "host_fault_driver=$host_fault_driver"
 fi
@@ -1144,6 +1254,10 @@ chmod 600 "$manifest_path"
 binary_digest="$(sha256sum "$binary" | awk '{print $1}')"
 printf '%s  argmin-s3\n' "$binary_digest" >"$local_run/binary.sha256"
 git rev-parse HEAD >"$local_run/git-commit"
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    echo "server_binary_sha256=$binary_digest"
+    echo "benchmark_binary_sha256=$(sha256sum "$benchmark_binary" | awk '{print $1}')"
+fi
 
 deploy_material=(
     "$material_dir/ca.crt"
@@ -1362,12 +1476,19 @@ start_frontend() {
     local unit="$run_name-frontend-$number-${frontend_unit_generations[$index]}"
     frontend_units[index]="$unit"
     diagnostic_unit_hosts["$unit"]="$index"
+    local -a benchmark_environment=()
+    if [[ -n "$payload_read_benchmark_profile" ]]; then
+        benchmark_environment=(
+            --setenv "ARGMIN_BENCHMARK_NEW_PAYLOAD_CODEC=$payload_read_benchmark_profile"
+        )
+    fi
     remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
         --property "StandardOutput=append:$remote_run/logs/frontend-$number.log" \
         --property "StandardError=append:$remote_run/logs/frontend-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         --setenv "ARGMIN_PROCESS_ID=frontend-$number" \
+        "${benchmark_environment[@]}" \
         "$remote_run/argmin-s3"
 }
 
@@ -1735,6 +1856,195 @@ run_data_client_on() {
         "AWS_TEST_SECRET_KEY=$s3_secret_access_key" \
         "AWS_TEST_REGION=us-east-1" \
         "$client_binary" "$@" 2>&1 | tee -a "$data_plane_client_log"
+}
+
+run_payload_read_benchmark_client() {
+    local label="$1"
+    local output_path="$2"
+    local existing_bucket="${3:-}"
+    local existing_key="${4:-}"
+    local range_start="${5:-}"
+    local setup_only="${6:-0}"
+    local endpoint="http://${addresses[0]}:$frontend_port"
+    local -a existing_args=()
+    local -a range_args=()
+    local -a setup_args=()
+    if [[ -n "$existing_bucket" ]]; then
+        existing_args=(--existing-bucket "$existing_bucket" --existing-key "$existing_key")
+    fi
+    if [[ -n "$range_start" ]]; then
+        range_args=(--range-start "$range_start")
+    fi
+    if ((setup_only)); then
+        setup_args=(--setup-only)
+    fi
+    printf '+ env AWS_ACCESS_KEY_ID=%q AWS_SECRET_ACCESS_KEY=%q AWS_REGION=%q' \
+        'argmin-multihost-primary' '<redacted>' 'us-east-1'
+    printf ' %q' \
+        "$benchmark_binary" \
+        --payload-profile "$payload_read_benchmark_profile" \
+        --ec-shape "$ec_data_shards+$ec_parity_shards" \
+        --endpoint "$endpoint" \
+        --pg-count "$pg_count" \
+        --keep-object \
+        --object-mib "${PAYLOAD_READ_BENCHMARK_OBJECT_MIB:-16}" \
+        --warmup-iters "${PAYLOAD_READ_BENCHMARK_WARMUP_ITERS:-4}" \
+        --full-iters "${PAYLOAD_READ_BENCHMARK_FULL_ITERS:-16}" \
+        --range-iters "${PAYLOAD_READ_BENCHMARK_RANGE_ITERS:-64}" \
+        --samples "${PAYLOAD_READ_BENCHMARK_SAMPLES:-5}" \
+        "${range_args[@]}" \
+        "${setup_args[@]}" \
+        "${existing_args[@]}"
+    printf '\n'
+    {
+        echo "benchmark_scenario=$label"
+        env \
+            "AWS_ACCESS_KEY_ID=argmin-multihost-primary" \
+            "AWS_SECRET_ACCESS_KEY=$s3_secret_access_key" \
+            "AWS_REGION=us-east-1" \
+            "$benchmark_binary" \
+            --payload-profile "$payload_read_benchmark_profile" \
+            --ec-shape "$ec_data_shards+$ec_parity_shards" \
+            --endpoint "$endpoint" \
+            --pg-count "$pg_count" \
+            --keep-object \
+            --object-mib "${PAYLOAD_READ_BENCHMARK_OBJECT_MIB:-16}" \
+            --warmup-iters "${PAYLOAD_READ_BENCHMARK_WARMUP_ITERS:-4}" \
+            --full-iters "${PAYLOAD_READ_BENCHMARK_FULL_ITERS:-16}" \
+            --range-iters "${PAYLOAD_READ_BENCHMARK_RANGE_ITERS:-64}" \
+            --samples "${PAYLOAD_READ_BENCHMARK_SAMPLES:-5}" \
+            "${range_args[@]}" \
+            "${setup_args[@]}" \
+            "${existing_args[@]}"
+    } | tee "$output_path"
+}
+
+payload_benchmark_output_field() {
+    local output_path="$1"
+    local field="$2"
+    local -a values=()
+    mapfile -t values < <(sed -n "s/^$field=//p" "$output_path")
+    ((${#values[@]} == 1)) ||
+        die "benchmark output must contain exactly one $field field"
+    printf '%s\n' "${values[0]}"
+}
+
+inspect_payload_benchmark_object() {
+    local bucket="$1"
+    local key="$2"
+    local metadata_pg="$3"
+    local data_pg inspection_output status
+    local shard_index node_id row
+    local -a shard_location_rows=() shard_nodes=()
+    command_process_number=1
+    for ((data_pg = 0; data_pg < pg_count; data_pg++)); do
+        status=0
+        inspection_output="$(frontend_command \
+            control-plane-inspect-object-payload-placement \
+            "$remote_run/unused.sock" "$metadata_pg" "$data_pg" \
+            "$bucket" "$key" 2>&1)" || status=$?
+        if ((status == 0)); then
+            grep -Fx "payload_codec=$payload_read_benchmark_profile" \
+                <<<"$inspection_output" >/dev/null ||
+                die "durable benchmark payload codec does not match $payload_read_benchmark_profile"
+            benchmark_data_pg="$(sed -n \
+                's/^segment_index=0 data_pg_id=\([0-9][0-9]*\) .*/\1/p' \
+                <<<"$inspection_output")"
+            [[ "$benchmark_data_pg" =~ ^[0-9]+$ ]] ||
+                die "payload diagnostic did not contain segment 0 placement"
+            [[ "$benchmark_data_pg" == "$data_pg" ]] ||
+                die "payload diagnostic returned an unexpected data PG"
+            benchmark_metadata_primary="$(sed -n \
+                's/^metadata_pg_route .* primary_node_id=\([0-9][0-9]*\) acting_set=.*/\1/p' \
+                <<<"$inspection_output")"
+            benchmark_data_acting_set_csv="$(sed -n \
+                "s/^data_pg_route pg_id=$data_pg .* acting_set=//p" \
+                <<<"$inspection_output")"
+            [[ "$benchmark_metadata_primary" =~ ^[0-9]+$ ]] ||
+                die "payload diagnostic did not contain the metadata primary"
+            [[ "$benchmark_data_acting_set_csv" =~ ^[0-9]+(,[0-9]+)+$ ]] ||
+                die "payload diagnostic did not contain the data-PG acting set"
+            mapfile -t shard_location_rows < <(sed -n \
+                's/^segment_shard_location segment_index=0 shard_index=\([0-9][0-9]*\) node_id=\([0-9][0-9]*\)$/\1:\2/p' \
+                <<<"$inspection_output")
+            ((${#shard_location_rows[@]} == ec_total_shards)) ||
+                die "payload diagnostic did not contain every segment-0 shard location"
+            shard_nodes=()
+            for row in "${shard_location_rows[@]}"; do
+                shard_index="${row%%:*}"
+                node_id="${row#*:}"
+                [[ "$shard_index" == "${#shard_nodes[@]}" ]] ||
+                    die "payload diagnostic segment-0 shard locations are not canonical and complete"
+                shard_nodes+=("$node_id")
+            done
+            benchmark_segment_zero_shard_nodes_csv="$(
+                IFS=,
+                printf '%s' "${shard_nodes[*]}"
+            )"
+            printf '%s\n' "$inspection_output"
+            return 0
+        fi
+        ((status == 3)) ||
+            die "payload placement inspection failed while probing data PG $data_pg: $inspection_output"
+    done
+    die "could not resolve benchmark payload data PG"
+}
+
+run_multihost_payload_read_benchmark() {
+    local setup_output="$metrics_dir/payload-read-setup.log"
+    local healthy_output="$metrics_dir/payload-read-healthy.log"
+    local systematic_output="$metrics_dir/payload-read-missing-systematic.log"
+    local bucket key metadata_pg metadata_primary systematic_node systematic_index candidate_index
+    local range_start
+    local -a acting_set=() segment_zero_shard_nodes=()
+
+    echo "== create multihost payload-read benchmark object =="
+    run_payload_read_benchmark_client setup "$setup_output" "" "" "" 1
+    bucket="$(payload_benchmark_output_field "$setup_output" benchmark_bucket)"
+    key="$(payload_benchmark_output_field "$setup_output" benchmark_key)"
+    metadata_pg="$(payload_benchmark_output_field "$setup_output" benchmark_metadata_pg)"
+    benchmark_data_pg=""
+    benchmark_metadata_primary=""
+    benchmark_data_acting_set_csv=""
+    benchmark_segment_zero_shard_nodes_csv=""
+    inspect_payload_benchmark_object "$bucket" "$key" "$metadata_pg"
+
+    IFS=, read -r -a acting_set <<<"$benchmark_data_acting_set_csv"
+    ((${#acting_set[@]} == ec_total_shards)) ||
+        die "payload diagnostic acting set does not match EC width"
+    IFS=, read -r -a segment_zero_shard_nodes <<<"$benchmark_segment_zero_shard_nodes_csv"
+    ((${#segment_zero_shard_nodes[@]} == ec_total_shards)) ||
+        die "payload diagnostic shard placement does not match EC width"
+    metadata_primary="$benchmark_metadata_primary"
+    systematic_index=-1
+    systematic_node=""
+    for ((candidate_index = 0; candidate_index < ec_data_shards; candidate_index++)); do
+        if [[ "${segment_zero_shard_nodes[$candidate_index]}" != "$metadata_primary" ]]; then
+            systematic_index="$candidate_index"
+            systematic_node="${segment_zero_shard_nodes[$candidate_index]}"
+            break
+        fi
+    done
+    ((systematic_index >= 0)) ||
+        die "could not select a systematic shard independently of the metadata primary"
+    # Select the middle of this systematic shard's plaintext span in the first
+    # full segment. Staying away from both EC boundaries makes the selection
+    # robust to the per-record Cobblestone authentication overhead, and using
+    # segment zero avoids assuming that the final segment is full sized.
+    range_start=$((8 * 1024 * 1024 * (2 * systematic_index + 1) / (2 * ec_data_shards)))
+
+    echo "== run healthy multihost payload-read benchmark =="
+    run_payload_read_benchmark_client healthy "$healthy_output" "$bucket" "$key" "$range_start"
+
+    echo "== run multihost payload-read benchmark with systematic shard unavailable =="
+    stop_storage "$systematic_node"
+    run_payload_read_benchmark_client missing-systematic "$systematic_output" \
+        "$bucket" "$key" "$range_start"
+    start_storage "$systematic_node"
+    wait_storage_listener "$systematic_node"
+
+    assert_all_service_units_active
+    echo "payload_read_multihost_benchmark_complete profile=$payload_read_benchmark_profile ec=$ec_data_shards+$ec_parity_shards data_pg=$benchmark_data_pg systematic_index=$systematic_index systematic_node=$systematic_node metadata_primary=$metadata_primary range_start=$range_start"
 }
 
 capture_cluster_diagnostics() {
@@ -2347,6 +2657,10 @@ if ((start_cluster)); then
     echo "cluster_lifecycle_file=$lifecycle_file"
     echo "cluster_lifecycle_record=$lifecycle_record"
     leave_cluster_running=1
+    exit 0
+fi
+if [[ -n "$payload_read_benchmark_profile" ]]; then
+    run_multihost_payload_read_benchmark
     exit 0
 fi
 

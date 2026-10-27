@@ -824,10 +824,26 @@ impl LivePgMetadataTransferAdmin {
             })?;
         let cluster = self.build_cluster(&runtime_map)?;
         Ok(
-            cluster.object_payload_placement_diagnostic_for_expected_pgs(
+            cluster.object_payload_placement_diagnostic_for_expected_pgs_with_data_route_resolver(
                 &bucket,
                 &key,
                 Some((metadata_pg_id.get(), data_pg_id)),
+                |pg_id, cluster_epoch| {
+                    let runtime_map = self
+                        .control_plane
+                        .serving_pg_runtime_map_snapshot(pg_id, crate::clock::current_time_millis())
+                        .map_err(|error| {
+                            format!(
+                                "failed to obtain serving payload placement map: {}",
+                                error.retained_diagnostic_message()
+                            )
+                        })?;
+                    self.build_cluster(&runtime_map)?
+                        .object_payload_placement_diagnostic_data_route_at_epoch(
+                            pg_id,
+                            cluster_epoch,
+                        )
+                },
             ),
         )
     }

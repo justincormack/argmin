@@ -1512,6 +1512,14 @@ impl SegmentPayloadCodec {
         self as u8
     }
 
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SegmentAes256GcmV1 => "segment-aes-256-gcm-v1",
+            Self::Cobblestone256SegmentV1 => "cobblestone-256-segment-v1",
+        }
+    }
+
     /// Return the canonical stored length for one logical segment.
     #[must_use]
     pub fn stored_size(self, logical_size: u64) -> Option<u64> {
@@ -6707,6 +6715,12 @@ impl ObjectReadSnapshot {
         let mut diagnostic = String::new();
         writeln!(diagnostic, "generation_id={}", live.generation_id.get())
             .expect("writing to a String cannot fail");
+        writeln!(
+            diagnostic,
+            "payload_codec={}",
+            live.encryption.payload_codec().as_str()
+        )
+        .expect("writing to a String cannot fail");
         writeln!(diagnostic, "segment_count={}", self.object_segments.len())
             .expect("writing to a String cannot fail");
         for segment in &self.object_segments {
@@ -10072,6 +10086,7 @@ mod tests {
             snapshot.payload_placement_diagnostic().unwrap(),
             concat!(
                 "generation_id=29\n",
+                "payload_codec=segment-aes-256-gcm-v1\n",
                 "segment_count=1\n",
                 "segment_index=3 data_pg_id=31 placement_cluster_epoch=37\n",
             )

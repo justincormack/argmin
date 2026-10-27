@@ -109,15 +109,64 @@ the current whole-segment AES-GCM codec and future encrypted codecs under the
 same SSE-S3 or SSE-C key mode; former tag-0 bytes are immutable rejection
 evidence, not a supported performance profile.
 
-Reference runs require a clean worktree, making the printed source revision a
+Reference runs require a clean worktree and runner-built current-source release
+server and benchmark-client binaries, making the printed source revision a
 complete identifier for the measured source. The runner refuses a dirty tree
-by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, but
-marks them `reference_run=false`; their results must not be recorded as a
-reference baseline. The output records the CPU architecture and model, selected
+by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, and
+debug or unverified prebuilt binary paths remain usable, but either condition
+marks the result `reference_run=false`; those results must not be recorded as a
+reference baseline. The output records binary provenance and digests, the CPU architecture and model, selected
 CRC64, SHA-256, and EC runtime backends, compile-time crypto provider, explicit
 local EC shape, and the authoritatively observed durable payload profile. The
 selection seam is benchmark-only; ordinary test-server and production
 constructors retain the production writer default.
+
+### Multihost and degraded payload reads
+
+Use the dedicated multihost mode to compare healthy and degraded reads over the production
+TLS/TCP storage path. Run each profile from the same clean revision and host set:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2 \
+  --addresses 192.168.1.124,192.168.1.155,192.168.1.116 \
+  --release \
+  --pg-count 16 \
+  --ec-data-shards 2 \
+  --ec-parity-shards 1 \
+  --payload-read-benchmark segment-aes-256-gcm-v1
+
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2 \
+  --addresses 192.168.1.124,192.168.1.155,192.168.1.116 \
+  --release \
+  --pg-count 16 \
+  --ec-data-shards 2 \
+  --ec-parity-shards 1 \
+  --payload-read-benchmark cobblestone-256-segment-v1
+```
+
+This mode builds the server with the benchmark-only immutable writer selector; ordinary builds
+remain pinned to the production default. It creates one object, then uses a storage-owned
+diagnostic to verify the durable codec and resolve the exact metadata and data placement routes,
+including the storage-computed shard-index-to-node mapping. The degraded case stops a systematic
+shard's exact storage node, rather than treating acting-set order as shard order, and requires that
+node not to be the object's metadata primary. Metadata service therefore remains available and the
+same object and byte range exercise the data reconstruction path. The selected 4 KiB range lies in
+the middle of that systematic shard's plaintext span in the first full segment. The runner restarts
+the stopped node and requires every service to recover before succeeding.
+
+The workload can be reduced for exploratory validation with
+`PAYLOAD_READ_BENCHMARK_OBJECT_MIB`, `PAYLOAD_READ_BENCHMARK_WARMUP_ITERS`,
+`PAYLOAD_READ_BENCHMARK_FULL_ITERS`, `PAYLOAD_READ_BENCHMARK_RANGE_ITERS`, and
+`PAYLOAD_READ_BENCHMARK_SAMPLES`. Reference runs require a clean worktree; setting
+`ALLOW_DIRTY_BENCHMARK=1` permits a run but records `reference_run=false`. Supplying an arbitrary
+prebuilt or non-release binary also forces that value to false. The output includes the source
+revision, build provenance, binary digests, Rust/kernel/CPU identity, selected codec, exact
+placement, and the healthy and degraded client measurements. External multihost clients report
+`work_metrics_available=false`: the `payload_read_*` counters are process-local and cannot be
+truthfully inferred from one distributed process. The clean local matrix owns exact work-counter
+comparisons; this matrix owns network-visible throughput, latency, TTFB, and degraded-read cost.
 
 ### Clean local payload-codec comparison
 

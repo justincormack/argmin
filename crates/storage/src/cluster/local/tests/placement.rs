@@ -50,16 +50,105 @@ fn object_payload_placement_diagnostic_distinguishes_mismatch_from_unavailabilit
     let metadata_pg = cluster.test_object_pg_id_for(&bucket, &key);
     let data_pg = committed.written.data_pg_id;
 
+    let diagnostic = cluster.object_payload_placement_diagnostic_for_expected_pgs(
+        &bucket,
+        &key,
+        Some((metadata_pg, data_pg)),
+    );
     assert_eq!(
-        cluster
-            .object_payload_placement_diagnostic_for_expected_pgs(
-                &bucket,
-                &key,
-                Some((metadata_pg, data_pg)),
-            )
-            .outcome(),
+        diagnostic.outcome(),
         crate::ObjectPayloadPlacementDiagnosticOutcome::Success
     );
+    let text = diagnostic.into_text();
+    assert!(
+        text.contains(&format!(
+            "metadata_pg_route pg_id={metadata_pg} cluster_epoch="
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("data_pg_route pg_id={data_pg} cluster_epoch=")),
+        "{text}"
+    );
+    assert!(text.contains(" acting_set=0,1,2\n"), "{text}");
+
+    let mut resolved_data_route = None;
+    let diagnostic = cluster
+        .object_payload_placement_diagnostic_for_expected_pgs_with_data_route_resolver(
+            &bucket,
+            &key,
+            Some((metadata_pg, data_pg)),
+            |pg_id, cluster_epoch| {
+                resolved_data_route = Some((pg_id.get(), cluster_epoch));
+                cluster
+                    .object_payload_placement_diagnostic_data_route_at_epoch(pg_id, cluster_epoch)
+            },
+        );
+    assert_eq!(
+        diagnostic.outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Success
+    );
+    assert_eq!(
+        resolved_data_route,
+        Some((data_pg, cluster.operation_epoch()))
+    );
+
+    let unsorted_acting_set = vec![NodeId::new(2), NodeId::new(0), NodeId::new(1)];
+    let unsorted_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        cluster.operation_epoch(),
+        PgId::new(data_pg),
+        NodeId::new(2),
+        unsorted_acting_set.clone(),
+        crate::PgState::Active,
+    );
+    let placement_key = crate::cluster::segment_payload_placement_key(
+        &committed.segment_okh,
+        committed.generation_id,
+    );
+    let exact_locations = cluster
+        .place_payload_shards_for_pg_route_snapshot(
+            &unsorted_route,
+            DataPgId::new_for_test(PgId::new(data_pg)),
+            committed.written.ec,
+            &placement_key,
+        )
+        .unwrap();
+    assert_ne!(
+        exact_locations
+            .iter()
+            .map(ShardLocation::node_id)
+            .collect::<Vec<_>>(),
+        unsorted_acting_set,
+        "fixture must distinguish acting-set order from shard-index placement"
+    );
+    let diagnostic = cluster
+        .object_payload_placement_diagnostic_for_expected_pgs_with_data_route_resolver(
+            &bucket,
+            &key,
+            Some((metadata_pg, data_pg)),
+            |pg_id, cluster_epoch| {
+                assert_eq!(pg_id, unsorted_route.pg_id());
+                assert_eq!(cluster_epoch, unsorted_route.cluster_epoch());
+                cluster.object_payload_placement_diagnostic_data_route(unsorted_route.clone())
+            },
+        );
+    assert_eq!(
+        diagnostic.outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Success
+    );
+    let text = diagnostic.into_text();
+    assert!(text.contains(" acting_set=2,0,1\n"), "{text}");
+    for location in exact_locations {
+        assert!(
+            text.contains(&format!(
+                "segment_shard_location segment_index=0 shard_index={} node_id={}\n",
+                location.shard_index().get(),
+                location.node_id().as_u32()
+            )),
+            "{text}"
+        );
+    }
+
     assert_eq!(
         cluster
             .object_payload_placement_diagnostic_for_expected_pgs(
