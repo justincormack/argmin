@@ -8,15 +8,13 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 use observability::MetricsSnapshot;
 use s3_tests::server::{
-    PayloadReadBenchmarkEcShape, PayloadReadBenchmarkProfile, TEST_ACCESS_KEY, TEST_REGION,
-    TEST_SECRET_KEY,
+    PayloadReadBenchmarkEcShape, TEST_ACCESS_KEY, TEST_REGION, TEST_SECRET_KEY,
 };
 
 const MIB: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct Config {
-    payload_profile: PayloadReadBenchmarkProfile,
     ec_shape: PayloadReadBenchmarkEcShape,
     endpoint: Option<String>,
     pg_count: Option<u32>,
@@ -35,7 +33,6 @@ struct Config {
 
 impl Config {
     fn parse() -> Result<Self, String> {
-        let mut payload_profile = None;
         let mut ec_shape = None;
         let mut endpoint = None;
         let mut pg_count = None;
@@ -53,21 +50,6 @@ impl Config {
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--payload-profile" => {
-                    let value = args.next().ok_or("missing value for --payload-profile")?;
-                    payload_profile = Some(match value.as_str() {
-                        "segment-aes-256-gcm-v1" => PayloadReadBenchmarkProfile::SegmentAes256GcmV1,
-                        "cobblestone-256-segment-v1" => {
-                            PayloadReadBenchmarkProfile::Cobblestone256SegmentV1
-                        }
-                        _ => {
-                            return Err(format!(
-                                "invalid --payload-profile value: {value}\n{}",
-                                Self::usage()
-                            ));
-                        }
-                    });
-                }
                 "--ec-shape" => {
                     let value = args.next().ok_or("missing value for --ec-shape")?;
                     ec_shape = Some(match value.as_str() {
@@ -127,8 +109,6 @@ impl Config {
             }
         }
 
-        let payload_profile = payload_profile
-            .ok_or_else(|| format!("--payload-profile is required\n{}", Self::usage()))?;
         let ec_shape =
             ec_shape.ok_or_else(|| format!("--ec-shape is required\n{}", Self::usage()))?;
         if object_size <= 8 * MIB {
@@ -156,7 +136,6 @@ impl Config {
             return Err("--existing-bucket is valid only with --endpoint".into());
         }
         Ok(Self {
-            payload_profile,
             ec_shape,
             endpoint,
             pg_count,
@@ -175,9 +154,8 @@ impl Config {
     }
 
     fn usage() -> String {
-        "usage: payload_read_bench --payload-profile \
-         <segment-aes-256-gcm-v1|cobblestone-256-segment-v1> \
-         --ec-shape <1+0|2+1|3+1|4+2> [--endpoint URL --pg-count N] [--keep-object] \
+        "usage: payload_read_bench --ec-shape <1+0|2+1|3+1|4+2> \
+         [--endpoint URL --pg-count N] [--keep-object] \
          [--existing-bucket NAME --existing-key KEY] \
          [--setup-only] [--object-mib N] [--range-bytes N] [--range-start N] \
          [--warmup-iters N] [--full-iters N] [--range-iters N] [--samples N]"
@@ -526,13 +504,7 @@ async fn put_benchmark_object(client: &Client, bucket: &str, key: &str, payload:
 async fn main() -> Result<(), String> {
     let config = Config::parse()?;
     let server = if config.endpoint.is_none() {
-        Some(
-            s3_tests::TestServer::start_http_for_payload_read_benchmark(
-                config.payload_profile,
-                config.ec_shape,
-            )
-            .await,
-        )
+        Some(s3_tests::TestServer::start_http_for_payload_read_benchmark(config.ec_shape).await)
     } else {
         None
     };
@@ -593,10 +565,12 @@ async fn main() -> Result<(), String> {
                 .map_err(|error| format!("observe durable benchmark payload profile: {error}"))
         })
         .transpose()?;
-    if persisted_profile.is_some_and(|profile| profile != config.payload_profile) {
+    if persisted_profile
+        .is_some_and(|profile| profile != storage::SegmentPayloadCodec::Cobblestone256SegmentV1)
+    {
         return Err(format!(
-            "benchmark requested payload profile {} but durable object recorded {}",
-            config.payload_profile.as_str(),
+            "benchmark expected payload profile {} but durable object recorded {}",
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1.as_str(),
             persisted_profile.expect("checked present").as_str()
         ));
     }
@@ -636,13 +610,13 @@ async fn main() -> Result<(), String> {
     println!("endpoint={endpoint}");
     println!("ec_shape={}", config.ec_shape.as_str());
     println!(
-        "requested_payload_profile={}",
-        config.payload_profile.as_str()
+        "payload_profile={}",
+        storage::SegmentPayloadCodec::Cobblestone256SegmentV1.as_str()
     );
     println!(
         "persisted_payload_profile={}",
         persisted_profile
-            .map(PayloadReadBenchmarkProfile::as_str)
+            .map(storage::SegmentPayloadCodec::as_str)
             .unwrap_or("external-verification-required")
     );
     println!(

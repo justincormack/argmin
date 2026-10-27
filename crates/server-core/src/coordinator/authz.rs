@@ -74,7 +74,7 @@ use super::{
     should_probe_multipart_complete_auth_lookup,
 };
 use crate::error::ServerError;
-use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};
+use crate::sse::SseCustomerRequest;
 
 #[derive(Clone, Copy)]
 enum MissingObjectDiscovery {

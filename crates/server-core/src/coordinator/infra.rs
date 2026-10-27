@@ -418,52 +418,23 @@ impl Coordinator {
         managed_key_provider: StaticManagedKeyProvider,
         background_worker_mode: BackgroundWorkerMode,
     ) -> Result<Self, ServerError> {
-        Self::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_and_payload_codec_inner(
+        Self::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_inner(
             storage_cluster,
             maintenance_storage_cluster,
             region,
             sse_c_validator,
             managed_key_provider,
             background_worker_mode,
-            storage::SegmentPayloadCodec::SegmentAes256GcmV1,
         )
     }
 
-    /// Create a coordinator with one immutable codec choice for newly written
-    /// payloads.
-    ///
-    /// Existing objects remain self-describing and are always read with their
-    /// persisted codec. Deployment composition must select this value before
-    /// the coordinator is shared so a request cannot race writer selection.
-    #[cfg(feature = "payload-codec-benchmark")]
-    pub fn new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_and_payload_codec(
+    fn new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_inner(
         storage_cluster: StorageClusterRouteHandle,
         maintenance_storage_cluster: StorageClusterRouteHandle,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: StaticManagedKeyProvider,
         background_worker_mode: BackgroundWorkerMode,
-        new_payload_codec: storage::SegmentPayloadCodec,
-    ) -> Result<Self, ServerError> {
-        Self::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_and_payload_codec_inner(
-            storage_cluster,
-            maintenance_storage_cluster,
-            region,
-            sse_c_validator,
-            managed_key_provider,
-            background_worker_mode,
-            new_payload_codec,
-        )
-    }
-
-    fn new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode_and_payload_codec_inner(
-        storage_cluster: StorageClusterRouteHandle,
-        maintenance_storage_cluster: StorageClusterRouteHandle,
-        region: String,
-        sse_c_validator: Option<SseCustomerValidatorConfig>,
-        managed_key_provider: StaticManagedKeyProvider,
-        background_worker_mode: BackgroundWorkerMode,
-        new_payload_codec: storage::SegmentPayloadCodec,
     ) -> Result<Self, ServerError> {
         let storage_context =
             CoordinatorStorageContext::new(storage_cluster, maintenance_storage_cluster);
@@ -509,7 +480,6 @@ impl Coordinator {
             region,
             sse_c_validator,
             Some(managed_key_provider),
-            new_payload_codec,
             (
                 background_worker_mode.object_reclaim_and_bucket_finalize,
                 background_worker_mode.pending_metadata_command_recovery,
@@ -633,7 +603,6 @@ impl Coordinator {
             region,
             sse_c_validator,
             managed_key_provider,
-            storage::SegmentPayloadCodec::SegmentAes256GcmV1,
             background_sweepers,
         )
     }
@@ -644,7 +613,6 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
-        new_payload_codec: storage::SegmentPayloadCodec,
         background_sweepers: (bool, bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
@@ -710,7 +678,6 @@ impl Coordinator {
             region,
             sse_c_validator,
             managed_key_provider,
-            new_payload_codec,
             _reclaim_sweeper: reclaim_sweeper,
             _shard_scavenger_sweeper: shard_scavenger_sweeper,
             _shard_repair_sweeper: shard_repair_sweeper,

@@ -2626,6 +2626,7 @@ fn already_recorded_direct_put_fanout_cleans_terminal_stream_uploads() {
             PgId::new(object_pg),
             &primary_pg,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )

@@ -434,7 +434,7 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
 }
 
 #[test]
-fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
+fn healthy_get_object_streaming_does_not_use_reconstruction_buffer_pool() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
     coord
@@ -480,15 +480,15 @@ fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
         })
         .unwrap();
     assert_eq!(first.body.read_all().unwrap(), data);
-    assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
+    assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
     let metrics_after_first = observability::metrics_snapshot();
     assert_eq!(
         metrics_after_first.payload_read_buffer_checkouts_total,
-        metrics_before.payload_read_buffer_checkouts_total + 1
+        metrics_before.payload_read_buffer_checkouts_total
     );
     assert_eq!(
         metrics_after_first.payload_read_buffer_allocations_total,
-        metrics_before.payload_read_buffer_allocations_total + 1
+        metrics_before.payload_read_buffer_allocations_total
     );
 
     let second = coord
@@ -505,11 +505,11 @@ fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
         })
         .unwrap();
     assert_eq!(second.body.read_all().unwrap(), data);
-    assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
+    assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
     let metrics_after_second = observability::metrics_snapshot();
     assert_eq!(
         metrics_after_second.payload_read_buffer_checkouts_total,
-        metrics_after_first.payload_read_buffer_checkouts_total + 1
+        metrics_after_first.payload_read_buffer_checkouts_total
     );
     assert_eq!(
         metrics_after_second.payload_read_buffer_allocations_total,

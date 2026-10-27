@@ -3474,20 +3474,27 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
     let key = crate::tests::object_key("object-read-rpc-key");
     let generation_id = GenerationId::new(9).unwrap();
     let segment_vid = GenerationId::new(10).unwrap();
+    let encryption = committed_metadata_only_test_encryption(1, &bucket, &key, generation_id);
+    let ec = EcShape { k: 4, m: 2 };
+    let (segment_crc64, shard_integrity) =
+        crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+            ec,
+            encryption.segment_stored_size(12).unwrap(),
+        );
     let segment = ObjectSegmentRecord {
-        shard_integrity: None,
+        shard_integrity: Some(shard_integrity),
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: VersionId::Null,
         segment_index: 0,
         size: 12,
-        segment_crc64: 99,
+        segment_crc64,
         segment_okh: [3; 16],
         segment_vid,
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: ec.k,
+        ec_m: ec.m,
     };
     {
         let node = SharedStorageNode::open_with_default_ec_shape(
@@ -3519,7 +3526,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
                 generation_id,
                 size: 12,
                 etag: ObjectEtag::single_part(99),
-                ec: EcShape { k: 4, m: 2 },
+                ec,
                 layout: ObjectLayout::Standard,
                 tags: Some(SerializedTagSet::new(
                     "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"
@@ -3528,12 +3535,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: committed_metadata_only_test_encryption(
-                    1,
-                    &bucket,
-                    &key,
-                    generation_id,
-                ),
+                encryption,
             },
             std::slice::from_ref(&segment),
         )
@@ -5412,6 +5414,13 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         lease_deadline: 200,
         target_context: Some(key.as_str().to_string()),
     };
+    let encryption = metadata_only_test_encryption();
+    let ec = EcShape { k: 4, m: 2 };
+    let (segment_crc64, shard_integrity) =
+        crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+            ec,
+            encryption.segment_stored_size(12).unwrap(),
+        );
     let request = CommitDirectPutObjectReq {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -5426,14 +5435,14 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         generation_id: reserved_generation,
         size: 12,
         etag_crc64: 99,
-        ec: EcShape { k: 4, m: 2 },
+        ec,
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: metadata_only_test_encryption(),
+        encryption,
         segment_index: 0,
-        segment_crc64: 99,
+        segment_crc64,
         segment_okh: [7; 16],
         segment_vid: GenerationId::new(10).unwrap(),
         data_pg_id: 0,
@@ -5454,7 +5463,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     let command = route
         .build_direct_put_commit_command_until(
             BuildDirectPutCommitCommandReq {
-                shard_integrity: None,
+                shard_integrity: Some(&shard_integrity),
                 request: &request,
                 version_id: VersionId::Null,
                 expected_snapshot: &snapshot,
@@ -5475,7 +5484,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     crossed_request.key = crate::tests::object_key("direct-put-crossed-route-key");
     let crossed_error = route
         .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
-            shard_integrity: None,
+            shard_integrity: Some(&shard_integrity),
             request: &crossed_request,
             version_id: VersionId::Null,
             expected_snapshot: &snapshot,

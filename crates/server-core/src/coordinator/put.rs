@@ -643,7 +643,6 @@ impl Coordinator {
         let write_encryption = self.resume_write_encryption(
             segment_authorization.encryption(),
             req.sse_customer,
-            crate::sse::SseCustomerSegmentScope::object(),
             false,
         )?;
         let payload_crc64 = checksum::crc64::checksum(req.data);
@@ -826,12 +825,8 @@ impl Coordinator {
         let finalization = route
             .authorize_stream_finalization(req.session_id)
             .map_err(Self::map_stream_upload_failure)?;
-        let write_encryption = self.resume_write_encryption(
-            finalization.encryption(),
-            req.sse_customer,
-            crate::sse::SseCustomerSegmentScope::object(),
-            false,
-        )?;
+        let write_encryption =
+            self.resume_write_encryption(finalization.encryption(), req.sse_customer, false)?;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
         route
             .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {

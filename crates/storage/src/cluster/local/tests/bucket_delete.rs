@@ -3290,6 +3290,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
                 pg_id,
                 &pg,
                 &commit_req,
+                &written.written_shards,
                 crate::VersionId::Null,
                 commit_req.bucket_write_reservation.clone(),
             )

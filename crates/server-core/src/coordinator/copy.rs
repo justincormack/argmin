@@ -740,7 +740,6 @@ impl Coordinator {
                     write_encryption = Some(
                         self.load_stream_part_write_encryption_on_admitted_multipart_route(
                             &authorization,
-                            part_number,
                             req.sse_customer,
                         )?,
                     );

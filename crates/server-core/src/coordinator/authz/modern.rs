@@ -276,7 +276,6 @@ impl Coordinator {
         let sse_customer = self.prepare_existing_sse_customer_write_context(
             dst_upload.encryption(),
             req.sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
         let checksum_algorithm = dst_upload
@@ -339,7 +338,6 @@ impl Coordinator {
         let sse_customer = self.prepare_existing_sse_customer_write_context(
             upload.encryption(),
             req.sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
         let checksum_algorithm = upload.checksum_config().map(|config| config.algorithm());
@@ -473,12 +471,8 @@ impl Coordinator {
             &bucket_info,
             upload.encryption().uses_sse_customer_headers(),
         )?;
-        let multipart_write_encryption = self.resume_write_encryption(
-            upload.encryption(),
-            req.sse_customer,
-            SseCustomerSegmentScope::object(),
-            false,
-        )?;
+        let multipart_write_encryption =
+            self.resume_write_encryption(upload.encryption(), req.sse_customer, false)?;
 
         let (upload, completion_context) = multipart_route
             .authorize_multipart_upload_completion(

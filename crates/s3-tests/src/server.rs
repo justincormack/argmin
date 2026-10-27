@@ -77,44 +77,6 @@ enum TestServerTransport {
     Https,
 }
 
-/// Internal payload profiles supported by the end-to-end payload-read
-/// benchmark.
-///
-/// This benchmark-owned selector is intentionally narrower than the general
-/// storage test-support surface. Ordinary S3 conformance tests continue to
-/// start the server with the production writer default.
-#[cfg(feature = "payload-read-bench")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PayloadReadBenchmarkProfile {
-    SegmentAes256GcmV1,
-    Cobblestone256SegmentV1,
-}
-
-#[cfg(feature = "payload-read-bench")]
-impl PayloadReadBenchmarkProfile {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SegmentAes256GcmV1 => "segment-aes-256-gcm-v1",
-            Self::Cobblestone256SegmentV1 => "cobblestone-256-segment-v1",
-        }
-    }
-
-    const fn storage_codec(self) -> storage::SegmentPayloadCodec {
-        match self {
-            Self::SegmentAes256GcmV1 => storage::SegmentPayloadCodec::SegmentAes256GcmV1,
-            Self::Cobblestone256SegmentV1 => storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-        }
-    }
-
-    fn from_storage_codec(codec: storage::SegmentPayloadCodec) -> Self {
-        match codec {
-            storage::SegmentPayloadCodec::SegmentAes256GcmV1 => Self::SegmentAes256GcmV1,
-            storage::SegmentPayloadCodec::Cobblestone256SegmentV1 => Self::Cobblestone256SegmentV1,
-        }
-    }
-}
-
 /// Local EC layouts supported by the end-to-end payload-read benchmark.
 #[cfg(feature = "payload-read-bench")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,8 +112,6 @@ impl PayloadReadBenchmarkEcShape {
 #[derive(Clone, Copy)]
 struct TestServerStorageConfig {
     ec_shape: storage::EcShape,
-    #[cfg(feature = "payload-read-bench")]
-    new_payload_codec: Option<storage::SegmentPayloadCodec>,
 }
 
 impl Default for TestServerStorageConfig {
@@ -162,27 +122,10 @@ impl Default for TestServerStorageConfig {
                 k: ec_config.data_shards(),
                 m: ec_config.parity_shards(),
             },
-            #[cfg(feature = "payload-read-bench")]
-            new_payload_codec: None,
         }
     }
 }
 
-#[cfg(feature = "payload-read-bench")]
-fn configure_test_server_coordinator(
-    mut coordinator: server_core::coordinator::Coordinator,
-    storage_config: TestServerStorageConfig,
-) -> server_core::coordinator::Coordinator {
-    if let Some(payload_codec) = storage_config.new_payload_codec {
-        server_core::coordinator::test_helpers::select_new_payload_codec(
-            &mut coordinator,
-            payload_codec,
-        );
-    }
-    coordinator
-}
-
-#[cfg(not(feature = "payload-read-bench"))]
 fn configure_test_server_coordinator(
     coordinator: server_core::coordinator::Coordinator,
     _storage_config: TestServerStorageConfig,
@@ -279,15 +222,9 @@ impl TestServer {
         .await
     }
 
-    /// Start the local HTTP benchmark server with one explicit internal
-    /// writer profile and EC layout.
-    ///
-    /// All pooled frontends receive the selection before being shared, so no
-    /// request can race a process-local profile change. The production server
-    /// constructors remain pinned to their ordinary writer default.
+    /// Start the local HTTP benchmark server with an explicit EC layout.
     #[cfg(feature = "payload-read-bench")]
     pub async fn start_http_for_payload_read_benchmark(
-        profile: PayloadReadBenchmarkProfile,
         ec_shape: PayloadReadBenchmarkEcShape,
     ) -> Self {
         Self::start_with_transport_and_storage_config(
@@ -295,7 +232,6 @@ impl TestServer {
             TEST_REGION,
             TestServerStorageConfig {
                 ec_shape: ec_shape.storage_shape(),
-                new_payload_codec: Some(profile.storage_codec()),
             },
         )
         .await
@@ -604,13 +540,12 @@ impl TestServer {
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<PayloadReadBenchmarkProfile, String> {
+    ) -> Result<storage::SegmentPayloadCodec, String> {
         server_core::coordinator::test_helpers::observe_current_object_payload_codec(
             &self.control_coordinator,
             bucket,
             key,
         )
-        .map(PayloadReadBenchmarkProfile::from_storage_codec)
         .map_err(|error| error.to_string())
     }
 

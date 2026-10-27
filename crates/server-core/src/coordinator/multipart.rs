@@ -322,7 +322,6 @@ impl Coordinator {
             .map_err(|error| Self::map_upload_part_stream_error(req.upload_id, error))?;
         let write_encryption = self.load_stream_part_write_encryption_on_admitted_multipart_route(
             &authorization,
-            req.part_number,
             req.sse_customer,
         )?;
         let payload_crc64 = checksum::crc64::checksum(req.data);

@@ -329,7 +329,7 @@ fn multipart_upload_lifecycle() {
         (1, part1_fixture, [0x11; 16], GenerationId::MIN),
         (2, part2_fixture, [0x22; 16], GenerationId::new(2).unwrap()),
     ] {
-        let segment = MultipartPartSegmentRecord {
+        let mut segment = MultipartPartSegmentRecord {
             shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
@@ -366,6 +366,23 @@ fn multipart_upload_lifecycle() {
             )
             .unwrap();
         assert_eq!(written.len(), usize::from(ec.k + ec.m));
+        let shard_batch = written
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        segment.shard_integrity = Some(
+            crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+                segment.data_pg_id,
+                ec,
+                &segment.segment_okh,
+                segment.segment_vid,
+                fixture.storage_bytes.len() as u64,
+                segment.segment_crc64,
+                &shard_batch,
+            )
+            .unwrap()
+            .durable_record(),
+        );
         cluster
             .test_register_payload_shard_acks(0, &written)
             .unwrap();

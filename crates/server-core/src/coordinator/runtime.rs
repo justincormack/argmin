@@ -11,8 +11,8 @@ use s3_types::BucketLifecycleConfiguration;
 use storage::{
     BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey,
     ObjectPayloadFullSegmentRead, ObjectPayloadRangeReadOutcome, ProcessLocalRegistryKey,
-    SegmentPayloadCodec, StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission,
-    UploadId, UploadState, VersionId,
+    StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -29,7 +29,6 @@ use crate::sse::{
     prepare_authorized_managed_encryption_segment_stream,
     prepare_authorized_sse_customer_segment_range, prepare_authorized_sse_customer_segment_stream,
     AuthorizedCobblestoneSegmentStreamRead, AuthorizedSegmentRead, SseCustomerRequest,
-    SseCustomerSegmentScope,
 };
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
@@ -1087,12 +1086,7 @@ impl ReadRuntime {
             stored_bytes: u64::try_from(buf.len()).unwrap_or(u64::MAX),
             ..observability::PayloadReadMetricDelta::default()
         });
-        self.decrypt_segment_if_needed_in_place(
-            segment,
-            part_number,
-            sse_customer_request,
-            &mut buf,
-        )?;
+        self.decrypt_segment_in_place(segment, part_number, sse_customer_request, &mut buf)?;
         Ok(buf.into_shared())
     }
 
@@ -1102,7 +1096,7 @@ impl ReadRuntime {
     pub(super) fn begin_checked_segment_payload_stream(
         &self,
         segment: &SegmentPayloadRecord,
-        part_number: Option<u32>,
+        _part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<
         (
@@ -1111,11 +1105,6 @@ impl ReadRuntime {
         ),
         ServerError,
     > {
-        if segment.encryption.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1 {
-            return Err(ServerError::InternalError {
-                reason: "incremental payload stream requires the Cobblestone profile".to_string(),
-            });
-        }
         let encryption_subject = segment
             .storage_segment
             .encryption_subject()
@@ -1123,12 +1112,8 @@ impl ReadRuntime {
                 reason: "payload segment is missing its storage-minted encryption subject"
                     .to_string(),
             })?;
-        let segment_scope = part_number.map_or(Ok(SseCustomerSegmentScope::object()), |part| {
-            SseCustomerSegmentScope::multipart_part(part)
-        })?;
         let authorized = AuthorizedSegmentRead::new(
             encryption_subject,
-            segment_scope,
             segment.segment_index(),
             segment.size() as usize,
         );
@@ -1192,10 +1177,6 @@ impl ReadRuntime {
             self.read_checked_segment_payload(segment, part_number, sse_customer_request)
                 .map(|payload| (payload, plaintext_range.start, plaintext_range.end))
         };
-        if segment.encryption.payload_codec() != SegmentPayloadCodec::Cobblestone256SegmentV1 {
-            return full_fallback();
-        }
-
         let encryption_subject = segment
             .storage_segment
             .encryption_subject()
@@ -1203,12 +1184,8 @@ impl ReadRuntime {
                 reason: "payload segment is missing its storage-minted encryption subject"
                     .to_string(),
             })?;
-        let segment_scope = part_number.map_or(Ok(SseCustomerSegmentScope::object()), |part| {
-            SseCustomerSegmentScope::multipart_part(part)
-        })?;
         let authorized = AuthorizedSegmentRead::new(
             encryption_subject,
-            segment_scope,
             segment.segment_index(),
             segment.size() as usize,
         );
@@ -1318,10 +1295,10 @@ impl ReadRuntime {
         .map_err(super::map_object_read_failure)
     }
 
-    fn decrypt_segment_if_needed_in_place(
+    fn decrypt_segment_in_place(
         &self,
         segment: &SegmentPayloadRecord,
-        part_number: Option<u32>,
+        _part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
         stored_bytes: &mut Vec<u8>,
     ) -> Result<(), ServerError> {
@@ -1343,17 +1320,12 @@ impl ReadRuntime {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-C validator key is not configured".to_string(),
                         })?;
-                let segment_scope = part_number
-                    .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
-                        SseCustomerSegmentScope::multipart_part(p)
-                    })?;
                 decrypt_authorized_sse_customer_segment_in_place(
                     validator,
                     state,
                     request,
                     AuthorizedSegmentRead::new(
                         encryption_subject,
-                        segment_scope,
                         segment.segment_index(),
                         segment.size() as usize,
                     ),
@@ -1367,16 +1339,11 @@ impl ReadRuntime {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-S3 key provider is not configured".to_string(),
                         })?;
-                let segment_scope = part_number
-                    .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
-                        SseCustomerSegmentScope::multipart_part(p)
-                    })?;
                 decrypt_authorized_managed_encryption_segment_in_place(
                     provider,
                     state,
                     AuthorizedSegmentRead::new(
                         encryption_subject,
-                        segment_scope,
                         segment.segment_index(),
                         segment.size() as usize,
                     ),
@@ -1385,10 +1352,6 @@ impl ReadRuntime {
             }
         };
         result?;
-        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-            decrypted_bytes: u64::try_from(stored_bytes.len()).unwrap_or(u64::MAX),
-            ..observability::PayloadReadMetricDelta::default()
-        });
         Ok(())
     }
 }

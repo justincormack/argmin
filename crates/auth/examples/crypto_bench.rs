@@ -6,7 +6,9 @@ use std::io::{self, Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use argmin_crypto::aead::{Aes256GcmKey, AES_256_GCM_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN};
+use argmin_crypto::cobblestone::{
+    self, Cobblestone256Key, COBBLESTONE_256_INPUT_KEY_LEN, COBBLESTONE_SALT_LEN,
+};
 use auth::{
     authenticate_request, CredentialStore, ExpectedSigningRegion, IdentityProvider, SecretKey,
     SigningService,
@@ -27,10 +29,8 @@ const PATH: &str = "/benchmark/object";
 const QUERY: &str = "partNumber=1&uploadId=crypto-benchmark";
 const HOST: &str = "benchmark.s3.us-east-1.amazonaws.com";
 const BENCHMARK_TLS_ALPN: &[u8] = b"argmin-crypto-bench/1";
-const SSE_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
-const SSE_SEGMENT_NONCE_PREFIX: [u8; 6] = [0x42; 6];
-const SSE_SEGMENT_NONCE_SCOPE: [u8; 2] = [0; 2];
-const SSE_SEGMENT_KEY: [u8; AES_256_GCM_KEY_LEN] = [0x24; AES_256_GCM_KEY_LEN];
+const SSE_SEGMENT_CONTEXT: &[u8] = b"argmin:crypto-bench:cobblestone:v1";
+const SSE_SEGMENT_KEY: [u8; COBBLESTONE_256_INPUT_KEY_LEN] = [0x24; COBBLESTONE_256_INPUT_KEY_LEN];
 
 #[derive(Debug, Clone, Copy)]
 struct Config {
@@ -69,7 +69,7 @@ fn main() -> Result<(), String> {
     println!("tls_crypto_provider={}", tls_provider::provider_name());
     println!("crypto_provider={}", argmin_crypto::provider_name());
     println!("sha256_backend={}", checksum::sha256::backend_name());
-    println!("sse_profile=segment-aes256-gcm");
+    println!("sse_profile=cobblestone-256-segment-v1");
     println!("tls_profile=storage-rpc-tls13");
     println!("block_size_bytes={}", config.block_size);
     println!("sample_iters={}", config.sample_iters);
@@ -237,22 +237,15 @@ fn benchmark_data(size: usize) -> Vec<u8> {
 }
 
 fn sse_encrypt_segment(plaintext: &[u8], segment_index: u32) -> Vec<u8> {
-    // Keep this operation aligned with the SSE-S3/SSE-C segment write path:
-    // construct the AES key for the segment, copy into a new output buffer,
-    // and append the authentication tag in place.
-    let key = Aes256GcmKey::new(&SSE_SEGMENT_KEY).expect("benchmark SSE key must be valid");
-    let mut nonce = [0_u8; AES_GCM_NONCE_LEN];
-    let scope_start = SSE_SEGMENT_NONCE_PREFIX.len();
-    let index_start = scope_start + SSE_SEGMENT_NONCE_SCOPE.len();
-    nonce[..scope_start].copy_from_slice(&SSE_SEGMENT_NONCE_PREFIX);
-    nonce[scope_start..index_start].copy_from_slice(&SSE_SEGMENT_NONCE_SCOPE);
-    nonce[index_start..].copy_from_slice(&segment_index.to_be_bytes());
-
-    let mut ciphertext = plaintext.to_vec();
-    key.seal_in_place_append_tag(nonce, SSE_SEGMENT_AAD, &mut ciphertext)
-        .expect("benchmark SSE encryption must succeed");
-    assert_eq!(ciphertext.len(), plaintext.len() + AES_GCM_TAG_LEN);
-    ciphertext
+    // Measure the same chunked construction used by both production SSE
+    // modes. The benchmark context is deliberately private to this harness;
+    // production supplies its storage-minted logical segment subject.
+    let key = Cobblestone256Key::new(&SSE_SEGMENT_KEY).expect("benchmark SSE key must be valid");
+    let mut salt = [0x42; COBBLESTONE_SALT_LEN];
+    let index_start = salt.len() - size_of::<u32>();
+    salt[index_start..].copy_from_slice(&segment_index.to_be_bytes());
+    cobblestone::seal(&key, salt, SSE_SEGMENT_CONTEXT, plaintext)
+        .expect("benchmark SSE encryption must succeed")
 }
 
 fn signed_request() -> Result<(IdentityProvider, SignedRequest), String> {

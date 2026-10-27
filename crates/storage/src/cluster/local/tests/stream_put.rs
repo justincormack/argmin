@@ -46,6 +46,8 @@ fn stage_encrypted_put_object_stream_segment(
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let segment =
+        stream_segment_with_shard_integrity(segment, encrypted.storage_bytes.len(), &written);
     cluster
         .commit_stream_segment_append(
             bucket,
@@ -952,6 +954,7 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     version_id,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -1122,6 +1125,7 @@ fn stream_put_create_pending_install_race_reruns_authorization_action() {
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -1288,6 +1292,7 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -1497,6 +1502,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -2289,7 +2295,7 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
                 encryption: committed_encryption,
             },
             segments: vec![crate::ObjectSegmentRecord {
-                shard_integrity: None,
+                shard_integrity: segment.shard_integrity.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: crate::VersionId::Null,

@@ -1,7 +1,9 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phases 0 through 4 complete; Phase 5 production writer selection and benchmark
-gate remain)
+Status: Implementation complete; compatibility validation open (the Rust official-client
+late-body-failure canary is pinned; Python/Boto3, Go v2, Java v2, JavaScript v3, and AWS CLI probes
+remain required before archival. Partial EC reconstruction remains an optional, separately
+measured follow-up.)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -11,14 +13,12 @@ to plaintext below mean decrypted logical data, not a supported unencrypted dura
 
 ## Context
 
-Argmin currently encrypts each internal payload segment as one AES-256-GCM record. Newly written
-standard-object and multipart-part payloads use an 8 MiB internal segment size, so a small range
-read can require reading, assembling, and authenticating an entire segment. The storage layer also
-validates complete shard bytes against durable CRC64 acknowledgements before returning the segment.
-The S3 read path still has that whole-segment behavior. The first Phase 3 slice has replaced the
-storage-node range RPC's former read-and-hash-whole-shard implementation with exact leased,
-positioned IO, but no bytes from that partial primitive are exposed to S3 before Phase 4 adds
-profile authentication and fallback.
+Argmin originally encrypted each internal payload segment as one AES-256-GCM record. That format
+made a small range read load, assemble, and authenticate an entire 8 MiB segment. Phases 1 through
+5 implemented and measured Cobblestone-256, and the final format decision selected it as the sole
+current payload codec for both SSE-S3 and SSE-C. The whole-segment writer, reader, runtime selector,
+and benchmark selector are retired; immutable old state/frame specimens remain only as rejection
+evidence.
 
 The C2SP [chunked-encryption specification](https://c2sp.org/chunked-encryption) defines
 authenticated streaming and random-access encryption with a predictable plaintext/ciphertext
@@ -38,7 +38,7 @@ normal-path random-access property unreachable. Partial EC reconstruction is a l
 measured optimization; the initial degraded path deliberately falls back to the current full
 segment validation and reconstruction machinery.
 
-## Provisional Decision
+## Final Decision
 
 The preferred design, subject to the measurement and specification-stability gates below, is:
 
@@ -55,30 +55,32 @@ The preferred design, subject to the measurement and specification-stability gat
 7. A missing, unavailable, malformed, or unauthenticated required shard leaves the partial path
    and uses full-segment physical validation/reconstruction. General partial EC reconstruction is
    not an initial-format completion requirement.
-8. The current format remains authoritative until partial IO and benchmark gates demonstrate a
-   material range-read benefit without an unacceptable sequential-read regression.
+8. Cobblestone-256 is the sole current format because the completed partial-IO and benchmark gates
+   demonstrated a material range-read benefit without a sequential-read regression. The retired
+   whole-segment format remains only as immutable rejection evidence.
 
 An 8 MiB segment is comfortably below Cobblestone's message limit. Treating each segment as a
 message preserves the existing publication, recovery, reclaim, multipart, and EC units. Treating a
 complete S3 object as one message would not: S3 objects can be much larger, and multipart parts are
 written, replaced, and recovered independently before their final order is committed.
 
-The C2SP document is currently labelled a development specification. Before making it the only
-writer format, record the exact reviewed revision or stable profile and decide how future upstream
-changes affect Argmin's persisted profile. An Argmin format identifier must never silently mean
-"whatever the current C2SP main branch says."
+The C2SP document is currently labelled a development specification. The sole-writer decision
+therefore records the exact reviewed revision and verification against upstream at selection time.
+An Argmin format identifier never means "whatever the current C2SP main branch says"; a future
+upstream change requires an explicit new compatibility decision.
 
 ### Reviewed specification and implementation choice
 
 The Phase 0 design baseline is the C2SP `chunked-encryption.md` file at commit
 [`d757bb90e5966d92d17353a3964ca1af776b63e0`](https://github.com/C2SP/C2SP/blob/d757bb90e5966d92d17353a3964ca1af776b63e0/chunked-encryption.md),
-dated 2026-08-24. As checked on 2026-10-17, C2SP still labels the document a development
-specification and has no chunked-encryption release tag. The pinned commit is therefore review
-evidence, not approval to make the profile Argmin's sole writer. Before enabling that writer,
-compare the pinned text and vectors with the then-current stable specification or, if it remains
-untagged, repeat and record the upstream review. The durable Argmin profile identifier always
-means the pinned construction; an upstream change requires a new explicit compatibility decision
-and may require a new Argmin profile identifier.
+dated 2026-08-24. At the 2026-10-27 sole-writer decision, the current C2SP revision was
+[`fea9004f73fbec8cf7a8b1936430e2487eb23b55`](https://github.com/C2SP/C2SP/blob/fea9004f73fbec8cf7a8b1936430e2487eb23b55/chunked-encryption.md).
+The reviewed file at both revisions had SHA-256
+`4c2efb7e9930d4df06835f64c111e13c475afb6eed314b85fbbaac59a8227201`, so the selection did not
+silently adopt changed upstream bytes. C2SP still had no stable chunked-encryption release tag.
+The durable Argmin profile identifier continues to mean the original pinned construction; an
+upstream change requires a new explicit compatibility decision and may require a new Argmin
+profile identifier.
 
 The independently versioned Wycheproof baseline is commit
 [`b61843a9a5115bb758134b6a1f5d5e502d445342`](https://github.com/C2SP/wycheproof/blob/b61843a9a5115bb758134b6a1f5d5e502d445342/testvectors_v1/c2sp_chunked_encryption_aes_256_gcm_test.json).
@@ -170,7 +172,7 @@ but its effective writer is automatic SSE-S3.
 
 ### Phase 0 implementation inventory and target seam
 
-The current code has no independent payload-codec choice. The completed prerequisite deliberately
+At Phase 0, the code had no independent payload-codec choice. The completed prerequisite deliberately
 did not add one: it left a single fixed whole-segment AES-GCM representation after deleting the
 plaintext state. SSE-C and SSE-S3 both call their whole-segment AES-GCM helpers. On reads,
 `SegmentPayloadRecord` carries only `ObjectEncryption`; the reader loads and authenticates a
@@ -184,12 +186,12 @@ The write-path inventory is:
 
 | Effective path | Current codec selection and identity timing | Required Phase 1/2 seam |
 | --- | --- | --- |
-| Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff, mints the standard-object segment subject, and consumes it at the profile-dispatched encoder. | Complete. Production still selects the frozen whole-segment profile until the Phase 5 writer decision. |
+| Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff, mints the standard-object segment subject, and consumes it at the profile-dispatched encoder. | Complete; production selects Cobblestone through the sole profile. |
 | Promoted buffered and streamed `PutObject`/POST Object | Session creation durably reserves the eventual object generation under the session ID. Each append reloads that exact reservation through a non-cloneable storage capability, binds it to the session encryption state plus segment geometry, and consumes it at the common profile-dispatched encoder. | Complete without duplicating the generation in `StreamUploadRecord`. |
 | `CopyObject` destination | Reads source chunks and feeds them through the same destination session subject, append capability, and profile-dispatched encoder as streamed PUT; the source encryption state cannot supply destination identity. | Complete. |
 | `UploadPart` | Session creation durably reserves a non-recycling part payload generation under the session ID before the first segment can be encrypted. The opaque multipart-part subject binds upload, part number, reservation, encryption instance, segment index, and geometry at every append; finalization and recovery require the same authority. | Complete. |
 | `UploadPartCopy` destination | Uses exactly the same multipart stream subject, append capability, and encoder as ordinary `UploadPart` after reading source chunks. | Complete. |
-| Full and ranged object/copy-source reads | Dispatch on the durable payload codec and consume storage-minted object/segment subjects. The frozen whole-segment reader authenticates a complete segment before slicing; the Cobblestone reader owns its subject-bound chunk geometry and release rules. | Common profile contract complete; real partial shard IO remains Phase 3. |
+| Full and ranged object/copy-source reads | Dispatch on the durable payload codec and consume storage-minted object/segment subjects. The Cobblestone reader owns its subject-bound chunk geometry and release rules. | Complete; the former whole-segment reader was removed after the Phase 5 decision. |
 
 `next_segment_vid` is a physical stream-segment allocator and is not a substitute for the logical
 object or part generation required by the encryption context. Streamed PUT already has a separate
@@ -218,11 +220,12 @@ but may not call raw encryption/decryption helpers or publish a caller-built pla
 `Vec` around them. Stored-size and range geometry are profile operations rather than global
 constants.
 
-The initial release guarantees are deliberately different behind the common contract:
+The design initially compared two release contracts. Only the Cobblestone contract remains
+reachable; the whole-segment row is retained here as historical decision evidence:
 
 | Profile | Earliest plaintext release | Successful finalization requirement | Late failure behavior |
 | --- | --- | --- | --- |
-| `SegmentAes256GcmV1` | Per segment, after that complete segment AEAD record authenticates. | AEAD, exact length, and required physical-health processing complete for every requested segment. | Emit no bytes from the failing segment. If the response is uncommitted, return the mapped error; otherwise abort the transport, even when no body bytes were emitted. |
+| retired `SegmentAes256GcmV1` | Per segment, after that complete segment AEAD record authenticates. | AEAD, exact length, and required physical-health processing complete for every requested segment. | Historical only: immutable bytes are rejected and there is no reader or writer. |
 | `Cobblestone256SegmentV1` | Per 16 KiB chunk, only after that chunk authenticates. | Canonical terminal-chunk/length rules, every selected/full-read chunk, and final physical-health processing complete. | If headers or prior authenticated chunks were emitted, send no bytes from the failing chunk and abort the transport; otherwise return the mapped pre-response error. |
 
 The concrete Rust types may differ, but Phase 2 is not complete if callers can bypass these
@@ -627,8 +630,9 @@ succeeds and `ByteStream::collect()` then fails for premature EOF and both short
 `Content-Length` at EOF and raises `IncompleteReadError`. Preserve these as permanent integration
 canaries against Argmin, using exact pinned SDK versions rather than relying only on source review.
 
-Before enabling chunk streaming, run and record the equivalent behavior for the official AWS SDKs
-for Rust, Python/Boto3, Go v2, Java v2, and JavaScript v3, plus the AWS CLI:
+Before declaring client compatibility complete, archiving this plan, or shipping the first release,
+run and record the equivalent behavior for the official AWS SDKs for Rust, Python/Boto3, Go v2,
+Java v2, and JavaScript v3, plus the AWS CLI:
 
 - headers and at least one authenticated body chunk are received successfully;
 - a deterministic later body error terminates below the declared full or `206` range length;
@@ -641,6 +645,15 @@ for Rust, Python/Boto3, Go v2, Java v2, and JavaScript v3, plus the AWS CLI:
 Keep raw HTTP/1.x framing tests authoritative for the server behavior and representative official
 client tests authoritative for consumption behavior. A future HTTP/2 implementation needs the same
 matrix with an error/reset stream rather than a clean short DATA sequence.
+
+Completion audit (2026-10-27): this remains an explicit compatibility gate rather than an inferred
+property of HTTP libraries. The locked Rust client is covered by
+`aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets`, which proves `send()` exposes
+committed `200`/`206` headers and `ByteStream::collect()` rejects the short body. Equivalent pinned
+probes for Python/Boto3, Go v2, Java v2, JavaScript v3, and AWS CLI have not yet been recorded.
+Consequently, the codec implementation and sole-writer transition are complete, but this plan is
+not closed or ready to archive until those five client families pass the same full/range and
+file-helper matrix. Source inspection alone does not satisfy this gate.
 
 ### Full reads
 
@@ -669,16 +682,12 @@ authenticated chunks can be withdrawn.
 
 ## Durable Representation And Versioning
 
-Persist an explicit segment payload-codec profile as an independently typed field in the
-self-describing `ObjectEncryption` key/mode state, for example:
-
-- `SegmentAes256GcmV1` for the current encrypted representation;
-- `Cobblestone256SegmentV1` for the proposed representation.
-
-The exact names are less important than making the distinction durable and exhaustive. Validate
-the allowed cross-product of each encrypted codec with the applicable SSE-S3 or SSE-C state.
-Crossed codec/key-state combinations fail closed. Stored size calculations must become
-profile-aware; they can no longer assume `plaintext length + 16`.
+Persist the independently typed segment payload-codec profile in the self-describing
+`ObjectEncryption` key/mode state. Current state accepts only
+`Cobblestone256SegmentV1`; the former `SegmentAes256GcmV1` tag remains immutable rejection
+evidence. Validate the exhaustive Cobblestone/SSE-S3 and Cobblestone/SSE-C cross-product and fail
+closed on retired, unknown, or crossed state. Stored-size calculations are profile-owned and never
+assume `plaintext length + 16`.
 
 This is the first slice that introduces that discriminator. Its prior current state is the one
 implicit whole-segment encrypted representation left by the plaintext-removal plan; the format
@@ -2048,9 +2057,39 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
   the measured cost of deferring partial EC reconstruction. Full-read TTFB depended on which
   systematic span was missing: loss of shard zero required reconstruction before the first byte,
   while loss of shard one still allowed the first authenticated plaintext span to be emitted.
-- Phase 5 measurement is complete. Production writer selection remains
-  `SegmentAes256GcmV1`; changing it to Cobblestone is now a separate evidence-based format decision,
-  not unfinished benchmark work.
+- Phase 5 measurement is complete. The evidence selected `Cobblestone256SegmentV1` as the sole
+  production writer and reader profile; the format retirement is recorded below as a separate
+  evidence-based slice rather than folded into the benchmark result.
+
+Implementation update (2026-10-27, sole current payload codec):
+
+- Production and test-server configuration no longer contain a payload-codec selector. Buffered,
+  streamed, copy, multipart, recovery, full-read, and range-read paths construct only
+  `Cobblestone256SegmentV1` and dispatch only its authenticated codec implementation.
+- The whole-segment AES-GCM reader, writer, nonce-scope helper, benchmark feature, CLI/environment
+  selector, and crossed-live-profile tests are removed. The standalone crypto benchmark now
+  measures the current Cobblestone construction rather than a retired primitive.
+- SSE-C state v7 and SSE-S3 state v5 accept only codec tag 2. Exact v6/v4 tag-1 state and every
+  recorded containing command, RPC, checkpoint, digest, and row specimen remain immutable
+  rejection evidence; no compatibility reader is retained.
+- Current Cobblestone segment construction requires a complete shard-integrity witness before
+  publication. Test-only command builders consume actual shard acknowledgements, while
+  metadata-only fixtures use a storage-owned coherent zero-filled witness and cannot silently
+  mint the old witness-free live shape.
+- The selection review compared the pinned C2SP file with upstream revision
+  `fea9004f73fbec8cf7a8b1936430e2487eb23b55` and recorded their identical SHA-256 above.
+- The whole-segment fallback reader was removed rather than retained as unreachable compatibility
+  code. Full-segment reconstruction now produces Cobblestone ciphertext and authenticates it with
+  the same current codec as healthy systematic reads. The complete-message opener reuses the
+  reconstruction allocation, compacts authenticated records in place, preserves ciphertext on
+  layout/header-commitment rejection, and consumes the allocation after record opening begins so
+  unauthenticated plaintext cannot escape on a later tag failure.
+- Implementation validation passed `cargo nextest run --no-fail-fast` with 9,001 tests and the complete
+  OpenSSL-provider suite with 9,009 tests; both had zero failures and six declared skips. The
+  storage-only suite passed 3,517 tests with six declared skips. Workspace all-target/all-feature
+  checking, Clippy with warnings denied, storage doctests, the storage boundary checker,
+  formatting, and diff checks close the codec implementation slice. They do not satisfy the
+  separate official-client release/archival gate above.
 
 ### Optional follow-up: Partial EC reconstruction
 
@@ -2091,12 +2130,10 @@ show that known-erasure full-segment fallbacks materially harm a range-heavy wor
 ### Payload-codec and encryption-state cross-product
 
 Pin the complete compatibility relation rather than testing only operational behavior for valid
-profiles. At minimum, the current registry contains these valid pairs:
+profiles. The current registry contains exactly these valid pairs:
 
 | Payload codec | `ObjectEncryption` state |
 |---|---|
-| `SegmentAes256GcmV1` | SSE-S3 |
-| `SegmentAes256GcmV1` | SSE-C |
 | `Cobblestone256SegmentV1` | SSE-S3 |
 | `Cobblestone256SegmentV1` | SSE-C |
 
@@ -2109,9 +2146,9 @@ and read positive canaries. Independently construct immutable malformed fixtures
   delete-marker carriers replaced by the explicit payloadless schema shape, rejected as
   unsupported current state before effects;
 - unknown codec and encryption-state tags;
-- a current encryption state carrying the wrong current/previous codec profile;
-- current codec tags containing bytes framed under another codec, in both old-to-new and
-  new-to-old directions; and
+- a current encryption state carrying retired whole-segment tag 1 or an unknown codec profile;
+- current codec tags containing bytes framed under the retired codec, and retired tags containing
+  Cobblestone-framed bytes; and
 - supported outer state with noncurrent nested codec/state versions, plus noncurrent outer state
   containing an otherwise current nested profile.
 
@@ -2277,6 +2314,6 @@ every path that can construct or resume an encryption subject.
   chunk and terminate the transport without pretending the partial body succeeded.
 - Ring and OpenSSL produce and consume one byte-identical persistent profile in both directions.
 - S3-visible checksum and encryption behavior is unchanged.
-- Current and new persisted profiles are never confused, and the format/version ledger contains
-  immutable evidence for the selected transition.
+- Retired and current persisted profiles are never confused, and the format/version ledger
+  contains immutable evidence for the selected transition.
 - Full and range benchmarks justify the enabled writer profile with recorded, reproducible data.

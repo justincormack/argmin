@@ -67,6 +67,18 @@
         delete_specific_proof.operation_kind = "delete-object-version".to_string();
         let mut marker_proof = proof.clone();
         marker_proof.operation_kind = "insert-delete-marker".to_string();
+        let direct_put_encryption = crate::tests::committed_metadata_only_test_encryption(
+            proof.bucket_incarnation_generation,
+            &bucket,
+            &key,
+            reserved_generation,
+        );
+        let direct_put_ec = EcShape { k: 4, m: 2 };
+        let (direct_put_segment_crc64, direct_put_shard_integrity) =
+            crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                direct_put_ec,
+                direct_put_encryption.segment_stored_size(12).unwrap(),
+            );
         let direct_put_request = crate::CommitDirectPutObjectReq {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -78,19 +90,14 @@
             generation_id: reserved_generation,
             size: 12,
             etag_crc64: 99,
-            ec: EcShape { k: 4, m: 2 },
+            ec: direct_put_ec,
             tags: None,
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::tests::committed_metadata_only_test_encryption(
-                proof.bucket_incarnation_generation,
-                &bucket,
-                &key,
-                reserved_generation,
-            ),
+            encryption: direct_put_encryption,
             segment_index: 0,
-            segment_crc64: 99,
+            segment_crc64: direct_put_segment_crc64,
             segment_okh: [7; 16],
             segment_vid: GenerationId::new(10).unwrap(),
             data_pg_id: 0,
@@ -306,7 +313,7 @@
             let command = primary_route
                 .build_direct_put_commit_command(
                     &direct_put_request,
-                    None,
+                    Some(&direct_put_shard_integrity),
                     VersionId::Null,
                     &snapshot,
                 )
@@ -323,7 +330,7 @@
         let capability_mismatch = crate::clock::with_time_override(1_000, || {
             primary_route.build_direct_put_commit_command(
                 &mismatched_direct_put_request,
-                None,
+                Some(&direct_put_shard_integrity),
                 VersionId::Null,
                 &direct_put_snapshot,
             )

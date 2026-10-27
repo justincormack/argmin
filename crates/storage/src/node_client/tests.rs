@@ -3633,8 +3633,16 @@ fn test_object_read_multipart_segment(
     key: &ObjectKey,
     part_number: u32,
 ) -> MultipartPartSegmentRecord {
+    let ec = EcShape { k: 4, m: 2 };
+    let (segment_crc64, shard_integrity) =
+        crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+            ec,
+            metadata_only_test_encryption()
+                .segment_stored_size(12)
+                .unwrap(),
+        );
     MultipartPartSegmentRecord {
-        shard_integrity: None,
+        shard_integrity: Some(shard_integrity),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: UploadId::try_from("u".repeat(128)).unwrap(),
@@ -3642,13 +3650,13 @@ fn test_object_read_multipart_segment(
         part_number,
         segment_index: 0,
         size: 12,
-        segment_crc64: 99,
+        segment_crc64,
         segment_okh: [7; 16],
         segment_vid: GenerationId::new(30 + u64::from(part_number)).unwrap(),
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: ec.k,
+        ec_m: ec.m,
     }
 }
 

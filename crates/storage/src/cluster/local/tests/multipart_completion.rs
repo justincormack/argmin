@@ -3577,6 +3577,7 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
                 PgId::new(2),
                 &pg,
                 &winner_req,
+                &winner_written.written_shards,
                 crate::VersionId::Null,
                 winner_req.bucket_write_reservation.clone(),
             )

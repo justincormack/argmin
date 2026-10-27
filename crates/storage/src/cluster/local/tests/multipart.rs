@@ -1789,6 +1789,7 @@ fn multipart_create_terminal_install_conflict_reinspects_before_draining_newer_c
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -1993,6 +1994,7 @@ fn multipart_create_command_id_race_drains_winner_and_reruns_authorization_actio
                             pg_id,
                             &pg,
                             &install_req,
+                            &winner_written.written_shards,
                             crate::VersionId::Null,
                             install_req.bucket_write_reservation.clone(),
                         )

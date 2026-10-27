@@ -31,7 +31,6 @@ openssl = [
     "storage/openssl",
 ]
 test-utils = []
-payload-codec-benchmark = []
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",

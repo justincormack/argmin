@@ -1289,7 +1289,7 @@ impl SharedStorageNode {
         if segments.is_empty() {
             return Ok(crate::TestObjectPayloadSnapshot::new(
                 segments,
-                crate::SegmentPayloadCodec::SegmentAes256GcmV1,
+                crate::SegmentPayloadCodec::Cobblestone256SegmentV1,
                 None,
             ));
         }
@@ -3663,7 +3663,11 @@ mod tests {
         assert_eq!(snapshot.generation_id(), Some(old_generation));
         assert_eq!(
             snapshot.stored_size_for(segment),
-            Some(old_size as usize + crate::OBJECT_ENCRYPTION_SEGMENT_TAG_LEN),
+            Some(
+                crate::SegmentPayloadCodec::Cobblestone256SegmentV1
+                    .stored_size(old_size)
+                    .unwrap() as usize,
+            ),
             "replacement cannot pair old segments with its newer generation"
         );
         assert_eq!(

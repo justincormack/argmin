@@ -570,8 +570,8 @@ the authenticated empty terminal record first. If a later systematic range or
 physical witness check fails, the existing complete reconstruction path
 resumes after the exact plaintext prefix already emitted. An unrecoverable
 failure exposes no bytes from the failing record and terminates an already
-committed response. The historical whole-segment encrypted codec continues to
-use its whole-segment authentication unit.
+committed response. Historical whole-segment codec bytes are rejected at the
+current format boundary; there is no compatibility reader.
 
 `ObjectPayloadLease::release` is the current active token release path. It must
 release against the actual storage-node sessions captured at acquisition time

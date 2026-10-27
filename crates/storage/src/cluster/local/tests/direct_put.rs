@@ -739,6 +739,7 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
             pg_id,
             &pg,
             &request,
+            &payload.written.written_shards,
             crate::VersionId::Null,
             request.bucket_write_reservation.clone(),
         )
@@ -876,6 +877,7 @@ fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
             pg_id,
             &primary_pg,
             &request,
+            &payload.written.written_shards,
             crate::VersionId::Null,
             request.bucket_write_reservation.clone(),
         )
@@ -1024,10 +1026,17 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
         },
         prepared.bucket_write_reservation.clone(),
     );
-    pending_request.ec = EcShape { k: 1, m: 1 };
-    let command_shard_count = pending_request.ec.k + pending_request.ec.m;
     assert!(
-        command_shard_count < payload_identity.ec.k + payload_identity.ec.m,
+        payload_identity.ec.m > 0,
+        "the regression requires at least one parity shard"
+    );
+    pending_request.ec = EcShape {
+        k: payload_identity.ec.k,
+        m: payload_identity.ec.m - 1,
+    };
+    let command_shard_count = usize::from(pending_request.ec.k + pending_request.ec.m);
+    assert!(
+        command_shard_count < usize::from(payload_identity.ec.k + payload_identity.ec.m),
         "the regression requires caller shards beyond the command's overlapping prefix"
     );
     let shard_batch: Vec<(&ShardKey, WriteAck)> = pending_payload
@@ -1049,6 +1058,7 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
             pg_id,
             &pg,
             &pending_request,
+            &pending_payload.written.written_shards[..command_shard_count],
             crate::VersionId::Null,
             pending_request.bucket_write_reservation.clone(),
         )
@@ -1099,7 +1109,7 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
                     shard_index,
                 )
                 .unwrap(),
-            shard_index < command_shard_count,
+            usize::from(shard_index) < command_shard_count,
             "command-owned overlap must survive while caller-only shards are cleaned"
         );
     }
@@ -1371,6 +1381,7 @@ fn direct_put_terminal_install_conflict_reinspects_before_draining_newer_command
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -2113,6 +2124,7 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -2451,6 +2463,7 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
             pg_id,
             &primary_pg,
             &request,
+            &payload.written.written_shards,
             crate::VersionId::from_u64(1),
             prepared.bucket_write_reservation.clone(),
         )
@@ -3225,6 +3238,7 @@ fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
             PgId::new(2),
             &object_pg_store,
             &stale_req,
+            &stale_written.written_shards,
             crate::VersionId::Null,
             stale_req.bucket_write_reservation.clone(),
         )
@@ -4772,6 +4786,7 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                 pg_id,
                 &pg,
                 &hook_req,
+                &hook_written_shards,
                 crate::VersionId::Null,
                 hook_req.bucket_write_reservation.clone(),
             )
@@ -5280,6 +5295,7 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
                     pg_id,
                     &pg,
                     &hook_req,
+                    &hook_written_shards,
                     crate::VersionId::Null,
                     hook_req.bucket_write_reservation.clone(),
                 )
@@ -6641,6 +6657,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
                     pg_id,
                     &pg,
                     &hook_contender_req,
+                    &hook_contender_shards,
                     crate::VersionId::Null,
                     hook_contender_req.bucket_write_reservation.clone(),
                 )

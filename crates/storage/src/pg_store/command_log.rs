@@ -7878,6 +7878,15 @@ mod canonical_format_baseline_tests {
                 119, 81, 82, 47, 9, 112, 187, 154, 49, 165, 215, 234, 186, 20,
             ],
         );
+        const HISTORICAL_CHECKPOINT_V6_SSE_S3_V4_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            14_586_496_295_449_754_783,
+            4_289_673_327_371_849_680,
+            7_760,
+            [
+                187, 234, 215, 105, 206, 12, 80, 118, 214, 96, 141, 228, 103, 18, 164, 4, 12, 143,
+                213, 1, 21, 38, 129, 107, 15, 86, 244, 163, 226, 196, 22, 61,
+            ],
+        );
         assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 8);
         assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 6);
 
@@ -7965,12 +7974,12 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             current_evidence,
             (
-                14_586_496_295_449_754_783,
-                4_289_673_327_371_849_680,
+                4_699_376_559_631_902_336,
+                2_653_891_692_263_939_273,
                 7_760,
                 [
-                    187, 234, 215, 105, 206, 12, 80, 118, 214, 96, 141, 228, 103, 18, 164, 4, 12,
-                    143, 213, 1, 21, 38, 129, 107, 15, 86, 244, 163, 226, 196, 22, 61,
+                    236, 211, 171, 181, 222, 159, 50, 70, 64, 206, 214, 63, 71, 219, 235, 252, 166,
+                    54, 65, 229, 183, 46, 116, 163, 117, 199, 158, 41, 81, 47, 126, 218,
                 ],
             )
         );
@@ -7986,6 +7995,10 @@ mod canonical_format_baseline_tests {
         assert_ne!(
             current_evidence,
             HISTORICAL_CHECKPOINT_V6_SSE_S3_V3_EVIDENCE
+        );
+        assert_ne!(
+            current_evidence,
+            HISTORICAL_CHECKPOINT_V6_SSE_S3_V4_EVIDENCE
         );
 
         let mut checkpoint_v2 = checkpoint.clone();
@@ -8060,6 +8073,15 @@ mod canonical_format_baseline_tests {
                 172, 227, 201, 224, 207, 1, 221, 80, 220, 35, 70, 64, 76, 171,
             ],
         );
+        const HISTORICAL_DERIVED_V2_SSE_S3_V4_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            14_586_496_295_449_754_783,
+            9_436_251_475_144_964_531,
+            7_374,
+            [
+                105, 172, 163, 203, 124, 51, 195, 126, 125, 225, 53, 160, 123, 54, 53, 39, 21, 157,
+                18, 245, 245, 28, 170, 56, 73, 250, 166, 12, 216, 36, 25, 173,
+            ],
+        );
         let derived_v2_evidence = (
             checkpoint_v2.state_digest.value(),
             checkpoint_v2.checkpoint_crc64,
@@ -8069,12 +8091,12 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             derived_v2_evidence,
             (
-                14_586_496_295_449_754_783,
-                9_436_251_475_144_964_531,
+                4_699_376_559_631_902_336,
+                11_795_839_173_412_898_809,
                 7_374,
                 [
-                    105, 172, 163, 203, 124, 51, 195, 126, 125, 225, 53, 160, 123, 54, 53, 39, 21,
-                    157, 18, 245, 245, 28, 170, 56, 73, 250, 166, 12, 216, 36, 25, 173,
+                    171, 132, 216, 77, 55, 24, 206, 49, 14, 1, 250, 191, 149, 179, 126, 19, 75,
+                    211, 202, 43, 122, 16, 98, 248, 242, 19, 92, 240, 59, 113, 242, 22,
                 ],
             )
         );
@@ -8087,6 +8109,10 @@ mod canonical_format_baseline_tests {
         assert_ne!(
             derived_v2_evidence,
             HISTORICAL_DERIVED_V2_SSE_S3_V3_EVIDENCE
+        );
+        assert_ne!(
+            derived_v2_evidence,
+            HISTORICAL_DERIVED_V2_SSE_S3_V4_EVIDENCE
         );
         assert!(matches!(
             decode_metadata_command_checkpoint_payload(&encoded_v2),

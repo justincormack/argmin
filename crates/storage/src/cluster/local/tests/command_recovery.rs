@@ -77,6 +77,7 @@ fn authorized_recovery_rejects_malformed_encryption_profile_before_effects() {
             fixture.pg_id,
             &primary_pg,
             &request,
+            &written.written_shards,
             crate::VersionId::Null,
             request.bucket_write_reservation.clone(),
         )
@@ -982,6 +983,7 @@ fn refresh_recovery_applies_direct_put_from_historical_active_route() {
             pg_id,
             &object_pg_store,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )
@@ -3161,6 +3163,7 @@ fn object_generation_reservation_waits_for_unrelated_direct_put_recovery() {
             pg_id,
             &pg,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )
@@ -4971,6 +4974,7 @@ fn stale_duplicate_direct_put_commit_index_is_reissued_before_apply() {
             PgId::new(object_pg),
             &object_pg_store,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             bucket_write_proof,
         )
@@ -5093,6 +5097,7 @@ fn direct_put_reissue_failure_fixture(
             pg_id,
             &object_pg_store,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )
@@ -5187,6 +5192,7 @@ fn direct_put_fatal_reissue_response_does_not_reinspect_after_abandonment() {
             pg_id,
             &object_pg_store,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )
@@ -5528,6 +5534,7 @@ fn direct_put_fatal_reissue_response_survives_published_c2_classification() {
             pg_id,
             &object_pg_store,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )
@@ -5754,6 +5761,11 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
     cluster
         .register_payload_shard_acks(segment.data_pg_id, &shard_batch)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let stale_command = MetadataCommandEnvelope::new(
         cluster
             .next_object_metadata_command_id(PgId::new(object_pg))
@@ -11489,6 +11501,7 @@ fn abandoned_physically_mismatched_direct_put_fails_before_recovery() {
             PgId::new(object_pg),
             &object_pg_store,
             &abandoned_req,
+            &abandoned_written.written_shards,
             crate::VersionId::Null,
             bucket_write_proof.clone(),
         )
@@ -12008,6 +12021,7 @@ fn direct_put_commit_waits_for_unrelated_direct_put_recovery() {
             pg_id,
             &pg,
             &source_req,
+            &source_written.written_shards,
             crate::VersionId::Null,
             source_req.bucket_write_reservation.clone(),
         )

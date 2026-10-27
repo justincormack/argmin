@@ -24,8 +24,8 @@ Options:
   --client-binary PATH   Use a prebuilt UAT client; standard target paths build it
   --benchmark-binary PATH
                          Use a prebuilt payload-read benchmark client
-  --payload-read-benchmark PROFILE
-                         Run healthy and recovered missing-shard reads for PROFILE;
+  --payload-read-benchmark
+                         Run healthy and recovered missing-shard reads;
                          requires at least one host beyond the EC width
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
@@ -424,9 +424,8 @@ while (($# > 0)); do
             shift 2
             ;;
         --payload-read-benchmark)
-            [[ $# -ge 2 ]] || die "--payload-read-benchmark requires a value"
-            payload_read_benchmark_profile="$2"
-            shift 2
+            payload_read_benchmark_profile="cobblestone-256-segment-v1"
+            shift
             ;;
         --release)
             release=1
@@ -582,12 +581,6 @@ if ((start_cluster)); then
         die "--start-cluster does not use --client-binary"
 fi
 if [[ -n "$payload_read_benchmark_profile" ]]; then
-    case "$payload_read_benchmark_profile" in
-        segment-aes-256-gcm-v1|cobblestone-256-segment-v1) ;;
-        *)
-            die "--payload-read-benchmark requires segment-aes-256-gcm-v1 or cobblestone-256-segment-v1"
-            ;;
-    esac
     ((release == 1)) || die "--payload-read-benchmark requires --release"
     ((start_cluster == 0 && startup_only == 0 && quantitative == 0)) ||
         die "--payload-read-benchmark cannot be combined with another run mode"
@@ -689,10 +682,6 @@ case "$binary" in
         fi
         ;;
 esac
-if [[ -n "$payload_read_benchmark_profile" && ${#server_build[@]} -ne 0 ]]; then
-    server_build+=(--features payload-codec-benchmark)
-fi
-
 if [[ -n "$payload_read_benchmark_profile" ]]; then
     if [[ -z "$benchmark_binary" ]]; then
         benchmark_build=(cargo build --release -p s3-tests --features payload-read-bench --bin payload_read_bench)
@@ -1479,19 +1468,12 @@ start_frontend() {
     local unit="$run_name-frontend-$number-${frontend_unit_generations[$index]}"
     frontend_units[index]="$unit"
     diagnostic_unit_hosts["$unit"]="$index"
-    local -a benchmark_environment=()
-    if [[ -n "$payload_read_benchmark_profile" ]]; then
-        benchmark_environment=(
-            --setenv "ARGMIN_BENCHMARK_NEW_PAYLOAD_CODEC=$payload_read_benchmark_profile"
-        )
-    fi
     remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
         --property "StandardOutput=append:$remote_run/logs/frontend-$number.log" \
         --property "StandardError=append:$remote_run/logs/frontend-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         --setenv "ARGMIN_PROCESS_ID=frontend-$number" \
-        "${benchmark_environment[@]}" \
         "$remote_run/argmin-s3"
 }
 
@@ -1914,7 +1896,6 @@ run_payload_read_benchmark_client() {
         'argmin-multihost-primary' '<redacted>' 'us-east-1'
     printf ' %q' \
         "$benchmark_binary" \
-        --payload-profile "$payload_read_benchmark_profile" \
         --ec-shape "$ec_data_shards+$ec_parity_shards" \
         --endpoint "$endpoint" \
         --pg-count "$pg_count" \
@@ -1935,7 +1916,6 @@ run_payload_read_benchmark_client() {
             "AWS_SECRET_ACCESS_KEY=$s3_secret_access_key" \
             "AWS_REGION=us-east-1" \
             "$benchmark_binary" \
-            --payload-profile "$payload_read_benchmark_profile" \
             --ec-shape "$ec_data_shards+$ec_parity_shards" \
             --endpoint "$endpoint" \
             --pg-count "$pg_count" \

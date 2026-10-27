@@ -5,25 +5,6 @@
 mod tests {
     use super::*;
 
-    #[cfg(feature = "payload-codec-benchmark")]
-    #[test]
-    fn payload_codec_benchmark_selection_is_exact_and_fail_closed() {
-        assert_eq!(
-            parse_payload_codec_benchmark_selection("segment-aes-256-gcm-v1").unwrap(),
-            storage::SegmentPayloadCodec::SegmentAes256GcmV1
-        );
-        assert_eq!(
-            parse_payload_codec_benchmark_selection("cobblestone-256-segment-v1").unwrap(),
-            storage::SegmentPayloadCodec::Cobblestone256SegmentV1
-        );
-        for invalid in ["", "cobblestone", "SegmentAes256GcmV1", "plaintext"] {
-            assert!(
-                parse_payload_codec_benchmark_selection(invalid).is_err(),
-                "unexpectedly accepted {invalid:?}"
-            );
-        }
-    }
-
     #[test]
     fn object_payload_placement_inspection_deletes_only_confirmed_mismatches() {
         assert_eq!(

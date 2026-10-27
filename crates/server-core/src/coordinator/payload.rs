@@ -216,15 +216,12 @@ pub(super) fn segment_payload_buffer_capacity(ec_shape: EcShape) -> usize {
 }
 
 pub(super) fn max_stored_segment_size() -> usize {
-    [
-        SegmentPayloadCodec::SegmentAes256GcmV1,
-        SegmentPayloadCodec::Cobblestone256SegmentV1,
-    ]
-    .into_iter()
-    .filter_map(|codec| codec.stored_size(INTERNAL_SEGMENT_SIZE as u64))
-    .filter_map(|size| usize::try_from(size).ok())
-    .max()
-    .expect("at least one payload codec supports the internal segment size")
+    [SegmentPayloadCodec::Cobblestone256SegmentV1]
+        .into_iter()
+        .filter_map(|codec| codec.stored_size(INTERNAL_SEGMENT_SIZE as u64))
+        .filter_map(|size| usize::try_from(size).ok())
+        .max()
+        .expect("at least one payload codec supports the internal segment size")
 }
 
 #[cfg(test)]

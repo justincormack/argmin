@@ -53,14 +53,14 @@ running them on a newly provisioned machine.
 Run the current payload-read baseline with:
 
 ```bash
-PAYLOAD_PROFILE=segment-aes-256-gcm-v1 EC_SHAPE=4+2 ./scripts/bench-payload-read
-PAYLOAD_PROFILE=cobblestone-256-segment-v1 EC_SHAPE=4+2 ./scripts/bench-payload-read
+EC_SHAPE=4+2 ./scripts/bench-payload-read
 ```
 
 Use the same commands with `--openssl` for the compile-time OpenSSL provider.
-`PAYLOAD_PROFILE` and `EC_SHAPE` are required so a reference run cannot silently
-benchmark the production default or an unintended topology. The supported local
-shapes are `1+0` and `4+2`. Unlike the focused component benchmarks below, this
+`EC_SHAPE` is required so a reference run cannot silently benchmark an unintended
+topology. Cobblestone-256 is the sole current payload codec; the former profile
+selector was removed with the unreachable whole-segment reader and writer. The
+supported local shapes are `1+0` and `4+2`. Unlike the focused component benchmarks below, this
 starts the local release S3 server and an AWS SDK client and exercises HTTP,
 SigV4, authorization, object metadata, EC shard reads, physical CRC validation,
 SSE-S3 decryption, response streaming, and SDK body consumption. It is intended
@@ -71,7 +71,6 @@ The following environment variables adjust the workload:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `PAYLOAD_PROFILE` | required | `segment-aes-256-gcm-v1` or `cobblestone-256-segment-v1` |
 | `EC_SHAPE` | required | Local `1+0` or `4+2` placement |
 | `OBJECT_MIB` | `16` | Size of the object; must exceed the 8 MiB segment size |
 | `RANGE_BYTES` | `4096` | Size of the range selected from inside a full segment |
@@ -80,12 +79,12 @@ The following environment variables adjust the workload:
 | `RANGE_ITERS` | `64` | Range GET requests in each sample |
 | `SAMPLES` | `5` | Number of full and range samples |
 
-Benchmark protocol `payload_read_v3` selects the requested writer profile on
-every pooled frontend before any frontend is shared. After the PUT, a narrow
+Benchmark protocol `payload_read_v3` uses the sole production writer profile on
+every pooled frontend. After the PUT, a narrow
 server-owned observation loads the current live object through the ordinary
 admitted metadata-read route and requires its self-describing durable codec to
-equal `PAYLOAD_PROFILE`. The output records both requested and persisted
-profiles. `HeadObject` independently verifies the AWS-visible SSE-S3 AES256
+equal Cobblestone-256. The output records the expected and persisted profile.
+`HeadObject` independently verifies the AWS-visible SSE-S3 AES256
 mode; that header alone is not codec evidence because both profiles expose the
 same S3 encryption mode. The benchmark also does not create a plaintext S3
 object: an absent or deleted bucket encryption configuration has AWS's
@@ -104,10 +103,10 @@ the whole response in the benchmark client. One untimed request per case is
 still collected and compared byte-for-byte with the expected payload as a
 correctness canary.
 
-The payload-codec comparison therefore has no plaintext benchmark axis. Compare
-the current whole-segment AES-GCM codec and future encrypted codecs under the
-same SSE-S3 or SSE-C key mode; former tag-0 bytes are immutable rejection
-evidence, not a supported performance profile.
+The payload benchmark has no plaintext or codec-selection axis. Cobblestone-256
+is the sole current codec under both SSE-S3 and SSE-C; former plaintext tag 0
+and whole-segment tag 1 bytes are immutable rejection evidence, not supported
+performance profiles.
 
 Reference runs require a clean worktree and runner-built current-source release
 server and benchmark-client binaries, making the printed source revision a
@@ -118,13 +117,14 @@ marks the result `reference_run=false`; those results must not be recorded as a
 reference baseline. The output records binary provenance and digests, the CPU architecture and model, selected
 CRC64, SHA-256, and EC runtime backends, compile-time crypto provider, explicit
 local EC shape, and the authoritatively observed durable payload profile. The
-selection seam is benchmark-only; ordinary test-server and production
-constructors retain the production writer default.
+retired comparison measurements below remain historical evidence; current
+benchmark, test-server, and production constructors all use the sole
+Cobblestone writer.
 
 ### Multihost and degraded payload reads
 
-Use the dedicated multihost mode to compare healthy and degraded reads over the production
-TLS/TCP storage path. Run each profile from the same clean revision and host set:
+Use the dedicated multihost mode to compare healthy and degraded Cobblestone reads over the
+production TLS/TCP storage path from a clean revision:
 
 ```bash
 ./scripts/uat-multihost-raft \
@@ -134,21 +134,11 @@ TLS/TCP storage path. Run each profile from the same clean revision and host set
   --pg-count 16 \
   --ec-data-shards 2 \
   --ec-parity-shards 1 \
-  --payload-read-benchmark segment-aes-256-gcm-v1
-
-./scripts/uat-multihost-raft \
-  --hosts grey0,grey1,grey2,grey3 \
-  --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.154 \
-  --release \
-  --pg-count 16 \
-  --ec-data-shards 2 \
-  --ec-parity-shards 1 \
-  --payload-read-benchmark cobblestone-256-segment-v1
+  --payload-read-benchmark
 ```
 
 This mode requires at least one spare storage host beyond the `k+m` EC width. It builds the server
-with the benchmark-only immutable writer selector; ordinary builds remain pinned to the production
-default. It creates one object, then uses a storage-owned
+and benchmark client from current source in release mode. It creates one object, then uses a storage-owned
 diagnostic to verify the durable codec and resolve the exact metadata and data placement routes,
 including the storage-computed shard-index-to-node mapping. The degraded case stops a systematic
 shard's exact storage node, rather than treating acting-set order as shard order. It then waits for

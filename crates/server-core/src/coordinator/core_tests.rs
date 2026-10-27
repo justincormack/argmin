@@ -10361,7 +10361,7 @@ fn cobblestone_body_uses_retained_route_after_unix_data_pg_move(
     let tmp = test_util::tempdir();
     let mut scenario = TestRetainedReadPgMoveScenario::new(tmp.path()).unwrap();
     let validator = sse_customer.map(|_| test_sse_customer_validator_config());
-    let mut coord =
+    let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             scenario.route_handle(),
             "us-east-1".to_string(),
@@ -10370,7 +10370,6 @@ fn cobblestone_body_uses_retained_route_after_unix_data_pg_move(
             BackgroundWorkerMode::none(),
         )
         .unwrap();
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
 
     let bucket = scenario.bucket().to_string();
     let key = scenario.key().to_string();
@@ -21548,8 +21547,7 @@ fn cobblestone_range_authentication_failure_uses_full_witness_reconstruction() {
         return;
     }
     let tmp = test_util::tempdir();
-    let mut coord = setup_ec_fault_injection_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -21625,8 +21623,7 @@ fn cobblestone_full_read_streams_authenticated_prefix_before_late_reconstruction
         return;
     }
     let tmp = test_util::tempdir();
-    let mut coord = setup_ec_fault_injection_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)

@@ -18,8 +18,8 @@ use storage::{
     ObjectEncryptionKeyBinding, ObjectEncryptionStateError, ObjectEncryptionSubject,
     SegmentEncryptionSubject, SegmentPayloadCodec, SseCustomerObjectState, SseS3ObjectState,
     OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
-    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
+    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
     SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
 
@@ -30,9 +30,7 @@ pub const SSE_CUSTOMER_ALGORITHM: &str = "AES256";
 pub const SSE_C_CUSTOMER_KEY_LEN: usize = 32;
 pub const SSE_C_DEK_LEN: usize = 32;
 const AES_256_GCM_TAG_LEN: usize = 16;
-pub const SSE_C_SEGMENT_TAG_LEN: usize = AES_256_GCM_TAG_LEN;
 const SSE_C_WRAP_AAD: &[u8] = b"argmin:sse-c:wrap:v1";
-const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
 const SSE_C_CHECKSUM_AAD: &[u8] = b"argmin:sse-c:checksum:v1";
 const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
 const CHECKSUM_METADATA_VERSION: u8 = 1;
@@ -42,7 +40,6 @@ const CHECKSUM_METADATA_MAX_VALUE_LEN: usize =
 // Keep the persisted SSE-S3 wire format stable even though the internal
 // provider boundary is now modelled as generic managed encryption.
 const MANAGED_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
-const MANAGED_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
 const MANAGED_CHECKSUM_AAD: &[u8] = b"argmin:sse-s3:checksum:v1";
 const MANAGED_ENCRYPTION_LABEL: &str = "managed encryption";
 
@@ -71,22 +68,11 @@ fn checksum_metadata_codec_error(_error: ChecksumMetadataCodecError) -> ServerEr
 }
 
 struct AeadDescriptor<'a> {
-    aad: &'a [u8],
     label: &'a str,
-}
-
-struct SegmentSealParameters<'a> {
-    payload_codec: SegmentPayloadCodec,
-    segment_nonce_prefix: &'a [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    segment_scope: SseCustomerSegmentScope,
-    payload_aead_context: &'a [u8],
-    segment_index: u32,
-    descriptor: AeadDescriptor<'a>,
 }
 
 pub(crate) struct AuthorizedSegmentRead<'a> {
     subject: &'a SegmentEncryptionSubject,
-    segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
     plaintext_len: usize,
 }
@@ -94,13 +80,11 @@ pub(crate) struct AuthorizedSegmentRead<'a> {
 impl<'a> AuthorizedSegmentRead<'a> {
     pub(crate) fn new(
         subject: &'a SegmentEncryptionSubject,
-        segment_scope: SseCustomerSegmentScope,
         segment_index: u32,
         plaintext_len: usize,
     ) -> Self {
         Self {
             subject,
-            segment_scope,
             segment_index,
             plaintext_len,
         }
@@ -584,7 +568,6 @@ pub struct SseCustomerWriteContext {
     request: SseCustomerRequest,
     encryption: ObjectEncryption,
     dek: [u8; SSE_C_DEK_LEN],
-    segment_scope: SseCustomerSegmentScope,
 }
 
 impl SseCustomerWriteContext {
@@ -604,7 +587,7 @@ impl SseCustomerWriteContext {
         segment_index: u32,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ServerError> {
-        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+        let ObjectEncryption::SseCustomer(_) = &self.encryption else {
             return Err(ServerError::InternalError {
                 reason: "SSE-C write context missing encryption state".to_string(),
             });
@@ -623,37 +606,11 @@ impl SseCustomerWriteContext {
                     .to_string(),
             });
         }
-        encrypt_segment_with_dek(
+        encrypt_cobblestone_segment(
             &self.dek,
-            state,
-            self.segment_scope,
-            subject,
-            segment_index,
+            subject.payload_aead_context(),
             plaintext,
-        )
-    }
-
-    #[cfg(test)]
-    fn encrypt_segment(
-        &self,
-        segment_index: u32,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, ServerError> {
-        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
-            return Err(ServerError::InternalError {
-                reason: "SSE-C write context missing encryption state".to_string(),
-            });
-        };
-        encrypt_legacy_segment_with_dek_and_prefix(
-            &self.dek,
-            state.segment_nonce_prefix(),
-            self.segment_scope,
-            segment_index,
-            plaintext,
-            AeadDescriptor {
-                aad: SSE_C_SEGMENT_AAD,
-                label: "SSE-C",
-            },
+            "SSE-C",
         )
     }
 
@@ -736,7 +693,6 @@ pub struct ManagedEncryptionWriteContext {
     dek: [u8; SSE_C_DEK_LEN],
     #[cfg_attr(not(test), allow(dead_code))]
     wrapping_key: [u8; SSE_C_DEK_LEN],
-    segment_scope: SseCustomerSegmentScope,
 }
 
 impl ManagedEncryptionWriteContext {
@@ -751,7 +707,7 @@ impl ManagedEncryptionWriteContext {
         segment_index: u32,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ServerError> {
-        let ObjectEncryption::SseS3(state) = &self.encryption else {
+        let ObjectEncryption::SseS3(_) = &self.encryption else {
             return Err(ServerError::InternalError {
                 reason: "managed write context missing encryption state".to_string(),
             });
@@ -770,44 +726,11 @@ impl ManagedEncryptionWriteContext {
                     .to_string(),
             });
         }
-        encrypt_segment_with_dek_and_prefix(
+        encrypt_cobblestone_segment(
             &self.dek,
+            subject.payload_aead_context(),
             plaintext,
-            SegmentSealParameters {
-                payload_codec: state.payload_codec(),
-                segment_nonce_prefix: state.segment_nonce_prefix(),
-                segment_scope: self.segment_scope,
-                payload_aead_context: subject.payload_aead_context(),
-                segment_index,
-                descriptor: AeadDescriptor {
-                    aad: MANAGED_SEGMENT_AAD,
-                    label: MANAGED_ENCRYPTION_LABEL,
-                },
-            },
-        )
-    }
-
-    #[cfg(test)]
-    fn encrypt_segment(
-        &self,
-        segment_index: u32,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, ServerError> {
-        let ObjectEncryption::SseS3(state) = &self.encryption else {
-            return Err(ServerError::InternalError {
-                reason: "managed write context missing encryption state".to_string(),
-            });
-        };
-        encrypt_legacy_segment_with_dek_and_prefix(
-            &self.dek,
-            state.segment_nonce_prefix(),
-            self.segment_scope,
-            segment_index,
-            plaintext,
-            AeadDescriptor {
-                aad: MANAGED_SEGMENT_AAD,
-                label: MANAGED_ENCRYPTION_LABEL,
-            },
+            MANAGED_ENCRYPTION_LABEL,
         )
     }
 
@@ -887,49 +810,9 @@ impl fmt::Debug for ManagedEncryptionWriteContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SseCustomerSegmentScope(u16);
-
-impl SseCustomerSegmentScope {
-    #[must_use]
-    pub(crate) fn object() -> Self {
-        Self(0)
-    }
-
-    pub(crate) fn multipart_part(part_number: u32) -> Result<Self, ServerError> {
-        if part_number == 0 {
-            return Err(ServerError::InternalError {
-                reason: "multipart SSE-C nonce scope requires a positive part number".to_string(),
-            });
-        }
-        let part_number = u16::try_from(part_number).map_err(|_| ServerError::InternalError {
-            reason: format!(
-                "multipart SSE-C part number {part_number} does not fit in the nonce scope"
-            ),
-        })?;
-        Ok(Self(part_number))
-    }
-
-    fn encode(self) -> [u8; SSE_C_SEGMENT_NONCE_SCOPE_LEN] {
-        self.0.to_be_bytes()
-    }
-}
-
 pub fn prepare_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     request: &SseCustomerRequest,
-) -> Result<SseCustomerWriteContext, ServerError> {
-    prepare_sse_customer_write_with_payload_codec(
-        validator,
-        request,
-        SegmentPayloadCodec::SegmentAes256GcmV1,
-    )
-}
-
-pub(crate) fn prepare_sse_customer_write_with_payload_codec(
-    validator: &SseCustomerValidatorConfig,
-    request: &SseCustomerRequest,
-    payload_codec: SegmentPayloadCodec,
 ) -> Result<SseCustomerWriteContext, ServerError> {
     let mut validator_salt = [0u8; SSE_C_VALIDATOR_SALT_LEN];
     argmin_crypto::random::fill(&mut validator_salt).map_err(|_| ServerError::InternalError {
@@ -982,11 +865,9 @@ pub(crate) fn prepare_sse_customer_write_with_payload_codec(
                 wrap_nonce,
                 wrapped_dek,
                 segment_nonce_prefix,
-            )
-            .with_payload_codec(payload_codec),
+            ),
         ),
         dek,
-        segment_scope: SseCustomerSegmentScope::object(),
     })
 }
 
@@ -994,7 +875,6 @@ pub(crate) fn resume_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
-    segment_scope: SseCustomerSegmentScope,
 ) -> Result<SseCustomerWriteContext, ServerError> {
     if state.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1 {
         return Err(ServerError::InternalError {
@@ -1015,7 +895,6 @@ pub(crate) fn resume_sse_customer_write(
         request: request.clone(),
         encryption: ObjectEncryption::SseCustomer(state.clone()),
         dek,
-        segment_scope,
     })
 }
 
@@ -1036,16 +915,6 @@ pub fn validate_sse_customer_read(
 
 pub fn prepare_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
-) -> Result<ManagedEncryptionWriteContext, ServerError> {
-    prepare_managed_encryption_write_with_payload_codec(
-        provider,
-        SegmentPayloadCodec::SegmentAes256GcmV1,
-    )
-}
-
-pub(crate) fn prepare_managed_encryption_write_with_payload_codec(
-    provider: &impl ManagedKeyProvider,
-    payload_codec: SegmentPayloadCodec,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
     let wrapping_key = provider.active_key();
 
@@ -1082,19 +951,15 @@ pub(crate) fn prepare_managed_encryption_write_with_payload_codec(
     })?;
 
     Ok(ManagedEncryptionWriteContext {
-        encryption: ObjectEncryption::SseS3(
-            SseS3ObjectState::new_with_encryption_instance_id(
-                encryption_instance_id,
-                wrapping_key.key_id,
-                wrap_nonce,
-                wrapped_dek,
-                segment_nonce_prefix,
-            )
-            .with_payload_codec(payload_codec),
-        ),
+        encryption: ObjectEncryption::SseS3(SseS3ObjectState::new_with_encryption_instance_id(
+            encryption_instance_id,
+            wrapping_key.key_id,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+        )),
         dek,
         wrapping_key: *wrapping_key.wrapping_key(),
-        segment_scope: SseCustomerSegmentScope::object(),
     })
 }
 
@@ -1102,7 +967,6 @@ pub(crate) fn prepare_managed_encryption_write_with_payload_codec(
 pub(crate) fn resume_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
-    segment_scope: SseCustomerSegmentScope,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
     if state.key_binding() != ObjectEncryptionKeyBinding::ProvisionalV1 {
         return Err(ServerError::InternalError {
@@ -1127,7 +991,6 @@ pub(crate) fn resume_managed_encryption_write(
         encryption: ObjectEncryption::SseS3(state.clone()),
         dek,
         wrapping_key: *wrapping_key.wrapping_key(),
-        segment_scope,
     })
 }
 
@@ -1165,14 +1028,12 @@ pub(crate) fn decrypt_authorized_managed_encryption_segment_in_place(
         wrap_aad,
         MANAGED_ENCRYPTION_LABEL,
     )?;
-    decrypt_segment_with_dek_and_prefix_in_place(
+    decrypt_cobblestone_segment_in_place(
         &dek,
-        state.payload_codec(),
-        state.segment_nonce_prefix(),
-        read,
+        read.subject.payload_aead_context(),
         ciphertext,
+        read.plaintext_len,
         AeadDescriptor {
-            aad: MANAGED_SEGMENT_AAD,
             label: MANAGED_ENCRYPTION_LABEL,
         },
     )
@@ -1255,42 +1116,6 @@ pub(crate) fn prepare_authorized_managed_encryption_segment_stream(
         MANAGED_ENCRYPTION_LABEL,
     )?;
     prepare_authorized_cobblestone_segment_stream(&dek, read, MANAGED_ENCRYPTION_LABEL)
-}
-
-#[cfg(test)]
-fn decrypt_managed_encryption_segment_in_place(
-    provider: &impl ManagedKeyProvider,
-    state: &SseS3ObjectState,
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-    ciphertext: &mut Vec<u8>,
-    plaintext_len: usize,
-) -> Result<(), ServerError> {
-    let wrapping_key =
-        provider
-            .lookup_key(state.wrapping_key_id())
-            .ok_or(ServerError::InternalError {
-                reason: "managed wrapping key for object is not available".to_string(),
-            })?;
-    let dek = unwrap_managed_dek(
-        wrapping_key.wrapping_key(),
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        MANAGED_WRAP_AAD,
-        MANAGED_ENCRYPTION_LABEL,
-    )?;
-    decrypt_legacy_segment_with_dek_and_prefix_in_place(
-        &dek,
-        state.segment_nonce_prefix(),
-        segment_scope,
-        segment_index,
-        ciphertext,
-        plaintext_len,
-        AeadDescriptor {
-            aad: MANAGED_SEGMENT_AAD,
-            label: MANAGED_ENCRYPTION_LABEL,
-        },
-    )
 }
 
 pub fn decrypt_managed_encryption_checksum(
@@ -1468,16 +1293,12 @@ pub(crate) fn decrypt_authorized_sse_customer_segment_in_place(
         wrap_aad,
         "SSE-C",
     )?;
-    decrypt_segment_with_dek_and_prefix_in_place(
+    decrypt_cobblestone_segment_in_place(
         &dek,
-        state.payload_codec(),
-        state.segment_nonce_prefix(),
-        read,
+        read.subject.payload_aead_context(),
         ciphertext,
-        AeadDescriptor {
-            aad: SSE_C_SEGMENT_AAD,
-            label: "SSE-C",
-        },
+        read.plaintext_len,
+        AeadDescriptor { label: "SSE-C" },
     )
 }
 
@@ -1605,39 +1426,6 @@ fn prepare_authorized_cobblestone_segment_range(
         payload_aead_context: read.subject.payload_aead_context().to_vec(),
         selection,
     })
-}
-
-#[cfg(test)]
-fn decrypt_sse_customer_segment_in_place(
-    validator: &SseCustomerValidatorConfig,
-    state: &SseCustomerObjectState,
-    request: &SseCustomerRequest,
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-    ciphertext: &mut Vec<u8>,
-    plaintext_len: usize,
-) -> Result<(), ServerError> {
-    validate_sse_customer_read(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
-    let dek = unwrap_managed_dek(
-        &kek,
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        SSE_C_WRAP_AAD,
-        "SSE-C",
-    )?;
-    decrypt_legacy_segment_with_dek_and_prefix_in_place(
-        &dek,
-        state.segment_nonce_prefix(),
-        segment_scope,
-        segment_index,
-        ciphertext,
-        plaintext_len,
-        AeadDescriptor {
-            aad: SSE_C_SEGMENT_AAD,
-            label: "SSE-C",
-        },
-    )
 }
 
 pub fn decrypt_sse_customer_checksum(
@@ -1809,249 +1597,24 @@ fn unwrap_managed_dek(
         })
 }
 
-fn encrypt_segment_with_dek(
+fn encrypt_cobblestone_segment(
     dek: &[u8; SSE_C_DEK_LEN],
-    state: &SseCustomerObjectState,
-    segment_scope: SseCustomerSegmentScope,
-    subject: &SegmentEncryptionSubject,
-    segment_index: u32,
+    payload_aead_context: &[u8],
     plaintext: &[u8],
+    label: &str,
 ) -> Result<Vec<u8>, ServerError> {
-    encrypt_segment_with_dek_and_prefix(
-        dek,
-        plaintext,
-        SegmentSealParameters {
-            payload_codec: state.payload_codec(),
-            segment_nonce_prefix: state.segment_nonce_prefix(),
-            segment_scope,
-            payload_aead_context: subject.payload_aead_context(),
-            segment_index,
-            descriptor: AeadDescriptor {
-                aad: SSE_C_SEGMENT_AAD,
-                label: "SSE-C",
-            },
-        },
-    )
-}
-
-fn encrypt_segment_with_dek_and_prefix(
-    dek: &[u8; SSE_C_DEK_LEN],
-    plaintext: &[u8],
-    parameters: SegmentSealParameters<'_>,
-) -> Result<Vec<u8>, ServerError> {
-    match parameters.payload_codec {
-        SegmentPayloadCodec::SegmentAes256GcmV1 => encrypt_legacy_segment_with_dek_and_prefix(
-            dek,
-            parameters.segment_nonce_prefix,
-            parameters.segment_scope,
-            parameters.segment_index,
-            plaintext,
-            parameters.descriptor,
-        ),
-        SegmentPayloadCodec::Cobblestone256SegmentV1 => {
-            let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
-                reason: format!(
-                    "failed to create {} Cobblestone segment sealing key",
-                    parameters.descriptor.label
-                ),
-            })?;
-            let mut salt = [0_u8; COBBLESTONE_SALT_LEN];
-            argmin_crypto::random::fill(&mut salt).map_err(|_| ServerError::InternalError {
-                reason: format!(
-                    "failed to generate {} Cobblestone segment salt",
-                    parameters.descriptor.label
-                ),
-            })?;
-            cobblestone::seal(&key, salt, parameters.payload_aead_context, plaintext).map_err(
-                |_| ServerError::InternalError {
-                    reason: format!(
-                        "failed to encrypt {} Cobblestone segment",
-                        parameters.descriptor.label
-                    ),
-                },
-            )
-        }
-    }
-}
-
-fn encrypt_legacy_segment_with_dek_and_prefix(
-    dek: &[u8; SSE_C_DEK_LEN],
-    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-    plaintext: &[u8],
-    descriptor: AeadDescriptor<'_>,
-) -> Result<Vec<u8>, ServerError> {
-    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
-        reason: format!("failed to create {} segment sealing key", descriptor.label),
+    let key = Cobblestone256Key::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} Cobblestone segment sealing key"),
     })?;
-    let mut buf = plaintext.to_vec();
-    sealing_key
-        .seal_in_place_append_tag(
-            segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
-            descriptor.aad,
-            &mut buf,
-        )
-        .map_err(|_| ServerError::InternalError {
-            reason: format!("failed to encrypt {} segment", descriptor.label),
-        })?;
-    Ok(buf)
-}
-
-fn decrypt_segment_with_dek_and_prefix_in_place(
-    dek: &[u8; SSE_C_DEK_LEN],
-    payload_codec: SegmentPayloadCodec,
-    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    read: AuthorizedSegmentRead<'_>,
-    ciphertext: &mut Vec<u8>,
-    descriptor: AeadDescriptor<'_>,
-) -> Result<(), ServerError> {
-    match payload_codec {
-        SegmentPayloadCodec::SegmentAes256GcmV1 => {
-            decrypt_legacy_segment_with_dek_and_prefix_in_place(
-                dek,
-                segment_nonce_prefix,
-                read.segment_scope,
-                read.segment_index,
-                ciphertext,
-                read.plaintext_len,
-                descriptor,
-            )
-        }
-        SegmentPayloadCodec::Cobblestone256SegmentV1 => decrypt_cobblestone_segment_in_place(
-            dek,
-            read.subject.payload_aead_context(),
-            ciphertext,
-            read.plaintext_len,
-            descriptor,
-        ),
-    }
-}
-
-#[cfg(test)]
-pub(crate) struct CrossedSegmentTestInput<'a> {
-    pub(crate) source_codec: SegmentPayloadCodec,
-    pub(crate) subject: &'a SegmentEncryptionSubject,
-    pub(crate) segment_scope: SseCustomerSegmentScope,
-    pub(crate) segment_index: u32,
-    pub(crate) plaintext: &'a [u8],
-}
-
-#[cfg(test)]
-pub(crate) fn test_encrypt_crossed_managed_segment(
-    provider: &impl ManagedKeyProvider,
-    state: &SseS3ObjectState,
-    input: CrossedSegmentTestInput<'_>,
-) -> Result<Vec<u8>, ServerError> {
-    let wrapping_key =
-        provider
-            .lookup_key(state.wrapping_key_id())
-            .ok_or(ServerError::InternalError {
-                reason: "managed wrapping key for object is not available".to_string(),
-            })?;
-    let wrap_subject = input.subject.dek_wrap_subject();
-    let wrap_aad = match state.key_binding() {
-        ObjectEncryptionKeyBinding::ProvisionalV1 => MANAGED_WRAP_AAD,
-        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
-    };
-    let dek = unwrap_managed_dek(
-        wrapping_key.wrapping_key(),
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        wrap_aad,
-        MANAGED_ENCRYPTION_LABEL,
-    )?;
-    encrypt_segment_with_dek_and_prefix(
-        &dek,
-        input.plaintext,
-        SegmentSealParameters {
-            payload_codec: input.source_codec,
-            segment_nonce_prefix: state.segment_nonce_prefix(),
-            segment_scope: input.segment_scope,
-            payload_aead_context: input.subject.payload_aead_context(),
-            segment_index: input.segment_index,
-            descriptor: AeadDescriptor {
-                aad: MANAGED_SEGMENT_AAD,
-                label: MANAGED_ENCRYPTION_LABEL,
-            },
-        },
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn test_encrypt_crossed_sse_customer_segment(
-    validator: &SseCustomerValidatorConfig,
-    state: &SseCustomerObjectState,
-    request: &SseCustomerRequest,
-    input: CrossedSegmentTestInput<'_>,
-) -> Result<Vec<u8>, ServerError> {
-    validate_sse_customer_read(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
-    let wrap_subject = input.subject.dek_wrap_subject();
-    let wrap_aad = match state.key_binding() {
-        ObjectEncryptionKeyBinding::ProvisionalV1 => SSE_C_WRAP_AAD,
-        ObjectEncryptionKeyBinding::ObjectSubjectV2 => wrap_subject.aead_context(),
-    };
-    let dek = unwrap_managed_dek(
-        &kek,
-        state.wrap_nonce(),
-        state.wrapped_dek(),
-        wrap_aad,
-        "SSE-C",
-    )?;
-    encrypt_segment_with_dek_and_prefix(
-        &dek,
-        input.plaintext,
-        SegmentSealParameters {
-            payload_codec: input.source_codec,
-            segment_nonce_prefix: state.segment_nonce_prefix(),
-            segment_scope: input.segment_scope,
-            payload_aead_context: input.subject.payload_aead_context(),
-            segment_index: input.segment_index,
-            descriptor: AeadDescriptor {
-                aad: SSE_C_SEGMENT_AAD,
-                label: "SSE-C",
-            },
-        },
-    )
-}
-
-fn decrypt_legacy_segment_with_dek_and_prefix_in_place(
-    dek: &[u8; SSE_C_DEK_LEN],
-    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-    ciphertext: &mut Vec<u8>,
-    plaintext_len: usize,
-    descriptor: AeadDescriptor<'_>,
-) -> Result<(), ServerError> {
-    let opening_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
-        reason: format!("failed to create {} segment opening key", descriptor.label),
+    let mut salt = [0_u8; COBBLESTONE_SALT_LEN];
+    argmin_crypto::random::fill(&mut salt).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to generate {label} Cobblestone segment salt"),
     })?;
-    observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-        aead_records: 1,
-        ..observability::PayloadReadMetricDelta::default()
-    });
-    let actual_plaintext_len = opening_key
-        .open_in_place(
-            segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
-            descriptor.aad,
-            ciphertext,
-        )
-        .map_err(|_| ServerError::InternalError {
-            reason: format!("failed to decrypt {} segment", descriptor.label),
-        })?
-        .len();
-    if actual_plaintext_len != plaintext_len {
-        return Err(ServerError::InternalError {
-            reason: format!(
-                "decrypted {} segment length {} did not match expected {}",
-                descriptor.label, actual_plaintext_len, plaintext_len
-            ),
-        });
-    }
-    ciphertext.truncate(plaintext_len);
-    Ok(())
+    cobblestone::seal(&key, salt, payload_aead_context, plaintext).map_err(|_| {
+        ServerError::InternalError {
+            reason: format!("failed to encrypt {label} Cobblestone segment"),
+        }
+    })
 }
 
 fn decrypt_cobblestone_segment_in_place(
@@ -2082,28 +1645,24 @@ fn decrypt_cobblestone_segment_in_place(
             descriptor.label
         ),
     })?;
-    let mut opener =
-        Cobblestone256StreamOpener::new(key, payload_aead_context, ciphertext.len() as u64)
-            .map_err(|_| failure())?;
-    let mut plaintext = Vec::with_capacity(plaintext_len);
-    opener
-        .update(&ciphertext[..COBBLESTONE_HEADER_LEN], &mut plaintext)
-        .map_err(|_| failure())?;
-    for chunk_index in 0..layout.chunk_count() {
-        let range = layout
-            .ciphertext_range_for_chunk(chunk_index)
-            .map_err(|_| failure())?;
-        let start = usize::try_from(range.start).map_err(|_| failure())?;
-        let end = usize::try_from(range.end).map_err(|_| failure())?;
-        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-            aead_records: 1,
-            ..observability::PayloadReadMetricDelta::default()
-        });
-        opener
-            .update(&ciphertext[start..end], &mut plaintext)
-            .map_err(|_| failure())?;
-    }
-    opener.finish().map_err(|_| failure())?;
+    let plaintext = cobblestone::open_owned_with_observers(
+        key,
+        payload_aead_context,
+        ciphertext,
+        || {
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                aead_records: 1,
+                ..observability::PayloadReadMetricDelta::default()
+            });
+        },
+        |opened_len| {
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                decrypted_bytes: u64::try_from(opened_len).unwrap_or(u64::MAX),
+                ..observability::PayloadReadMetricDelta::default()
+            });
+        },
+    )
+    .map_err(|_| failure())?;
     if plaintext.len() != plaintext_len {
         return Err(ServerError::InternalError {
             reason: format!(
@@ -2116,20 +1675,6 @@ fn decrypt_cobblestone_segment_in_place(
     }
     *ciphertext = plaintext;
     Ok(())
-}
-
-fn segment_nonce(
-    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(segment_nonce_prefix);
-    let scope_start = SSE_C_SEGMENT_NONCE_PREFIX_LEN;
-    let scope_end = scope_start + SSE_C_SEGMENT_NONCE_SCOPE_LEN;
-    nonce[scope_start..scope_end].copy_from_slice(&segment_scope.encode());
-    nonce[scope_end..].copy_from_slice(&segment_index.to_be_bytes());
-    nonce
 }
 
 fn encode_checksum_metadata(
@@ -2275,8 +1820,6 @@ struct SseCustomerChecksumProfileFixture {
     kek: [u8; SSE_C_DEK_LEN],
     wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
     segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    segment_plaintext: &'static [u8],
-    segment_ciphertext: Vec<u8>,
     checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
     checksum: ObjectChecksumMetadata,
     checksum_plaintext: Vec<u8>,
@@ -2300,19 +1843,6 @@ fn sse_customer_checksum_profile_fixture() -> SseCustomerChecksumProfileFixture 
     let kek = derive_wrap_key(&customer_key, &wrap_salt).unwrap();
     let wrapped_dek = wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C").unwrap();
     let segment_nonce_prefix = [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
-    let segment_plaintext = b"compat-sse-c";
-    let segment_ciphertext = encrypt_legacy_segment_with_dek_and_prefix(
-        &dek,
-        &segment_nonce_prefix,
-        SseCustomerSegmentScope::object(),
-        7,
-        segment_plaintext,
-        AeadDescriptor {
-            aad: SSE_C_SEGMENT_AAD,
-            label: "SSE-C",
-        },
-    )
-    .unwrap();
     let checksum_nonce = [0x88; SSE_C_CHECKSUM_NONCE_LEN];
     let checksum = ObjectChecksumMetadata::new(
         checksum::ChecksumAlgorithm::Sha256,
@@ -2353,8 +1883,6 @@ fn sse_customer_checksum_profile_fixture() -> SseCustomerChecksumProfileFixture 
         kek,
         wrapped_dek,
         segment_nonce_prefix,
-        segment_plaintext,
-        segment_ciphertext,
         checksum_nonce,
         checksum,
         checksum_plaintext,
@@ -2387,8 +1915,6 @@ struct SseS3ChecksumProfileFixture {
     wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
     wrapped_dek: [u8; storage::SSE_S3_WRAPPED_DEK_LEN],
     segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-    segment_plaintext: &'static [u8],
-    segment_ciphertext: Vec<u8>,
     checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
     checksum: ObjectChecksumMetadata,
     checksum_plaintext: Vec<u8>,
@@ -2415,19 +1941,6 @@ fn sse_s3_checksum_profile_fixture() -> SseS3ChecksumProfileFixture {
     )
     .unwrap();
     let segment_nonce_prefix = [0x44u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
-    let segment_plaintext = b"compat-sse-s3";
-    let segment_ciphertext = encrypt_legacy_segment_with_dek_and_prefix(
-        &dek,
-        &segment_nonce_prefix,
-        SseCustomerSegmentScope::object(),
-        7,
-        segment_plaintext,
-        AeadDescriptor {
-            aad: MANAGED_SEGMENT_AAD,
-            label: MANAGED_ENCRYPTION_LABEL,
-        },
-    )
-    .unwrap();
     let checksum_nonce = [0x55u8; SSE_S3_CHECKSUM_NONCE_LEN];
     let checksum = ObjectChecksumMetadata::new(
         checksum::ChecksumAlgorithm::Sha256,
@@ -2461,8 +1974,6 @@ fn sse_s3_checksum_profile_fixture() -> SseS3ChecksumProfileFixture {
         wrap_nonce,
         wrapped_dek,
         segment_nonce_prefix,
-        segment_plaintext,
-        segment_ciphertext,
         checksum_nonce,
         checksum,
         checksum_plaintext,
@@ -2483,6 +1994,28 @@ mod tests {
     use super::*;
     use crate::system_metadata::ObjectChecksumMetadata;
     use checksum::{ChecksumAlgorithm, ChecksumType};
+
+    // Immutable reference specimens for the retired whole-segment codec. The
+    // reader is intentionally gone, but these exact bytes and their complete
+    // construction parameters remain append-only format evidence.
+    const RETIRED_SSE_C_SEGMENT_V1_AAD: &[u8] = b"argmin:sse-c:segment:v1";
+    const RETIRED_SSE_C_SEGMENT_V1_NONCE: [u8; 12] = [
+        0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+    ];
+    const RETIRED_SSE_C_SEGMENT_V1_PLAINTEXT: &[u8] = b"compat-sse-c";
+    const RETIRED_SSE_C_SEGMENT_V1_CIPHERTEXT: [u8; 28] = [
+        0x42, 0x67, 0x70, 0xfb, 0x3a, 0x5e, 0x07, 0xe1, 0x95, 0xf7, 0xf1, 0x96, 0x49, 0x3c, 0x59,
+        0x52, 0xdc, 0x87, 0x2e, 0xbb, 0xd4, 0x9b, 0xe4, 0x01, 0xdd, 0x1b, 0x99, 0x44,
+    ];
+    const RETIRED_SSE_S3_SEGMENT_V1_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
+    const RETIRED_SSE_S3_SEGMENT_V1_NONCE: [u8; 12] = [
+        0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+    ];
+    const RETIRED_SSE_S3_SEGMENT_V1_PLAINTEXT: &[u8] = b"compat-sse-s3";
+    const RETIRED_SSE_S3_SEGMENT_V1_CIPHERTEXT: [u8; 29] = [
+        0xf0, 0x05, 0xef, 0x0d, 0x52, 0xfe, 0x04, 0x8e, 0xae, 0x22, 0x79, 0xa0, 0x1a, 0x23, 0x8c,
+        0x13, 0xfe, 0x8f, 0x3a, 0x1d, 0xe6, 0xef, 0x57, 0xff, 0xf6, 0x5e, 0x4d, 0xd8, 0x7d,
+    ];
 
     fn request() -> SseCustomerRequest {
         SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "dummy-md5".to_string())
@@ -2540,15 +2073,84 @@ mod tests {
     }
 
     #[test]
+    fn retired_whole_segment_ciphertext_vectors_remain_frozen_rejection_evidence() {
+        assert_eq!(RETIRED_SSE_C_SEGMENT_V1_AAD, b"argmin:sse-c:segment:v1");
+        assert_eq!(
+            RETIRED_SSE_C_SEGMENT_V1_NONCE,
+            [0x77, 0x77, 0x77, 0x77, 0x77, 0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,]
+        );
+        assert_eq!(RETIRED_SSE_C_SEGMENT_V1_PLAINTEXT, b"compat-sse-c");
+        assert_eq!(RETIRED_SSE_C_SEGMENT_V1_CIPHERTEXT.len(), 12 + 16);
+        assert_eq!(RETIRED_SSE_S3_SEGMENT_V1_AAD, b"argmin:sse-s3:segment:v1");
+        assert_eq!(
+            RETIRED_SSE_S3_SEGMENT_V1_NONCE,
+            [0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,]
+        );
+        assert_eq!(RETIRED_SSE_S3_SEGMENT_V1_PLAINTEXT, b"compat-sse-s3");
+        assert_eq!(RETIRED_SSE_S3_SEGMENT_V1_CIPHERTEXT.len(), 13 + 16);
+
+        let sse_c_fixture = sse_customer_checksum_profile_fixture();
+        assert_eq!(sse_c_fixture.dek, [0x66; SSE_C_DEK_LEN]);
+        assert_eq!(
+            sse_c_fixture.segment_nonce_prefix,
+            [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN]
+        );
+        let mut sse_c_reference = RETIRED_SSE_C_SEGMENT_V1_CIPHERTEXT.to_vec();
+        let sse_c_plaintext = Aes256GcmKey::new(&sse_c_fixture.dek)
+            .unwrap()
+            .open_in_place(
+                RETIRED_SSE_C_SEGMENT_V1_NONCE,
+                RETIRED_SSE_C_SEGMENT_V1_AAD,
+                &mut sse_c_reference,
+            )
+            .unwrap();
+        assert_eq!(sse_c_plaintext, RETIRED_SSE_C_SEGMENT_V1_PLAINTEXT);
+        let mut sse_c_ciphertext = RETIRED_SSE_C_SEGMENT_V1_CIPHERTEXT.to_vec();
+        assert!(decrypt_cobblestone_segment_in_place(
+            &sse_c_fixture.dek,
+            RETIRED_SSE_C_SEGMENT_V1_AAD,
+            &mut sse_c_ciphertext,
+            RETIRED_SSE_C_SEGMENT_V1_PLAINTEXT.len(),
+            AeadDescriptor { label: "SSE-C" },
+        )
+        .is_err());
+        assert_eq!(sse_c_ciphertext, RETIRED_SSE_C_SEGMENT_V1_CIPHERTEXT);
+
+        let sse_s3_fixture = sse_s3_checksum_profile_fixture();
+        assert_eq!(sse_s3_fixture.dek, [0x22; SSE_C_DEK_LEN]);
+        assert_eq!(
+            sse_s3_fixture.segment_nonce_prefix,
+            [0x44; SSE_S3_SEGMENT_NONCE_PREFIX_LEN]
+        );
+        let mut sse_s3_reference = RETIRED_SSE_S3_SEGMENT_V1_CIPHERTEXT.to_vec();
+        let sse_s3_plaintext = Aes256GcmKey::new(&sse_s3_fixture.dek)
+            .unwrap()
+            .open_in_place(
+                RETIRED_SSE_S3_SEGMENT_V1_NONCE,
+                RETIRED_SSE_S3_SEGMENT_V1_AAD,
+                &mut sse_s3_reference,
+            )
+            .unwrap();
+        assert_eq!(sse_s3_plaintext, RETIRED_SSE_S3_SEGMENT_V1_PLAINTEXT);
+        let mut sse_s3_ciphertext = RETIRED_SSE_S3_SEGMENT_V1_CIPHERTEXT.to_vec();
+        assert!(decrypt_cobblestone_segment_in_place(
+            &sse_s3_fixture.dek,
+            RETIRED_SSE_S3_SEGMENT_V1_AAD,
+            &mut sse_s3_ciphertext,
+            RETIRED_SSE_S3_SEGMENT_V1_PLAINTEXT.len(),
+            AeadDescriptor {
+                label: MANAGED_ENCRYPTION_LABEL,
+            },
+        )
+        .is_err());
+        assert_eq!(sse_s3_ciphertext, RETIRED_SSE_S3_SEGMENT_V1_CIPHERTEXT);
+    }
+
+    #[test]
     fn sse_customer_terminal_binding_rewraps_and_opens_only_under_exact_object_subject() {
         let validator = validator();
         let request = request();
-        let write = prepare_sse_customer_write_with_payload_codec(
-            &validator,
-            &request,
-            SegmentPayloadCodec::Cobblestone256SegmentV1,
-        )
-        .unwrap();
+        let write = prepare_sse_customer_write(&validator, &request).unwrap();
         let provisional = write.encryption().clone();
         let provisional_subject = object_subject(&provisional, "object");
         let plaintext = b"payload encrypted before terminal SSE-C rewrap";
@@ -2584,12 +2186,7 @@ mod tests {
             &validator,
             committed_state,
             &request,
-            AuthorizedSegmentRead::new(
-                &committed_segment_subject,
-                SseCustomerSegmentScope::object(),
-                0,
-                plaintext.len(),
-            ),
+            AuthorizedSegmentRead::new(&committed_segment_subject, 0, plaintext.len()),
             &mut opened_payload,
         )
         .unwrap();
@@ -2610,12 +2207,7 @@ mod tests {
             &validator,
             committed_state,
             &request,
-            AuthorizedSegmentRead::new(
-                &crossed_segment_subject,
-                SseCustomerSegmentScope::object(),
-                0,
-                plaintext.len(),
-            ),
+            AuthorizedSegmentRead::new(&crossed_segment_subject, 0, plaintext.len(),),
             &mut crossed_payload,
         )
         .is_err());
@@ -2624,11 +2216,7 @@ mod tests {
     #[test]
     fn managed_terminal_binding_rewraps_and_opens_only_under_exact_object_subject() {
         let provider = managed_key_provider();
-        let write = prepare_managed_encryption_write_with_payload_codec(
-            &provider,
-            SegmentPayloadCodec::Cobblestone256SegmentV1,
-        )
-        .unwrap();
+        let write = prepare_managed_encryption_write(&provider).unwrap();
         let provisional = write.encryption().clone();
         let provisional_subject = object_subject(&provisional, "object");
         let plaintext = b"payload encrypted before terminal SSE-S3 rewrap";
@@ -2662,12 +2250,7 @@ mod tests {
         decrypt_authorized_managed_encryption_segment_in_place(
             &provider,
             committed_state,
-            AuthorizedSegmentRead::new(
-                &committed_segment_subject,
-                SseCustomerSegmentScope::object(),
-                0,
-                plaintext.len(),
-            ),
+            AuthorizedSegmentRead::new(&committed_segment_subject, 0, plaintext.len()),
             &mut opened_payload,
         )
         .unwrap();
@@ -2686,12 +2269,7 @@ mod tests {
         assert!(decrypt_authorized_managed_encryption_segment_in_place(
             &provider,
             committed_state,
-            AuthorizedSegmentRead::new(
-                &crossed_segment_subject,
-                SseCustomerSegmentScope::object(),
-                0,
-                plaintext.len(),
-            ),
+            AuthorizedSegmentRead::new(&crossed_segment_subject, 0, plaintext.len(),),
             &mut crossed_payload,
         )
         .is_err());
@@ -2700,7 +2278,6 @@ mod tests {
     #[test]
     fn cobblestone_segment_profile_dispatch_authenticates_exact_context() {
         let dek = [0x41; SSE_C_DEK_LEN];
-        let nonce_prefix = [0x52; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
         let context = b"storage-minted-segment-subject";
 
         for plaintext_len in [
@@ -2711,22 +2288,9 @@ mod tests {
             cobblestone::COBBLESTONE_CHUNK_LEN + 1,
         ] {
             let plaintext = vec![0x63; plaintext_len];
-            let ciphertext = encrypt_segment_with_dek_and_prefix(
-                &dek,
-                &plaintext,
-                SegmentSealParameters {
-                    payload_codec: SegmentPayloadCodec::Cobblestone256SegmentV1,
-                    segment_nonce_prefix: &nonce_prefix,
-                    segment_scope: SseCustomerSegmentScope::object(),
-                    payload_aead_context: context,
-                    segment_index: 7,
-                    descriptor: AeadDescriptor {
-                        aad: MANAGED_SEGMENT_AAD,
-                        label: MANAGED_ENCRYPTION_LABEL,
-                    },
-                },
-            )
-            .unwrap();
+            let ciphertext =
+                encrypt_cobblestone_segment(&dek, context, &plaintext, MANAGED_ENCRYPTION_LABEL)
+                    .unwrap();
             assert_eq!(
                 ciphertext.len() as u64,
                 SegmentPayloadCodec::Cobblestone256SegmentV1
@@ -2745,7 +2309,6 @@ mod tests {
                 &mut dispatched,
                 plaintext_len,
                 AeadDescriptor {
-                    aad: MANAGED_SEGMENT_AAD,
                     label: MANAGED_ENCRYPTION_LABEL,
                 },
             )
@@ -2759,7 +2322,6 @@ mod tests {
                 &mut crossed,
                 plaintext_len,
                 AeadDescriptor {
-                    aad: MANAGED_SEGMENT_AAD,
                     label: MANAGED_ENCRYPTION_LABEL,
                 },
             )
@@ -2802,22 +2364,19 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let mut ciphertext = ctx.encrypt_segment(3, b"hello world").unwrap();
-        let allocation = ciphertext.as_ptr();
-        let capacity = ciphertext.capacity();
-        decrypt_sse_customer_segment_in_place(
+        let subject = segment_subject(ctx.encryption(), "object", 11);
+        let mut ciphertext = ctx
+            .encrypt_authorized_segment(&subject, 0, b"hello world")
+            .unwrap();
+        decrypt_authorized_sse_customer_segment_in_place(
             &validator,
             state,
             &req,
-            SseCustomerSegmentScope::object(),
-            3,
+            AuthorizedSegmentRead::new(&subject, 0, 11),
             &mut ciphertext,
-            11,
         )
         .unwrap();
         assert_eq!(ciphertext, b"hello world");
-        assert_eq!(ciphertext.as_ptr(), allocation);
-        assert_eq!(ciphertext.capacity(), capacity);
     }
 
     #[test]
@@ -2828,16 +2387,15 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let subject = segment_subject(ctx.encryption(), "object", 3);
+        let mut ciphertext = ctx.encrypt_authorized_segment(&subject, 0, b"abc").unwrap();
         let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
-        let err = decrypt_sse_customer_segment_in_place(
+        let err = decrypt_authorized_sse_customer_segment_in_place(
             &validator,
             state,
             &wrong,
-            SseCustomerSegmentScope::object(),
-            0,
+            AuthorizedSegmentRead::new(&subject, 0, 3),
             &mut ciphertext,
-            3,
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -2851,68 +2409,14 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
-        let err = decrypt_sse_customer_segment_in_place(
+        let subject = segment_subject(ctx.encryption(), "object", 3);
+        let mut ciphertext = ctx.encrypt_authorized_segment(&subject, 0, b"abc").unwrap();
+        let err = decrypt_authorized_sse_customer_segment_in_place(
             &missing_validator(),
             state,
             &req,
-            SseCustomerSegmentScope::object(),
-            0,
+            AuthorizedSegmentRead::new(&subject, 0, 3),
             &mut ciphertext,
-            3,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ServerError::InternalError { .. }));
-    }
-
-    #[test]
-    fn sse_c_multipart_nonce_scope_is_part_specific() {
-        let req = request();
-        let validator = validator();
-        let base_ctx = prepare_sse_customer_write(&validator, &req).unwrap();
-        let ObjectEncryption::SseCustomer(state) = base_ctx.encryption() else {
-            panic!("expected SSE-C object state");
-        };
-        let part1_ctx = resume_sse_customer_write(
-            &validator,
-            state,
-            &req,
-            SseCustomerSegmentScope::multipart_part(1).unwrap(),
-        )
-        .unwrap();
-        let part2_ctx = resume_sse_customer_write(
-            &validator,
-            state,
-            &req,
-            SseCustomerSegmentScope::multipart_part(2).unwrap(),
-        )
-        .unwrap();
-
-        let mut part1_ciphertext = part1_ctx.encrypt_segment(0, b"same-data").unwrap();
-        let part2_ciphertext = part2_ctx.encrypt_segment(0, b"same-data").unwrap();
-        assert_ne!(part1_ciphertext, part2_ciphertext);
-        let mut wrong_scope_ciphertext = part1_ciphertext.clone();
-
-        decrypt_sse_customer_segment_in_place(
-            &validator,
-            state,
-            &req,
-            SseCustomerSegmentScope::multipart_part(1).unwrap(),
-            0,
-            &mut part1_ciphertext,
-            9,
-        )
-        .unwrap();
-        assert_eq!(part1_ciphertext, b"same-data");
-
-        let err = decrypt_sse_customer_segment_in_place(
-            &validator,
-            state,
-            &req,
-            SseCustomerSegmentScope::multipart_part(2).unwrap(),
-            0,
-            &mut wrong_scope_ciphertext,
-            9,
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InternalError { .. }));
@@ -2927,13 +2431,7 @@ mod tests {
             panic!("expected SSE-C object state");
         };
         let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
-        let err = resume_sse_customer_write(
-            &validator,
-            state,
-            &wrong,
-            SseCustomerSegmentScope::multipart_part(1).unwrap(),
-        )
-        .unwrap_err();
+        let err = resume_sse_customer_write(&validator, state, &wrong).unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
@@ -2945,13 +2443,7 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let err = resume_sse_customer_write(
-            &missing_validator(),
-            state,
-            &req,
-            SseCustomerSegmentScope::multipart_part(1).unwrap(),
-        )
-        .unwrap_err();
+        let err = resume_sse_customer_write(&missing_validator(), state, &req).unwrap_err();
         assert!(matches!(err, ServerError::InternalError { .. }));
     }
 
@@ -3021,44 +2513,6 @@ mod tests {
                 0xe0, 0x62, 0x56, 0x70, 0xd0, 0x6b,
             ]
         );
-        assert_eq!(
-            fixture.segment_ciphertext,
-            vec![
-                0x42, 0x67, 0x70, 0xfb, 0x3a, 0x5e, 0x07, 0xe1, 0x95, 0xf7, 0xf1, 0x96, 0x49, 0x3c,
-                0x59, 0x52, 0xdc, 0x87, 0x2e, 0xbb, 0xd4, 0x9b, 0xe4, 0x01, 0xdd, 0x1b, 0x99, 0x44,
-            ]
-        );
-        let mut decrypted_segment = fixture.segment_ciphertext.clone();
-        decrypt_legacy_segment_with_dek_and_prefix_in_place(
-            &fixture.dek,
-            &fixture.segment_nonce_prefix,
-            SseCustomerSegmentScope::object(),
-            7,
-            &mut decrypted_segment,
-            fixture.segment_plaintext.len(),
-            AeadDescriptor {
-                aad: SSE_C_SEGMENT_AAD,
-                label: "SSE-C",
-            },
-        )
-        .unwrap();
-        assert_eq!(decrypted_segment, fixture.segment_plaintext);
-
-        let mut crossed_segment = fixture.segment_ciphertext.clone();
-        assert!(decrypt_legacy_segment_with_dek_and_prefix_in_place(
-            &[0x67; SSE_C_DEK_LEN],
-            &fixture.segment_nonce_prefix,
-            SseCustomerSegmentScope::object(),
-            7,
-            &mut crossed_segment,
-            fixture.segment_plaintext.len(),
-            AeadDescriptor {
-                aad: SSE_C_SEGMENT_AAD,
-                label: "SSE-C",
-            },
-        )
-        .is_err());
-
         assert_eq!(
             fixture.checksum_plaintext,
             [
@@ -3257,21 +2711,18 @@ mod tests {
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let mut ciphertext = ctx.encrypt_segment(4, b"hello sse-s3").unwrap();
-        let allocation = ciphertext.as_ptr();
-        let capacity = ciphertext.capacity();
-        decrypt_managed_encryption_segment_in_place(
+        let subject = segment_subject(ctx.encryption(), "object", 12);
+        let mut ciphertext = ctx
+            .encrypt_authorized_segment(&subject, 0, b"hello sse-s3")
+            .unwrap();
+        decrypt_authorized_managed_encryption_segment_in_place(
             &provider,
             state,
-            SseCustomerSegmentScope::object(),
-            4,
+            AuthorizedSegmentRead::new(&subject, 0, 12),
             &mut ciphertext,
-            12,
         )
         .unwrap();
         assert_eq!(ciphertext, b"hello sse-s3");
-        assert_eq!(ciphertext.as_ptr(), allocation);
-        assert_eq!(ciphertext.capacity(), capacity);
     }
 
     #[test]
@@ -3281,20 +2732,16 @@ mod tests {
         let ObjectEncryption::SseS3(state) = initial.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let resumed = resume_managed_encryption_write(
+        let resumed = resume_managed_encryption_write(&provider, state).unwrap();
+        let subject = segment_subject(resumed.encryption(), "object", 9);
+        let mut ciphertext = resumed
+            .encrypt_authorized_segment(&subject, 0, b"part-data")
+            .unwrap();
+        decrypt_authorized_managed_encryption_segment_in_place(
             &provider,
             state,
-            SseCustomerSegmentScope::multipart_part(2).unwrap(),
-        )
-        .unwrap();
-        let mut ciphertext = resumed.encrypt_segment(1, b"part-data").unwrap();
-        decrypt_managed_encryption_segment_in_place(
-            &provider,
-            state,
-            SseCustomerSegmentScope::multipart_part(2).unwrap(),
-            1,
+            AuthorizedSegmentRead::new(&subject, 0, 9),
             &mut ciphertext,
-            9,
         )
         .unwrap();
         assert_eq!(ciphertext, b"part-data");
@@ -3333,7 +2780,6 @@ mod tests {
         }
 
         assert_eq!(MANAGED_WRAP_AAD, b"argmin:sse-s3:wrap:v1");
-        assert_eq!(MANAGED_SEGMENT_AAD, b"argmin:sse-s3:segment:v1");
         assert_eq!(MANAGED_CHECKSUM_AAD, b"argmin:sse-s3:checksum:v1");
 
         let fixture = sse_s3_checksum_profile_fixture();
@@ -3346,30 +2792,6 @@ mod tests {
                 0x91, 0xa6, 0x05, 0x0c, 0x86, 0x37,
             ]
         );
-        assert_eq!(
-            fixture.segment_ciphertext,
-            vec![
-                0xf0, 0x05, 0xef, 0x0d, 0x52, 0xfe, 0x04, 0x8e, 0xae, 0x22, 0x79, 0xa0, 0x1a, 0x23,
-                0x8c, 0x13, 0xfe, 0x8f, 0x3a, 0x1d, 0xe6, 0xef, 0x57, 0xff, 0xf6, 0x5e, 0x4d, 0xd8,
-                0x7d,
-            ]
-        );
-        let mut decrypted_segment = fixture.segment_ciphertext.clone();
-        decrypt_legacy_segment_with_dek_and_prefix_in_place(
-            &fixture.dek,
-            &fixture.segment_nonce_prefix,
-            SseCustomerSegmentScope::object(),
-            7,
-            &mut decrypted_segment,
-            fixture.segment_plaintext.len(),
-            AeadDescriptor {
-                aad: MANAGED_SEGMENT_AAD,
-                label: MANAGED_ENCRYPTION_LABEL,
-            },
-        )
-        .unwrap();
-        assert_eq!(decrypted_segment, fixture.segment_plaintext);
-
         assert_eq!(
             fixture.checksum_plaintext,
             [
@@ -3439,18 +2861,17 @@ mod tests {
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let subject = segment_subject(ctx.encryption(), "object", 3);
+        let mut ciphertext = ctx.encrypt_authorized_segment(&subject, 0, b"abc").unwrap();
         let missing_provider = StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
             key_id: 8,
             wrapping_key: [12u8; 32],
         });
-        let err = decrypt_managed_encryption_segment_in_place(
+        let err = decrypt_authorized_managed_encryption_segment_in_place(
             &missing_provider,
             state,
-            SseCustomerSegmentScope::object(),
-            0,
+            AuthorizedSegmentRead::new(&subject, 0, 3),
             &mut ciphertext,
-            3,
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InternalError { .. }));
@@ -3464,7 +2885,10 @@ mod tests {
         let ObjectEncryption::SseCustomer(sse_c_state) = sse_c_context.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let sse_c_ciphertext = sse_c_context.encrypt_segment(0, b"abc").unwrap();
+        let sse_c_subject = segment_subject(sse_c_context.encryption(), "object", 3);
+        let sse_c_ciphertext = sse_c_context
+            .encrypt_authorized_segment(&sse_c_subject, 0, b"abc")
+            .unwrap();
         let wrong_request =
             SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
 
@@ -3481,27 +2905,25 @@ mod tests {
         let before = observability::metrics_snapshot();
         let mut wrong_key_ciphertext = sse_c_ciphertext.clone();
         assert!(matches!(
-            decrypt_sse_customer_segment_in_place(
+            decrypt_authorized_sse_customer_segment_in_place(
                 &validator,
                 sse_c_state,
                 &wrong_request,
-                SseCustomerSegmentScope::object(),
-                0,
+                AuthorizedSegmentRead::new(&sse_c_subject, 0, 3),
                 &mut wrong_key_ciphertext,
-                3,
             ),
             Err(ServerError::AccessDenied)
         ));
-        let mut missing_managed_key_ciphertext =
-            managed_context.encrypt_segment(0, b"abc").unwrap();
+        let managed_subject = segment_subject(managed_context.encryption(), "object", 3);
+        let mut missing_managed_key_ciphertext = managed_context
+            .encrypt_authorized_segment(&managed_subject, 0, b"abc")
+            .unwrap();
         assert!(matches!(
-            decrypt_managed_encryption_segment_in_place(
+            decrypt_authorized_managed_encryption_segment_in_place(
                 &missing_provider,
                 managed_state,
-                SseCustomerSegmentScope::object(),
-                0,
+                AuthorizedSegmentRead::new(&managed_subject, 0, 3),
                 &mut missing_managed_key_ciphertext,
-                3,
             ),
             Err(ServerError::InternalError { .. })
         ));
@@ -3514,14 +2936,12 @@ mod tests {
         let mut corrupted_ciphertext = sse_c_ciphertext;
         *corrupted_ciphertext.last_mut().unwrap() ^= 1;
         assert!(matches!(
-            decrypt_sse_customer_segment_in_place(
+            decrypt_authorized_sse_customer_segment_in_place(
                 &validator,
                 sse_c_state,
                 &request,
-                SseCustomerSegmentScope::object(),
-                0,
+                AuthorizedSegmentRead::new(&sse_c_subject, 0, 3),
                 &mut corrupted_ciphertext,
-                3,
             ),
             Err(ServerError::InternalError { .. })
         ));

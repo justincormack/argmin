@@ -3704,15 +3704,12 @@ mod tests {
         let ObjectEncryption::SseS3(state) = crate::tests::metadata_only_test_encryption() else {
             panic!("fixture must use SSE-S3");
         };
-        let encryption = ObjectEncryption::SseS3(
-            crate::SseS3ObjectState::new(
-                state.wrapping_key_id(),
-                *state.wrap_nonce(),
-                *state.wrapped_dek(),
-                *state.segment_nonce_prefix(),
-            )
-            .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
-        );
+        let encryption = ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+            state.wrapping_key_id(),
+            *state.wrap_nonce(),
+            *state.wrapped_dek(),
+            *state.segment_nonce_prefix(),
+        ));
         let segment = ObjectSegmentRecord {
             shard_integrity: None,
             bucket: BucketName::try_from("bucket").unwrap(),
@@ -4268,7 +4265,9 @@ mod tests {
             .expect("object segment placed reference should be listed");
         assert_eq!(
             object_segment.stored_size,
-            1000 + OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
+            SegmentPayloadCodec::Cobblestone256SegmentV1
+                .stored_size(1000)
+                .unwrap()
         );
         assert_eq!(object_segment.crc64, object_segment_crc64);
         assert!(object_segment.shard_integrity.is_some());
@@ -4290,7 +4289,9 @@ mod tests {
             .expect("object part placed reference should be listed");
         assert_eq!(
             object_part.stored_size,
-            1234 + OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
+            SegmentPayloadCodec::Cobblestone256SegmentV1
+                .stored_size(1234)
+                .unwrap()
         );
         assert_eq!(object_part.crc64, multipart_segment_crc64);
         assert!(object_part.shard_integrity.is_some());

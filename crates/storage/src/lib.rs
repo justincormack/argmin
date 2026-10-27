@@ -3762,18 +3762,11 @@ pub mod test_support {
     impl TestObjectPayloadCodecObservation {
         pub(crate) fn from_encryption(encryption: &ObjectEncryption) -> Self {
             Self {
-                is_cobblestone_256_segment_v1: match encryption.payload_codec() {
-                    SegmentPayloadCodec::SegmentAes256GcmV1 => false,
-                    SegmentPayloadCodec::Cobblestone256SegmentV1 => true,
-                },
+                is_cobblestone_256_segment_v1: encryption.payload_codec()
+                    == SegmentPayloadCodec::Cobblestone256SegmentV1,
                 is_object_subject_bound: encryption.key_binding()
                     == ObjectEncryptionKeyBinding::ObjectSubjectV2,
             }
-        }
-
-        #[must_use]
-        pub const fn is_segment_aes_256_gcm_v1(self) -> bool {
-            !self.is_cobblestone_256_segment_v1
         }
 
         #[must_use]
@@ -4265,12 +4258,12 @@ pub use types::{
     WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
     OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,
-    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN,
-    SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
-    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_CHECKSUM_NONCE_LEN,
-    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
+    OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
+    SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN, SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
+    SSE_S3_WRAP_NONCE_LEN,
 };
 pub(crate) use types::{
     AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, CommitDirectPutObjectReq,

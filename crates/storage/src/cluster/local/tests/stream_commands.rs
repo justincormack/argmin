@@ -2530,10 +2530,15 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let witnessed_segment = stream_segment_with_shard_integrity(
+        segment.clone(),
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
 
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
-    let hook_segment = segment.clone();
+    let hook_segment = witnessed_segment.clone();
     let hook_target = target.clone();
     let hook_map = Arc::clone(&map);
     let hook_once = Arc::new(AtomicBool::new(true));
@@ -2585,7 +2590,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
                 key: &key,
                 session_id: &session_id,
                 segment_index: segment.segment_index,
-                segment_record: &segment,
+                segment_record: &witnessed_segment,
                 stored_segment_size: crate::cluster::StreamAppendStoredSegmentSize::Exact(
                     encrypted.storage_bytes.len() as u64,
                 ),
@@ -2616,7 +2621,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
         let pg = node.get_pg(object_pg).unwrap();
         assert_eq!(
             crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
-            vec![segment.clone()]
+            vec![witnessed_segment.clone()]
         );
     }
 
@@ -2696,6 +2701,11 @@ fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
 
     let collision_reservation_id = crate::SessionId::try_from("3c".repeat(16)).unwrap();
     let pending_reservation_id = crate::SessionId::try_from("3d".repeat(16)).unwrap();
@@ -3220,6 +3230,11 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     cluster
         .commit_stream_segment_append(
             &bucket,
@@ -3821,6 +3836,19 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
     cluster
         .register_payload_shard_acks(second_segment.data_pg_id, &second_shard_batch)
         .unwrap();
+    let second_witness = crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+        second_segment.data_pg_id,
+        EcShape {
+            k: second_segment.ec_k,
+            m: second_segment.ec_m,
+        },
+        &second_segment.segment_okh,
+        second_segment.segment_vid,
+        second_encrypted.storage_bytes.len() as u64,
+        second_segment.segment_crc64,
+        &second_shard_batch,
+    )
+    .unwrap();
 
     for (segment, encrypted) in [
         (&first_segment, &first_encrypted),
@@ -3841,7 +3869,10 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
     let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
-    let hook_segment = second_segment.clone();
+    let hook_segment = crate::StreamUploadSegmentRecord {
+        shard_integrity: Some(second_witness.durable_record()),
+        ..second_segment.clone()
+    };
     let hook_target = second_target.clone();
     let _hook_guard =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
@@ -6772,6 +6803,11 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     cluster
         .commit_stream_segment_append(
             &bucket,

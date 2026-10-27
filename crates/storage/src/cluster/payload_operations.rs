@@ -6415,6 +6415,7 @@ impl StorageCluster {
         pg_id: PgId,
         object_pg: &crate::PgStore,
         req: &CommitDirectPutObjectReq,
+        written_shards: &[WrittenShardAck],
         version_id: VersionId,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
@@ -6447,8 +6448,27 @@ impl StorageCluster {
             None
         };
 
+        let stored_segment_size = req.encryption.segment_stored_size(req.size).ok_or_else(|| {
+            ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                reason: "direct PUT segment has invalid stored codec geometry".to_string(),
+            })
+        })?;
+        let shard_batch: Vec<_> = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        let shard_integrity = Self::build_payload_shard_integrity_witness(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+            stored_segment_size,
+            req.segment_crc64,
+            &shard_batch,
+        )?
+        .durable_record();
         let segment_record = ObjectSegmentRecord {
-            shard_integrity: None,
+            shard_integrity: Some(shard_integrity),
             bucket: req.bucket.clone(),
             key: req.key.clone(),
             version_id,

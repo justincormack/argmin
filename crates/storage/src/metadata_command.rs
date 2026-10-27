@@ -5348,6 +5348,38 @@ mod tests {
         15_431_799_212_681_859_503,
         585_700_342_204_918_605,
     ];
+    const IMMUTABLE_V11_SSE_S3_V4_ALL_VARIANT_CHECKSUMS: [u64; 30] = [
+        1_823_888_188_837_738_123,
+        12_530_097_086_218_595_292,
+        1_783_846_759_543_017_215,
+        17_858_848_157_294_608_060,
+        7_134_733_398_828_026_607,
+        1_843_562_537_221_042_982,
+        13_610_686_504_679_361_641,
+        6_621_870_101_727_758_425,
+        9_413_645_625_304_074_522,
+        2_588_941_653_116_204_339,
+        13_728_027_982_590_338_563,
+        8_953_971_771_838_591_472,
+        17_631_579_246_827_314_322,
+        4_497_604_267_552_394_245,
+        6_729_229_385_669_463_065,
+        4_795_384_904_553_294_974,
+        3_312_595_607_235_474_276,
+        5_798_076_562_073_984_309,
+        16_678_183_066_430_423_000,
+        2_337_570_449_713_525_698,
+        5_265_562_070_442_450_937,
+        16_430_862_501_248_150_941,
+        17_598_587_499_391_051_976,
+        15_555_201_368_631_162_286,
+        7_565_154_432_215_251_451,
+        16_379_006_855_824_226_457,
+        6_183_517_103_309_104_107,
+        7_758_223_525_012_698_668,
+        15_431_799_212_681_859_503,
+        585_700_342_204_918_605,
+    ];
 
     fn decode_metadata_command_envelope_for_test(
         bytes: &[u8],
@@ -5472,20 +5504,21 @@ mod tests {
         const SSE_S3_V3_INSTANCE_ID_LEN: usize = crate::OBJECT_ENCRYPTION_INSTANCE_RANDOM_LEN;
 
         let current_state = current_encryption.encode_state().unwrap();
-        assert_eq!(current_state[0], 4, "fixture must use SSE-S3 state v4");
-        assert!(matches!(historical_version, 1..=3));
+        assert_eq!(current_state[0], 5, "fixture must use SSE-S3 state v5");
+        assert!(matches!(historical_version, 1..=4));
         let omitted_instance_len = usize::from(historical_version <= 2) * SSE_S3_V3_INSTANCE_ID_LEN;
         let omitted_codec_len = usize::from(historical_version == 1);
         let mut historical_state =
             Vec::with_capacity(current_state.len() - 1 - omitted_instance_len - omitted_codec_len);
         historical_state.push(historical_version);
         if historical_version >= 2 {
-            historical_state.push(current_state[1]);
+            historical_state.push(1);
         }
-        let remaining_offset = if historical_version <= 2 {
-            3 + SSE_S3_V3_INSTANCE_ID_LEN
-        } else {
-            3
+        let remaining_offset = match historical_version {
+            1 | 2 => 3 + SSE_S3_V3_INSTANCE_ID_LEN,
+            3 => 3,
+            4 => 2,
+            _ => unreachable!("historical version range is checked above"),
         };
         historical_state.extend_from_slice(&current_state[remaining_offset..]);
 
@@ -5590,6 +5623,26 @@ mod tests {
             checksum::crc64::checksum(&historical_bytes),
             expected_checksum,
             "the historical v11/SSE-S3-v3 command specimen changed"
+        );
+        let current_bytes = current.command_bytes_with_encoding_version_for_test(11);
+        if historical_bytes == current_bytes {
+            assert_applied_log_decoder_accepts(current);
+        } else {
+            assert!(decode_metadata_command_envelope_for_test(&historical_bytes).is_err());
+        }
+    }
+
+    fn assert_immutable_v11_sse_s3_v4_command_is_rejected(
+        current: &MetadataCommandEnvelope,
+        expected_checksum: u64,
+        current_encryption: &ObjectEncryption,
+    ) {
+        let historical_bytes =
+            command_bytes_with_historical_sse_s3_state(current, 11, current_encryption, 4);
+        assert_eq!(
+            checksum::crc64::checksum(&historical_bytes),
+            expected_checksum,
+            "the historical v11/SSE-S3-v4 command specimen changed"
         );
         let current_bytes = current.command_bytes_with_encoding_version_for_test(11);
         if historical_bytes == current_bytes {
@@ -6675,15 +6728,12 @@ mod tests {
 
     #[test]
     fn metadata_command_header_and_full_decoders_reject_malformed_payload_profiles_identically() {
-        let encryption = ObjectEncryption::SseS3(
-            SseS3ObjectState::new(
-                9,
-                [10; SSE_S3_WRAP_NONCE_LEN],
-                [11; SSE_S3_WRAPPED_DEK_LEN],
-                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            )
-            .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
-        );
+        let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
         let mut encoded = Vec::new();
         encode_object_encryption(&mut encoded, &encryption);
 
@@ -7608,6 +7658,11 @@ mod tests {
                 IMMUTABLE_V11_SSE_S3_V3_ALL_VARIANT_CHECKSUMS[offset],
                 &sse_s3_encryption,
             );
+            assert_immutable_v11_sse_s3_v4_command_is_rejected(
+                &envelope,
+                IMMUTABLE_V11_SSE_S3_V4_ALL_VARIANT_CHECKSUMS[offset],
+                &sse_s3_encryption,
+            );
             if !V9_STREAM_SESSION_VARIANT_INDICES.contains(&offset) {
                 assert_immutable_v9_command_is_rejected(
                     &envelope,
@@ -7631,31 +7686,31 @@ mod tests {
                 1_823_888_188_837_738_123,
                 12_530_097_086_218_595_292,
                 1_783_846_759_543_017_215,
-                17_858_848_157_294_608_060,
-                7_134_733_398_828_026_607,
-                1_843_562_537_221_042_982,
+                1_596_200_477_502_775_117,
+                18_344_400_800_674_143_463,
+                3_506_871_500_002_470_127,
                 13_610_686_504_679_361_641,
                 6_621_870_101_727_758_425,
                 9_413_645_625_304_074_522,
                 2_588_941_653_116_204_339,
                 13_728_027_982_590_338_563,
                 8_953_971_771_838_591_472,
-                17_631_579_246_827_314_322,
-                4_497_604_267_552_394_245,
-                6_729_229_385_669_463_065,
-                4_795_384_904_553_294_974,
-                3_312_595_607_235_474_276,
-                5_798_076_562_073_984_309,
-                16_678_183_066_430_423_000,
-                2_337_570_449_713_525_698,
-                5_265_562_070_442_450_937,
-                16_430_862_501_248_150_941,
+                10_310_589_748_364_560_869,
+                5_031_596_208_149_928_306,
+                2_799_663_565_977_786_734,
+                4_122_412_684_973_717_769,
+                6_215_483_639_263_487_507,
+                3_156_890_018_081_359_938,
+                65_095_186_959_146_435,
+                9_573_292_260_627_646_549,
+                7_069_855_164_291_583_981,
+                14_918_179_802_415_316_361,
                 17_598_587_499_391_051_976,
                 15_555_201_368_631_162_286,
-                7_565_154_432_215_251_451,
+                852_872_343_901_668_487,
                 16_379_006_855_824_226_457,
                 6_183_517_103_309_104_107,
-                7_758_223_525_012_698_668,
+                1_158_514_066_553_217_883,
                 15_431_799_212_681_859_503,
                 585_700_342_204_918_605,
             ]
@@ -7673,6 +7728,10 @@ mod tests {
         );
         assert_eq!(
             IMMUTABLE_V11_SSE_S3_V3_ALL_VARIANT_CHECKSUMS.len(),
+            checksums.len()
+        );
+        assert_eq!(
+            IMMUTABLE_V11_SSE_S3_V4_ALL_VARIANT_CHECKSUMS.len(),
             checksums.len()
         );
         assert_ne!(
@@ -7693,6 +7752,10 @@ mod tests {
         );
         assert_ne!(
             IMMUTABLE_V11_SSE_S3_V3_ALL_VARIANT_CHECKSUMS.as_slice(),
+            checksums.as_slice()
+        );
+        assert_ne!(
+            IMMUTABLE_V11_SSE_S3_V4_ALL_VARIANT_CHECKSUMS.as_slice(),
             checksums.as_slice()
         );
 

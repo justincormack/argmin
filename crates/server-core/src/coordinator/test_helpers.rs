@@ -21,19 +21,6 @@ pub fn requester(principal: &str) -> Requester {
     Requester::authenticated(AccountIdentity::from_principal(principal))
 }
 
-/// Selects the internal payload codec for subsequently authorized writes.
-///
-/// Production constructors do not expose codec selection and remain pinned to
-/// the current writer. Cross-crate protocol tests use this feature-gated seam
-/// to exercise a supported reader/writer profile before it becomes the
-/// production default.
-pub fn select_new_payload_codec(
-    coord: &mut Coordinator,
-    payload_codec: storage::SegmentPayloadCodec,
-) {
-    coord.test_select_new_payload_codec(payload_codec);
-}
-
 /// Observe the durable payload codec for the current live object through the
 /// ordinary admitted metadata-read route.
 ///

@@ -797,6 +797,53 @@ pub fn open(
     Ok(plaintext)
 }
 
+/// Authenticate a complete message while retaining its owned allocation for
+/// the resulting plaintext.
+///
+/// Successful records are compacted over the header and interleaved tags in
+/// place. Layout or header-commitment failures leave the caller's ciphertext
+/// untouched. Once record opening begins, the allocation is consumed; if any
+/// record fails, it is not returned, so neither the failing record nor earlier
+/// authenticated plaintext can escape to the caller.
+pub fn open_owned_with_observers(
+    input_key: Cobblestone256Key,
+    context: &[u8],
+    ciphertext: &mut Vec<u8>,
+    mut before_open: impl FnMut(),
+    mut after_open: impl FnMut(usize),
+) -> Result<Vec<u8>, CryptoError> {
+    let layout = Cobblestone256MessageLayout::from_ciphertext_len(ciphertext.len() as u64)?;
+    let opener = Cobblestone256Opener::from_header(
+        &input_key,
+        context,
+        ciphertext
+            .get(..COBBLESTONE_HEADER_LEN)
+            .ok_or(CryptoError)?,
+    )?;
+    let mut ciphertext = std::mem::take(ciphertext);
+    let mut output_offset = 0usize;
+    for chunk_index in 0..layout.chunk_count() {
+        let range = layout.ciphertext_range_for_chunk(chunk_index)?;
+        let start = usize::try_from(range.start).map_err(|_| CryptoError)?;
+        let end = usize::try_from(range.end).map_err(|_| CryptoError)?;
+        before_open();
+        let plaintext_len = opener
+            .open_chunk(
+                layout,
+                chunk_index,
+                ciphertext.get_mut(start..end).ok_or(CryptoError)?,
+            )?
+            .len();
+        after_open(plaintext_len);
+        ciphertext.copy_within(start..start + plaintext_len, output_offset);
+        output_offset = output_offset
+            .checked_add(plaintext_len)
+            .ok_or(CryptoError)?;
+    }
+    ciphertext.truncate(output_offset);
+    Ok(ciphertext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1041,80 @@ mod tests {
             .is_err());
         assert_eq!(attempts.get(), 2);
         assert_eq!(successes.get(), 1);
+    }
+
+    #[test]
+    fn owned_complete_message_authenticates_and_compacts_in_one_allocation() {
+        let plaintext = vec![0x7c; COBBLESTONE_CHUNK_LEN * 3 + 19];
+        let mut ciphertext = seal(
+            &key(),
+            [0x2b; COBBLESTONE_SALT_LEN],
+            b"owned-complete",
+            &plaintext,
+        )
+        .unwrap();
+        let layout =
+            Cobblestone256MessageLayout::from_ciphertext_len(ciphertext.len() as u64).unwrap();
+        let allocation = ciphertext.as_ptr();
+        let capacity = ciphertext.capacity();
+        let attempts = std::cell::Cell::new(0usize);
+        let successes = std::cell::Cell::new(0usize);
+        let opened = open_owned_with_observers(
+            key(),
+            b"owned-complete",
+            &mut ciphertext,
+            || attempts.set(attempts.get() + 1),
+            |_| successes.set(successes.get() + 1),
+        )
+        .unwrap();
+        assert!(ciphertext.is_empty());
+        assert_eq!(opened.as_ptr(), allocation);
+        assert_eq!(opened.capacity(), capacity);
+        assert_eq!(opened, plaintext);
+        assert_eq!(
+            attempts.get(),
+            usize::try_from(layout.chunk_count()).unwrap()
+        );
+        assert_eq!(successes.get(), attempts.get());
+
+        let mut corrupted = seal(
+            &key(),
+            [0x2c; COBBLESTONE_SALT_LEN],
+            b"owned-complete",
+            &plaintext,
+        )
+        .unwrap();
+        let second = layout.ciphertext_range_for_chunk(1).unwrap();
+        corrupted[usize::try_from(second.end).unwrap() - 1] ^= 1;
+        let attempts = std::cell::Cell::new(0usize);
+        let successes = std::cell::Cell::new(0usize);
+        assert!(open_owned_with_observers(
+            key(),
+            b"owned-complete",
+            &mut corrupted,
+            || attempts.set(attempts.get() + 1),
+            |_| successes.set(successes.get() + 1),
+        )
+        .is_err());
+        assert!(corrupted.is_empty());
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(successes.get(), 1);
+
+        let mut crossed = seal(
+            &key(),
+            [0x2d; COBBLESTONE_SALT_LEN],
+            b"owned-complete",
+            &plaintext,
+        )
+        .unwrap();
+        let expected = crossed.clone();
+        let allocation = crossed.as_ptr();
+        assert!(
+            open_owned_with_observers(key(), b"crossed-context", &mut crossed, || {}, |_| {},)
+                .is_err()
+        );
+        assert_eq!(crossed.as_ptr(), allocation);
+        assert_eq!(crossed, expected);
     }
 
     #[test]

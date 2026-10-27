@@ -288,6 +288,7 @@ impl Fixture {
                 PgId::new(0),
                 &pg,
                 &request,
+                &payload.written.written_shards,
                 crate::VersionId::Null,
                 request.bucket_write_reservation.clone(),
             )

@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 use storage::{
-    BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SegmentPayloadCodec,
-    SessionId, StreamUploadTarget,
+    BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SessionId,
+    StreamUploadTarget,
 };
 
 #[cfg(test)]
@@ -21,23 +21,13 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::sse::{
-    prepare_managed_encryption_write_with_payload_codec,
-    prepare_sse_customer_write_with_payload_codec, resume_managed_encryption_write,
+    prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
     resume_sse_customer_write, validate_sse_customer_completion_replay, validate_sse_customer_read,
     ManagedEncryptionWriteContext, SseCustomerRequest, SseCustomerResponseHeaders,
-    SseCustomerSegmentScope, SseCustomerWriteContext,
+    SseCustomerWriteContext,
 };
 
 impl Coordinator {
-    fn new_payload_codec(&self) -> SegmentPayloadCodec {
-        self.new_payload_codec
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(super) fn test_select_new_payload_codec(&mut self, payload_codec: SegmentPayloadCodec) {
-        self.new_payload_codec = payload_codec;
-    }
-
     pub fn retained_stream_upload_cleanup(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
@@ -133,11 +123,7 @@ impl Coordinator {
                         .ok_or(ServerError::NotImplemented {
                             feature: "SSE-C requires ARGMIN_SSE_C_VALIDATOR_KEY".to_string(),
                         })?;
-                let write = prepare_sse_customer_write_with_payload_codec(
-                    validator,
-                    request,
-                    self.new_payload_codec(),
-                )?;
+                let write = prepare_sse_customer_write(validator, request)?;
                 Ok(Some(write))
             }
         }
@@ -152,7 +138,7 @@ impl Coordinator {
             .ok_or(ServerError::NotImplemented {
                 feature: "SSE-S3 requires managed key provider configuration".to_string(),
             })?;
-        prepare_managed_encryption_write_with_payload_codec(provider, self.new_payload_codec())
+        prepare_managed_encryption_write(provider)
     }
 
     pub(super) fn resolve_write_encryption(
@@ -179,7 +165,6 @@ impl Coordinator {
         &self,
         encryption: &ObjectEncryption,
         sse_customer: Option<&SseCustomerRequest>,
-        segment_scope: SseCustomerSegmentScope,
         sse_customer_headers_required: bool,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         match encryption {
@@ -187,7 +172,6 @@ impl Coordinator {
                 let sse_customer = self.prepare_existing_sse_customer_write_context(
                     encryption,
                     sse_customer,
-                    segment_scope,
                     sse_customer_headers_required,
                 )?;
                 Ok(match sse_customer {
@@ -209,8 +193,7 @@ impl Coordinator {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-S3 key provider is not configured".to_string(),
                         })?;
-                let managed_write =
-                    resume_managed_encryption_write(provider, state, segment_scope)?;
+                let managed_write = resume_managed_encryption_write(provider, state)?;
                 Ok(ActiveWriteEncryption::managed(
                     ManagedEncryptionAlgorithm::Aes256,
                     managed_write,
@@ -222,15 +205,9 @@ impl Coordinator {
     pub(super) fn load_stream_part_write_encryption_on_admitted_multipart_route(
         &self,
         authorization: &storage::AuthorizedStreamPartSegment<'_, '_>,
-        part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        self.resume_write_encryption(
-            authorization.encryption(),
-            sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
-            false,
-        )
+        self.resume_write_encryption(authorization.encryption(), sse_customer, false)
     }
 
     #[cfg(test)]
@@ -257,12 +234,8 @@ impl Coordinator {
                 let authorization = put_route
                     .authorize_stream_segment(session_id, segment_index, data.len() as u64)
                     .map_err(Self::map_stream_upload_failure)?;
-                let write_encryption = self.resume_write_encryption(
-                    authorization.encryption(),
-                    None,
-                    SseCustomerSegmentScope::object(),
-                    false,
-                )?;
+                let write_encryption =
+                    self.resume_write_encryption(authorization.encryption(), None, false)?;
                 let storage_data = write_encryption.encrypt_standard_object_segment(
                     authorization.encryption_subject(),
                     segment_index,
@@ -306,7 +279,6 @@ impl Coordinator {
                 let write_encryption = self
                     .load_stream_part_write_encryption_on_admitted_multipart_route(
                         &authorization,
-                        part_number,
                         None,
                     )?;
                 let storage_data = write_encryption.encrypt_multipart_part_segment(
@@ -348,7 +320,6 @@ impl Coordinator {
         &self,
         encryption: &ObjectEncryption,
         sse_customer: Option<&SseCustomerRequest>,
-        segment_scope: SseCustomerSegmentScope,
         headers_required: bool,
     ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
         match encryption {
@@ -368,12 +339,7 @@ impl Coordinator {
                         .ok_or(ServerError::InternalError {
                             reason: "SSE-C validator key is not configured".to_string(),
                         })?;
-                Ok(Some(resume_sse_customer_write(
-                    validator,
-                    state,
-                    request,
-                    segment_scope,
-                )?))
+                Ok(Some(resume_sse_customer_write(validator, state, request)?))
             }
             ObjectEncryption::SseS3(_) => {
                 if sse_customer.is_some() {

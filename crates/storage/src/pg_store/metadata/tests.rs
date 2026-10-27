@@ -2393,20 +2393,26 @@ fn test_object_segment(
     version_id: VersionId,
     segment_index: u32,
 ) -> ObjectSegmentRecord {
+    let ec = EcShape { k: 2, m: 1 };
+    let stored_size = SegmentPayloadProfile::SseS3Cobblestone256SegmentV1
+        .stored_size(64)
+        .unwrap();
+    let (segment_crc64, shard_integrity) =
+        crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(ec, stored_size);
     ObjectSegmentRecord {
-        shard_integrity: None,
+        shard_integrity: Some(shard_integrity),
         bucket,
         key,
         version_id,
         segment_index,
         size: 64,
-        segment_crc64: 0x1234 + u64::from(segment_index),
+        segment_crc64,
         segment_okh: [segment_index as u8; 16],
         segment_vid: GenerationId::new(u64::from(segment_index) + 1).unwrap(),
         data_pg_id: segment_index + 1,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 2,
-        ec_m: 1,
+        ec_k: ec.k,
+        ec_m: ec.m,
     }
 }
 
@@ -2414,72 +2420,36 @@ fn cobblestone_test_encryption() -> ObjectEncryption {
     let ObjectEncryption::SseS3(state) = metadata_only_test_encryption() else {
         panic!("metadata fixture must use SSE-S3");
     };
-    ObjectEncryption::SseS3(
-        SseS3ObjectState::new(
-            state.wrapping_key_id(),
-            *state.wrap_nonce(),
-            *state.wrapped_dek(),
-            *state.segment_nonce_prefix(),
-        )
-        .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
-    )
+    ObjectEncryption::SseS3(SseS3ObjectState::new(
+        state.wrapping_key_id(),
+        *state.wrap_nonce(),
+        *state.wrapped_dek(),
+        *state.segment_nonce_prefix(),
+    ))
 }
 
-fn test_encryption_profiles() -> [(SegmentPayloadProfile, ObjectEncryption); 4] {
+fn test_encryption_profiles() -> [(SegmentPayloadProfile, ObjectEncryption); 2] {
     [
         (
-            SegmentPayloadProfile::SseCustomerSegmentAes256GcmV1,
-            ObjectEncryption::SseCustomer(
-                SseCustomerObjectState::new(
-                    1,
-                    [2; SSE_C_VALIDATOR_SALT_LEN],
-                    [3; SSE_C_VALIDATOR_HMAC_LEN],
-                    [4; SSE_C_WRAP_SALT_LEN],
-                    [5; SSE_C_WRAP_NONCE_LEN],
-                    [6; SSE_C_WRAPPED_DEK_LEN],
-                    [7; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-                )
-                .with_payload_codec(SegmentPayloadCodec::SegmentAes256GcmV1),
-            ),
-        ),
-        (
             SegmentPayloadProfile::SseCustomerCobblestone256SegmentV1,
-            ObjectEncryption::SseCustomer(
-                SseCustomerObjectState::new(
-                    8,
-                    [9; SSE_C_VALIDATOR_SALT_LEN],
-                    [10; SSE_C_VALIDATOR_HMAC_LEN],
-                    [11; SSE_C_WRAP_SALT_LEN],
-                    [12; SSE_C_WRAP_NONCE_LEN],
-                    [13; SSE_C_WRAPPED_DEK_LEN],
-                    [14; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-                )
-                .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
-            ),
-        ),
-        (
-            SegmentPayloadProfile::SseS3SegmentAes256GcmV1,
-            ObjectEncryption::SseS3(
-                SseS3ObjectState::new(
-                    15,
-                    [16; SSE_S3_WRAP_NONCE_LEN],
-                    [17; SSE_S3_WRAPPED_DEK_LEN],
-                    [18; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-                )
-                .with_payload_codec(SegmentPayloadCodec::SegmentAes256GcmV1),
-            ),
+            ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+                8,
+                [9; SSE_C_VALIDATOR_SALT_LEN],
+                [10; SSE_C_VALIDATOR_HMAC_LEN],
+                [11; SSE_C_WRAP_SALT_LEN],
+                [12; SSE_C_WRAP_NONCE_LEN],
+                [13; SSE_C_WRAPPED_DEK_LEN],
+                [14; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+            )),
         ),
         (
             SegmentPayloadProfile::SseS3Cobblestone256SegmentV1,
-            ObjectEncryption::SseS3(
-                SseS3ObjectState::new(
-                    19,
-                    [20; SSE_S3_WRAP_NONCE_LEN],
-                    [21; SSE_S3_WRAPPED_DEK_LEN],
-                    [22; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-                )
-                .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
-            ),
+            ObjectEncryption::SseS3(SseS3ObjectState::new(
+                15,
+                [16; SSE_S3_WRAP_NONCE_LEN],
+                [17; SSE_S3_WRAPPED_DEK_LEN],
+                [18; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )),
         ),
     ]
 }

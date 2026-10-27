@@ -568,6 +568,7 @@ fn cluster_shard_scavenger_treats_pending_direct_put_as_referenced() {
             pg_id,
             &pg,
             &commit_req,
+            &written.written_shards,
             crate::VersionId::Null,
             commit_req.bucket_write_reservation.clone(),
         )

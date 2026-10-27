@@ -393,15 +393,6 @@ Connection: close\r\n\r\n",
         setup_frontend_with_storage_handle(storage_handle)
     }
 
-    fn setup_frontend_with_payload_codec(
-        dir: &std::path::Path,
-        payload_codec: storage::SegmentPayloadCodec,
-    ) -> Arc<HttpFrontend> {
-        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
-        let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
-        setup_frontend_with_storage_handle_and_payload_codec(storage_handle, Some(payload_codec))
-    }
-
     fn setup_dynamic_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let storage_cluster = open_dynamic_test_storage_cluster(dir);
         let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
@@ -411,18 +402,12 @@ Connection: close\r\n\r\n",
     fn setup_frontend_with_storage_handle(
         storage_handle: storage::StorageClusterRouteHandle,
     ) -> Arc<HttpFrontend> {
-        setup_frontend_with_storage_handle_and_payload_codec(storage_handle, None)
-    }
-
-    fn setup_frontend_with_storage_handle_and_payload_codec(
-        storage_handle: storage::StorageClusterRouteHandle,
-        payload_codec: Option<storage::SegmentPayloadCodec>,
-    ) -> Arc<HttpFrontend> {
+        let storage_handle = storage_handle;
         let test_storage_cluster = storage_handle.current();
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let mut coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
                 storage_handle,
                 "us-east-1".to_string(),
                 None,
@@ -430,12 +415,6 @@ Connection: close\r\n\r\n",
                 server_core::coordinator::BackgroundWorkerMode::none(),
             )
             .unwrap();
-        if let Some(payload_codec) = payload_codec {
-            server_core::coordinator::test_helpers::select_new_payload_codec(
-                &mut coordinator,
-                payload_codec,
-            );
-        }
         let mut credentials = auth::CredentialStore::new();
         credentials
             .add(
@@ -1113,10 +1092,7 @@ Content-Length: {}\r\n\
     #[tokio::test(flavor = "multi_thread")]
     async fn completed_cobblestone_chunked_streaming_put_keeps_connection_reusable() {
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend_with_payload_codec(
-            tmp.path(),
-            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-        );
+        let frontend = setup_frontend(tmp.path());
         create_test_bucket(&frontend, "chunked-keepalive-bucket");
         let stream_finalization_count = Arc::new(AtomicUsize::new(0));
         let stream_finalization_count_for_hook = Arc::clone(&stream_finalization_count);
@@ -1226,7 +1202,6 @@ Connection: close\r\n\r\n",
             )
             .unwrap();
         assert!(persisted_codec.is_cobblestone_256_segment_v1());
-        assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
         assert!(
             persisted_codec.is_object_subject_bound(),
             "promoted PUT finalization must bind DEK and checksum ciphertext to the exact object subject"
@@ -1236,10 +1211,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn cobblestone_integrity_failures_abort_committed_socket_responses() {
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend_with_payload_codec(
-            tmp.path(),
-            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-        );
+        let frontend = setup_frontend(tmp.path());
         let bucket = "cobblestone-socket-failure-bucket";
         create_test_bucket(&frontend, bucket);
         let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
@@ -1368,10 +1340,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn completed_cobblestone_streaming_post_round_trips_over_socket() {
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend_with_payload_codec(
-            tmp.path(),
-            storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-        );
+        let frontend = setup_frontend(tmp.path());
         create_test_bucket(&frontend, "post-cobblestone-bucket");
         let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
 
@@ -1406,7 +1375,6 @@ Connection: close\r\n\r\n"
             )
             .unwrap();
         assert!(persisted_codec.is_cobblestone_256_segment_v1());
-        assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
         assert!(
             persisted_codec.is_object_subject_bound(),
             "POST finalization must bind DEK and checksum ciphertext to the exact object subject"

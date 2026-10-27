@@ -24,7 +24,6 @@ openssl = [
     "tls-provider/openssl",
 ]
 local-debug-endpoints = ["server-http/local-debug-endpoints"]
-payload-codec-benchmark = ["server-core/payload-codec-benchmark"]
 test-unauthenticated-internal-rpc = []
 test-live-metadata-transfer-failpoints = []
 deep-tracing = [

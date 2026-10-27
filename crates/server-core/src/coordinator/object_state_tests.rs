@@ -5678,220 +5678,6 @@ fn direct_cobblestone_payload() -> Vec<u8> {
         .collect()
 }
 
-fn load_authorized_payload_snapshot(
-    coord: &Coordinator,
-    key: &str,
-) -> storage::LeasedObjectReadSnapshotOutcome<()> {
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key(key);
-    let admission = coord.admit_storage_route_for_request().unwrap();
-    let bucket_snapshot = admission
-        .active_bucket_route(&bucket)
-        .unwrap()
-        .load_bucket_snapshot(storage::BucketSnapshotRequest::default())
-        .unwrap();
-    let route = admission
-        .active_object_payload_read_route(
-            &bucket,
-            &key,
-            None,
-            storage::ObjectReadSnapshotMode::FullPayloadLayout,
-            &bucket_snapshot.bucket_incarnation_read_subject(),
-        )
-        .unwrap();
-    route
-        .load_leased_object_read_snapshot_if(|_| Ok::<(), ()>(()))
-        .unwrap()
-        .expect("crossed-profile object must have a live payload snapshot")
-}
-
-#[test]
-fn authorized_segment_reads_reject_crossed_profile_ciphertext_at_authentication() {
-    use crate::sse::{
-        decrypt_authorized_managed_encryption_segment_in_place,
-        decrypt_authorized_sse_customer_segment_in_place, test_encrypt_crossed_managed_segment,
-        test_encrypt_crossed_sse_customer_segment, AuthorizedSegmentRead, CrossedSegmentTestInput,
-        SseCustomerSegmentScope,
-    };
-
-    let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator_with_sse_c(tmp.path());
-    coord
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
-
-    let cobblestone_plaintext_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 37;
-    let cobblestone_stored_len = storage::SegmentPayloadCodec::Cobblestone256SegmentV1
-        .stored_size(cobblestone_plaintext_len as u64)
-        .unwrap() as usize;
-    let legacy_plaintext_len = cobblestone_stored_len
-        .checked_sub(crate::sse::SSE_C_SEGMENT_TAG_LEN)
-        .unwrap();
-    let customer_request = test_sse_customer_request();
-
-    for (encryption_name, customer_request) in
-        [("managed", None), ("customer", Some(&customer_request))]
-    {
-        if customer_request.is_some() {
-            enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
-        }
-        for (target_codec, target_plaintext_len, source_codec, source_plaintext_len) in [
-            (
-                storage::SegmentPayloadCodec::SegmentAes256GcmV1,
-                legacy_plaintext_len,
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-                cobblestone_plaintext_len,
-            ),
-            (
-                storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
-                cobblestone_plaintext_len,
-                storage::SegmentPayloadCodec::SegmentAes256GcmV1,
-                legacy_plaintext_len,
-            ),
-        ] {
-            coord.test_select_new_payload_codec(target_codec);
-            let key = format!("crossed-{encryption_name}-{target_codec:?}");
-            let target_plaintext = vec![0x47; target_plaintext_len];
-            test_helpers::put_object(
-                &coord,
-                &PutObjectRequest {
-                    encryption: customer_request.map_or_else(
-                        WriteEncryptionRequest::none,
-                        WriteEncryptionRequest::sse_customer,
-                    ),
-                    policy_context: PutObjectPolicyContext::default(),
-                    object_lock: ObjectLockState::default(),
-                    object: object_request_with_expected_owner(
-                        "bucket",
-                        &key,
-                        test_requester(),
-                        None,
-                    ),
-                    data: &target_plaintext,
-                    metadata: &MetadataBlob::new(),
-                    system_metadata: &SystemMetadata::EMPTY,
-                    tags: None,
-                    cond: NO_WRITE,
-                    acl: NO_PUT_OBJECT_ACL.into(),
-                },
-            )
-            .unwrap();
-
-            let loaded = load_authorized_payload_snapshot(&coord, &key);
-            let snapshot = loaded.snapshot();
-            let live = snapshot.stored.as_live().unwrap();
-            let segment = snapshot.object_segments.first().unwrap();
-            assert_eq!(segment.segment_index(), 0);
-            assert_eq!(segment.size(), target_plaintext_len as u64);
-            assert_eq!(live.encryption.payload_codec(), target_codec);
-            let subject = segment
-                .encryption_subject()
-                .expect("admitted payload load must mint a segment subject");
-            let source_plaintext = vec![0x93; source_plaintext_len];
-            let scope = SseCustomerSegmentScope::object();
-            let mut crossed_ciphertext = match &live.encryption {
-                storage::ObjectEncryption::SseCustomer(state) => {
-                    test_encrypt_crossed_sse_customer_segment(
-                        coord.sse_c_validator.as_ref().unwrap(),
-                        state,
-                        customer_request.unwrap(),
-                        CrossedSegmentTestInput {
-                            source_codec,
-                            subject,
-                            segment_scope: scope,
-                            segment_index: segment.segment_index(),
-                            plaintext: &source_plaintext,
-                        },
-                    )
-                    .unwrap()
-                }
-                storage::ObjectEncryption::SseS3(state) => test_encrypt_crossed_managed_segment(
-                    coord.managed_key_provider.as_ref().unwrap(),
-                    state,
-                    CrossedSegmentTestInput {
-                        source_codec,
-                        subject,
-                        segment_scope: scope,
-                        segment_index: segment.segment_index(),
-                        plaintext: &source_plaintext,
-                    },
-                )
-                .unwrap(),
-            };
-            assert_eq!(
-                crossed_ciphertext.len() as u64,
-                target_codec
-                    .stored_size(target_plaintext_len as u64)
-                    .unwrap(),
-                "crossed ciphertext must pass selected-profile framing validation"
-            );
-            if target_codec == storage::SegmentPayloadCodec::Cobblestone256SegmentV1 {
-                assert_eq!(
-                    argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_ciphertext_len(
-                        crossed_ciphertext.len() as u64,
-                    )
-                    .unwrap()
-                    .plaintext_len(),
-                    target_plaintext_len as u64,
-                    "legacy-as-Cobblestone input must reach authentication after exact geometry"
-                );
-            }
-            let original_ciphertext = crossed_ciphertext.clone();
-            let error = match &live.encryption {
-                storage::ObjectEncryption::SseCustomer(state) => {
-                    decrypt_authorized_sse_customer_segment_in_place(
-                        coord.sse_c_validator.as_ref().unwrap(),
-                        state,
-                        customer_request.unwrap(),
-                        AuthorizedSegmentRead::new(
-                            subject,
-                            scope,
-                            segment.segment_index(),
-                            target_plaintext_len,
-                        ),
-                        &mut crossed_ciphertext,
-                    )
-                    .unwrap_err()
-                }
-                storage::ObjectEncryption::SseS3(state) => {
-                    decrypt_authorized_managed_encryption_segment_in_place(
-                        coord.managed_key_provider.as_ref().unwrap(),
-                        state,
-                        AuthorizedSegmentRead::new(
-                            subject,
-                            scope,
-                            segment.segment_index(),
-                            target_plaintext_len,
-                        ),
-                        &mut crossed_ciphertext,
-                    )
-                    .unwrap_err()
-                }
-            };
-            let label = if customer_request.is_some() {
-                "SSE-C"
-            } else {
-                "managed encryption"
-            };
-            let profile = if target_codec == storage::SegmentPayloadCodec::Cobblestone256SegmentV1 {
-                " Cobblestone"
-            } else {
-                ""
-            };
-            assert_eq!(
-                error.to_string(),
-                format!("internal error: failed to decrypt {label}{profile} segment")
-            );
-            if target_codec == storage::SegmentPayloadCodec::Cobblestone256SegmentV1 {
-                assert_eq!(
-                    crossed_ciphertext, original_ciphertext,
-                    "failed Cobblestone authentication must not expose plaintext"
-                );
-            }
-        }
-    }
-}
-
 fn assert_cobblestone_object(
     coord: &Coordinator,
     key: &str,
@@ -5907,7 +5693,6 @@ fn assert_cobblestone_object(
         )
         .unwrap();
     assert!(persisted_codec.is_cobblestone_256_segment_v1());
-    assert!(!persisted_codec.is_segment_aes_256_gcm_v1());
     assert!(
         persisted_codec.is_object_subject_bound(),
         "terminal publication must bind DEK and checksum ciphertext to the exact object subject"
@@ -6088,8 +5873,7 @@ fn assert_direct_cobblestone_range_reads_only_selected_records(
 #[test]
 fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6101,8 +5885,7 @@ fn direct_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
 #[test]
 fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_records() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6194,8 +5977,7 @@ fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_reco
 #[test]
 fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator_with_sse_c(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator_with_sse_c(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6210,8 +5992,7 @@ fn direct_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
 fn direct_put_cobblestone_sse_s3_survives_storage_restart() {
     let tmp = test_util::tempdir();
     {
-        let mut coord = setup_coordinator(tmp.path());
-        coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+        let coord = setup_coordinator(tmp.path());
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
@@ -6232,8 +6013,7 @@ fn direct_put_cobblestone_sse_c_survives_storage_restart() {
     let tmp = test_util::tempdir();
     let request = test_sse_customer_request();
     {
-        let mut coord = setup_coordinator_with_sse_c(tmp.path());
-        coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+        let coord = setup_coordinator_with_sse_c(tmp.path());
         coord
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
@@ -6425,8 +6205,7 @@ fn stream_put_and_read_cobblestone_object(
 #[test]
 fn stream_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6437,8 +6216,7 @@ fn stream_put_cobblestone_sse_s3_round_trips_through_production_storage_path() {
 #[test]
 fn stream_put_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator_with_sse_c(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator_with_sse_c(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6693,8 +6471,7 @@ fn upload_part_and_read_cobblestone_object(
 #[test]
 fn upload_part_cobblestone_sse_s3_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6705,8 +6482,7 @@ fn upload_part_cobblestone_sse_s3_round_trips_through_production_storage_path() 
 #[test]
 fn upload_part_cobblestone_sse_c_round_trips_through_production_storage_path() {
     let tmp = test_util::tempdir();
-    let mut coord = setup_coordinator_with_sse_c(tmp.path());
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    let coord = setup_coordinator_with_sse_c(tmp.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -6757,13 +6533,7 @@ fn copy_and_read_cobblestone_objects(
             VersionId::Null,
         )
         .unwrap();
-    assert!(
-        source_codec.is_segment_aes_256_gcm_v1(),
-        "copy source must persist the legacy segment codec before writer selection changes"
-    );
-    assert!(!source_codec.is_cobblestone_256_segment_v1());
-
-    coord.test_select_new_payload_codec(storage::SegmentPayloadCodec::Cobblestone256SegmentV1);
+    assert!(source_codec.is_cobblestone_256_segment_v1());
     let destination_encryption = match sse_customer {
         Some(request) => WriteEncryptionRequest::sse_customer(request),
         None => WriteEncryptionRequest::none(),
@@ -6801,7 +6571,6 @@ fn copy_and_read_cobblestone_objects(
         copied_codec.is_cobblestone_256_segment_v1(),
         "CopyObject destination must persist the selected Cobblestone codec"
     );
-    assert!(!copied_codec.is_segment_aes_256_gcm_v1());
     assert!(
         copied_codec.is_object_subject_bound(),
         "CopyObject destination finalization must bind DEK and checksum ciphertext to the exact object subject"
@@ -6916,7 +6685,7 @@ fn copy_and_read_cobblestone_objects(
 }
 
 #[test]
-fn copy_paths_cobblestone_sse_s3_round_trip_from_legacy_source() {
+fn copy_paths_cobblestone_sse_s3_round_trip_from_current_source() {
     let tmp = test_util::tempdir();
     let mut coord = setup_coordinator(tmp.path());
     coord
@@ -6927,7 +6696,7 @@ fn copy_paths_cobblestone_sse_s3_round_trip_from_legacy_source() {
 }
 
 #[test]
-fn copy_paths_cobblestone_sse_c_round_trip_from_legacy_source() {
+fn copy_paths_cobblestone_sse_c_round_trip_from_current_source() {
     let tmp = test_util::tempdir();
     let mut coord = setup_coordinator_with_sse_c(tmp.path());
     coord
