@@ -6107,8 +6107,7 @@ fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_reco
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let payload_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
-        + super::read_core::AUTHENTICATED_READ_COALESCE_BYTES
-        + 37;
+        + super::read_core::AUTHENTICATED_READ_COALESCE_BYTES;
     let payload = (0..payload_len)
         .map(|index| u8::try_from(index % 251).unwrap())
         .collect::<Vec<_>>();
@@ -6158,10 +6157,12 @@ fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_reco
     );
     assert_eq!(first.as_ref(), &payload[..first.len()]);
 
+    let before_second = observability::metrics_snapshot();
     let second = body
         .next_chunk(INTERNAL_SEGMENT_SIZE)
         .unwrap()
         .expect("coalesced authenticated records");
+    let after_second = observability::metrics_snapshot();
     assert_eq!(
         second.len(),
         super::read_core::AUTHENTICATED_READ_COALESCE_BYTES
@@ -6169,6 +6170,17 @@ fn full_cobblestone_read_releases_first_record_then_coalesces_authenticated_reco
     assert_eq!(
         second.as_ref(),
         &payload[first.len()..first.len() + second.len()]
+    );
+    assert_eq!(
+        after_second.payload_read_aead_records_total
+            - before_second.payload_read_aead_records_total,
+        u64::try_from(
+            super::read_core::AUTHENTICATED_READ_COALESCE_BYTES
+                / argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+                + 1
+        )
+        .unwrap(),
+        "the final owned window must authenticate its empty terminal record before exposure"
     );
 
     let mut streamed = first.as_ref().to_vec();

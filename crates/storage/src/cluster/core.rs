@@ -1836,40 +1836,37 @@ pub enum ObjectPayloadFullSegmentReadOutcome {
     FullSegmentFallbackRequired,
 }
 
+/// One owned window returned by a sequential full-segment ciphertext read.
+///
+/// The ciphertext variant transfers the allocation filled by storage directly
+/// to the profile-owned authentication boundary. Its bytes remain
+/// unauthenticated and must never be exposed to a client before that step.
+pub enum ObjectPayloadFullSegmentReadWindow {
+    UnauthenticatedCiphertext(Vec<u8>),
+    FullSegmentFallbackRequired,
+}
+
 enum ObjectPayloadFullSegmentReadAuthority {
     Active(Arc<ActiveObjectPayloadRead>),
     Retained(Arc<RetainedObjectPayloadRead>),
 }
 
-/// Maximum ciphertext retained between authenticated-record reads.
-///
-/// The first record is deliberately read without this window so response
-/// TTFB remains bounded by one Cobblestone record. Once that record has been
-/// authenticated, bounded read-ahead amortizes shard-handle/RPC setup without
-/// recreating the former whole-segment buffer.
-const FULL_SEGMENT_READ_AHEAD_BYTES: u64 = 2 * 1024 * 1024;
-
 /// Opaque storage-owned state for a sequential full-segment ciphertext read.
 ///
-/// The reader accepts only contiguous ranges starting at byte zero. It hashes
-/// each hidden systematic shard as bytes cross the storage boundary, reads the
-/// small EC padding suffix before completion, and compares every resulting
-/// checksum with the durable shard-integrity witness. Callers receive bytes
-/// only as unauthenticated ciphertext and must pass them to the exact payload
-/// codec before exposure.
+/// The reader accepts only contiguous, caller-selected windows starting at
+/// byte zero. It hashes each hidden systematic shard as bytes cross the
+/// storage boundary, reads the small EC padding suffix before completion, and
+/// compares every resulting checksum with the durable shard-integrity witness.
+/// Each successful read transfers the storage-filled allocation directly to
+/// the exact payload codec before exposure.
 pub struct ObjectPayloadFullSegmentRead {
     authority: ObjectPayloadFullSegmentReadAuthority,
     segment: ObjectPayloadSegment,
     next_offset: u64,
-    storage_read_offset: u64,
     stored_size: u64,
     shard_size: u64,
     systematic_hashers: Vec<checksum::crc64::Hasher>,
     systematic_bytes: Vec<u64>,
-    read_ahead_enabled: bool,
-    read_buffer: Vec<u8>,
-    read_buffer_start: u64,
-    read_buffer_offset: usize,
     fallback_required: bool,
 }
 
@@ -1916,42 +1913,24 @@ impl ObjectPayloadFullSegmentRead {
             authority,
             segment,
             next_offset: 0,
-            storage_read_offset: 0,
             stored_size,
             shard_size,
             systematic_hashers: (0..data_shards)
                 .map(|_| checksum::crc64::Hasher::new())
                 .collect(),
             systematic_bytes: vec![0; data_shards],
-            read_ahead_enabled: false,
-            read_buffer: Vec::new(),
-            read_buffer_start: 0,
-            read_buffer_offset: 0,
             fallback_required: false,
         })
     }
 
-    /// Enables bounded ciphertext read-ahead after the caller has
-    /// authenticated and exposed the first nonempty record.
-    ///
-    /// Keeping this transition explicit prevents storage from trading the
-    /// first-byte latency improvement for fewer physical reads. Returned bytes
-    /// remain limited to the exact codec-requested range; the extra ciphertext
-    /// stays private to this capability until later records request it.
-    pub fn enable_bounded_read_ahead_after_first_authenticated_record(&mut self) {
-        self.read_ahead_enabled = true;
-    }
-
-    /// Reads the next contiguous stored-ciphertext range and incorporates it
-    /// into the per-shard physical CRC state.
-    pub fn read_next_stored_range_into(
+    /// Reads one exact contiguous stored-ciphertext window into a newly owned
+    /// allocation and incorporates it into the per-shard physical CRC state.
+    pub fn read_next_stored_window(
         &mut self,
         range: std::ops::Range<u64>,
-        dst: &mut Vec<u8>,
-    ) -> Result<ObjectPayloadRangeReadOutcome, ObjectReadFailure> {
+    ) -> Result<ObjectPayloadFullSegmentReadWindow, ObjectReadFailure> {
         if self.fallback_required {
-            dst.clear();
-            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+            return Ok(ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired);
         }
         if range.start != self.next_offset || range.start >= range.end || range.end > self.stored_size
         {
@@ -1968,118 +1947,47 @@ impl ObjectPayloadFullSegmentRead {
                 reason: "streamed full-segment range length exceeds platform limits".to_string(),
             })
         })?;
-        let buffered_end = self
-            .read_buffer_start
-            .checked_add(self.read_buffer.len() as u64)
-            .ok_or_else(|| {
-                ObjectReadFailure::from_store(StoreError::PayloadShardSetMismatch {
-                    reason: "streamed full-segment read buffer geometry overflowed".to_string(),
-                })
-            })?;
-        let buffered_offset = self
-            .read_buffer_start
-            .checked_add(self.read_buffer_offset as u64)
-            .ok_or_else(|| {
-                ObjectReadFailure::from_store(StoreError::PayloadShardSetMismatch {
-                    reason: "streamed full-segment read buffer offset overflowed".to_string(),
-                })
-            })?;
-        if buffered_offset != range.start || range.end > buffered_end {
-            if buffered_offset != range.start || self.storage_read_offset != buffered_end {
-                return Err(ObjectReadFailure::from_store(
-                    StoreError::PayloadShardSetMismatch {
-                        reason: "streamed full-segment read escaped its buffered ciphertext window"
-                            .to_string(),
-                    },
-                ));
-            }
-            if self.read_buffer_offset == self.read_buffer.len() {
-                self.read_buffer.clear();
-            } else {
-                self.read_buffer
-                    .copy_within(self.read_buffer_offset.., 0);
-                self.read_buffer
-                    .truncate(self.read_buffer.len() - self.read_buffer_offset);
-            }
-            self.read_buffer_offset = 0;
-            self.read_buffer_start = range.start;
-            let fetch_start = self.storage_read_offset;
-            let fetch_end = if self.read_ahead_enabled {
-                fetch_start
-                    .saturating_add(FULL_SEGMENT_READ_AHEAD_BYTES)
-                    .max(range.end)
-                    .min(self.stored_size)
-            } else {
-                range.end
-            };
-            let fetch_range = fetch_start..fetch_end;
-            let mut fetched = Vec::new();
-            let outcome = match &self.authority {
-                ObjectPayloadFullSegmentReadAuthority::Active(active) => active
-                    .read_validated_segment_payload_stored_range_into(
-                        &self.segment,
-                        self.segment
-                            .validated_shard_integrity()
-                            .expect("streaming construction requires a validated integrity witness"),
-                        fetch_range.clone(),
-                        &mut fetched,
-                    ),
-                ObjectPayloadFullSegmentReadAuthority::Retained(retained) => retained
-                    .read_validated_segment_payload_stored_range_into(
-                        &self.segment,
-                        self.segment
-                            .validated_shard_integrity()
-                            .expect("streaming construction requires a validated integrity witness"),
-                        fetch_range.clone(),
-                        &mut fetched,
-                    ),
-            }?;
-            if outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
-                self.fallback_required = true;
-                dst.clear();
-                return Ok(outcome);
-            }
-            let fetched_len = usize::try_from(fetch_range.end - fetch_range.start).map_err(|_| {
-                ObjectReadFailure::from_store(StoreError::PayloadShardSetMismatch {
-                    reason: "streamed full-segment fetch length exceeds platform limits"
-                        .to_string(),
-                })
-            })?;
-            if fetched.len() != fetched_len {
-                return Err(ObjectReadFailure::from_store(
-                    StoreError::PayloadShardSetMismatch {
-                        reason: "streamed full-segment fetch returned an unexpected byte count"
-                            .to_string(),
-                    },
-                ));
-            }
-            self.update_physical_crc(fetch_range.start, &fetched)?;
-            self.storage_read_offset = fetch_range.end;
-            self.read_buffer.extend_from_slice(&fetched);
-            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                stored_bytes: u64::try_from(fetched_len).unwrap_or(u64::MAX),
-                crc_bytes: u64::try_from(fetched_len).unwrap_or(u64::MAX),
-                ..observability::PayloadReadMetricDelta::default()
-            });
+        let mut ciphertext = Vec::with_capacity(expected_len);
+        let outcome = match &self.authority {
+            ObjectPayloadFullSegmentReadAuthority::Active(active) => active
+                .read_validated_segment_payload_stored_range_into(
+                    &self.segment,
+                    self.segment
+                        .validated_shard_integrity()
+                        .expect("streaming construction requires a validated integrity witness"),
+                    range.clone(),
+                    &mut ciphertext,
+                ),
+            ObjectPayloadFullSegmentReadAuthority::Retained(retained) => retained
+                .read_validated_segment_payload_stored_range_into(
+                    &self.segment,
+                    self.segment
+                        .validated_shard_integrity()
+                        .expect("streaming construction requires a validated integrity witness"),
+                    range.clone(),
+                    &mut ciphertext,
+                ),
+        }?;
+        if outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
+            self.fallback_required = true;
+            return Ok(ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired);
         }
-
-        let buffered_end = self.read_buffer_offset.checked_add(expected_len).ok_or_else(|| {
-            ObjectReadFailure::from_store(StoreError::PayloadShardSetMismatch {
-                reason: "streamed full-segment buffered range overflowed".to_string(),
-            })
-        })?;
-        let Some(buffered) = self.read_buffer.get(self.read_buffer_offset..buffered_end) else {
+        if ciphertext.len() != expected_len {
             return Err(ObjectReadFailure::from_store(
                 StoreError::PayloadShardSetMismatch {
-                    reason: "streamed full-segment buffered range is incomplete".to_string(),
+                    reason: "streamed full-segment window returned an unexpected byte count"
+                        .to_string(),
                 },
             ));
-        };
-        dst.clear();
-        dst.extend_from_slice(buffered);
-        self.read_buffer_offset = buffered_end;
+        }
+        self.update_physical_crc(range.start, &ciphertext)?;
         self.next_offset = range.end;
-        Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext)
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            stored_bytes: u64::try_from(expected_len).unwrap_or(u64::MAX),
+            crc_bytes: u64::try_from(expected_len).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        Ok(ObjectPayloadFullSegmentReadWindow::UnauthenticatedCiphertext(ciphertext))
     }
 
     fn update_physical_crc(
@@ -2137,7 +2045,7 @@ impl ObjectPayloadFullSegmentRead {
         if self.fallback_required {
             return Ok(ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired);
         }
-        if self.next_offset != self.stored_size || self.storage_read_offset != self.stored_size {
+        if self.next_offset != self.stored_size {
             return Err(ObjectReadFailure::from_store(
                 StoreError::PayloadShardSetMismatch {
                     reason: "streamed full segment was finished before all ciphertext was read"

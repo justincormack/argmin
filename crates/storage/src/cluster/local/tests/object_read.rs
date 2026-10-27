@@ -1439,7 +1439,7 @@ fn validated_shard_integrity_rejects_a_crossed_stored_request_before_shard_acces
 }
 
 #[test]
-fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular_ranges() {
+fn sequential_full_segment_read_validates_every_systematic_byte_across_owned_windows() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
         LocalClusterMap::open(
@@ -1453,9 +1453,8 @@ fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular
     let cluster = current_cluster(&map);
     let bucket = crate::tests::bucket_name("sequential-full-segment-bucket");
     let key = crate::tests::object_key("sequential-full-segment-key");
-    // Exceed the bounded read-ahead window so a codec-sized request must
-    // straddle two physical fetches rather than accidentally relying on one
-    // oversized buffer.
+    // Exceed one production-sized authenticated window so the capability must
+    // transfer multiple independently owned allocations.
     let payload = (0..2_200_001)
         .map(|index| (index % usize::from(u8::MAX)) as u8)
         .collect::<Vec<_>>();
@@ -1497,42 +1496,32 @@ fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular
     let mut reader = active.begin_full_segment_read(&segment).unwrap();
     let stored_size = committed.encrypted.storage_bytes.len();
     let mut assembled = Vec::with_capacity(stored_size);
-    let mut start = 0usize;
-    let widths = [1usize, 16_383, 2, 19_997, 31];
-    let mut width_index = 0usize;
-    while start < stored_size {
-        let end = (start + widths[width_index % widths.len()]).min(stored_size);
-        let mut selected = Vec::new();
-        let outcome = reader
-            .read_next_stored_range_into(
-                u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
-                &mut selected,
-            )
-            .unwrap();
-        assert_eq!(
-            outcome,
-            crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
-        );
-        assembled.extend_from_slice(&selected);
-        start = end;
-        width_index += 1;
-        if width_index == 1 {
-            assert_eq!(
-                physical_reads.load(Ordering::SeqCst),
-                1,
-                "the first response unit must not incur read-ahead latency"
-            );
-            reader.enable_bounded_read_ahead_after_first_authenticated_record();
+    let first_end = 1usize;
+    let second_end = (first_end + 2 * 1024 * 1024).min(stored_size);
+    for range in [0..first_end, first_end..second_end, second_end..stored_size] {
+        if range.is_empty() {
+            continue;
         }
+        let selected = match reader
+            .read_next_stored_window(
+                u64::try_from(range.start).unwrap()..u64::try_from(range.end).unwrap(),
+            )
+            .unwrap()
+        {
+            crate::ObjectPayloadFullSegmentReadWindow::UnauthenticatedCiphertext(selected) => {
+                selected
+            }
+            crate::ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired => {
+                panic!("healthy owned window unexpectedly required reconstruction")
+            }
+        };
+        assert_eq!(selected, committed.encrypted.storage_bytes[range.clone()]);
+        assembled.extend_from_slice(&selected);
     }
     assert_eq!(assembled, committed.encrypted.storage_bytes);
     assert!(
-        width_index > physical_reads.load(Ordering::SeqCst),
-        "bounded read-ahead must amortize physical reads across logical ranges"
-    );
-    assert!(
         physical_reads.load(Ordering::SeqCst) <= usize::from(committed.written.ec.k) + 2,
-        "the first exact read and two bounded windows must amortize systematic shard reads"
+        "the first exact read and two owned windows must bound systematic shard reads"
     );
     assert_eq!(
         reader.finish().unwrap(),
@@ -1601,13 +1590,15 @@ fn sequential_full_segment_read_validates_physical_padding_before_completion() {
             .unwrap(),
     );
     let mut reader = active.begin_full_segment_read(&segment).unwrap();
-    let mut selected = Vec::new();
-    assert_eq!(
-        reader
-            .read_next_stored_range_into(0..u64::try_from(stored_size).unwrap(), &mut selected,)
-            .unwrap(),
-        crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
-    );
+    let selected = match reader
+        .read_next_stored_window(0..u64::try_from(stored_size).unwrap())
+        .unwrap()
+    {
+        crate::ObjectPayloadFullSegmentReadWindow::UnauthenticatedCiphertext(selected) => selected,
+        crate::ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired => {
+            panic!("logical ciphertext unexpectedly required reconstruction")
+        }
+    };
     assert_eq!(
         selected, committed.encrypted.storage_bytes,
         "padding corruption must not alter the logical ciphertext range"
@@ -1777,16 +1768,17 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let stored_size = committed.encrypted.storage_bytes.len();
     let midpoint = stored_size / 2;
     for range in [0..midpoint, midpoint..stored_size] {
-        let mut chunk = Vec::new();
-        assert_eq!(
-            full_reader
-                .read_next_stored_range_into(
-                    u64::try_from(range.start).unwrap()..u64::try_from(range.end).unwrap(),
-                    &mut chunk,
-                )
-                .unwrap(),
-            crate::ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext
-        );
+        let chunk = match full_reader
+            .read_next_stored_window(
+                u64::try_from(range.start).unwrap()..u64::try_from(range.end).unwrap(),
+            )
+            .unwrap()
+        {
+            crate::ObjectPayloadFullSegmentReadWindow::UnauthenticatedCiphertext(chunk) => chunk,
+            crate::ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired => {
+                panic!("healthy retained window unexpectedly required reconstruction")
+            }
+        };
         streamed.extend_from_slice(&chunk);
     }
     assert_eq!(streamed, committed.encrypted.storage_bytes);

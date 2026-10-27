@@ -8,7 +8,7 @@ use storage::ObjectPayloadLease;
 use storage::{
     ActiveObjectPayloadRead, BucketName, GenerationId, ObjectEncryption, ObjectKey,
     ObjectPayloadFullSegmentRead, ObjectPayloadFullSegmentReadOutcome,
-    ObjectPayloadRangeReadOutcome, ObjectPayloadSegment, ObjectReadMultipartPart,
+    ObjectPayloadFullSegmentReadWindow, ObjectPayloadSegment, ObjectReadMultipartPart,
     RetainedObjectPayloadRead, SegmentPayloadCodec, StorageCluster,
 };
 
@@ -107,7 +107,6 @@ struct StreamingFullSegment {
     physical: Option<ObjectPayloadFullSegmentRead>,
     crypto: AuthorizedCobblestoneSegmentStreamRead,
     plaintext_released: usize,
-    terminal_plaintext: Option<Vec<u8>>,
 }
 
 /// Bound authenticated plaintext retained after the first response record.
@@ -293,29 +292,36 @@ impl SegmentListReader {
     ) -> Result<StreamingFullSegmentStep, ServerError> {
         let first_response_record = streaming.plaintext_released == 0;
         let coalesce_limit = target_size.clamp(1, AUTHENTICATED_READ_COALESCE_BYTES);
-        let mut authenticated = if first_response_record {
-            Vec::new()
-        } else {
-            Vec::with_capacity(coalesce_limit)
-        };
         loop {
-            let Some(range) = streaming.crypto.next_ciphertext_range() else {
+            let window_plaintext_limit = if first_response_record {
+                1
+            } else {
+                coalesce_limit
+            };
+            let Some(range) = streaming
+                .crypto
+                .next_ciphertext_window(window_plaintext_limit)
+            else {
                 return Err(ServerError::InternalError {
                     reason: "Cobblestone stream exhausted without terminal physical validation"
                         .to_string(),
                 });
             };
-            let mut ciphertext = Vec::new();
-            let outcome = streaming
+            let ciphertext = match streaming
                 .physical
                 .as_mut()
                 .expect("streaming segment retains physical authority until completion")
-                .read_next_stored_range_into(range, &mut ciphertext)
-                .map_err(super::map_object_read_failure)?;
-            if outcome == ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired {
-                return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired);
-            }
-            let plaintext = match streaming.crypto.authenticate_next(ciphertext) {
+                .read_next_stored_window(range)
+                .map_err(super::map_object_read_failure)?
+            {
+                ObjectPayloadFullSegmentReadWindow::UnauthenticatedCiphertext(ciphertext) => {
+                    ciphertext
+                }
+                ObjectPayloadFullSegmentReadWindow::FullSegmentFallbackRequired => {
+                    return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired);
+                }
+            };
+            let plaintext = match streaming.crypto.authenticate_next_window(ciphertext) {
                 Ok(plaintext) => plaintext,
                 Err(_) => return Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired),
             };
@@ -327,17 +333,9 @@ impl SegmentListReader {
                     .physical
                     .take()
                     .expect("streaming segment finishes physical authority exactly once");
-                let mut terminal_plaintext =
-                    streaming.terminal_plaintext.take().unwrap_or_default();
-                terminal_plaintext.extend_from_slice(&plaintext);
-                if authenticated.capacity() == 0 {
-                    authenticated = terminal_plaintext;
-                } else {
-                    authenticated.extend_from_slice(&terminal_plaintext);
-                }
                 return match physical.finish().map_err(super::map_object_read_failure)? {
                     ObjectPayloadFullSegmentReadOutcome::Complete => {
-                        Ok(StreamingFullSegmentStep::Complete(authenticated))
+                        Ok(StreamingFullSegmentStep::Complete(plaintext))
                     }
                     ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired => {
                         Ok(StreamingFullSegmentStep::FullSegmentFallbackRequired)
@@ -347,24 +345,7 @@ impl SegmentListReader {
             if plaintext.is_empty() {
                 continue;
             }
-            if streaming.crypto.next_record_is_empty_terminal() {
-                debug_assert!(streaming.terminal_plaintext.is_none());
-                streaming.terminal_plaintext = Some(plaintext);
-                continue;
-            }
-            streaming
-                .physical
-                .as_mut()
-                .expect("nonterminal stream retains physical authority")
-                .enable_bounded_read_ahead_after_first_authenticated_record();
-            if authenticated.capacity() == 0 {
-                authenticated = plaintext;
-            } else {
-                authenticated.extend_from_slice(&plaintext);
-            }
-            if first_response_record || authenticated.len() >= coalesce_limit {
-                return Ok(StreamingFullSegmentStep::Plaintext(authenticated));
-            }
+            return Ok(StreamingFullSegmentStep::Plaintext(plaintext));
         }
     }
 
@@ -559,7 +540,6 @@ impl SegmentListReader {
                     physical: Some(physical),
                     crypto,
                     plaintext_released: 0,
-                    terminal_plaintext: None,
                 });
                 continue;
             }

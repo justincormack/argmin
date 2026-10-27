@@ -121,12 +121,12 @@ pub(crate) struct AuthorizedCobblestoneSegmentRangeRead {
 
 /// Incremental, subject-bound opener for one complete Cobblestone segment.
 ///
-/// The caller obtains the next exact stored-ciphertext range from this value,
+/// The caller obtains the next exact stored-ciphertext window from this value,
 /// reads it through storage's sequential physical-integrity capability, and
-/// returns those bytes to [`Self::authenticate_next`]. No plaintext from a
-/// failing record is returned. The final record is not sufficient to complete
-/// a response until the storage capability has also validated every physical
-/// systematic-shard byte.
+/// returns ownership to [`Self::authenticate_next_window`]. No plaintext from
+/// a failing record is returned. The final window is not sufficient to
+/// complete a response until the storage capability has also validated every
+/// physical systematic-shard byte.
 pub(crate) struct AuthorizedCobblestoneSegmentStreamRead {
     opener: Cobblestone256StreamOpener,
     layout: Cobblestone256MessageLayout,
@@ -138,59 +138,93 @@ pub(crate) struct AuthorizedCobblestoneSegmentStreamRead {
 }
 
 impl AuthorizedCobblestoneSegmentStreamRead {
+    /// Select the next complete-record ciphertext window.
+    ///
+    /// `max_plaintext_bytes` is a soft bound: at least one record is always
+    /// selected, and an immediately following empty terminal record is kept in
+    /// the same window so its authentication completes before the preceding
+    /// plaintext can be exposed.
     #[must_use]
-    pub(crate) fn next_ciphertext_range(&self) -> Option<Range<u64>> {
+    pub(crate) fn next_ciphertext_window(&self, max_plaintext_bytes: usize) -> Option<Range<u64>> {
         if !self.header_authenticated {
             return Some(0..COBBLESTONE_HEADER_LEN as u64);
         }
         if self.next_chunk >= self.layout.chunk_count() {
             return None;
         }
-        self.layout.ciphertext_range_for_chunk(self.next_chunk).ok()
+        let first = self
+            .layout
+            .ciphertext_range_for_chunk(self.next_chunk)
+            .ok()?;
+        let mut end = first.end;
+        let first_plaintext = self
+            .layout
+            .plaintext_range_for_chunk(self.next_chunk)
+            .ok()?;
+        let mut selected_plaintext =
+            usize::try_from(first_plaintext.end.checked_sub(first_plaintext.start)?).ok()?;
+        let mut chunk = self.next_chunk + 1;
+        while chunk < self.layout.chunk_count() {
+            let plaintext = self.layout.plaintext_range_for_chunk(chunk).ok()?;
+            let include_empty_terminal = plaintext.is_empty();
+            let plaintext_len =
+                usize::try_from(plaintext.end.checked_sub(plaintext.start)?).ok()?;
+            let next_plaintext = selected_plaintext.checked_add(plaintext_len)?;
+            if !include_empty_terminal && next_plaintext > max_plaintext_bytes.max(1) {
+                break;
+            }
+            end = self.layout.ciphertext_range_for_chunk(chunk).ok()?.end;
+            selected_plaintext = next_plaintext;
+            chunk += 1;
+            if include_empty_terminal {
+                break;
+            }
+        }
+        Some(first.start..end)
     }
 
-    pub(crate) fn authenticate_next(
+    pub(crate) fn authenticate_next_window(
         &mut self,
         ciphertext: Vec<u8>,
     ) -> Result<Vec<u8>, ServerError> {
-        let expected = self
-            .next_ciphertext_range()
-            .ok_or_else(|| ServerError::InternalError {
-                reason: format!(
-                    "received trailing ciphertext for {} Cobblestone segment",
-                    self.label
-                ),
+        let header = !self.header_authenticated;
+        let opened_records = std::cell::Cell::new(0u64);
+        let plaintext = self
+            .opener
+            .open_next_window_owned_with_observers(
+                ciphertext,
+                || {
+                    observability::record_payload_read_metrics(
+                        observability::PayloadReadMetricDelta {
+                            aead_records: 1,
+                            ..observability::PayloadReadMetricDelta::default()
+                        },
+                    );
+                },
+                |plaintext_len| {
+                    opened_records.set(opened_records.get().saturating_add(1));
+                    observability::record_payload_read_metrics(
+                        observability::PayloadReadMetricDelta {
+                            decrypted_bytes: u64::try_from(plaintext_len).unwrap_or(u64::MAX),
+                            ..observability::PayloadReadMetricDelta::default()
+                        },
+                    );
+                },
+            )
+            .map_err(|_| ServerError::InternalError {
+                reason: format!("failed to decrypt {} Cobblestone segment", self.label),
             })?;
-        let expected_len = usize::try_from(expected.end - expected.start).map_err(|_| {
-            ServerError::InternalError {
-                reason: format!("{} Cobblestone record length is invalid", self.label),
-            }
-        })?;
-        if ciphertext.len() != expected_len {
-            return Err(ServerError::InternalError {
-                reason: format!(
-                    "{} Cobblestone record length {} did not match expected {}",
-                    self.label,
-                    ciphertext.len(),
-                    expected_len
-                ),
-            });
-        }
-
-        if self.header_authenticated {
-            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                aead_records: 1,
-                ..observability::PayloadReadMetricDelta::default()
-            });
-        }
-        let plaintext =
-            self.opener
-                .open_next_owned(ciphertext)
-                .map_err(|_| ServerError::InternalError {
-                    reason: format!("failed to decrypt {} Cobblestone segment", self.label),
+        if header {
+            self.header_authenticated = true;
+            debug_assert!(plaintext.is_empty());
+            debug_assert_eq!(opened_records.get(), 0);
+        } else {
+            self.next_chunk = self
+                .next_chunk
+                .checked_add(opened_records.get())
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: format!("{} Cobblestone record count overflowed", self.label),
                 })?;
-        if self.header_authenticated {
-            self.next_chunk += 1;
             self.authenticated_plaintext_len = self
                 .authenticated_plaintext_len
                 .checked_add(plaintext.len())
@@ -200,13 +234,6 @@ impl AuthorizedCobblestoneSegmentStreamRead {
                         self.label
                     ),
                 })?;
-            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                decrypted_bytes: u64::try_from(plaintext.len()).unwrap_or(u64::MAX),
-                ..observability::PayloadReadMetricDelta::default()
-            });
-        } else {
-            self.header_authenticated = true;
-            debug_assert!(plaintext.is_empty());
         }
         Ok(plaintext)
     }
@@ -214,18 +241,6 @@ impl AuthorizedCobblestoneSegmentStreamRead {
     #[must_use]
     pub(crate) fn input_complete(&self) -> bool {
         self.header_authenticated && self.next_chunk == self.layout.chunk_count()
-    }
-
-    /// Reports whether the next record is the mandatory authenticated empty
-    /// terminal record for an exact chunk-multiple message.
-    #[must_use]
-    pub(crate) fn next_record_is_empty_terminal(&self) -> bool {
-        if !self.header_authenticated || self.next_chunk >= self.layout.chunk_count() {
-            return false;
-        }
-        self.layout
-            .plaintext_range_for_chunk(self.next_chunk)
-            .is_ok_and(|range| range.is_empty())
     }
 
     pub(crate) fn finish(&mut self) -> Result<(), ServerError> {

@@ -1907,6 +1907,40 @@ Implementation update (2026-10-27, request-bound shard-integrity capability):
   `memmove` remained about 0.76 billion sampled cycles and is now the clearest avoidable residual
   in the sequential path; this capability slice deliberately does not change buffer ownership.
 
+Implementation update (2026-10-27, owned authenticated read windows):
+
+- The sequential storage capability now reads each exact caller-selected ciphertext window
+  directly into the allocation it returns. The former private read-ahead buffer, fetched-to-buffer
+  copy, per-record buffer-to-ciphertext copy, and buffer compaction state are gone. The request-bound
+  integrity capability, incremental per-systematic-shard CRC state, retained-route lease binding,
+  final padding read, and full-segment fallback semantics are unchanged.
+- The profile boundary selects complete-record windows by plaintext size. It still reads and
+  authenticates only one record before the first nonempty response, then selects up to 2 MiB of
+  plaintext records per later window. An empty exact-multiple terminal record is always included
+  with the preceding plaintext window even if that exceeds the soft bound by one tag, so that
+  plaintext cannot be exposed before terminal authentication.
+- `Cobblestone256StreamOpener` consumes the owned window, authenticates every record in order, and
+  compacts plaintext over the interleaved 16-byte tags within the same allocation. On any failure
+  the consumed allocation is not returned, including any earlier authenticated plaintext in that
+  private window. The final window remains private until both crypto finish and storage's complete
+  physical-witness validation succeed. Server-core moves the resulting allocation directly into
+  `SharedPayloadBuffer` rather than building a second coalescing vector.
+- Crypto tests pin allocation identity, multi-record authentication accounting, exact-multiple
+  terminal handling, and a later-record tag failure returning no window. Storage tests cover active
+  and retained owned windows plus final EC-padding validation. The production reader regression
+  pins the first 16 KiB response, the following 2 MiB owned response, and authentication of the
+  empty terminal record before that final response is exposed; the late-corruption regression
+  continues to prove fallback after an already emitted authenticated prefix.
+- Two opposite-order comparisons against the saved request-bound binary on the same local 4+2,
+  Ring, 16 MiB exploratory setup measured 17-20% higher median full-read throughput and about 16%
+  lower completion p50. First-byte latency remained approximately 1 ms, and the independent 4 KiB
+  range result moved in opposite directions between run orders and remains within run-to-run noise.
+  A matching 128-read profile reduced sampled `memmove` work from about 0.76 billion to about
+  0.12 billion cycles (roughly 84%) and total sampled cycles from 3.88 billion to 3.08 billion.
+  The remaining dominant work is AES-GCM, the required CRC passes, and the once-per-snapshot
+  durable-witness composition. These are still dirty, temporary writer-selection measurements;
+  production writer selection remains `SegmentAes256GcmV1` pending the clean Phase 5 matrix.
+
 ### Optional follow-up: Partial EC reconstruction
 
 This is not part of the initial completion path. Start it only if Phase 3/4 production-like metrics
