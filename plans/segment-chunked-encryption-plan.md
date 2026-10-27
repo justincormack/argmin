@@ -1997,10 +1997,12 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
 - The runner selects a segment-zero systematic shard from that exact placement whose node is not
   the object's metadata primary, chooses a 4 KiB range in the middle of that shard's plaintext span
   in the first full segment, and uses the same object and range for healthy and degraded samples.
-  It stops only the selected storage service, waits for a newer fully serving route map using the
-  spare host, then re-resolves the object and proves that its persisted segment still targets the
-  unavailable node before measuring reconstruction. It restarts the node afterward and requires a
-  further fully serving route-map advance and complete service recovery.
+  It stops only the selected storage service, waits until a newer fully serving route map has
+  removed that node from every current PG acting set, then re-resolves the object and proves that
+  its persisted segment still targets the unavailable node before measuring reconstruction. The
+  exact all-route condition excludes momentarily healthy epochs between serialized per-PG
+  replacements. It restarts the node afterward and requires a further fully serving route-map
+  advance and complete service recovery.
 - Reduced dirty-worktree validation passed end to end for both profiles over three hosts and
   production TLS/TCP routes with `2+1` EC, but completed before the stopped node's heartbeat lease
   expired. A normal-size follow-up correctly exposed that this topology has no spare: after lease
@@ -2013,13 +2015,21 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
   TTFB was 3.136 ms, while its degraded range necessarily entered full-segment reconstruction and
   measured 82.974 ms; this is the expected cost of deferring partial EC reconstruction.
 - Corrected reduced validation passed end to end for both profiles over four hosts with `2+1` EC.
-  In each run the object was created at epoch 13, systematic shard zero resolved to node 2, node 2
-  was stopped, and every PG became fully serving through the spare before sampling. The
-  whole-segment run recovered at epoch 17 and rejoined at epoch 22; the Cobblestone run recovered
-  at epoch 16 and rejoined at epoch 21. Reinspection after recovery retained the original data PG,
-  placement epoch 13, and exact shard-zero location on unavailable node 2. Both full and range
-  reads then succeeded through the historical-placement reconstruction path. These deliberately
-  one-sample dirty-worktree runs validate the scenario and are not reference performance evidence.
+  However, the first normal-workload clean run at `2e0ea8a6` showed that the old readiness check
+  could observe a momentarily fully serving epoch between serialized per-PG replacements. A later
+  map returned another PG to Peering and the degraded range request failed with `SlowDown` during
+  bucket-snapshot loading, before payload reconstruction. That incomplete run is not performance
+  evidence.
+- The harness now requires the stopped node to be absent from every current PG acting set. The
+  post-recovery placement diagnostic also retries bounded transient failures while the finalized
+  route map is installed by storage nodes. Corrected 9 MiB, one-sample dirty-worktree runs passed
+  end to end for both profiles over four hosts with `2+1` EC. Both recovered at epoch 53, retained
+  their original epoch-13 data placement and exact systematic-shard location on the unavailable
+  node, and completed both full and range reads through historical-placement reconstruction. The
+  whole-segment run measured 81.233 MiB/s degraded full-read throughput and 74.287 ms degraded
+  range TTFB. Cobblestone measured 160.098 MiB/s and 3.784 ms range TTFB while healthy, then
+  60.151 MiB/s and 89.399 ms after falling back to full-segment reconstruction. These exploratory
+  runs validate the corrected scenario and are not reference performance evidence.
 - The authoritative clean, paired multihost matrix remains the final Phase 5 measurement before
   the production writer decision. It must use the normal workload, both profile orderings, the
   same hosts and EC shape, and the clean-tree reference guard documented in

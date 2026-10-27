@@ -496,6 +496,49 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
         };
     }
 
+    if command == "control-plane-runtime-map-routes-exclude-node" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(node_id) = args
+            .next()
+            .and_then(|arg| arg.to_string_lossy().parse::<u32>().ok())
+        else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match control_plane_runtime_map_routes_containing_node(Path::new(&path), node_id) {
+            Ok((epoch, pg_routes, active_serving_pg_routes, routes_containing_node)) => {
+                println!(
+                    "{} {} {} {}",
+                    epoch.get(),
+                    pg_routes,
+                    active_serving_pg_routes,
+                    routes_containing_node
+                );
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-runtime-map-diagnostics" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -1293,6 +1336,28 @@ fn control_plane_runtime_map_ready(
         status.cluster_epoch(),
         status.pg_routes(),
         status.active_serving_pg_routes(),
+    ))
+}
+
+fn control_plane_runtime_map_routes_containing_node(
+    socket_path: &Path,
+    node_id: u32,
+) -> Result<(ClusterEpoch, usize, usize, usize), String> {
+    let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
+    let Some(status) = control_plane
+        .runtime_map_node_exclusion_status(node_id)
+        .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?
+    else {
+        return Err(format!(
+            "control-plane runtime map does not contain storage node {}",
+            node_id
+        ));
+    };
+    Ok((
+        status.cluster_epoch(),
+        status.pg_routes(),
+        status.active_serving_pg_routes(),
+        status.routes_containing_node(),
     ))
 }
 

@@ -152,9 +152,12 @@ default. It creates one object, then uses a storage-owned
 diagnostic to verify the durable codec and resolve the exact metadata and data placement routes,
 including the storage-computed shard-index-to-node mapping. The degraded case stops a systematic
 shard's exact storage node, rather than treating acting-set order as shard order. It then waits for
-the heartbeat lease and unavailable-placement grace to elapse and for every PG to become fully
-serving through the spare host. Before sampling, it re-resolves the object and proves that the
-persisted segment still places the selected shard on the stopped node. The same object and byte
+the heartbeat lease and unavailable-placement grace to elapse, and for every current PG route to
+exclude the unavailable node and become fully serving through the spare host. This exact condition
+also excludes momentarily healthy maps between serialized per-PG replacements. Before sampling, it
+uses a bounded retry while the finalized map is installed by storage nodes, then re-resolves the
+object and proves that the persisted segment still places the selected shard on the stopped node.
+The same object and byte
 range therefore exercise retained-placement EC reconstruction after control-plane recovery, rather
 than only the transient interval before route expiry. The selected 4 KiB range lies in the middle
 of that systematic shard's plaintext span in the first full segment. The runner restarts the stopped

@@ -28,6 +28,37 @@ pub struct ControlPlaneFrontendClient {
     dispatch: ControlPlaneServiceClientDispatch,
 }
 
+/// Storage-owned projection of one runtime map's serving and node-exclusion
+/// state for process-level readiness checks.
+pub struct ControlPlaneRuntimeMapNodeExclusionStatus {
+    cluster_epoch: crate::ClusterEpoch,
+    pg_routes: usize,
+    active_serving_pg_routes: usize,
+    routes_containing_node: usize,
+}
+
+impl ControlPlaneRuntimeMapNodeExclusionStatus {
+    #[must_use]
+    pub fn cluster_epoch(&self) -> crate::ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn pg_routes(&self) -> usize {
+        self.pg_routes
+    }
+
+    #[must_use]
+    pub fn active_serving_pg_routes(&self) -> usize {
+        self.active_serving_pg_routes
+    }
+
+    #[must_use]
+    pub fn routes_containing_node(&self) -> usize {
+        self.routes_containing_node
+    }
+}
+
 /// Opaque storage-node heartbeat transport and authentication capability.
 pub struct ControlPlaneStorageNodeClient {
     dispatch: ControlPlaneServiceClientDispatch,
@@ -168,6 +199,42 @@ impl ControlPlaneFrontendClient {
             ControlPlaneServiceClientDispatch::Authenticated(client) => client
                 .runtime_map_status_with_check_applied_timeout(crate::clock::current_time_millis()),
         }
+    }
+
+    pub fn runtime_map_node_exclusion_status(
+        &self,
+        node_id: u32,
+    ) -> Result<
+        Option<ControlPlaneRuntimeMapNodeExclusionStatus>,
+        crate::control_plane::ControlPlaneError,
+    > {
+        let diagnostics = self.runtime_map_diagnostics()?;
+        let runtime_map = diagnostics.runtime_map();
+        let node_id = NodeId::new(node_id);
+        if !runtime_map
+            .nodes()
+            .iter()
+            .any(|node| node.node_id() == node_id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(ControlPlaneRuntimeMapNodeExclusionStatus {
+            cluster_epoch: runtime_map.cluster_epoch(),
+            pg_routes: runtime_map.pg_routes().len(),
+            active_serving_pg_routes: runtime_map
+                .pg_routes()
+                .iter()
+                .filter(|route| {
+                    route.state() == crate::PgState::Active
+                        && route.primary_lease_deadline_ms().is_some()
+                })
+                .count(),
+            routes_containing_node: runtime_map
+                .pg_routes()
+                .iter()
+                .filter(|route| route.acting_set().contains(&node_id))
+                .count(),
+        }))
     }
 }
 

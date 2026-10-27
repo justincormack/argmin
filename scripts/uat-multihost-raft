@@ -1687,6 +1687,35 @@ wait_runtime_map_ready() {
     die "control-plane runtime map did not become ready"
 }
 
+wait_runtime_map_routes_exclude_node() {
+    local node_id="$1"
+    local minimum_exclusive_epoch="$2"
+    local deadline=$((SECONDS + 180))
+    local status=""
+    local runtime_epoch runtime_pg_routes active_serving_pg_routes routes_containing_node trailing
+    while ((SECONDS < deadline)); do
+        if status="$(frontend_command control-plane-runtime-map-routes-exclude-node \
+            "$remote_run/unused.sock" "$node_id" 2>&1)"; then
+            read -r runtime_epoch runtime_pg_routes active_serving_pg_routes \
+                routes_containing_node trailing <<<"$status"
+            if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$runtime_pg_routes" == "$pg_count" &&
+                "$minimum_exclusive_epoch" =~ ^-?[0-9]+$ &&
+                "$runtime_epoch" -gt "$minimum_exclusive_epoch" &&
+                "$active_serving_pg_routes" == "$pg_count" &&
+                "$routes_containing_node" == "0" && -z "$trailing" ]]; then
+                last_runtime_epoch="$runtime_epoch"
+                echo "runtime_map_routes_exclude_node node_id=$node_id epoch=$runtime_epoch pg_routes=$runtime_pg_routes"
+                return 0
+            fi
+            status="runtime-map is not fully serving without node $node_id: $status"
+        fi
+        sleep 0.2
+    done
+    [[ -z "$status" ]] || echo "last_runtime_map_node_exclusion_error=$status" >&2
+    frontend_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
+    die "control-plane runtime map did not evict storage node $node_id from every PG route"
+}
+
 wait_pg_runtime_map_ready() {
     local pg_id="$1"
     local minimum_exclusive_epoch="$2"
@@ -1936,60 +1965,69 @@ inspect_payload_benchmark_object() {
     local bucket="$1"
     local key="$2"
     local metadata_pg="$3"
-    local data_pg inspection_output status
+    local deadline=$((SECONDS + 30))
+    local data_pg inspection_output status last_inspection_error=""
     local shard_index node_id row
     local -a shard_location_rows=() shard_nodes=()
     command_process_number=1
-    for ((data_pg = 0; data_pg < pg_count; data_pg++)); do
-        status=0
-        inspection_output="$(frontend_command \
-            control-plane-inspect-object-payload-placement \
-            "$remote_run/unused.sock" "$metadata_pg" "$data_pg" \
-            "$bucket" "$key" 2>&1)" || status=$?
-        if ((status == 0)); then
-            grep -Fx "payload_codec=$payload_read_benchmark_profile" \
-                <<<"$inspection_output" >/dev/null ||
-                die "durable benchmark payload codec does not match $payload_read_benchmark_profile"
-            benchmark_data_pg="$(sed -n \
-                's/^segment_index=0 data_pg_id=\([0-9][0-9]*\) .*/\1/p' \
-                <<<"$inspection_output")"
-            [[ "$benchmark_data_pg" =~ ^[0-9]+$ ]] ||
-                die "payload diagnostic did not contain segment 0 placement"
-            [[ "$benchmark_data_pg" == "$data_pg" ]] ||
-                die "payload diagnostic returned an unexpected data PG"
-            benchmark_metadata_primary="$(sed -n \
-                's/^metadata_pg_route .* primary_node_id=\([0-9][0-9]*\) acting_set=.*/\1/p' \
-                <<<"$inspection_output")"
-            benchmark_data_acting_set_csv="$(sed -n \
-                "s/^data_pg_route pg_id=$data_pg .* acting_set=//p" \
-                <<<"$inspection_output")"
-            [[ "$benchmark_metadata_primary" =~ ^[0-9]+$ ]] ||
-                die "payload diagnostic did not contain the metadata primary"
-            [[ "$benchmark_data_acting_set_csv" =~ ^[0-9]+(,[0-9]+)+$ ]] ||
-                die "payload diagnostic did not contain the data-PG acting set"
-            mapfile -t shard_location_rows < <(sed -n \
-                's/^segment_shard_location segment_index=0 shard_index=\([0-9][0-9]*\) node_id=\([0-9][0-9]*\)$/\1:\2/p' \
-                <<<"$inspection_output")
-            ((${#shard_location_rows[@]} == ec_total_shards)) ||
-                die "payload diagnostic did not contain every segment-0 shard location"
-            shard_nodes=()
-            for row in "${shard_location_rows[@]}"; do
-                shard_index="${row%%:*}"
-                node_id="${row#*:}"
-                [[ "$shard_index" == "${#shard_nodes[@]}" ]] ||
-                    die "payload diagnostic segment-0 shard locations are not canonical and complete"
-                shard_nodes+=("$node_id")
-            done
-            benchmark_segment_zero_shard_nodes_csv="$(
-                IFS=,
-                printf '%s' "${shard_nodes[*]}"
-            )"
-            printf '%s\n' "$inspection_output"
-            return 0
-        fi
-        ((status == 3)) ||
-            die "payload placement inspection failed while probing data PG $data_pg: $inspection_output"
+    while ((SECONDS < deadline)); do
+        for ((data_pg = 0; data_pg < pg_count; data_pg++)); do
+            status=0
+            inspection_output="$(frontend_command \
+                control-plane-inspect-object-payload-placement \
+                "$remote_run/unused.sock" "$metadata_pg" "$data_pg" \
+                "$bucket" "$key" 2>&1)" || status=$?
+            if ((status == 0)); then
+                grep -Fx "payload_codec=$payload_read_benchmark_profile" \
+                    <<<"$inspection_output" >/dev/null ||
+                    die "durable benchmark payload codec does not match $payload_read_benchmark_profile"
+                benchmark_data_pg="$(sed -n \
+                    's/^segment_index=0 data_pg_id=\([0-9][0-9]*\) .*/\1/p' \
+                    <<<"$inspection_output")"
+                [[ "$benchmark_data_pg" =~ ^[0-9]+$ ]] ||
+                    die "payload diagnostic did not contain segment 0 placement"
+                [[ "$benchmark_data_pg" == "$data_pg" ]] ||
+                    die "payload diagnostic returned an unexpected data PG"
+                benchmark_metadata_primary="$(sed -n \
+                    's/^metadata_pg_route .* primary_node_id=\([0-9][0-9]*\) acting_set=.*/\1/p' \
+                    <<<"$inspection_output")"
+                benchmark_data_acting_set_csv="$(sed -n \
+                    "s/^data_pg_route pg_id=$data_pg .* acting_set=//p" \
+                    <<<"$inspection_output")"
+                [[ "$benchmark_metadata_primary" =~ ^[0-9]+$ ]] ||
+                    die "payload diagnostic did not contain the metadata primary"
+                [[ "$benchmark_data_acting_set_csv" =~ ^[0-9]+(,[0-9]+)+$ ]] ||
+                    die "payload diagnostic did not contain the data-PG acting set"
+                mapfile -t shard_location_rows < <(sed -n \
+                    's/^segment_shard_location segment_index=0 shard_index=\([0-9][0-9]*\) node_id=\([0-9][0-9]*\)$/\1:\2/p' \
+                    <<<"$inspection_output")
+                ((${#shard_location_rows[@]} == ec_total_shards)) ||
+                    die "payload diagnostic did not contain every segment-0 shard location"
+                shard_nodes=()
+                for row in "${shard_location_rows[@]}"; do
+                    shard_index="${row%%:*}"
+                    node_id="${row#*:}"
+                    [[ "$shard_index" == "${#shard_nodes[@]}" ]] ||
+                        die "payload diagnostic segment-0 shard locations are not canonical and complete"
+                    shard_nodes+=("$node_id")
+                done
+                benchmark_segment_zero_shard_nodes_csv="$(
+                    IFS=,
+                    printf '%s' "${shard_nodes[*]}"
+                )"
+                printf '%s\n' "$inspection_output"
+                return 0
+            fi
+            if ((status != 3)); then
+                last_inspection_error="data PG $data_pg: $inspection_output"
+                break
+            fi
+        done
+        sleep 0.2
     done
+    [[ -z "$last_inspection_error" ]] ||
+        printf 'last_payload_placement_inspection_error=%s\n' \
+            "$last_inspection_error" >&2
     die "could not resolve benchmark payload data PG"
 }
 
@@ -2047,7 +2085,7 @@ run_multihost_payload_read_benchmark() {
     pre_failure_epoch="$last_runtime_epoch"
     echo "== stop systematic shard node and wait for spare-host route recovery =="
     stop_storage "$systematic_node"
-    wait_runtime_map_ready "$pre_failure_epoch"
+    wait_runtime_map_routes_exclude_node "$systematic_node" "$pre_failure_epoch"
 
     benchmark_data_pg=""
     benchmark_metadata_primary=""

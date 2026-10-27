@@ -154,8 +154,8 @@ pub use control_plane_server_bootstrap::{
     ControlPlaneRpcServerListenerInput, ControlPlaneRpcServerLoops,
 };
 pub use control_plane_service_client::{
-    ControlPlaneFrontendClient, ControlPlaneServiceClientBootstrapError,
-    ControlPlaneStorageNodeClient,
+    ControlPlaneFrontendClient, ControlPlaneRuntimeMapNodeExclusionStatus,
+    ControlPlaneServiceClientBootstrapError, ControlPlaneStorageNodeClient,
 };
 pub use error::{
     BucketListingFailure, BucketListingFailureKind, BucketSnapshotLoadFailure,

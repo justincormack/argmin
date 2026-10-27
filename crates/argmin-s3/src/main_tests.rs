@@ -5311,6 +5311,23 @@ mod tests {
         assert_eq!(active_serving_pg_routes, 0);
 
         std::fs::remove_file(&socket_path).unwrap();
+        let node_route_server = spawn_raft_unix_rpc_server(&harness, &socket_path, 31_150);
+        let (
+            node_route_epoch,
+            node_route_count,
+            active_serving_node_routes,
+            routes_containing_node,
+        ) =
+            control_plane_runtime_map_routes_containing_node(&socket_path, 1)
+                .expect("runtime-map node-route helper should read raft map");
+        node_route_server.join().unwrap();
+
+        assert_eq!(node_route_epoch, before.cluster_epoch());
+        assert_eq!(node_route_count, 1);
+        assert_eq!(active_serving_node_routes, 0);
+        assert_eq!(routes_containing_node, 1);
+
+        std::fs::remove_file(&socket_path).unwrap();
         let diagnostics_server =
             spawn_raft_unix_rpc_server(&harness, &socket_path, 31_200);
         let diagnostics = control_plane_runtime_map_diagnostics(&socket_path)
