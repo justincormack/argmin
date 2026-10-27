@@ -25,7 +25,8 @@ Options:
   --benchmark-binary PATH
                          Use a prebuilt payload-read benchmark client
   --payload-read-benchmark PROFILE
-                         Run healthy and missing-shard read measurements for PROFILE
+                         Run healthy and recovered missing-shard reads for PROFILE;
+                         requires at least one host beyond the EC width
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
   --lifecycle-root PATH  Private lifecycle registry (default: XDG state directory)
@@ -646,6 +647,8 @@ ec_total_shards=$((ec_data_shards + ec_parity_shards))
 if [[ -n "$payload_read_benchmark_profile" ]]; then
     [[ "$ec_data_shards+$ec_parity_shards" == "2+1" || "$ec_data_shards+$ec_parity_shards" == "3+1" ]] ||
         die "--payload-read-benchmark requires EC 2+1 or 3+1"
+    ((host_count > ec_total_shards)) ||
+        die "--payload-read-benchmark requires at least one spare host beyond EC $ec_data_shards+$ec_parity_shards"
 fi
 validate_route_rotation
 for address in "${addresses[@]}"; do
@@ -1995,6 +1998,8 @@ run_multihost_payload_read_benchmark() {
     local healthy_output="$metrics_dir/payload-read-healthy.log"
     local systematic_output="$metrics_dir/payload-read-missing-systematic.log"
     local bucket key metadata_pg metadata_primary systematic_node systematic_index candidate_index
+    local original_data_pg original_segment_zero_shard_nodes_csv
+    local pre_failure_epoch pre_rejoin_epoch
     local range_start
     local -a acting_set=() segment_zero_shard_nodes=()
 
@@ -2016,6 +2021,8 @@ run_multihost_payload_read_benchmark() {
     ((${#segment_zero_shard_nodes[@]} == ec_total_shards)) ||
         die "payload diagnostic shard placement does not match EC width"
     metadata_primary="$benchmark_metadata_primary"
+    original_data_pg="$benchmark_data_pg"
+    original_segment_zero_shard_nodes_csv="$benchmark_segment_zero_shard_nodes_csv"
     systematic_index=-1
     systematic_node=""
     for ((candidate_index = 0; candidate_index < ec_data_shards; candidate_index++)); do
@@ -2036,15 +2043,37 @@ run_multihost_payload_read_benchmark() {
     echo "== run healthy multihost payload-read benchmark =="
     run_payload_read_benchmark_client healthy "$healthy_output" "$bucket" "$key" "$range_start"
 
-    echo "== run multihost payload-read benchmark with systematic shard unavailable =="
+    wait_runtime_map_ready
+    pre_failure_epoch="$last_runtime_epoch"
+    echo "== stop systematic shard node and wait for spare-host route recovery =="
     stop_storage "$systematic_node"
+    wait_runtime_map_ready "$pre_failure_epoch"
+
+    benchmark_data_pg=""
+    benchmark_metadata_primary=""
+    benchmark_data_acting_set_csv=""
+    benchmark_segment_zero_shard_nodes_csv=""
+    inspect_payload_benchmark_object "$bucket" "$key" "$metadata_pg"
+    [[ "$benchmark_data_pg" == "$original_data_pg" ]] ||
+        die "payload data PG changed after unavailable-node recovery"
+    [[ "$benchmark_segment_zero_shard_nodes_csv" == "$original_segment_zero_shard_nodes_csv" ]] ||
+        die "persisted segment shard placement changed after unavailable-node recovery"
+    IFS=, read -r -a segment_zero_shard_nodes <<<"$benchmark_segment_zero_shard_nodes_csv"
+    [[ "${segment_zero_shard_nodes[$systematic_index]}" == "$systematic_node" ]] ||
+        die "selected systematic shard no longer resolves to the stopped storage node"
+
+    echo "== run multihost payload-read benchmark with recovered route and historical systematic shard unavailable =="
     run_payload_read_benchmark_client missing-systematic "$systematic_output" \
         "$bucket" "$key" "$range_start"
+
+    pre_rejoin_epoch="$last_runtime_epoch"
     start_storage "$systematic_node"
     wait_storage_listener "$systematic_node"
+    wait_for_storage_network
+    wait_runtime_map_ready "$pre_rejoin_epoch"
 
     assert_all_service_units_active
-    echo "payload_read_multihost_benchmark_complete profile=$payload_read_benchmark_profile ec=$ec_data_shards+$ec_parity_shards data_pg=$benchmark_data_pg systematic_index=$systematic_index systematic_node=$systematic_node metadata_primary=$metadata_primary range_start=$range_start"
+    echo "payload_read_multihost_benchmark_complete profile=$payload_read_benchmark_profile ec=$ec_data_shards+$ec_parity_shards data_pg=$benchmark_data_pg systematic_index=$systematic_index systematic_node=$systematic_node metadata_primary=$metadata_primary range_start=$range_start recovered_epoch=$pre_rejoin_epoch final_epoch=$last_runtime_epoch"
 }
 
 capture_cluster_diagnostics() {

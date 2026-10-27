@@ -1982,7 +1982,8 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
   work counters. External runs explicitly report `work_metrics_available=false` instead of
   emitting misleading zero deltas for work performed by remote frontend and storage processes.
 - `uat-multihost-raft` has a dedicated release-only payload benchmark mode for redundant `2+1` or
-  `3+1` EC. The server's benchmark feature requires an exact immutable writer selection before
+  `3+1` EC and requires at least one spare host beyond the EC width. The server's benchmark feature
+  requires an exact immutable writer selection before
   coordinator construction; builds without that feature remain pinned to
   `SegmentAes256GcmV1`. The runner records source and binary identities and reports a reference run
   only for a clean tree with runner-built current-source release server and client binaries. Dirty,
@@ -1996,16 +1997,29 @@ Implementation update (2026-10-27, multihost and degraded-read benchmark harness
 - The runner selects a segment-zero systematic shard from that exact placement whose node is not
   the object's metadata primary, chooses a 4 KiB range in the middle of that shard's plaintext span
   in the first full segment, and uses the same object and range for healthy and degraded samples.
-  It stops only the selected storage service, then restarts it and requires the complete deployment
-  to recover.
+  It stops only the selected storage service, waits for a newer fully serving route map using the
+  spare host, then re-resolves the object and proves that its persisted segment still targets the
+  unavailable node before measuring reconstruction. It restarts the node afterward and requires a
+  further fully serving route-map advance and complete service recovery.
 - Reduced dirty-worktree validation passed end to end for both profiles over three hosts and
-  production TLS/TCP routes with `2+1` EC. These results validate the harness rather than the
-  writer choice. With a 9 MiB object and deliberately tiny sample counts, Cobblestone measured
+  production TLS/TCP routes with `2+1` EC, but completed before the stopped node's heartbeat lease
+  expired. A normal-size follow-up correctly exposed that this topology has no spare: after lease
+  expiry every PG entered Peering and reads failed at bucket-snapshot loading before payload
+  reconstruction. The earlier numbers are therefore transient harness evidence, not degraded-read
+  reference results. With a 9 MiB object and deliberately tiny sample counts, Cobblestone measured
   17.844 healthy and 8.481 degraded full GET requests/s, plus 306.954 healthy and 12.185 degraded
   range requests/s. The whole-segment profile measured 9.859 healthy and 9.354 degraded full GET
   requests/s, plus 16.964 healthy and 12.963 degraded range requests/s. Cobblestone healthy range
   TTFB was 3.136 ms, while its degraded range necessarily entered full-segment reconstruction and
   measured 82.974 ms; this is the expected cost of deferring partial EC reconstruction.
+- Corrected reduced validation passed end to end for both profiles over four hosts with `2+1` EC.
+  In each run the object was created at epoch 13, systematic shard zero resolved to node 2, node 2
+  was stopped, and every PG became fully serving through the spare before sampling. The
+  whole-segment run recovered at epoch 17 and rejoined at epoch 22; the Cobblestone run recovered
+  at epoch 16 and rejoined at epoch 21. Reinspection after recovery retained the original data PG,
+  placement epoch 13, and exact shard-zero location on unavailable node 2. Both full and range
+  reads then succeeded through the historical-placement reconstruction path. These deliberately
+  one-sample dirty-worktree runs validate the scenario and are not reference performance evidence.
 - The authoritative clean, paired multihost matrix remains the final Phase 5 measurement before
   the production writer decision. It must use the normal workload, both profile orderings, the
   same hosts and EC shape, and the clean-tree reference guard documented in

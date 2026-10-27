@@ -128,8 +128,8 @@ TLS/TCP storage path. Run each profile from the same clean revision and host set
 
 ```bash
 ./scripts/uat-multihost-raft \
-  --hosts grey0,grey1,grey2 \
-  --addresses 192.168.1.124,192.168.1.155,192.168.1.116 \
+  --hosts grey0,grey1,grey2,grey3 \
+  --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.154 \
   --release \
   --pg-count 16 \
   --ec-data-shards 2 \
@@ -137,8 +137,8 @@ TLS/TCP storage path. Run each profile from the same clean revision and host set
   --payload-read-benchmark segment-aes-256-gcm-v1
 
 ./scripts/uat-multihost-raft \
-  --hosts grey0,grey1,grey2 \
-  --addresses 192.168.1.124,192.168.1.155,192.168.1.116 \
+  --hosts grey0,grey1,grey2,grey3 \
+  --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.154 \
   --release \
   --pg-count 16 \
   --ec-data-shards 2 \
@@ -146,15 +146,19 @@ TLS/TCP storage path. Run each profile from the same clean revision and host set
   --payload-read-benchmark cobblestone-256-segment-v1
 ```
 
-This mode builds the server with the benchmark-only immutable writer selector; ordinary builds
-remain pinned to the production default. It creates one object, then uses a storage-owned
+This mode requires at least one spare storage host beyond the `k+m` EC width. It builds the server
+with the benchmark-only immutable writer selector; ordinary builds remain pinned to the production
+default. It creates one object, then uses a storage-owned
 diagnostic to verify the durable codec and resolve the exact metadata and data placement routes,
 including the storage-computed shard-index-to-node mapping. The degraded case stops a systematic
-shard's exact storage node, rather than treating acting-set order as shard order, and requires that
-node not to be the object's metadata primary. Metadata service therefore remains available and the
-same object and byte range exercise the data reconstruction path. The selected 4 KiB range lies in
-the middle of that systematic shard's plaintext span in the first full segment. The runner restarts
-the stopped node and requires every service to recover before succeeding.
+shard's exact storage node, rather than treating acting-set order as shard order. It then waits for
+the heartbeat lease and unavailable-placement grace to elapse and for every PG to become fully
+serving through the spare host. Before sampling, it re-resolves the object and proves that the
+persisted segment still places the selected shard on the stopped node. The same object and byte
+range therefore exercise retained-placement EC reconstruction after control-plane recovery, rather
+than only the transient interval before route expiry. The selected 4 KiB range lies in the middle
+of that systematic shard's plaintext span in the first full segment. The runner restarts the stopped
+node and requires the route map and every service to recover before succeeding.
 
 The workload can be reduced for exploratory validation with
 `PAYLOAD_READ_BENCHMARK_OBJECT_MIB`, `PAYLOAD_READ_BENCHMARK_WARMUP_ITERS`,
