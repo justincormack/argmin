@@ -53,13 +53,16 @@ running them on a newly provisioned machine.
 Run the current payload-read baseline with:
 
 ```bash
-./scripts/bench-payload-read
+PAYLOAD_PROFILE=segment-aes-256-gcm-v1 EC_SHAPE=4+2 ./scripts/bench-payload-read
+PAYLOAD_PROFILE=cobblestone-256-segment-v1 EC_SHAPE=4+2 ./scripts/bench-payload-read
 ```
 
-Use `./scripts/bench-payload-read --openssl` for the compile-time OpenSSL
-provider. Unlike the focused component benchmarks below, this starts the local
-release S3 server and an AWS SDK client and exercises HTTP, SigV4,
-authorization, object metadata, 4+2 EC shard reads, physical CRC validation,
+Use the same commands with `--openssl` for the compile-time OpenSSL provider.
+`PAYLOAD_PROFILE` and `EC_SHAPE` are required so a reference run cannot silently
+benchmark the production default or an unintended topology. The supported local
+shapes are `1+0` and `4+2`. Unlike the focused component benchmarks below, this
+starts the local release S3 server and an AWS SDK client and exercises HTTP,
+SigV4, authorization, object metadata, EC shard reads, physical CRC validation,
 SSE-S3 decryption, response streaming, and SDK body consumption. It is intended
 to compare payload-codec changes on the same machine, not to represent a
 networked deployment's absolute throughput.
@@ -68,6 +71,8 @@ The following environment variables adjust the workload:
 
 | Variable | Default | Meaning |
 |---|---:|---|
+| `PAYLOAD_PROFILE` | required | `segment-aes-256-gcm-v1` or `cobblestone-256-segment-v1` |
+| `EC_SHAPE` | required | Local `1+0` or `4+2` placement |
 | `OBJECT_MIB` | `16` | Size of the object; must exceed the 8 MiB segment size |
 | `RANGE_BYTES` | `4096` | Size of the range selected from inside a full segment |
 | `WARMUP_ITERS` | `4` | Untimed requests before each operation |
@@ -75,15 +80,20 @@ The following environment variables adjust the workload:
 | `RANGE_ITERS` | `64` | Range GET requests in each sample |
 | `SAMPLES` | `5` | Number of full and range samples |
 
-The benchmark verifies with `HeadObject` that its object uses the AWS-visible
-SSE-S3 AES256 encryption mode. It deliberately does not infer the internal
-payload codec from that response: a future chunked codec will expose the same
-S3 encryption mode. It also does not create a plaintext S3 object: an absent or
-deleted bucket encryption configuration has AWS's automatic SSE-S3 default, so
-there is no production plaintext S3 writer. Each sample reports elapsed
-throughput, per-request header latency, body time to first byte, completion
-latency, and deltas for the `payload_read_*` work counters. Body TTFB is measured
-from immediately before the SDK sends the request until the first non-empty SDK
+Benchmark protocol `payload_read_v3` selects the requested writer profile on
+every pooled frontend before any frontend is shared. After the PUT, a narrow
+server-owned observation loads the current live object through the ordinary
+admitted metadata-read route and requires its self-describing durable codec to
+equal `PAYLOAD_PROFILE`. The output records both requested and persisted
+profiles. `HeadObject` independently verifies the AWS-visible SSE-S3 AES256
+mode; that header alone is not codec evidence because both profiles expose the
+same S3 encryption mode. The benchmark also does not create a plaintext S3
+object: an absent or deleted bucket encryption configuration has AWS's
+automatic SSE-S3 default, so there is no production plaintext S3 writer. Each
+sample reports elapsed throughput, per-request header latency, body time to
+first byte, completion latency, and deltas for the `payload_read_*` work
+counters. Body TTFB is measured from immediately before the SDK sends the
+request until the first non-empty SDK
 body chunk becomes visible; it therefore measures payload availability rather
 than merely receipt of HTTP response headers. Latencies use the nearest-rank
 p50/p95/p99 definition. The work counters distinguish response bytes from
@@ -104,7 +114,10 @@ complete identifier for the measured source. The runner refuses a dirty tree
 by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, but
 marks them `reference_run=false`; their results must not be recorded as a
 reference baseline. The output records the CPU architecture and model, selected
-CRC64, SHA-256, and EC runtime backends, and compile-time crypto provider.
+CRC64, SHA-256, and EC runtime backends, compile-time crypto provider, explicit
+local EC shape, and the authoritatively observed durable payload profile. The
+selection seam is benchmark-only; ordinary test-server and production
+constructors retain the production writer default.
 
 ### Whole-segment encrypted-read baseline
 

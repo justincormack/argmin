@@ -10,11 +10,37 @@ WARMUP_ITERS="${WARMUP_ITERS:-4}"
 FULL_ITERS="${FULL_ITERS:-16}"
 RANGE_ITERS="${RANGE_ITERS:-64}"
 SAMPLES="${SAMPLES:-5}"
+PAYLOAD_PROFILE="${PAYLOAD_PROFILE:-}"
+EC_SHAPE="${EC_SHAPE:-}"
 
-FEATURE_ARGS=()
+if [[ -z "$PAYLOAD_PROFILE" ]]; then
+  echo "error: PAYLOAD_PROFILE must be segment-aes-256-gcm-v1 or cobblestone-256-segment-v1" >&2
+  exit 2
+fi
+case "$PAYLOAD_PROFILE" in
+  segment-aes-256-gcm-v1|cobblestone-256-segment-v1) ;;
+  *)
+    echo "error: invalid PAYLOAD_PROFILE: $PAYLOAD_PROFILE" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "$EC_SHAPE" ]]; then
+  echo "error: EC_SHAPE must be 1+0 or 4+2" >&2
+  exit 2
+fi
+case "$EC_SHAPE" in
+  1+0|4+2) ;;
+  *)
+    echo "error: invalid EC_SHAPE: $EC_SHAPE" >&2
+    exit 2
+    ;;
+esac
+
+FEATURE_ARGS=(--features payload-read-bench)
 PROVIDER="ring"
 if [[ "${1:-}" == "--openssl" ]]; then
-  FEATURE_ARGS=(--no-default-features --features openssl)
+  FEATURE_ARGS=(--no-default-features --features openssl,payload-read-bench)
   PROVIDER="openssl"
   shift
 fi
@@ -50,10 +76,14 @@ if [[ -z "$CPU_MODEL" ]] && command -v sysctl >/dev/null 2>&1; then
 fi
 echo "cpu_model=${CPU_MODEL:-unknown}"
 echo "crypto_provider=$PROVIDER"
+echo "requested_payload_profile=$PAYLOAD_PROFILE"
+echo "requested_ec_shape=$EC_SHAPE"
 echo "object_mib=$OBJECT_MIB range_bytes=$RANGE_BYTES warmup_iters=$WARMUP_ITERS"
 echo "full_iters=$FULL_ITERS range_iters=$RANGE_ITERS samples=$SAMPLES"
 
 cargo run --offline -p s3-tests --bin payload_read_bench --release "${FEATURE_ARGS[@]}" -- \
+  --payload-profile "$PAYLOAD_PROFILE" \
+  --ec-shape "$EC_SHAPE" \
   --object-mib "$OBJECT_MIB" \
   --range-bytes "$RANGE_BYTES" \
   --warmup-iters "$WARMUP_ITERS" \

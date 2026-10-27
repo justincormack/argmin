@@ -30,6 +30,7 @@ deep-tracing = [
     "server_http/deep-tracing",
     "storage/deep-tracing",
 ]
+payload-read-bench = ["server-core/test-utils"]
 uat-pg-topology = ["storage/test-hooks"]
 
 [[bin]]
@@ -42,6 +43,7 @@ name = "payload_read_bench"
 path = "src/bin/payload_read_bench.rs"
 test = false
 bench = false
+required-features = ["payload-read-bench"]
 
 [dependencies]
 # Server (for local TestServer)

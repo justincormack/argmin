@@ -7,12 +7,17 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
 use observability::MetricsSnapshot;
-use s3_tests::server::{TEST_ACCESS_KEY, TEST_REGION, TEST_SECRET_KEY};
+use s3_tests::server::{
+    PayloadReadBenchmarkEcShape, PayloadReadBenchmarkProfile, TEST_ACCESS_KEY, TEST_REGION,
+    TEST_SECRET_KEY,
+};
 
 const MIB: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct Config {
+    payload_profile: PayloadReadBenchmarkProfile,
+    ec_shape: PayloadReadBenchmarkEcShape,
     object_size: usize,
     range_size: usize,
     warmup_iters: usize,
@@ -21,66 +26,103 @@ struct Config {
     samples: usize,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            object_size: 16 * MIB,
-            range_size: 4 * 1024,
-            warmup_iters: 4,
-            full_iters: 16,
-            range_iters: 64,
-            samples: 5,
-        }
-    }
-}
-
 impl Config {
     fn parse() -> Result<Self, String> {
-        let mut config = Self::default();
+        let mut payload_profile = None;
+        let mut ec_shape = None;
+        let mut object_size = 16 * MIB;
+        let mut range_size = 4 * 1024;
+        let mut warmup_iters = 4;
+        let mut full_iters = 16;
+        let mut range_iters = 64;
+        let mut samples = 5;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--payload-profile" => {
+                    let value = args.next().ok_or("missing value for --payload-profile")?;
+                    payload_profile = Some(match value.as_str() {
+                        "segment-aes-256-gcm-v1" => PayloadReadBenchmarkProfile::SegmentAes256GcmV1,
+                        "cobblestone-256-segment-v1" => {
+                            PayloadReadBenchmarkProfile::Cobblestone256SegmentV1
+                        }
+                        _ => {
+                            return Err(format!(
+                                "invalid --payload-profile value: {value}\n{}",
+                                Self::usage()
+                            ));
+                        }
+                    });
+                }
+                "--ec-shape" => {
+                    let value = args.next().ok_or("missing value for --ec-shape")?;
+                    ec_shape = Some(match value.as_str() {
+                        "1+0" => PayloadReadBenchmarkEcShape::OnePlusZero,
+                        "4+2" => PayloadReadBenchmarkEcShape::FourPlusTwo,
+                        _ => {
+                            return Err(format!(
+                                "invalid --ec-shape value: {value}\n{}",
+                                Self::usage()
+                            ));
+                        }
+                    });
+                }
                 "--object-mib" => {
                     let mib = parse_usize(&mut args, "--object-mib")?;
-                    config.object_size = mib.checked_mul(MIB).ok_or("--object-mib is too large")?;
+                    object_size = mib.checked_mul(MIB).ok_or("--object-mib is too large")?;
                 }
                 "--range-bytes" => {
-                    config.range_size = parse_usize(&mut args, "--range-bytes")?;
+                    range_size = parse_usize(&mut args, "--range-bytes")?;
                 }
                 "--warmup-iters" => {
-                    config.warmup_iters = parse_usize(&mut args, "--warmup-iters")?;
+                    warmup_iters = parse_usize(&mut args, "--warmup-iters")?;
                 }
                 "--full-iters" => {
-                    config.full_iters = parse_usize(&mut args, "--full-iters")?;
+                    full_iters = parse_usize(&mut args, "--full-iters")?;
                 }
                 "--range-iters" => {
-                    config.range_iters = parse_usize(&mut args, "--range-iters")?;
+                    range_iters = parse_usize(&mut args, "--range-iters")?;
                 }
                 "--samples" => {
-                    config.samples = parse_usize(&mut args, "--samples")?;
+                    samples = parse_usize(&mut args, "--samples")?;
                 }
                 "--help" | "-h" => return Err(Self::usage()),
                 _ => return Err(format!("unknown argument: {arg}\n{}", Self::usage())),
             }
         }
 
-        if config.object_size <= 8 * MIB {
+        let payload_profile = payload_profile
+            .ok_or_else(|| format!("--payload-profile is required\n{}", Self::usage()))?;
+        let ec_shape =
+            ec_shape.ok_or_else(|| format!("--ec-shape is required\n{}", Self::usage()))?;
+        if object_size <= 8 * MIB {
             return Err("--object-mib must be greater than 8 to exercise multiple segments".into());
         }
-        let range_start = config.object_size / 2 + 1024;
-        if config.range_size == 0 || config.range_size > config.object_size - range_start {
+        let range_start = object_size / 2 + 1024;
+        if range_size == 0 || range_size > object_size - range_start {
             return Err(
                 "--range-bytes must fit between the benchmark range start and object end".into(),
             );
         }
-        if config.full_iters == 0 || config.range_iters == 0 || config.samples == 0 {
+        if full_iters == 0 || range_iters == 0 || samples == 0 {
             return Err("iteration and sample counts must be greater than zero".into());
         }
-        Ok(config)
+        Ok(Self {
+            payload_profile,
+            ec_shape,
+            object_size,
+            range_size,
+            warmup_iters,
+            full_iters,
+            range_iters,
+            samples,
+        })
     }
 
     fn usage() -> String {
-        "usage: payload_read_bench [--object-mib N] [--range-bytes N] \
+        "usage: payload_read_bench --payload-profile \
+         <segment-aes-256-gcm-v1|cobblestone-256-segment-v1> \
+         --ec-shape <1+0|4+2> [--object-mib N] [--range-bytes N] \
          [--warmup-iters N] [--full-iters N] [--range-iters N] [--samples N]"
             .to_string()
     }
@@ -413,11 +455,11 @@ async fn put_benchmark_object(client: &Client, bucket: &str, key: &str, payload:
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let config = Config::parse()?;
-    let ec_config = ec::EcConfig::default();
-    if (ec_config.data_shards(), ec_config.parity_shards()) != (4, 2) {
-        return Err("payload_read_bench requires the pinned 4+2 test-server EC shape".into());
-    }
-    let server = s3_tests::TestServer::start_http().await;
+    let server = s3_tests::TestServer::start_http_for_payload_read_benchmark(
+        config.payload_profile,
+        config.ec_shape,
+    )
+    .await;
     let client = s3_tests::build_client_with_ca(
         server.endpoint(),
         TEST_ACCESS_KEY,
@@ -440,6 +482,17 @@ async fn main() -> Result<(), String> {
     let key = "payload-read-benchmark";
     put_benchmark_object(&client, &encrypted_bucket, key, &payload).await;
 
+    let persisted_profile = server
+        .observe_payload_read_benchmark_profile(&encrypted_bucket, key)
+        .map_err(|error| format!("observe durable benchmark payload profile: {error}"))?;
+    if persisted_profile != config.payload_profile {
+        return Err(format!(
+            "benchmark requested payload profile {} but durable object recorded {}",
+            config.payload_profile.as_str(),
+            persisted_profile.as_str()
+        ));
+    }
+
     let encrypted_head = client
         .head_object()
         .bucket(&encrypted_bucket)
@@ -460,15 +513,16 @@ async fn main() -> Result<(), String> {
         start: range_start,
         end: range_end,
     };
-    println!("benchmark=payload_read_v2");
+    println!("benchmark=payload_read_v3");
     println!("body_ttfb_definition=request_start_to_first_nonempty_sdk_body_bytes");
     println!("latency_percentile_method=nearest_rank");
     println!("transport=http");
+    println!("ec_shape={}", config.ec_shape.as_str());
     println!(
-        "ec_shape={}+{}",
-        ec_config.data_shards(),
-        ec_config.parity_shards()
+        "requested_payload_profile={}",
+        config.payload_profile.as_str()
     );
+    println!("persisted_payload_profile={}", persisted_profile.as_str());
     println!("crc64_backend={}", checksum::crc64::backend_name());
     println!("sha256_backend={}", checksum::sha256::backend_name());
     println!("ec_backend={}", ec::backend_name());

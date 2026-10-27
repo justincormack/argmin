@@ -77,6 +77,113 @@ enum TestServerTransport {
     Https,
 }
 
+/// Internal payload profiles supported by the end-to-end payload-read
+/// benchmark.
+///
+/// This benchmark-owned selector is intentionally narrower than the general
+/// storage test-support surface. Ordinary S3 conformance tests continue to
+/// start the server with the production writer default.
+#[cfg(feature = "payload-read-bench")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadReadBenchmarkProfile {
+    SegmentAes256GcmV1,
+    Cobblestone256SegmentV1,
+}
+
+#[cfg(feature = "payload-read-bench")]
+impl PayloadReadBenchmarkProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SegmentAes256GcmV1 => "segment-aes-256-gcm-v1",
+            Self::Cobblestone256SegmentV1 => "cobblestone-256-segment-v1",
+        }
+    }
+
+    const fn storage_codec(self) -> storage::SegmentPayloadCodec {
+        match self {
+            Self::SegmentAes256GcmV1 => storage::SegmentPayloadCodec::SegmentAes256GcmV1,
+            Self::Cobblestone256SegmentV1 => storage::SegmentPayloadCodec::Cobblestone256SegmentV1,
+        }
+    }
+
+    fn from_storage_codec(codec: storage::SegmentPayloadCodec) -> Self {
+        match codec {
+            storage::SegmentPayloadCodec::SegmentAes256GcmV1 => Self::SegmentAes256GcmV1,
+            storage::SegmentPayloadCodec::Cobblestone256SegmentV1 => Self::Cobblestone256SegmentV1,
+        }
+    }
+}
+
+/// Local EC layouts supported by the end-to-end payload-read benchmark.
+#[cfg(feature = "payload-read-bench")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadReadBenchmarkEcShape {
+    OnePlusZero,
+    FourPlusTwo,
+}
+
+#[cfg(feature = "payload-read-bench")]
+impl PayloadReadBenchmarkEcShape {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnePlusZero => "1+0",
+            Self::FourPlusTwo => "4+2",
+        }
+    }
+
+    const fn storage_shape(self) -> storage::EcShape {
+        match self {
+            Self::OnePlusZero => storage::EcShape { k: 1, m: 0 },
+            Self::FourPlusTwo => storage::EcShape { k: 4, m: 2 },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TestServerStorageConfig {
+    ec_shape: storage::EcShape,
+    #[cfg(feature = "payload-read-bench")]
+    new_payload_codec: Option<storage::SegmentPayloadCodec>,
+}
+
+impl Default for TestServerStorageConfig {
+    fn default() -> Self {
+        let ec_config = ec::EcConfig::default();
+        Self {
+            ec_shape: storage::EcShape {
+                k: ec_config.data_shards(),
+                m: ec_config.parity_shards(),
+            },
+            #[cfg(feature = "payload-read-bench")]
+            new_payload_codec: None,
+        }
+    }
+}
+
+#[cfg(feature = "payload-read-bench")]
+fn configure_test_server_coordinator(
+    mut coordinator: server_core::coordinator::Coordinator,
+    storage_config: TestServerStorageConfig,
+) -> server_core::coordinator::Coordinator {
+    if let Some(payload_codec) = storage_config.new_payload_codec {
+        server_core::coordinator::test_helpers::select_new_payload_codec(
+            &mut coordinator,
+            payload_codec,
+        );
+    }
+    coordinator
+}
+
+#[cfg(not(feature = "payload-read-bench"))]
+fn configure_test_server_coordinator(
+    coordinator: server_core::coordinator::Coordinator,
+    _storage_config: TestServerStorageConfig,
+) -> server_core::coordinator::Coordinator {
+    coordinator
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct LocalTraceConfig {
     enabled: bool,
@@ -118,6 +225,14 @@ pub fn open_test_storage_cluster(data_path: &Path, pg_ids: &[u32]) -> Arc<storag
         k: ec_config.data_shards(),
         m: ec_config.parity_shards(),
     };
+    open_test_storage_cluster_with_shape(data_path, pg_ids, ec_shape)
+}
+
+fn open_test_storage_cluster_with_shape(
+    data_path: &Path,
+    pg_ids: &[u32],
+    ec_shape: storage::EcShape,
+) -> Arc<storage::StorageCluster> {
     let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
     let node_ids: Vec<storage::NodeId> = (0..node_count).map(storage::NodeId::new).collect();
     storage::StorageCluster::open_static_local_nodes(data_path, &node_ids, pg_ids, ec_shape)
@@ -150,6 +265,41 @@ impl TestServer {
     }
 
     async fn start_with_transport(transport: TestServerTransport, region: &str) -> Self {
+        Self::start_with_transport_and_storage_config(
+            transport,
+            region,
+            TestServerStorageConfig::default(),
+        )
+        .await
+    }
+
+    /// Start the local HTTP benchmark server with one explicit internal
+    /// writer profile and EC layout.
+    ///
+    /// All pooled frontends receive the selection before being shared, so no
+    /// request can race a process-local profile change. The production server
+    /// constructors remain pinned to their ordinary writer default.
+    #[cfg(feature = "payload-read-bench")]
+    pub async fn start_http_for_payload_read_benchmark(
+        profile: PayloadReadBenchmarkProfile,
+        ec_shape: PayloadReadBenchmarkEcShape,
+    ) -> Self {
+        Self::start_with_transport_and_storage_config(
+            TestServerTransport::Http,
+            TEST_REGION,
+            TestServerStorageConfig {
+                ec_shape: ec_shape.storage_shape(),
+                new_payload_codec: Some(profile.storage_codec()),
+            },
+        )
+        .await
+    }
+
+    async fn start_with_transport_and_storage_config(
+        transport: TestServerTransport,
+        region: &str,
+        storage_config: TestServerStorageConfig,
+    ) -> Self {
         configure_local_tracing();
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -186,7 +336,8 @@ impl TestServer {
         let pg_ids: Vec<u32> = (0..TEST_PG_COUNT).collect();
 
         // Create one shared local storage cluster for all frontends.
-        let storage_cluster = open_test_storage_cluster(&data_path, &pg_ids);
+        let storage_cluster =
+            open_test_storage_cluster_with_shape(&data_path, &pg_ids, storage_config.ec_shape);
         let control_coordinator = {
             let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
                 1,
@@ -199,13 +350,14 @@ impl TestServer {
             )
             .map(server_core::sse::StaticManagedKeyProvider::single)
             .expect("valid test SSE-S3 wrapping key");
-            server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
+            let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
                 Arc::clone(&storage_cluster),
                 region.to_string(),
                 Some(sse_c_validator),
                 sse_s3_provider,
             )
-            .expect("create control coordinator")
+            .expect("create control coordinator");
+            configure_test_server_coordinator(coordinator, storage_config)
         };
 
         let host_id = Arc::<str>::from(server_http::http::new_host_id());
@@ -369,6 +521,8 @@ impl TestServer {
                         server_core::coordinator::BackgroundWorkerMode::all(),
                     )
                     .expect("create coordinator");
+                let coordinator =
+                    configure_test_server_coordinator(coordinator, storage_config);
 
                 server_http::http::HttpFrontend {
                     coordinator: Arc::new(coordinator),
@@ -435,6 +589,23 @@ impl TestServer {
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Observe the self-describing durable codec written for one benchmark
+    /// object through the normal admitted metadata-read route.
+    #[cfg(feature = "payload-read-bench")]
+    pub fn observe_payload_read_benchmark_profile(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<PayloadReadBenchmarkProfile, String> {
+        server_core::coordinator::test_helpers::observe_current_object_payload_codec(
+            &self.control_coordinator,
+            bucket,
+            key,
+        )
+        .map(PayloadReadBenchmarkProfile::from_storage_codec)
+        .map_err(|error| error.to_string())
     }
 
     pub fn tls_ca_pem(&self) -> Option<&'static [u8]> {

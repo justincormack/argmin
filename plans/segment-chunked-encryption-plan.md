@@ -1941,6 +1941,24 @@ Implementation update (2026-10-27, owned authenticated read windows):
   durable-witness composition. These are still dirty, temporary writer-selection measurements;
   production writer selection remains `SegmentAes256GcmV1` pending the clean Phase 5 matrix.
 
+Implementation update (2026-10-27, clean local benchmark selection):
+
+- The payload-read benchmark now requires an explicit
+  `segment-aes-256-gcm-v1` or `cobblestone-256-segment-v1` writer choice and an explicit local
+  `1+0` or `4+2` EC shape. A benchmark-only test-server constructor installs that choice on every
+  pooled frontend before any coordinator is shared; ordinary test-server and production
+  constructors retain the production default. This removes the previous source-editing workflow
+  and allows both profiles to be measured from one clean revision and binary.
+- After the benchmark PUT, a narrow server-owned observation loads the current live object through
+  the ordinary admitted metadata-read route and returns only its durable codec discriminator. The
+  run fails if that value differs from the requested profile, and protocol `payload_read_v3`
+  records both values. The AWS-visible `AES256` HeadObject response remains an independent S3-mode
+  check rather than being misused as internal-codec evidence. No general storage test-hook feature
+  or mutation surface is exposed to the AWS-facing harness.
+- The runner continues to reject reference results from a dirty worktree. Clean paired local
+  `1+0` and `4+2` results therefore follow after this harness slice is committed. Multihost and
+  degraded-read cases remain separate Phase 5 work before the writer decision.
+
 ### Optional follow-up: Partial EC reconstruction
 
 This is not part of the initial completion path. Start it only if Phase 3/4 production-like metrics

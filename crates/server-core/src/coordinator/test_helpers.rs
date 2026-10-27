@@ -34,6 +34,53 @@ pub fn select_new_payload_codec(
     coord.test_select_new_payload_codec(payload_codec);
 }
 
+/// Observe the durable payload codec for the current live object through the
+/// ordinary admitted metadata-read route.
+///
+/// This is deliberately narrower than exporting storage test hooks to an
+/// HTTP benchmark harness: it reveals only the self-describing codec selected
+/// by the completed write and cannot mutate storage state.
+pub fn observe_current_object_payload_codec(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+) -> Result<storage::SegmentPayloadCodec, ServerError> {
+    let bucket = storage::BucketName::try_from(bucket.to_string()).map_err(|error| {
+        ServerError::InvalidBucketName {
+            reason: error.to_string(),
+        }
+    })?;
+    let key = storage::ObjectKey::try_from(key.to_string()).map_err(|error| {
+        ServerError::InvalidArgument {
+            reason: error.to_string(),
+        }
+    })?;
+    let admission = coord.admit_storage_route_for_request()?;
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            storage::ObjectReadSnapshotMode::MetadataOnly,
+        )
+        .map_err(super::map_store_failure)?;
+    let observation = route
+        .load_object_if(|stored| {
+            Ok::<_, std::convert::Infallible>(
+                stored.as_live().map(|live| live.encryption.payload_codec()),
+            )
+        })
+        .map_err(super::map_object_read_failure)?;
+    let payload_codec = match observation {
+        Ok(payload_codec) => payload_codec,
+        Err(infallible) => match infallible {},
+    };
+    payload_codec.ok_or_else(|| ServerError::ObjectNotFound {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+    })
+}
+
 /// Put an object via the streaming path (begin -> append -> finalize).
 ///
 /// Available in-crate during `#[cfg(test)]` and cross-crate via the
