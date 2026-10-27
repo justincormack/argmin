@@ -19,7 +19,7 @@ struct SystematicShardPadding {
 
 fn systematic_shard_padding(
     req: SegmentStoredBytesRequest,
-    integrity: &crate::types::SegmentShardIntegrityRecord,
+    integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
     context: &str,
 ) -> Result<Option<SystematicShardPadding>, StoreError> {
     let stored_size = u64::try_from(req.stored_size).map_err(|_| {
@@ -27,8 +27,8 @@ fn systematic_shard_padding(
             reason: format!("stored segment size exceeds {context} padding coordinates"),
         }
     })?;
-    integrity
-        .validate(req.ec, stored_size, req.segment_crc64)
+    let integrity = integrity
+        .require_request(req)
         .map_err(|error| StoreError::PayloadShardSetMismatch {
             reason: format!("{context} padding read has an invalid integrity witness: {error}"),
         })?;
@@ -1283,6 +1283,42 @@ impl StorageCluster {
         )
     }
 
+    fn try_read_object_payload_segment_validated_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        let request = segment.stored_bytes_request();
+        let stored_size = u64::try_from(request.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds validated range coordinates".to_string(),
+            }
+        })?;
+        if range.start > range.end || range.end > stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "stored ciphertext range is outside the validated segment".to_string(),
+            });
+        }
+        integrity.require_request(request).map_err(|error| {
+            StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "validated segment shard integrity does not match active segment: {error}"
+                ),
+            }
+        })?;
+        if segment.placement_cluster_epoch() != self.operation_epoch() {
+            dst.clear();
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        }
+
+        self.require_current_payload_operation_epoch(request.data_pg_id)?;
+        self.try_read_placed_segment_systematic_validated_range_into(
+            request, integrity, range, dst,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_read_retained_object_payload_segment_stored_range_into(
         &self,
@@ -1310,6 +1346,48 @@ impl StorageCluster {
             data_pg,
             request,
             shard_integrity,
+            range,
+            dst,
+            leased_node_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_read_retained_object_payload_segment_validated_stored_range_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        request: SegmentStoredBytesRequest,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+        leased_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        let stored_size = u64::try_from(request.stored_size).map_err(|_| {
+            StoreError::PayloadShardSetMismatch {
+                reason: "stored segment size exceeds retained validated range coordinates"
+                    .to_string(),
+            }
+        })?;
+        if range.start > range.end || range.end > stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "stored ciphertext range is outside the retained validated segment"
+                    .to_string(),
+            });
+        }
+        integrity.require_request(request).map_err(|error| {
+            StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "validated segment shard integrity does not match retained segment: {error}"
+                ),
+            }
+        })?;
+        self.require_current_payload_operation_epoch(request.data_pg_id)?;
+        let data_pg = self.validated_data_pg(PgId::new(request.data_pg_id))?;
+        self.try_read_placed_segment_systematic_validated_range_at_placement_epoch_into(
+            placement_cluster_epoch,
+            data_pg,
+            request,
+            integrity,
             range,
             dst,
             leased_node_ids,
@@ -2923,29 +3001,48 @@ impl StorageCluster {
         dst: &mut Vec<u8>,
     ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
         dst.clear();
+        if systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range.clone())?
+            .is_empty()
+        {
+            return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
+        }
+        let Some(shard_integrity) = shard_integrity else {
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        };
+        let integrity = crate::types::ValidatedSegmentShardIntegrity::validate_for_request(
+            req,
+            shard_integrity,
+        )
+        .map_err(|error| StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "segment shard integrity witness does not match range-read geometry: {error}"
+            ),
+        })?;
+
+        self.try_read_placed_segment_systematic_validated_range_into(req, integrity, range, dst)
+    }
+
+    fn try_read_placed_segment_systematic_validated_range_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        dst.clear();
+        let integrity = integrity.require_request(req).map_err(|error| {
+            StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "validated segment shard integrity does not match active range request: {error}"
+                ),
+            }
+        })?;
         let ranges = systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range)?;
         let output_len = ranges
             .last()
             .map_or(0, |range| range.output_start + range.length);
         if ranges.is_empty() {
             return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
-        }
-        let Some(shard_integrity) = shard_integrity else {
-            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
-        };
-        let stored_size = u64::try_from(req.stored_size).map_err(|_| {
-            StoreError::PayloadShardSetMismatch {
-                reason: "stored segment size exceeds witness coordinates".to_string(),
-            }
-        })?;
-        if shard_integrity
-            .validate(req.ec, stored_size, req.segment_crc64)
-            .is_err()
-        {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "segment shard integrity witness does not match range-read geometry"
-                    .to_string(),
-            });
         }
 
         let reader = self.current_placed_segment_shard_reader(
@@ -2965,7 +3062,7 @@ impl StorageCluster {
         dst.resize(output_len, 0);
 
         for range in ranges {
-            let Some(expected) = shard_integrity.expected_ack(range.shard_index) else {
+            let Some(expected) = integrity.expected_ack(range.shard_index) else {
                 dst.clear();
                 read_handles.release().map_err(shard_io_error_to_store)?;
                 return Err(StoreError::PayloadShardSetMismatch {
@@ -3021,6 +3118,7 @@ impl StorageCluster {
     fn read_object_payload_segment_systematic_padding_into(
         &self,
         segment: &ObjectPayloadSegment,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
         let req = segment.stored_bytes_request();
@@ -3031,11 +3129,6 @@ impl StorageCluster {
             });
         }
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
-        let Some(integrity) = segment.shard_integrity() else {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "active padding read requires a shard integrity witness".to_string(),
-            });
-        };
         dst.clear();
         let Some(padding) = systematic_shard_padding(req, integrity, "active")? else {
             return Ok(());
@@ -3091,29 +3184,60 @@ impl StorageCluster {
         leased_node_ids: &BTreeSet<NodeId>,
     ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
         dst.clear();
+        if systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range.clone())?
+            .is_empty()
+        {
+            return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
+        }
+        let Some(shard_integrity) = shard_integrity else {
+            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
+        };
+        let integrity = crate::types::ValidatedSegmentShardIntegrity::validate_for_request(
+            req,
+            shard_integrity,
+        )
+        .map_err(|error| StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "segment shard integrity witness does not match retained range-read geometry: {error}"
+            ),
+        })?;
+
+        self.try_read_placed_segment_systematic_validated_range_at_placement_epoch_into(
+            placement_epoch,
+            data_pg,
+            req,
+            integrity,
+            range,
+            dst,
+            leased_node_ids,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_read_placed_segment_systematic_validated_range_at_placement_epoch_into(
+        &self,
+        placement_epoch: ClusterEpoch,
+        data_pg: DataPgId,
+        req: SegmentStoredBytesRequest,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+        leased_node_ids: &BTreeSet<NodeId>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, StoreError> {
+        dst.clear();
+        let integrity = integrity.require_request(req).map_err(|error| {
+            StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "validated segment shard integrity does not match retained range request: {error}"
+                ),
+            }
+        })?;
         let ranges = systematic_shard_ranges_for_segment_range(req.stored_size, req.ec.k, range)?;
         let output_len = ranges
             .last()
             .map_or(0, |range| range.output_start + range.length);
         if ranges.is_empty() {
             return Ok(ObjectPayloadRangeReadOutcome::UnauthenticatedCiphertext);
-        }
-        let Some(shard_integrity) = shard_integrity else {
-            return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
-        };
-        let stored_size = u64::try_from(req.stored_size).map_err(|_| {
-            StoreError::PayloadShardSetMismatch {
-                reason: "stored segment size exceeds retained witness coordinates".to_string(),
-            }
-        })?;
-        if shard_integrity
-            .validate(req.ec, stored_size, req.segment_crc64)
-            .is_err()
-        {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "segment shard integrity witness does not match retained range-read geometry"
-                    .to_string(),
-            });
         }
 
         if req.data_pg_id != data_pg.get() {
@@ -3141,7 +3265,7 @@ impl StorageCluster {
                 dst.clear();
                 return Ok(ObjectPayloadRangeReadOutcome::FullSegmentFallbackRequired);
             }
-            let Some(expected) = shard_integrity.expected_ack(range.shard_index) else {
+            let Some(expected) = integrity.expected_ack(range.shard_index) else {
                 dst.clear();
                 return Err(StoreError::PayloadShardSetMismatch {
                     reason: format!(
@@ -3180,17 +3304,13 @@ impl StorageCluster {
     fn read_retained_object_payload_segment_systematic_padding_into(
         &self,
         segment: &ObjectPayloadSegment,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
         leased_node_ids: &BTreeSet<NodeId>,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
         let req = segment.stored_bytes_request();
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
-        let Some(integrity) = segment.shard_integrity() else {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "retained padding read requires a shard integrity witness".to_string(),
-            });
-        };
         dst.clear();
         let Some(padding) = systematic_shard_padding(req, integrity, "retained")? else {
             return Ok(());

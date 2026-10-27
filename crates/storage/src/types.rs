@@ -3287,6 +3287,10 @@ pub(crate) enum SegmentShardIntegrityWitnessError {
     },
     #[error("systematic shard acknowledgements do not compose to the stored segment checksum")]
     SystematicChecksumMismatch,
+    #[error("validated segment shard integrity does not match the requested segment")]
+    RequestMismatch,
+    #[error("stored segment size exceeds integrity witness coordinates")]
+    StoredSizeOverflow,
 }
 
 impl SegmentShardIntegrityWitness {
@@ -3773,6 +3777,44 @@ pub(crate) struct SegmentStoredBytesRequest {
     pub(crate) ec: EcShape,
 }
 
+/// Borrowing proof that one durable shard-integrity record was validated for
+/// one exact persisted segment request.
+///
+/// Only [`ObjectPayloadSegment`] can mint this proof. Its fields deliberately
+/// remain private so range readers cannot detach a valid witness from its data
+/// PG, shard identity, generation, stored length, checksum, or EC shape.
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedSegmentShardIntegrity<'segment> {
+    request: SegmentStoredBytesRequest,
+    record: &'segment SegmentShardIntegrityRecord,
+}
+
+impl<'segment> ValidatedSegmentShardIntegrity<'segment> {
+    pub(crate) fn validate_for_request(
+        request: SegmentStoredBytesRequest,
+        record: &'segment SegmentShardIntegrityRecord,
+    ) -> Result<Self, SegmentShardIntegrityWitnessError> {
+        let stored_size = u64::try_from(request.stored_size)
+            .map_err(|_| SegmentShardIntegrityWitnessError::StoredSizeOverflow)?;
+        record.validate(request.ec, stored_size, request.segment_crc64)?;
+        Ok(Self { request, record })
+    }
+
+    pub(crate) fn require_request(
+        self,
+        request: SegmentStoredBytesRequest,
+    ) -> Result<Self, SegmentShardIntegrityWitnessError> {
+        if self.request != request {
+            return Err(SegmentShardIntegrityWitnessError::RequestMismatch);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn expected_ack(self, shard_index: usize) -> Option<WriteAck> {
+        self.record.expected_ack(shard_index)
+    }
+}
+
 /// Opaque storage-owned description of one persisted object payload segment.
 ///
 /// Callers may use the logical segment metadata needed to assemble an object
@@ -3896,6 +3938,16 @@ impl ObjectPayloadSegment {
             ObjectPayloadSegmentRecord::Object(record) => record.shard_integrity.as_ref(),
             ObjectPayloadSegmentRecord::Multipart(record) => record.shard_integrity.as_ref(),
         }
+    }
+
+    /// Mints the integrity proof established when this immutable segment was
+    /// constructed from authoritative storage records.
+    pub(crate) fn validated_shard_integrity(&self) -> Option<ValidatedSegmentShardIntegrity<'_>> {
+        self.shard_integrity()
+            .map(|record| ValidatedSegmentShardIntegrity {
+                request: self.stored_bytes_request(),
+                record,
+            })
     }
 
     pub fn size(&self) -> u64 {
@@ -9183,6 +9235,100 @@ mod tests {
             ),
             Err(SegmentShardIntegrityWitnessError::SystematicChecksumMismatch)
         );
+    }
+
+    #[test]
+    fn validated_segment_shard_integrity_is_bound_to_the_complete_stored_request() {
+        let profile = SegmentPayloadProfile::SseS3Cobblestone256SegmentV1;
+        let logical_size = 37_u64;
+        let stored_size = profile.stored_size(logical_size).unwrap();
+        let stored = (0..stored_size)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let ec = EcShape { k: 3, m: 2 };
+        let (keys, acks) = integrity_witness_fixture(&stored, ec);
+        let batch = keys
+            .iter()
+            .zip(&acks)
+            .map(|(key, ack)| (key, *ack))
+            .collect::<Vec<_>>();
+        let bucket = BucketName::try_from("integrity-bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("integrity-key".to_string()).unwrap();
+        let generation_id = GenerationId::new(47).unwrap();
+        let subject = ObjectPayloadSubject {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+        };
+        let witness = SegmentShardIntegrityWitness::from_ordered_shard_acks(
+            5,
+            ec,
+            &[0x31; 16],
+            generation_id,
+            stored_size,
+            checksum::crc64::checksum(&stored),
+            &batch,
+        )
+        .unwrap();
+        let segment = ObjectPayloadSegment::from_object_record(
+            &subject,
+            ObjectSegmentRecord {
+                shard_integrity: Some(witness.durable_record()),
+                bucket,
+                key,
+                version_id: VersionId::Null,
+                segment_index: 0,
+                size: logical_size,
+                segment_crc64: checksum::crc64::checksum(&stored),
+                segment_okh: [0x31; 16],
+                segment_vid: generation_id,
+                data_pg_id: 5,
+                placement_cluster_epoch: ClusterEpoch::new(7).unwrap(),
+                ec_k: ec.k,
+                ec_m: ec.m,
+            },
+            profile,
+        )
+        .unwrap();
+        let authority = segment.validated_shard_integrity().unwrap();
+        let request = segment.stored_bytes_request();
+        assert!(authority.require_request(request).is_ok());
+
+        let crossed = [
+            SegmentStoredBytesRequest {
+                data_pg_id: request.data_pg_id + 1,
+                ..request
+            },
+            SegmentStoredBytesRequest {
+                segment_okh: [0x32; 16],
+                ..request
+            },
+            SegmentStoredBytesRequest {
+                segment_vid: GenerationId::new(request.segment_vid.get() + 1).unwrap(),
+                ..request
+            },
+            SegmentStoredBytesRequest {
+                stored_size: request.stored_size + 1,
+                ..request
+            },
+            SegmentStoredBytesRequest {
+                segment_crc64: request.segment_crc64 ^ 1,
+                ..request
+            },
+            SegmentStoredBytesRequest {
+                ec: EcShape {
+                    k: request.ec.k - 1,
+                    m: request.ec.m + 1,
+                },
+                ..request
+            },
+        ];
+        for crossed_request in crossed {
+            assert!(matches!(
+                authority.require_request(crossed_request),
+                Err(SegmentShardIntegrityWitnessError::RequestMismatch)
+            ));
+        }
     }
 
     fn management_lookup_test_upload(state: UploadState) -> MultipartUploadRecord {

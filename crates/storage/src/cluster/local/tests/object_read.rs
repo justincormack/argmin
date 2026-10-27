@@ -1358,6 +1358,87 @@ fn active_object_payload_range_read_maps_only_intersecting_systematic_shards() {
 }
 
 #[test]
+fn validated_shard_integrity_rejects_a_crossed_stored_request_before_shard_access() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("crossed-integrity-bucket");
+    let first_key = crate::tests::object_key("crossed-integrity-first");
+    let second_key = crate::tests::object_key("crossed-integrity-second");
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &first_key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"first payload",
+    );
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &second_key,
+        crate::BucketVersioningState::Disabled,
+        [2; 16],
+        [2; 16],
+        b"different second payload",
+    );
+
+    let load_segment = |key: &crate::ObjectKey| {
+        cluster
+            .load_object_read_snapshot_if(
+                &bucket,
+                key,
+                None,
+                crate::ObjectReadSnapshotMode::FullPayloadLayout,
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .object_segments[0]
+            .clone()
+    };
+    let first_segment = load_segment(&first_key);
+    let second_segment = load_segment(&second_key);
+    assert_ne!(
+        first_segment.stored_bytes_request(),
+        second_segment.stored_bytes_request(),
+        "the canary must cross distinct physical shard requests"
+    );
+
+    let shard_reads = Arc::new(AtomicUsize::new(0));
+    let observed_shard_reads = Arc::clone(&shard_reads);
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |_, _| {
+            observed_shard_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let error = cluster
+        .try_read_object_payload_segment_validated_stored_range_into(
+            &second_segment,
+            first_segment.validated_shard_integrity().unwrap(),
+            0..1,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+    assert_eq!(
+        shard_reads.load(Ordering::SeqCst),
+        0,
+        "crossed request authority must fail before route or shard access"
+    );
+}
+
+#[test]
 fn sequential_full_segment_read_validates_every_systematic_byte_across_irregular_ranges() {
     let tmp = test_util::tempdir();
     let map = Arc::new(

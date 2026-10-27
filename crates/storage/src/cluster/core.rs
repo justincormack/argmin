@@ -1885,7 +1885,7 @@ impl ObjectPayloadFullSegmentRead {
                 reason: "stored segment size exceeds streaming coordinates".to_string(),
             })
         })?;
-        let Some(integrity) = segment.shard_integrity() else {
+        let Some(integrity) = segment.validated_shard_integrity() else {
             return Err(ObjectReadFailure::from_store(
                 StoreError::PayloadShardSetMismatch {
                     reason: "streamed full segment is missing its shard integrity witness"
@@ -1893,8 +1893,8 @@ impl ObjectPayloadFullSegmentRead {
                 },
             ));
         };
-        integrity
-            .validate(request.ec, stored_size, request.segment_crc64)
+        let integrity = integrity
+            .require_request(request)
             .map_err(|error| {
                 ObjectReadFailure::from_store(StoreError::PayloadShardSetMismatch {
                     reason: format!(
@@ -2016,14 +2016,20 @@ impl ObjectPayloadFullSegmentRead {
             let mut fetched = Vec::new();
             let outcome = match &self.authority {
                 ObjectPayloadFullSegmentReadAuthority::Active(active) => active
-                    .read_segment_payload_stored_range_into(
+                    .read_validated_segment_payload_stored_range_into(
                         &self.segment,
+                        self.segment
+                            .validated_shard_integrity()
+                            .expect("streaming construction requires a validated integrity witness"),
                         fetch_range.clone(),
                         &mut fetched,
                     ),
                 ObjectPayloadFullSegmentReadAuthority::Retained(retained) => retained
-                    .read_segment_payload_stored_range_into(
+                    .read_validated_segment_payload_stored_range_into(
                         &self.segment,
+                        self.segment
+                            .validated_shard_integrity()
+                            .expect("streaming construction requires a validated integrity witness"),
                         fetch_range.clone(),
                         &mut fetched,
                     ),
@@ -2160,12 +2166,18 @@ impl ObjectPayloadFullSegmentRead {
                     .cluster
                     .read_object_payload_segment_systematic_padding_into(
                         &self.segment,
+                        self.segment
+                            .validated_shard_integrity()
+                            .expect("streaming construction requires a validated integrity witness"),
                         &mut padding,
                     ),
                 ObjectPayloadFullSegmentReadAuthority::Retained(retained) => retained
                     .cluster
                     .read_retained_object_payload_segment_systematic_padding_into(
                         &self.segment,
+                        self.segment
+                            .validated_shard_integrity()
+                            .expect("streaming construction requires a validated integrity witness"),
                         &retained.leased_node_ids,
                         &mut padding,
                     ),
@@ -2180,12 +2192,13 @@ impl ObjectPayloadFullSegmentRead {
             });
         }
 
-        let request = self.segment.stored_bytes_request();
         let integrity = self
             .segment
-            .shard_integrity()
+            .validated_shard_integrity()
             .expect("streaming construction requires a validated integrity witness");
-        let mut actual_acks = Vec::with_capacity(self.systematic_hashers.len());
+        let integrity = integrity
+            .require_request(self.segment.stored_bytes_request())
+            .expect("streaming integrity remains bound to its segment request");
         for (shard_index, (hasher, byte_count)) in self
             .systematic_hashers
             .iter()
@@ -2207,14 +2220,6 @@ impl ObjectPayloadFullSegmentRead {
             if actual != expected {
                 return Ok(ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired);
             }
-            actual_acks.push(actual);
-        }
-        if !systematic_data_shard_acks_match_segment(
-            &actual_acks,
-            self.stored_size,
-            request.segment_crc64,
-        ) {
-            return Ok(ObjectPayloadFullSegmentReadOutcome::FullSegmentFallbackRequired);
         }
         Ok(ObjectPayloadFullSegmentReadOutcome::Complete)
     }
@@ -2290,6 +2295,28 @@ impl ActiveObjectPayloadRead {
         }
         self.cluster
             .try_read_object_payload_segment_stored_range_into(segment, range, dst)
+            .map_err(ObjectReadFailure::from_store)
+    }
+
+    fn read_validated_segment_payload_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, ObjectReadFailure> {
+        if !self.contains_segment(segment) {
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "validated payload range read is outside the active lease-bound segment set"
+                        .to_string(),
+                },
+            ));
+        }
+        self.cluster
+            .try_read_object_payload_segment_validated_stored_range_into(
+                segment, integrity, range, dst,
+            )
             .map_err(ObjectReadFailure::from_store)
     }
 
@@ -2421,6 +2448,33 @@ impl RetainedObjectPayloadRead {
                 segment.placement_cluster_epoch(),
                 segment.stored_bytes_request(),
                 segment.shard_integrity(),
+                range,
+                dst,
+                &self.leased_node_ids,
+            )
+            .map_err(ObjectReadFailure::from_store)
+    }
+
+    fn read_validated_segment_payload_stored_range_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        integrity: crate::types::ValidatedSegmentShardIntegrity<'_>,
+        range: std::ops::Range<u64>,
+        dst: &mut Vec<u8>,
+    ) -> Result<ObjectPayloadRangeReadOutcome, ObjectReadFailure> {
+        if !self.contains_segment(segment) {
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "validated payload range read is outside the retained object snapshot"
+                        .to_string(),
+                },
+            ));
+        }
+        self.cluster
+            .try_read_retained_object_payload_segment_validated_stored_range_into(
+                segment.placement_cluster_epoch(),
+                segment.stored_bytes_request(),
+                integrity,
                 range,
                 dst,
                 &self.leased_node_ids,

@@ -1882,6 +1882,31 @@ evidence):
   must identify the authoritative persisted codec without exposing general storage test hooks to
   the AWS-facing test harness.
 
+Implementation update (2026-10-27, request-bound shard-integrity capability):
+
+- Authoritative `ObjectPayloadSegment` construction now mints an opaque borrowing capability that
+  binds the already-validated durable shard witness to the complete physical request: data PG,
+  object key hash, payload generation, stored length, stored CRC64, and EC shape. Shared lower
+  range and padding primitives accept only that capability. Standalone range callers must perform
+  the full witness validation to mint the same type; there is no raw-record lower helper that a
+  cluster child module can call after merely asserting validation by convention.
+- The sequential active and retained readers reuse this request-bound proof for every bounded
+  physical fetch and for the final padding read. Each returned systematic shard is still CRC64
+  checked incrementally and compared byte-for-byte with the durable acknowledgement at
+  completion, but the reader no longer recomposes the unchanged durable witness for every 2 MiB
+  read-ahead window. Crossed physical requests fail before route selection or shard access, and
+  independent canaries cross every bound request field.
+- Two reverse-order, same-binary local 4+2 comparisons against the saved pre-change coalesced
+  Cobblestone binary measured a 31-42% full-read throughput increase and a 23-28% reduction in
+  median completion latency for 16 MiB objects. Median body TTFB fell from 1.60-1.64 ms to
+  1.02-1.10 ms; the independent 4 KiB Range path remained within run-to-run noise. These remain
+  exploratory dirty-writer-selection measurements rather than the clean Phase 5 matrix.
+- A matching post-change `perf` profile reduced sampled `checksum::crc64::combine` work from about
+  1.72 billion to 0.39 billion cycles. The remaining combine work occurs once while authoritative
+  object snapshots validate their durable segment records, not once per physical range fetch.
+  `memmove` remained about 0.76 billion sampled cycles and is now the clearest avoidable residual
+  in the sequential path; this capability slice deliberately does not change buffer ownership.
+
 ### Optional follow-up: Partial EC reconstruction
 
 This is not part of the initial completion path. Start it only if Phase 3/4 production-like metrics
