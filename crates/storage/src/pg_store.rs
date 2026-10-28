@@ -650,7 +650,7 @@ fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
         .expect("pg_store must only construct ObjectKey from validated values")
 }
 
-fn install_sqlite_profile_hook(conn: &Connection) {
+fn install_sqlite_profile_hook(conn: &mut Connection) {
     let Ok(raw_threshold) = env::var("ARGMIN_SQLITE_PROFILE_MS") else {
         return;
     };
@@ -661,10 +661,12 @@ fn install_sqlite_profile_hook(conn: &Connection) {
         return;
     };
     SQLITE_PROFILE_THRESHOLD_NANOS.store(threshold_ms.saturating_mul(1_000_000), Ordering::Relaxed);
-    conn.trace_v2(
+    if let Err(error) = conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(sqlite_profile_callback),
-    );
+    ) {
+        eprintln!("argmin_sqlite_profile failed to install profiling hook: {error}");
+    }
 }
 
 fn sqlite_profile_callback(event: TraceEvent<'_>) {
@@ -1186,12 +1188,12 @@ impl PgStore {
         })?;
 
         let db_path = pg_dir.join("metadata.db");
-        let conn = Connection::open(&db_path).map_err(|e| StoreError::Db {
+        let mut conn = Connection::open(&db_path).map_err(|e| StoreError::Db {
             context: "open pg database",
             source: e.into(),
         })?;
         conn.set_prepared_statement_cache_capacity(PG_STORE_STATEMENT_CACHE_CAPACITY);
-        install_sqlite_profile_hook(&conn);
+        install_sqlite_profile_hook(&mut conn);
 
         conn.execute_batch("PRAGMA recursive_triggers = ON")
             .map_err(|e| StoreError::Db {

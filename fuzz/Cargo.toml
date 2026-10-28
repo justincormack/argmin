@@ -13,7 +13,7 @@ non_kebab_case_bins = "allow"
 
 [dependencies]
 auth = { path = "../crates/auth" }
-base64 = "0.22"
+base64 = "0.23"
 libfuzzer-sys = "0.4"
 s3-types = { path = "../crates/s3-types" }
 serde_json = "1"

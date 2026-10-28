@@ -26,7 +26,7 @@ deep-tracing = ["observability/deep-tracing"]
 
 [dependencies]
 argmin-crypto = { path = "../crypto", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 serde_json = "1"

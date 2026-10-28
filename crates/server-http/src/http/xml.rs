@@ -1438,7 +1438,7 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref().as_bytes() {
                 b"Grantee" => {
                     in_grantee = true;
                     current_grantee_type = None;
@@ -1447,16 +1447,13 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                         let attr = attr.map_err(|_| ServerError::InvalidArgument {
                             reason: "invalid ACL XML attributes".to_string(),
                         })?;
-                        if attr.key.as_ref().ends_with(b"type") {
+                        if attr.key.as_ref().ends_with("type") {
                             current_grantee_type = Some(
-                                attr.decoded_and_normalized_value(
-                                    XmlVersion::Implicit1_0,
-                                    reader.decoder(),
-                                )
-                                .map_err(|_| ServerError::InvalidArgument {
-                                    reason: "invalid ACL grantee type".to_string(),
-                                })?
-                                .into_owned(),
+                                attr.normalized_value(XmlVersion::Implicit1_0)
+                                    .map_err(|_| ServerError::InvalidArgument {
+                                        reason: "invalid ACL grantee type".to_string(),
+                                    })?
+                                    .into_owned(),
                             );
                         }
                     }
@@ -1475,7 +1472,7 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                 }
                 _ => {}
             },
-            Ok(Event::Empty(e)) if e.local_name().as_ref() == b"Grantee" => {
+            Ok(Event::Empty(e)) if e.local_name().as_ref().as_bytes() == b"Grantee" => {
                 in_grantee = false;
                 current_grantee_type = None;
                 current_grantee = None;
@@ -1483,16 +1480,13 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                     let attr = attr.map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid ACL XML attributes".to_string(),
                     })?;
-                    if attr.key.as_ref().ends_with(b"type") {
+                    if attr.key.as_ref().ends_with("type") {
                         current_grantee_type = Some(
-                            attr.decoded_and_normalized_value(
-                                XmlVersion::Implicit1_0,
-                                reader.decoder(),
-                            )
-                            .map_err(|_| ServerError::InvalidArgument {
-                                reason: "invalid ACL grantee type".to_string(),
-                            })?
-                            .into_owned(),
+                            attr.normalized_value(XmlVersion::Implicit1_0)
+                                .map_err(|_| ServerError::InvalidArgument {
+                                    reason: "invalid ACL grantee type".to_string(),
+                                })?
+                                .into_owned(),
                         );
                     }
                 }
@@ -1511,7 +1505,7 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                 })?;
                 current_text.push_str(&text);
             }
-            Ok(Event::End(e)) => match e.local_name().as_ref() {
+            Ok(Event::End(e)) => match e.local_name().as_ref().as_bytes() {
                 b"Grantee" => {
                     in_grantee = false;
                     current_text_field = None;
@@ -1827,7 +1821,7 @@ pub fn parse_delete_objects_xml(
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"Delete") => state = State::InDelete,
                 (State::InDelete, b"Object") => {
                     current_etag = None;
@@ -1863,7 +1857,7 @@ pub fn parse_delete_objects_xml(
                 }
                 _ => return Err(malformed_delete_xml("unexpected element in delete XML")),
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"Delete") => state = State::Done,
                 (State::InDelete, b"Object") => {
                     return Err(malformed_delete_xml("Object missing <Key> element"));
@@ -1890,7 +1884,7 @@ pub fn parse_delete_objects_xml(
                     ))
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InDelete, b"Delete") => state = State::Done,
                 (State::InObject, b"Object") => {
                     let key = current_key
@@ -1989,8 +1983,7 @@ pub fn parse_delete_objects_xml(
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref())
-                    .map_err(|_| malformed_delete_xml("invalid UTF-8 in delete XML body"))?;
+                let text = t.as_ref();
                 match state {
                     State::InEtag
                     | State::InKey
@@ -2110,7 +2103,7 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"VersioningConfiguration") => state = State::InRoot,
                 (State::InRoot, b"Status") => {
                     current_text.clear();
@@ -2122,7 +2115,7 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
                     });
                 }
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"VersioningConfiguration") => state = State::Done,
                 (State::InRoot, b"Status") => status_text = Some(String::new()),
                 _ => {
@@ -2131,7 +2124,7 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
                     });
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"VersioningConfiguration") => state = State::Done,
                 (State::InStatus, b"Status") => {
                     status_text = Some(std::mem::take(&mut current_text));
@@ -2162,10 +2155,7 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
                 }
             }
             Ok(Event::CData(t)) => {
-                let text =
-                    std::str::from_utf8(t.as_ref()).map_err(|_| ServerError::MalformedXML {
-                        reason: "invalid UTF-8 in versioning XML body".to_string(),
-                    })?;
+                let text = t.as_ref();
                 match state {
                     State::InStatus => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -2300,7 +2290,7 @@ pub fn parse_bucket_object_lock_configuration_xml(
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::Start, b"ObjectLockConfiguration") => state = State::InRoot,
                 (State::InRoot, b"ObjectLockEnabled") => {
                     current_text.clear();
@@ -2329,7 +2319,7 @@ pub fn parse_bucket_object_lock_configuration_xml(
                     });
                 }
             },
-            Ok(Event::Empty(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::Start, b"ObjectLockConfiguration") => state = State::Done,
                 (State::InRoot, b"ObjectLockEnabled") => object_lock_enabled = Some(String::new()),
                 (State::InRoot, b"Rule") => {
@@ -2346,7 +2336,7 @@ pub fn parse_bucket_object_lock_configuration_xml(
                     });
                 }
             },
-            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::InRoot, b"ObjectLockConfiguration") => state = State::Done,
                 (State::InObjectLockEnabled, b"ObjectLockEnabled") => {
                     object_lock_enabled = Some(std::mem::take(&mut current_text));
@@ -2388,10 +2378,7 @@ pub fn parse_bucket_object_lock_configuration_xml(
                 }
             }
             Ok(Event::CData(t)) => {
-                let text =
-                    std::str::from_utf8(t.as_ref()).map_err(|_| ServerError::MalformedXML {
-                        reason: "invalid UTF-8 in object lock configuration XML body".to_string(),
-                    })?;
+                let text = t.as_ref();
                 match state {
                     State::InObjectLockEnabled | State::InMode | State::InDays | State::InYears => {
                         current_text.push_str(text);
@@ -2535,7 +2522,7 @@ pub fn parse_object_retention_xml(data: &[u8]) -> Result<ObjectRetention, Server
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::Start, b"Retention" | b"ObjectLockRetention") => state = State::InRoot,
                 (State::InRoot, b"Mode") => {
                     current_text.clear();
@@ -2556,7 +2543,7 @@ pub fn parse_object_retention_xml(data: &[u8]) -> Result<ObjectRetention, Server
                     "unexpected empty element in object retention XML",
                 ));
             }
-            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::InRoot, b"Retention" | b"ObjectLockRetention") => state = State::Done,
                 (State::InMode, b"Mode") => {
                     mode_text = Some(std::mem::take(&mut current_text));
@@ -2585,9 +2572,7 @@ pub fn parse_object_retention_xml(data: &[u8]) -> Result<ObjectRetention, Server
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
-                    malformed_retention_xml("invalid UTF-8 in object retention XML body")
-                })?;
+                let text = t.as_ref();
                 match state {
                     State::InMode | State::InRetainUntilDate => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -2682,7 +2667,7 @@ pub fn parse_object_legal_hold_xml(data: &[u8]) -> Result<LegalHoldStatus, Serve
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::Start, b"LegalHold") => state = State::InRoot,
                 (State::InRoot, b"Status") => {
                     current_text.clear();
@@ -2699,7 +2684,7 @@ pub fn parse_object_legal_hold_xml(data: &[u8]) -> Result<LegalHoldStatus, Serve
                     "unexpected empty element in legal hold XML",
                 ));
             }
-            Ok(Event::End(e)) => match (state, e.local_name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.local_name().as_ref().as_bytes()) {
                 (State::InRoot, b"LegalHold") => state = State::Done,
                 (State::InStatus, b"Status") => {
                     status_text = Some(std::mem::take(&mut current_text));
@@ -2724,9 +2709,7 @@ pub fn parse_object_legal_hold_xml(data: &[u8]) -> Result<LegalHoldStatus, Serve
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
-                    malformed_legal_hold_xml("invalid UTF-8 in legal hold XML body")
-                })?;
+                let text = t.as_ref();
                 match state {
                     State::InStatus => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -2824,7 +2807,7 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"ServerSideEncryptionConfiguration") => state = State::InRoot,
                 (State::InRoot, b"Rule") => {
                     if rule_seen {
@@ -2866,7 +2849,7 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
                     ));
                 }
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"ServerSideEncryptionConfiguration") => state = State::Done,
                 (State::InRoot, b"Rule") => {
                     if rule_seen {
@@ -2894,7 +2877,7 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
                     ));
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"ServerSideEncryptionConfiguration") => state = State::Done,
                 (State::InRule, b"Rule") => state = State::InRoot,
                 (State::InApplyDefault, b"ApplyServerSideEncryptionByDefault") => {
@@ -2940,9 +2923,7 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
-                    malformed_bucket_encryption_xml("invalid UTF-8 in bucket encryption XML body")
-                })?;
+                let text = t.as_ref();
                 match state {
                     State::InSseAlgorithm
                     | State::InKmsMasterKeyId
@@ -3423,7 +3404,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"CORSConfiguration") => state = State::InRoot,
                 (State::InRoot, b"CORSRule") => {
                     current_rule = Some(crate::cors::CorsRule {
@@ -3457,7 +3438,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                 }
                 _ => return Err(malformed_cors_xml("unexpected element in CORS XML")),
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"CORSConfiguration") => state = State::Done,
                 (State::InRoot, b"CORSRule") => {}
                 (
@@ -3467,7 +3448,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                 ) => {}
                 _ => return Err(malformed_cors_xml("unexpected empty element in CORS XML")),
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"CORSConfiguration") => state = State::Done,
                 (State::InRule, b"CORSRule") => {
                     let rule = current_rule
@@ -3559,8 +3540,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref())
-                    .map_err(|_| malformed_cors_xml("invalid UTF-8 in CORS XML body"))?;
+                let text = t.as_ref();
                 match state {
                     State::InAllowedOrigin
                     | State::InAllowedMethod
@@ -3673,11 +3653,11 @@ fn decode_xml_text_event(
     decode: impl FnOnce(&[u8]) -> Result<String, ServerError>,
 ) -> Result<String, ServerError> {
     match event {
-        Event::Text(text) => decode(text.as_ref()),
+        Event::Text(text) => decode(text.as_ref().as_bytes()),
         Event::GeneralRef(reference) => {
             let mut escaped = Vec::with_capacity(reference.len() + 2);
             escaped.push(b'&');
-            escaped.extend_from_slice(reference.as_ref());
+            escaped.extend_from_slice(reference.as_ref().as_bytes());
             escaped.push(b';');
             decode(&escaped)
         }
@@ -3850,7 +3830,7 @@ fn parse_tag_collection_xml(
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, name) if name == root_name => state = State::InRoot,
                 (State::InRoot, name) if name == collection_name => state = State::InCollection,
                 (State::InCollection, b"Tag") => {
@@ -3868,7 +3848,7 @@ fn parse_tag_collection_xml(
                 }
                 _ => return Err(malformed_tagging_xml("unexpected element in tagging XML")),
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, _) if schema == TagCollectionSchema::S3Control => {
                     state = State::Done;
                 }
@@ -3888,7 +3868,7 @@ fn parse_tag_collection_xml(
                     ));
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, name) if name == root_name => state = State::Done,
                 (State::InCollection, name) if name == collection_name => state = State::InRoot,
                 (State::InTag, b"Tag") => {
@@ -3923,8 +3903,7 @@ fn parse_tag_collection_xml(
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref())
-                    .map_err(|_| malformed_tagging_xml("invalid UTF-8 in tagging XML body"))?;
+                let text = t.as_ref();
                 match state {
                     State::InKey | State::InValue => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -4453,7 +4432,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"PublicAccessBlockConfiguration") => state = State::InRoot,
                 (State::InRoot, b"BlockPublicAcls") => {
                     current_text.clear();
@@ -4477,7 +4456,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
                     ))
                 }
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"BlockPublicAcls") => seen_block_public_acls = true,
                 (State::InRoot, b"IgnorePublicAcls") => seen_ignore_public_acls = true,
                 (State::InRoot, b"BlockPublicPolicy") => seen_block_public_policy = true,
@@ -4490,7 +4469,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
                     ));
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"PublicAccessBlockConfiguration") => state = State::Done,
                 (State::InBlockPublicAcls, b"BlockPublicAcls") => {
                     if !seen_block_public_acls {
@@ -4546,9 +4525,7 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
-                    malformed_pab_xml("invalid UTF-8 in public access block XML body")
-                })?;
+                let text = t.as_ref();
                 match state {
                     State::InBlockPublicAcls
                     | State::InIgnorePublicAcls
@@ -4659,7 +4636,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"OwnershipControls") => state = State::InRoot,
                 (State::InRoot, b"Rule") => state = State::InRule,
                 (State::InRule, b"ObjectOwnership") => {
@@ -4672,7 +4649,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
                     ))
                 }
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRule, b"ObjectOwnership") => object_ownership = Some(String::new()),
                 _ => {
                     return Err(malformed_ownership_xml(
@@ -4680,7 +4657,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
                     ));
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"OwnershipControls") => state = State::Done,
                 (State::InRule, b"Rule") => {
                     if object_ownership.is_none() {
@@ -4713,9 +4690,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref()).map_err(|_| {
-                    malformed_ownership_xml("invalid UTF-8 in ownership controls XML body")
-                })?;
+                let text = t.as_ref();
                 match state {
                     State::InObjectOwnership => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -4800,7 +4775,7 @@ pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"AbacStatus") => state = State::InRoot,
                 (State::InRoot, b"Status") => {
                     current_text.clear();
@@ -4808,7 +4783,7 @@ pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
                 }
                 _ => return Err(malformed_abac_xml("unexpected element in bucket ABAC XML")),
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"Status") => status = Some(String::new()),
                 _ => {
                     return Err(malformed_abac_xml(
@@ -4816,7 +4791,7 @@ pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
                     ));
                 }
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"AbacStatus") => state = State::Done,
                 (State::InStatus, b"Status") => {
                     status = Some(std::mem::take(&mut current_text));
@@ -4843,8 +4818,7 @@ pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref())
-                    .map_err(|_| malformed_abac_xml("invalid UTF-8 in bucket ABAC XML body"))?;
+                let text = t.as_ref();
                 match state {
                     State::InStatus => current_text.push_str(text),
                     _ if text.trim().is_empty() => {}
@@ -5393,7 +5367,7 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::Start, b"CompleteMultipartUpload") => state = State::InRoot,
                 (State::InRoot, b"Part") => {
                     current_part_number = None;
@@ -5424,13 +5398,13 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
                 }
                 _ => return Err(malformed_complete_multipart_xml()),
             },
-            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"Part") => {}
                 (State::InPart, b"PartNumber" | b"ETag") => {}
                 (State::InPart, name) if checksum_algorithm_for_element(name).is_some() => {}
                 _ => return Err(malformed_complete_multipart_xml()),
             },
-            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+            Ok(Event::End(e)) => match (state, e.name().as_ref().as_bytes()) {
                 (State::InRoot, b"CompleteMultipartUpload") => state = State::Done,
                 (State::InPart, b"Part") => {
                     let part_number =
@@ -5487,8 +5461,7 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
                 }
             }
             Ok(Event::CData(t)) => {
-                let text = std::str::from_utf8(t.as_ref())
-                    .map_err(|_| malformed_complete_multipart_xml())?;
+                let text = t.as_ref();
                 match state {
                     State::InPartNumber | State::InETag | State::InChecksum(_) => {
                         current_text.push_str(text);

@@ -32,7 +32,7 @@ placement = { path = "../placement" }
 s3-types = { path = "../s3-types", default-features = false }
 rapidhash = "4.4"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
-rusqlite = { version = "0.33", features = ["bundled", "functions", "trace"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "trace", "fallible_uint"] }
 thiserror = "2"
 tls-provider = { path = "../tls-provider", default-features = false }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }

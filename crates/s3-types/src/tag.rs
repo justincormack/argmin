@@ -486,54 +486,54 @@ impl TagSet {
         loop {
             match reader.read_event() {
                 Ok(Event::Start(element)) => match (state, element.name().as_ref()) {
-                    (State::Start, b"Tagging") => {
+                    (State::Start, "Tagging") => {
                         validate_tagging_root_attributes(&element)?;
                         state = State::InRoot;
                     }
-                    (State::InRoot, b"TagSet") => {
+                    (State::InRoot, "TagSet") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::InTagSet;
                     }
-                    (State::InTagSet, b"Tag") => {
+                    (State::InTagSet, "Tag") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         key.clear();
                         value.clear();
                         state = State::ExpectKey;
                     }
-                    (State::ExpectKey, b"Key") => {
+                    (State::ExpectKey, "Key") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::InKey;
                     }
-                    (State::ExpectValue, b"Value") => {
+                    (State::ExpectValue, "Value") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::InValue;
                     }
                     _ => return Err(malformed("unexpected element in stored tag XML")),
                 },
                 Ok(Event::Empty(element)) => match (state, element.name().as_ref()) {
-                    (State::InRoot, b"TagSet") => {
+                    (State::InRoot, "TagSet") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::ExpectRootEnd;
                     }
-                    (State::ExpectKey, b"Key") => {
+                    (State::ExpectKey, "Key") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::ExpectValue;
                     }
-                    (State::ExpectValue, b"Value") => {
+                    (State::ExpectValue, "Value") => {
                         ensure_no_stored_tag_attributes(&element)?;
                         state = State::ExpectTagEnd;
                     }
                     _ => return Err(malformed("unexpected empty element in stored tag XML")),
                 },
                 Ok(Event::End(element)) => match (state, element.name().as_ref()) {
-                    (State::InKey, b"Key") => state = State::ExpectValue,
-                    (State::InValue, b"Value") => state = State::ExpectTagEnd,
-                    (State::ExpectTagEnd, b"Tag") => {
+                    (State::InKey, "Key") => state = State::ExpectValue,
+                    (State::InValue, "Value") => state = State::ExpectTagEnd,
+                    (State::ExpectTagEnd, "Tag") => {
                         pairs.push((std::mem::take(&mut key), std::mem::take(&mut value)));
                         state = State::InTagSet;
                     }
-                    (State::InTagSet, b"TagSet") => state = State::ExpectRootEnd,
-                    (State::ExpectRootEnd, b"Tagging") => state = State::Done,
+                    (State::InTagSet, "TagSet") => state = State::ExpectRootEnd,
+                    (State::ExpectRootEnd, "Tagging") => state = State::Done,
                     _ => return Err(malformed("unexpected closing element in stored tag XML")),
                 },
                 Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
@@ -600,17 +600,16 @@ fn decode_canonical_tag_text(
     let raw = match event {
         Event::Text(text) => text.into_inner(),
         Event::GeneralRef(reference) => {
-            let mut bytes = Vec::with_capacity(reference.len() + 2);
-            bytes.push(b'&');
-            bytes.extend_from_slice(reference.as_ref());
-            bytes.push(b';');
+            let mut bytes = String::with_capacity(reference.len() + 2);
+            bytes.push('&');
+            bytes.push_str(reference.as_ref());
+            bytes.push(';');
             escaped = bytes;
             escaped.into()
         }
         _ => unreachable!("decode_canonical_tag_text only accepts text and reference events"),
     };
-    let raw =
-        std::str::from_utf8(raw.as_ref()).map_err(|_| malformed("stored tag XML is not UTF-8"))?;
+    let raw = raw.as_ref();
     unescape(raw)
         .map(std::borrow::Cow::into_owned)
         .map_err(|_| malformed(invalid_entity_reason))
@@ -619,13 +618,13 @@ fn decode_canonical_tag_text(
 fn validate_tagging_root_attributes(
     element: &BytesStart<'_>,
 ) -> Result<(), CanonicalTagSetParseError> {
-    const S3_NAMESPACE: &[u8] = b"http://s3.amazonaws.com/doc/2006-03-01/";
+    const S3_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
     let mut attributes = element.attributes();
     match attributes.next() {
         None => Ok(()),
         Some(Ok(attribute))
-            if attribute.key.as_ref() == b"xmlns"
+            if attribute.key.as_ref() == "xmlns"
                 && attribute.value.as_ref() == S3_NAMESPACE
                 && attributes.next().is_none() =>
         {

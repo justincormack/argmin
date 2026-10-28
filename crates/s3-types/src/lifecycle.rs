@@ -713,10 +713,10 @@ impl LifecycleXmlParser {
                 Ok(Event::Start(element)) => parser.open(&element)?,
                 Ok(Event::Empty(element)) => {
                     parser.open(&element)?;
-                    parser.close(local_element_name(element.local_name().as_ref())?)?;
+                    parser.close(element.local_name().as_ref())?;
                 }
                 Ok(Event::End(element)) => {
-                    parser.close(local_element_name(element.local_name().as_ref())?)?;
+                    parser.close(element.local_name().as_ref())?;
                 }
                 Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
                     parser.text_event(event)?;
@@ -760,7 +760,7 @@ impl LifecycleXmlParser {
         }
 
         let local_name = element.local_name();
-        let name = local_element_name(local_name.as_ref())?;
+        let name = local_name.as_ref();
         let frame = match self.frames.last_mut() {
             None if self.rules.is_some() => {
                 return Err(LifecycleConfigError::MalformedXml {
@@ -879,11 +879,11 @@ impl LifecycleXmlParser {
 
     fn text_event(&mut self, event: Event<'_>) -> Result<(), LifecycleConfigError> {
         match event {
-            Event::Text(text) => self.text(text.as_ref()),
+            Event::Text(text) => self.text(text.as_ref().as_bytes()),
             Event::GeneralRef(reference) => {
                 let mut escaped = Vec::with_capacity(reference.len() + 2);
                 escaped.push(b'&');
-                escaped.extend_from_slice(reference.as_ref());
+                escaped.extend_from_slice(reference.as_ref().as_bytes());
                 escaped.push(b';');
                 self.text(&escaped)
             }
@@ -1344,12 +1344,6 @@ fn unexpected_element(name: &str, parent: &str) -> LifecycleConfigError {
     LifecycleConfigError::MalformedXml {
         reason: format!("unexpected <{name}> in {parent}"),
     }
-}
-
-fn local_element_name(name: &[u8]) -> Result<&str, LifecycleConfigError> {
-    std::str::from_utf8(name).map_err(|_| LifecycleConfigError::MalformedXml {
-        reason: "XML element name is not valid UTF-8".to_string(),
-    })
 }
 
 fn validate_lifecycle_xml_attributes(element: &BytesStart<'_>) -> Result<(), LifecycleConfigError> {

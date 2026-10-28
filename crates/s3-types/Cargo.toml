@@ -10,7 +10,7 @@ openssl = ["checksum/openssl"]
 
 [dependencies]
 checksum = { path = "../checksum", default-features = false }
-quick-xml = "0.41"
+quick-xml = "0.42"
 thiserror = "2"
 unicode-general-category = "1.1"
 

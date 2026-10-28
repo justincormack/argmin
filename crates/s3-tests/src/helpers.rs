@@ -355,13 +355,13 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
                     return None;
                 }
                 if depth == 0 {
-                    if saw_root || root_closed || element.name().as_ref() != b"Error" {
+                    if saw_root || root_closed || element.name().as_ref() != "Error" {
                         return None;
                     }
                     saw_root = true;
                 } else if root_closed {
                     return None;
-                } else if depth == 1 && element.name().as_ref() == b"Code" {
+                } else if depth == 1 && element.name().as_ref() == "Code" {
                     if code.is_some() || in_code {
                         return None;
                     }
@@ -378,7 +378,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
                     return None;
                 }
                 if depth == 0 {
-                    if saw_root || root_closed || element.name().as_ref() != b"Error" {
+                    if saw_root || root_closed || element.name().as_ref() != "Error" {
                         return None;
                     }
                     saw_root = true;
@@ -388,7 +388,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
                         return None;
                     }
                     if depth == 1
-                        && element.name().as_ref() == b"Code"
+                        && element.name().as_ref() == "Code"
                         && code.replace(String::new()).is_some()
                     {
                         return None;
@@ -400,7 +400,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
                 if depth == 0 {
                     return None;
                 }
-                if in_code && depth == 2 && element.name().as_ref() == b"Code" {
+                if in_code && depth == 2 && element.name().as_ref() == "Code" {
                     code = Some(std::mem::take(&mut code_text));
                     in_code = false;
                 }
@@ -411,7 +411,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
             }
             Event::Text(text) => {
                 declaration_allowed = false;
-                let text = std::str::from_utf8(text.as_ref()).ok()?;
+                let text = text.as_ref();
                 if !xml_literal_text_is_well_formed(text, xml_version) {
                     return None;
                 }
@@ -427,7 +427,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
             }
             Event::GeneralRef(reference) => {
                 declaration_allowed = false;
-                let reference = std::str::from_utf8(reference.as_ref()).ok()?;
+                let reference = reference.as_ref();
                 let escaped = format!("&{reference};");
                 let text = unescape(&escaped).ok()?;
                 if !xml_decoded_text_is_well_formed(&text, xml_version) {
@@ -441,7 +441,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
             }
             Event::CData(text) => {
                 declaration_allowed = false;
-                let text = std::str::from_utf8(text.as_ref()).ok()?;
+                let text = text.as_ref();
                 if !xml_literal_text_is_well_formed(text, xml_version) {
                     return None;
                 }
@@ -461,15 +461,15 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
             Event::Decl(_) | Event::DocType(_) => return None,
             Event::Comment(comment) => {
                 declaration_allowed = false;
-                let comment = std::str::from_utf8(comment.as_ref()).ok()?;
+                let comment = comment.as_ref();
                 if !xml_literal_text_is_well_formed(comment, xml_version) {
                     return None;
                 }
             }
             Event::PI(instruction) => {
                 declaration_allowed = false;
-                let target = std::str::from_utf8(instruction.target()).ok()?;
-                let content = std::str::from_utf8(instruction.content()).ok()?;
+                let target = instruction.target();
+                let content = instruction.content();
                 if !xml_name_is_well_formed(target)
                     || target.eq_ignore_ascii_case("xml")
                     || !xml_literal_text_is_well_formed(content, xml_version)
@@ -484,7 +484,7 @@ fn top_level_embedded_error_code(body: &str) -> Option<String> {
 }
 
 fn xml_declaration_version(declaration: &BytesDecl<'_>) -> Option<XmlVersion> {
-    let mut input = declaration.as_ref().strip_prefix(b"xml")?;
+    let mut input = declaration.as_ref().as_bytes().strip_prefix(b"xml")?;
     if !consume_xml_space(&mut input) {
         return None;
     }
@@ -576,7 +576,7 @@ fn xml_element_attributes_are_well_formed(element: &BytesStart<'_>, version: Xml
     let mut attributes = element.attributes();
     attributes.with_checks(true).all(|attribute| {
         attribute.is_ok_and(|attribute| {
-            std::str::from_utf8(attribute.value.as_ref()).is_ok_and(|value| {
+            std::str::from_utf8(attribute.value.as_ref().as_bytes()).is_ok_and(|value| {
                 xml_literal_text_is_well_formed(value, version)
                     && attribute
                         .normalized_value(version)

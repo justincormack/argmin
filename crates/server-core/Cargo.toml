@@ -11,7 +11,7 @@ ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
 storage = { path = "../storage", default-features = false }
 s3-types = { path = "../s3-types", default-features = false }
-base64 = "0.22"
+base64 = "0.23"
 thiserror = "2"
 
 [features]

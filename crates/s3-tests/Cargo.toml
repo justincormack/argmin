@@ -79,10 +79,10 @@ tempfile = "3"
 test-util = { path = "../test-util" }
 
 # POST Object tests (raw HTTP, SigV4 signing)
-base64 = "0.22"
-md5_legacy = { package = "md-5", version = "0.10" }
+base64 = "0.23"
+md5_legacy = { package = "md-5", version = "0.11" }
 serde_json = "1"
 ring = "0.17"
-quick-xml = "0.41"
+quick-xml = "0.42"
 url = "2.5.8"
 xmlparser = "0.13"

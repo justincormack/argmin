@@ -10,4 +10,4 @@ openssl = ["dep:rustls-openssl"]
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-openssl = { version = "0.3.1", default-features = false, features = ["tls12"], optional = true }
+rustls-openssl = { version = "0.4.2", default-features = false, features = ["tls12"], optional = true }
