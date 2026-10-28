@@ -738,6 +738,26 @@ impl super::StorageCluster {
         segment_index: u32,
         shard_index: u8,
     ) -> Result<(), StoreError> {
+        self.test_inject_object_payload_shard_corruption_at_offset(
+            snapshot,
+            segment_index,
+            shard_index,
+            0,
+        )
+    }
+
+    /// Corrupts one exact byte of a placed shard file from a captured payload.
+    ///
+    /// This lower-level primitive stays crate-private. Public test support
+    /// exposes only storage-owned semantic record-failure scenarios.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_inject_object_payload_shard_corruption_at_offset(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+        shard_offset: u64,
+    ) -> Result<(), StoreError> {
         let path = self.test_object_payload_shard_file_path_from_snapshot(
             snapshot,
             segment_index,
@@ -747,11 +767,19 @@ impl super::StorageCluster {
             context: "read object payload shard for corruption",
             source,
         })?;
-        let first = data.first_mut().ok_or_else(|| StoreError::Io {
+        let shard_offset = usize::try_from(shard_offset).map_err(|_| StoreError::Io {
             context: "corrupt object payload shard",
-            source: std::io::Error::other("placed payload shard is empty"),
+            source: std::io::Error::other("payload shard corruption offset exceeds platform limits"),
         })?;
-        *first ^= 0xff;
+        let shard_len = data.len();
+        let byte = data.get_mut(shard_offset).ok_or_else(|| StoreError::Io {
+            context: "corrupt object payload shard",
+            source: std::io::Error::other(format!(
+                "payload shard corruption offset {shard_offset} is outside a {}-byte shard",
+                shard_len
+            )),
+        })?;
+        *byte ^= 0xff;
         std::fs::write(path, data).map_err(|source| StoreError::Io {
             context: "write corrupt object payload shard",
             source,

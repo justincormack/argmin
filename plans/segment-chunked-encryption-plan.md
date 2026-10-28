@@ -1,9 +1,8 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: Implementation complete; response-failure coverage audit open (the supported Rust AWS SDK
-late-body-failure canary is pinned, while the exhaustive failure-position matrix below must be
-mapped to named tests before archival. Additional SDK/CLI probes are optional diagnostics, not a
-closure requirement. Partial EC reconstruction remains an optional, separately measured follow-up.)
+Status: Implementation and response-failure coverage complete; ready for archival. Additional
+SDK/CLI probes are optional diagnostics, not a closure requirement. Partial EC reconstruction
+remains an optional, separately measured follow-up.
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -670,17 +669,51 @@ raw-socket response tests must cover at least zero-byte committed failure, a lat
 same segment, a later segment/part, and the terminal boundary. The Rust SDK canary must cover
 incomplete full and `206` bodies; it need not duplicate every injected storage fault.
 
-Coverage audit (2026-10-28): `cobblestone_integrity_failures_abort_committed_socket_responses`
-already pins a committed range failure with zero exposed bytes and a later-segment full-read
-failure with exactly one complete segment exposed.
-`aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets` proves that the locked Rust
-SDK exposes committed `200`/`206` metadata and rejects both short bodies during collection. Crypto,
-storage, retained-route, and fallback tests cover many lower-layer rows, but the named audit above
-must be completed—particularly same-segment later-record and terminal-boundary socket behavior,
-plus an explicit request counter proving each Rust SDK canary sends exactly one request and does
-not retry or concatenate attempts—before this plan is closed or moved to `plans/completed/`. The
-current one-accept test server is not itself evidence of the request count because it does not
-observe a retry attempt after serving the first connection.
+Coverage audit completed 2026-10-28:
+
+- `commitment_and_chunk_failures_release_no_failing_chunk`,
+  `selected_chunks_require_verified_header_and_exact_layout`, and
+  `invalid_ciphertext_lengths_are_rejected` pin key-commitment, exact-record, and canonical terminal
+  layout failures at the crypto boundary. `object_read_snapshot_construction_rejects_crossed_segment_subject`,
+  `admitted_payload_read_route_mints_exact_segment_encryption_subjects`,
+  `shard_scavenger_rejects_invalid_persisted_codec_geometry_without_partial_results`, and
+  `metadata_checkpoint_rejects_malformed_payload_profiles_in_every_carrier_without_mutation` pin
+  durable subject, geometry, and profile rejection before payload effects.
+- `cobblestone_integrity_failures_abort_committed_socket_responses` pins a committed `206` failure
+  at the first selected record with zero exposed bytes and a later-segment `200` failure with
+  exactly one complete segment exposed. `cobblestone_record_failures_abort_at_same_segment_boundaries`
+  pins second-record and terminal-record failures within one segment, including the terminal
+  record sharing a coalesced authenticated window with a preceding record that must be withheld.
+  All cases retain the declared successful response length and terminate the transport short.
+- The raw-socket record tests remove parity separately, first prove that the unchanged systematic
+  payload still returns exact bytes without fallback, and only then corrupt the selected record's
+  tag. Exact AEAD-attempt, successfully decrypted-byte, and fallback-counter deltas prove that the
+  selected record—not missing parity—caused discovery. Parity removal serves only to make the
+  subsequent full-segment fallback unrecoverable.
+- `cobblestone_range_authentication_failure_uses_full_witness_reconstruction` and
+  `cobblestone_full_read_streams_authenticated_prefix_before_late_reconstruction` apply exact
+  first- and second-record tag failures with parity retained and prove successful full-segment
+  reconstruction. `cobblestone_terminal_record_failure_recovers_withheld_preceding_record` applies
+  the terminal-tag failure with parity retained and proves that reconstruction returns both the
+  preceding record withheld from the failed authenticated window and the terminal plaintext
+  exactly once. `read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite`,
+  `retained_read_uses_persisted_witness_without_ack_rows_and_identifies_multiple_corrupt_shards`,
+  `retained_object_payload_range_read_falls_back_after_systematic_node_loss`,
+  `unix_retained_range_falls_back_for_historical_shard_failures`, and
+  `unix_systematic_range_disconnect_after_acquisition_preserves_full_fallback` pin exact
+  evidence-authorized repair, retained-route fallback, missing/malformed historical responses, and
+  disconnect plus lease-release classification. `ec_drop_m_plus_one_shards_fails` and
+  `retained_read_rejects_a_leased_node_subset_below_ec_k` pin failure beyond recoverable tolerance.
+- `cobblestone_authenticated_payload_with_padding_crc_mismatch_schedules_repair` authenticates the
+  complete logical ciphertext before detecting corruption solely in physical EC padding. It proves
+  that the exact client bytes succeed while the durable witness authorizes repair of only the
+  corrupt shard. `cancelling_cobblestone_read_after_authenticated_prefix_releases_payload_leases`
+  drops an incomplete reader after one emitted authenticated record and proves every exact
+  deletion-exclusion lease is released while the already returned immutable chunk remains valid.
+- `aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets` uses a listener that remains
+  available until explicitly stopped. It proves that the locked Rust SDK exposes committed
+  `200`/`206` metadata, rejects both short bodies during collection, and sends exactly one request
+  for each case; retries therefore cannot concatenate bytes from separate attempts.
 
 ### Full reads
 

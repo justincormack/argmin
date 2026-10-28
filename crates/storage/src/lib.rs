@@ -2841,6 +2841,302 @@ pub mod test_support {
         Ok(TestObjectPayloadShardFaultSet { faults })
     }
 
+    #[derive(Clone, Copy)]
+    enum TestCobblestoneRecordFailurePosition {
+        First,
+        Second,
+        Terminal,
+    }
+
+    fn inject_object_payload_first_segment_record_failure(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        position: TestCobblestoneRecordFailurePosition,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if segment.ec_k == 0 {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("captured payload has no data shards"),
+            }));
+        }
+
+        let layout = argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+            segment.size,
+        )
+        .map_err(|_| StoreError::Io {
+            context: "select object payload record failure",
+            source: std::io::Error::other("captured payload has invalid Cobblestone geometry"),
+        })
+        .map_err(TestStorageFailure::from_store)?;
+        let chunk_index = match position {
+            TestCobblestoneRecordFailurePosition::First => 0,
+            TestCobblestoneRecordFailurePosition::Second => {
+                if layout.chunk_count() < 3 {
+                    return Err(TestStorageFailure::from_store(StoreError::Io {
+                        context: "select object payload record failure",
+                        source: std::io::Error::other(
+                            "captured payload needs a second nonterminal Cobblestone record",
+                        ),
+                    }));
+                }
+                1
+            }
+            TestCobblestoneRecordFailurePosition::Terminal => layout
+                .chunk_count()
+                .checked_sub(1)
+                .ok_or_else(|| StoreError::Io {
+                    context: "select object payload record failure",
+                    source: std::io::Error::other("captured payload has no Cobblestone records"),
+                })
+                .map_err(TestStorageFailure::from_store)?,
+        };
+        let record_range = layout
+            .ciphertext_range_for_chunk(chunk_index)
+            .map_err(|_| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("selected Cobblestone record is invalid"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let corruption_offset = record_range
+            .end
+            .checked_sub(1)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("selected Cobblestone record is empty"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let stored_size = snapshot
+            .stored_size_for(segment)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("captured payload stored size is invalid"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let stored_size = u64::try_from(stored_size)
+            .map_err(|_| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("captured payload stored size exceeds u64"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if stored_size != layout.ciphertext_len() {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other(
+                    "captured payload codec size does not match Cobblestone layout",
+                ),
+            }));
+        }
+
+        let shard_size = stored_size.div_ceil(u64::from(segment.ec_k));
+        let shard_index = u8::try_from(corruption_offset / shard_size)
+            .map_err(|_| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("selected Cobblestone record maps outside u8 shards"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if shard_index >= segment.ec_k {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other(
+                    "selected Cobblestone record maps outside systematic shards",
+                ),
+            }));
+        }
+        let shard_offset = corruption_offset % shard_size;
+        let corrupt_fault = TestObjectPayloadShardFault {
+            snapshot: snapshot.clone(),
+            segment_index: segment.segment_index,
+            shard_index,
+        };
+        cluster
+            .test_inject_object_payload_shard_corruption_at_offset(
+                &corrupt_fault.snapshot,
+                corrupt_fault.segment_index,
+                corrupt_fault.shard_index,
+                shard_offset,
+            )
+            .map_err(TestStorageFailure::from_store)?;
+        Ok(TestObjectPayloadShardFaultSet {
+            faults: vec![corrupt_fault],
+        })
+    }
+
+    /// Removes every parity shard from storage's first payload segment while
+    /// leaving all systematic shards unchanged. Healthy reads must continue
+    /// to use the systematic fast path; a later fault cannot be recovered by
+    /// full-segment reconstruction.
+    pub fn inject_object_payload_first_segment_parity_loss(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload parity loss",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if segment.ec_m == 0 {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload parity loss",
+                source: std::io::Error::other("captured payload has no parity shards"),
+            }));
+        }
+
+        let parity_end = segment
+            .ec_k
+            .checked_add(segment.ec_m)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload record failure",
+                source: std::io::Error::other("captured payload shard count overflow"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let mut faults = Vec::with_capacity(usize::from(segment.ec_m));
+        for parity_shard_index in segment.ec_k..parity_end {
+            let fault = TestObjectPayloadShardFault {
+                snapshot: snapshot.clone(),
+                segment_index: segment.segment_index,
+                shard_index: parity_shard_index,
+            };
+            cluster
+                .test_inject_object_payload_shard_loss(
+                    &fault.snapshot,
+                    fault.segment_index,
+                    fault.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
+            faults.push(fault);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
+    /// Makes the first Cobblestone record of storage's first payload segment
+    /// fail authentication without changing the segment's other shards.
+    pub fn inject_object_payload_first_record_failure(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        inject_object_payload_first_segment_record_failure(
+            cluster,
+            snapshot,
+            TestCobblestoneRecordFailurePosition::First,
+        )
+    }
+
+    /// Makes the second Cobblestone record of storage's first payload segment
+    /// fail authentication after one complete record can be emitted, without
+    /// changing the segment's other shards.
+    pub fn inject_object_payload_second_record_failure(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        inject_object_payload_first_segment_record_failure(
+            cluster,
+            snapshot,
+            TestCobblestoneRecordFailurePosition::Second,
+        )
+    }
+
+    /// Makes the terminal Cobblestone record of storage's first payload
+    /// segment fail authentication after every preceding record can be
+    /// authenticated. A preceding record in the same coalesced window may be
+    /// withheld with the failing terminal record. No other shard is changed.
+    pub fn inject_object_payload_terminal_record_failure(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        inject_object_payload_first_segment_record_failure(
+            cluster,
+            snapshot,
+            TestCobblestoneRecordFailurePosition::Terminal,
+        )
+    }
+
+    /// Corrupts only EC padding after the logical ciphertext in storage's
+    /// first payload segment. Every Cobblestone record remains authentic, but
+    /// completing the physical shard CRC must enter diagnostic recovery and
+    /// identify this exact shard for repair.
+    pub fn inject_object_payload_first_segment_padding_corruption(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if segment.ec_k == 0 {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured payload has no data shards"),
+            }));
+        }
+        let stored_size = snapshot
+            .stored_size_for(segment)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured payload stored size is invalid"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let data_shards = usize::from(segment.ec_k);
+        let shard_size = stored_size.div_ceil(data_shards);
+        let padded_size = shard_size
+            .checked_mul(data_shards)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured payload padded size overflow"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        if padded_size == stored_size {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured payload has no physical EC padding"),
+            }));
+        }
+        let last_data_shard = segment.ec_k - 1;
+        let last_shard_logical_start = shard_size
+            .checked_mul(data_shards - 1)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload padding corruption",
+                source: std::io::Error::other("captured payload shard offset overflow"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
+        let padding_offset = stored_size - last_shard_logical_start;
+        let fault = TestObjectPayloadShardFault {
+            snapshot: snapshot.clone(),
+            segment_index: segment.segment_index,
+            shard_index: last_data_shard,
+        };
+        cluster
+            .test_inject_object_payload_shard_corruption_at_offset(
+                &fault.snapshot,
+                fault.segment_index,
+                fault.shard_index,
+                u64::try_from(padding_offset).map_err(|_| {
+                    TestStorageFailure::from_store(StoreError::Io {
+                        context: "select object payload padding corruption",
+                        source: std::io::Error::other(
+                            "captured payload padding offset exceeds u64",
+                        ),
+                    })
+                })?,
+            )
+            .map_err(TestStorageFailure::from_store)?;
+        Ok(fault)
+    }
+
     /// Schedules the requested number of data-shard repair wakes for storage's
     /// first payload segment without exposing their physical identities.
     pub fn schedule_object_payload_data_shard_repair_wakes(

@@ -21578,7 +21578,7 @@ fn cobblestone_range_authentication_failure_uses_full_witness_reconstruction() {
     .unwrap();
 
     let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-range-corrupt");
-    storage::test_support::inject_object_payload_first_data_shard_corruption(
+    storage::test_support::inject_object_payload_first_record_failure(
         &coord.storage_node(),
         &payload,
     )
@@ -21654,7 +21654,7 @@ fn cobblestone_full_read_streams_authenticated_prefix_before_late_reconstruction
     .unwrap();
 
     let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-late-corrupt");
-    storage::test_support::inject_object_payload_last_data_shard_corruption(
+    storage::test_support::inject_object_payload_second_record_failure(
         &coord.storage_node(),
         &payload,
     )
@@ -21703,6 +21703,288 @@ fn cobblestone_full_read_streams_authenticated_prefix_before_late_reconstruction
     assert!(
         after.payload_read_reconstructed_bytes_total
             > before.payload_read_reconstructed_bytes_total
+    );
+}
+
+#[test]
+fn cobblestone_terminal_record_failure_recovers_withheld_preceding_record() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let chunk_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN;
+    let data: Vec<u8> = (0..2 * chunk_len + 37)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "cobblestone-terminal-corrupt",
+                test_requester(),
+                None,
+            ),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-terminal-corrupt");
+    storage::test_support::inject_object_payload_terminal_record_failure(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
+
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "cobblestone-terminal-corrupt",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let before = observability::metrics_snapshot();
+    let mut body = object.body;
+    let first = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("first authenticated record must precede terminal-record recovery");
+    assert_eq!(first.as_ref(), &data[..chunk_len]);
+    let after_first = observability::metrics_snapshot();
+    assert_eq!(
+        after_first.payload_read_repair_fallback_total, before.payload_read_repair_fallback_total,
+        "the first record must be emitted without waiting for terminal-record recovery"
+    );
+    assert_eq!(
+        after_first.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        1
+    );
+    assert_eq!(
+        after_first.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        u64::try_from(chunk_len).unwrap()
+    );
+
+    let recovered = body
+        .next_chunk(INTERNAL_SEGMENT_SIZE)
+        .unwrap()
+        .expect("terminal fallback must recover the withheld preceding record and terminal bytes");
+    assert_eq!(
+        recovered.as_ref(),
+        &data[chunk_len..],
+        "fallback must restore the authenticated-but-withheld preceding record exactly once"
+    );
+    assert!(body.next_chunk(INTERNAL_SEGMENT_SIZE).unwrap().is_none());
+
+    let after = observability::metrics_snapshot();
+    assert_eq!(
+        after.payload_read_repair_fallback_total,
+        before.payload_read_repair_fallback_total + 1,
+        "terminal-tag failure must enter full witness reconstruction"
+    );
+    assert!(
+        after.payload_read_reconstructed_bytes_total
+            > before.payload_read_reconstructed_bytes_total
+    );
+    assert_eq!(
+        after.payload_read_aead_records_total - before.payload_read_aead_records_total,
+        6,
+        "the direct path must attempt three records and fallback must authenticate all three again"
+    );
+    assert_eq!(
+        after.payload_read_decrypted_bytes_total - before.payload_read_decrypted_bytes_total,
+        u64::try_from(2 * chunk_len + data.len()).unwrap(),
+        "the preceding record authenticates in the failed terminal window before complete fallback decryption"
+    );
+}
+
+#[test]
+fn cancelling_cobblestone_read_after_authenticated_prefix_releases_payload_leases() {
+    let tmp = test_util::tempdir();
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let chunk_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN;
+    let data = vec![b'c'; 2 * chunk_len + 37];
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "cobblestone-cancelled-read",
+                test_requester(),
+                None,
+            ),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-cancelled-read");
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "cobblestone-cancelled-read",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let mut body = object.body;
+    assert!(
+        storage::test_support::object_payload_snapshot_has_exact_shard_owner_leases(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap(),
+        "the live reader must hold its exact deletion-exclusion leases"
+    );
+
+    let emitted = body
+        .next_chunk(chunk_len)
+        .unwrap()
+        .expect("the first authenticated record must be emitted");
+    assert_eq!(emitted.as_ref(), &data[..chunk_len]);
+    assert!(
+        storage::test_support::object_payload_snapshot_has_exact_shard_owner_leases(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap(),
+        "an incomplete reader must retain its deletion-exclusion leases"
+    );
+
+    drop(body);
+    assert!(
+        storage::test_support::object_payload_snapshot_has_no_leases(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap(),
+        "cancelling after an emitted prefix must release every payload lease"
+    );
+    assert_eq!(emitted.as_ref(), &data[..chunk_len]);
+}
+
+#[test]
+fn cobblestone_authenticated_payload_with_padding_crc_mismatch_schedules_repair() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let chunk_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN;
+    let data = vec![b'p'; 2 * chunk_len + 37];
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "cobblestone-padding-crc",
+                test_requester(),
+                None,
+            ),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let payload = capture_object_payload_for_test(&coord, "bucket", "cobblestone-padding-crc");
+    let padding_fault =
+        storage::test_support::inject_object_payload_first_segment_padding_corruption(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap();
+    let metrics_before = observability::metrics_snapshot();
+    let object = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "cobblestone-padding-crc",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(object.body.read_all().unwrap(), data);
+    let metrics_after = observability::metrics_snapshot();
+    assert_eq!(
+        metrics_after.payload_read_repair_fallback_total,
+        metrics_before.payload_read_repair_fallback_total + 1,
+        "a late physical CRC mismatch must enter witness-backed reconstruction"
+    );
+    assert!(
+        storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &padding_fault,
+        )
+        .unwrap(),
+        "foreground diagnostic recovery must not rewrite padding inline"
+    );
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_pending_repair(
+            &coord.storage_node(),
+            &padding_fault,
+        )
+        .unwrap(),
+        "the durable witness must authorize repair of the exact padding-corrupt shard"
+    );
+    assert!(
+        storage::test_support::take_object_payload_shard_fault_repair_wake(
+            &coord.storage_node(),
+            &padding_fault,
+        )
+        .unwrap(),
+        "the physical diagnostic must wake the background repair worker"
     );
 }
 

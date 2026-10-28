@@ -815,25 +815,51 @@ pub fn build_configured_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    struct IncompleteSuccessServer {
+        request_count: Arc<AtomicUsize>,
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl IncompleteSuccessServer {
+        async fn stop(self) -> usize {
+            let _ = self.stop_tx.send(());
+            self.task.await.unwrap();
+            self.request_count.load(Ordering::SeqCst)
+        }
+    }
+
     async fn client_for_incomplete_success_response(
         response: &'static [u8],
-    ) -> (Client, tokio::task::JoinHandle<()>) {
+    ) -> (Client, IncompleteSuccessServer) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let task_request_count = Arc::clone(&request_count);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buffer).await.unwrap();
-                assert_ne!(read, 0, "AWS SDK disconnected before sending its request");
-                request.extend_from_slice(&buffer[..read]);
+            loop {
+                let accepted = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let (mut stream, _) = accepted.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0, "AWS SDK disconnected before sending its request");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                task_request_count.fetch_add(1, Ordering::SeqCst);
+                stream.write_all(response).await.unwrap();
+                stream.shutdown().await.unwrap();
             }
-            stream.write_all(response).await.unwrap();
-            stream.shutdown().await.unwrap();
         });
         let client = build_client_with_ca(
             &format!("http://{address}"),
@@ -842,7 +868,14 @@ mod tests {
             server::TEST_REGION,
             None,
         );
-        (client, server)
+        (
+            client,
+            IncompleteSuccessServer {
+                request_count,
+                stop_tx,
+                task: server,
+            },
+        )
     }
 
     #[test]
@@ -880,7 +913,11 @@ mod tests {
                 diagnostic.contains("UnexpectedEof") && diagnostic.contains("IncompleteBody"),
                 "unexpected full-GET body error: {error:?}"
             );
-            server.await.unwrap();
+            assert_eq!(
+                server.stop().await,
+                1,
+                "the Rust SDK must not retry or concatenate an incomplete full GET"
+            );
 
             let (client, server) = client_for_incomplete_success_response(
                 b"HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nContent-Range: bytes 4-11/20\r\nConnection: close\r\n\r\nabc",
@@ -906,7 +943,11 @@ mod tests {
                 diagnostic.contains("UnexpectedEof") && diagnostic.contains("IncompleteBody"),
                 "unexpected ranged-GET body error: {error:?}"
             );
-            server.await.unwrap();
+            assert_eq!(
+                server.stop().await,
+                1,
+                "the Rust SDK must not retry or concatenate an incomplete ranged GET"
+            );
         });
     }
 }

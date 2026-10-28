@@ -1228,11 +1228,12 @@ Connection: close\r\n\r\n",
                 s3_types::VersionId::Null,
             )
             .unwrap();
-        storage::test_support::inject_object_payload_first_segment_corruptions_beyond_parity(
-            &frontend.test_storage_cluster,
-            &range_snapshot,
-        )
-        .unwrap();
+        let range_parity_faults =
+            storage::test_support::inject_object_payload_first_segment_parity_loss(
+                &frontend.test_storage_cluster,
+                &range_snapshot,
+            )
+            .unwrap();
 
         let range_value = format!(
             "bytes={}-{}",
@@ -1257,8 +1258,46 @@ Range: {range_value}\r\n\
 Connection: close\r\n\r\n",
             signed_range.authorization, signed_range.amz_date, signed_range.amz_content_sha256,
         );
+        let range_healthy_metrics_before = observability::metrics_snapshot();
+        let range_healthy_response =
+            send_raw_http_request_until_transport_end(&addr, &range_request, &[]);
+        let range_healthy_metrics_after = observability::metrics_snapshot();
+        let (range_healthy_headers, range_healthy_body) =
+            split_raw_http_response(&range_healthy_response);
+        assert!(
+            range_healthy_headers.starts_with("HTTP/1.1 206"),
+            "{range_healthy_headers}"
+        );
+        assert_eq!(
+            range_healthy_body,
+            &range_payload[argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN - 3
+                ..argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN + 5],
+            "removing parity alone changed the selected-record read"
+        );
+        assert_eq!(
+            range_healthy_metrics_after.payload_read_repair_fallback_total,
+            range_healthy_metrics_before.payload_read_repair_fallback_total,
+            "missing parity must not make the healthy systematic range path fall back"
+        );
+        assert!(
+            storage::test_support::object_payload_shard_faults_remain(
+                &frontend.test_storage_cluster,
+                &range_parity_faults,
+            )
+            .unwrap(),
+            "the healthy systematic range read unexpectedly restored parity"
+        );
+
+        let range_record_faults =
+            storage::test_support::inject_object_payload_first_record_failure(
+                &frontend.test_storage_cluster,
+                &range_snapshot,
+            )
+            .unwrap();
+        let range_metrics_before = observability::metrics_snapshot();
         let range_response =
             send_raw_http_request_until_transport_end(&addr, &range_request, &[]);
+        let range_metrics_after = observability::metrics_snapshot();
         let (range_headers, range_body) = split_raw_http_response(&range_response);
         assert!(
             range_headers.starts_with("HTTP/1.1 206"),
@@ -1268,6 +1307,40 @@ Connection: close\r\n\r\n",
         assert!(
             range_body.is_empty(),
             "a failed selected-record read exposed plaintext after response commitment"
+        );
+        assert_eq!(
+            range_metrics_after.payload_read_aead_records_total
+                - range_metrics_before.payload_read_aead_records_total,
+            1,
+            "the ranged read did not fail at its first selected Cobblestone record"
+        );
+        assert_eq!(
+            range_metrics_after.payload_read_decrypted_bytes_total
+                - range_metrics_before.payload_read_decrypted_bytes_total,
+            0,
+            "the failed first selected record exposed authenticated plaintext"
+        );
+        assert_eq!(
+            range_metrics_after.payload_read_repair_fallback_total
+                - range_metrics_before.payload_read_repair_fallback_total,
+            1,
+            "the selected-record failure did not enter full-segment reconstruction"
+        );
+        assert!(
+            storage::test_support::object_payload_shard_faults_remain(
+                &frontend.test_storage_cluster,
+                &range_record_faults,
+            )
+            .unwrap(),
+            "the ranged response unexpectedly repaired its injected record fault"
+        );
+        assert!(
+            storage::test_support::object_payload_shard_faults_remain(
+                &frontend.test_storage_cluster,
+                &range_parity_faults,
+            )
+            .unwrap(),
+            "the ranged response unexpectedly restored its missing parity"
         );
 
         let full_key = "full";
@@ -1335,6 +1408,134 @@ Connection: close\r\n\r\n",
             &full_payload[..crate::coordinator::INTERNAL_SEGMENT_SIZE],
             "the transport must expose only the complete authenticated prefix before the later segment failure"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cobblestone_record_failures_abort_at_same_segment_boundaries() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let bucket = "cobblestone-record-failure-bucket";
+        create_test_bucket(&frontend, bucket);
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+        let chunk_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN;
+        let payload = vec![b'c'; 2 * chunk_len + 37];
+
+        for (key, terminal, expected_aead_attempts, expected_decrypted_bytes) in [
+            ("second-record", false, 2, chunk_len),
+            ("terminal-record", true, 3, 2 * chunk_len),
+        ] {
+            put_test_object(&frontend, bucket, key, &payload);
+            let uri = format!("/{bucket}/{key}");
+            let signed = sign_headers("GET", &uri, &addr, b"", &[]);
+            let request = format!(
+                "GET {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+                signed.authorization, signed.amz_date, signed.amz_content_sha256,
+            );
+            let snapshot = frontend
+                .test_storage_cluster
+                .test_capture_object_payload(
+                    &storage::BucketName::try_from(bucket.to_string()).unwrap(),
+                    &storage::ObjectKey::try_from(key.to_string()).unwrap(),
+                    s3_types::VersionId::Null,
+                )
+                .unwrap();
+            assert_eq!(snapshot.segment_count(), 1);
+            let parity_faults =
+                storage::test_support::inject_object_payload_first_segment_parity_loss(
+                    &frontend.test_storage_cluster,
+                    &snapshot,
+                )
+                .unwrap();
+            let healthy_metrics_before = observability::metrics_snapshot();
+            let healthy_response =
+                send_raw_http_request_until_transport_end(&addr, &request, &[]);
+            let healthy_metrics_after = observability::metrics_snapshot();
+            let (healthy_headers, healthy_body) = split_raw_http_response(&healthy_response);
+            assert!(
+                healthy_headers.starts_with("HTTP/1.1 200"),
+                "{healthy_headers}"
+            );
+            assert_eq!(healthy_body, payload);
+            assert_eq!(
+                healthy_metrics_after.payload_read_repair_fallback_total,
+                healthy_metrics_before.payload_read_repair_fallback_total,
+                "{key} missing parity changed the healthy systematic read path"
+            );
+            assert!(
+                storage::test_support::object_payload_shard_faults_remain(
+                    &frontend.test_storage_cluster,
+                    &parity_faults,
+                )
+                .unwrap(),
+                "{key} healthy systematic read unexpectedly restored parity"
+            );
+
+            let faults = if terminal {
+                storage::test_support::inject_object_payload_terminal_record_failure(
+                    &frontend.test_storage_cluster,
+                    &snapshot,
+                )
+                .unwrap()
+            } else {
+                storage::test_support::inject_object_payload_second_record_failure(
+                    &frontend.test_storage_cluster,
+                    &snapshot,
+                )
+                .unwrap()
+            };
+
+            let metrics_before = observability::metrics_snapshot();
+            let response = send_raw_http_request_until_transport_end(&addr, &request, &[]);
+            let metrics_after = observability::metrics_snapshot();
+            let (headers, body) = split_raw_http_response(&response);
+            assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+            assert_eq!(response_content_length(headers), payload.len());
+            assert_eq!(
+                body.len(),
+                chunk_len,
+                "{key} failure exposed bytes outside the first completed response window"
+            );
+            assert_eq!(body, &payload[..chunk_len]);
+            assert_eq!(
+                metrics_after.payload_read_aead_records_total
+                    - metrics_before.payload_read_aead_records_total,
+                expected_aead_attempts,
+                "{key} did not fail at the selected Cobblestone record"
+            );
+            assert_eq!(
+                metrics_after.payload_read_decrypted_bytes_total
+                    - metrics_before.payload_read_decrypted_bytes_total,
+                u64::try_from(expected_decrypted_bytes).unwrap(),
+                "{key} did not authenticate exactly the records preceding the selected failure"
+            );
+            assert_eq!(
+                metrics_after.payload_read_repair_fallback_total
+                    - metrics_before.payload_read_repair_fallback_total,
+                1,
+                "{key} did not enter full-segment reconstruction after authentication failed"
+            );
+            assert!(
+                storage::test_support::object_payload_shard_faults_remain(
+                    &frontend.test_storage_cluster,
+                    &faults,
+                )
+                .unwrap(),
+                "{key} unexpectedly repaired the injected record fault during the response"
+            );
+            assert!(
+                storage::test_support::object_payload_shard_faults_remain(
+                    &frontend.test_storage_cluster,
+                    &parity_faults,
+                )
+                .unwrap(),
+                "{key} unexpectedly restored parity during the failed response"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
