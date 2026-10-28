@@ -1,5 +1,9 @@
 # STS AssumeRole Issuance
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate after persistent
+> accounts, roles, trust, and credential administration have a concrete owner
+> model; see [`plans/README.md`](../README.md#deferred-inventory).
+
 ## Status
 
 This is the active, deliberately narrow STS plan. It replaces the rejected

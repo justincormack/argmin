@@ -1,5 +1,11 @@
 # Internal Control-Plane Identity and Authentication Plan
 
+> Roadmap status: **Completed** as of 2026-10-28. The shared authenticated
+> control-plane boundary is established. External secret distribution,
+> credential lifecycle, and operator controls remain production/multihost
+> concerns rather than unfinished foundation work; see
+> [`plans/README.md`](../README.md#recently-archived-plans).
+
 This plan defines the shared identity and authentication boundary for Argmin's
 internal control-plane traffic. It is intentionally broader than the Phase 12
 OpenRaft peer transport: Raft peer RPCs are the first enforcement target, but
@@ -120,7 +126,7 @@ authorization. The initial TCP configuration uses an explicit trust bundle,
 normally a private cluster CA but optionally an explicitly selected public-PKI
 bundle, rather than silently inheriting ambient roots. Certificate issuance,
 trust, and rotation are defined in
-[static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md).
+[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
 
 The usable signing/verifying material should be scoped by principal and role.
 This is a credential-capability boundary, not a requirement to split roles into
@@ -193,7 +199,7 @@ the full TCP plus secret-distribution/rotation shape will outgrow flat env
 configuration. The TCP/configuration slice should introduce an optional
 configuration file, and production-shaped TCP mode may require one. That file
 uses the versioned manifest and validation contract in
-[static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md)
+[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
 and should be able to describe:
 
 - cluster identity and transport listeners;
@@ -298,7 +304,7 @@ The first implementation slice should start with items 1 and 2 if they remain
 small enough to review together. Raft transport wiring should wait until the
 standalone envelope and fail-closed codec tests are in place.
 
-Status:
+Implementation history:
 
 - 2026-07-07: Started items 1 and 2 with `storage::control_plane_auth`: shared
   principal/service/operation, auth decision, and rejection-reason types plus a
@@ -753,12 +759,12 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   authentication and operation authorization. Authenticated storage RPC for
   replicated deployments, including local Unix topologies, was implemented by
   the Unix-first, transport-independent slices recorded in the
-  [completed multihost transition plan](completed/multihost-transition-plan.md),
+  [completed multihost transition plan](multihost-transition-plan.md),
   reusing this plan's cluster/principal/credential primitives for Unix and TCP.
   Its authenticated process-role permission is only the outer authorization
   layer; trusted PG roles and request-scoped route/payload capabilities remain
   owned by
-  [storage-boundary-compiler-enforcement-plan.md](completed/storage-boundary-compiler-enforcement-plan.md)
+  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
   and are reconstructed from local state after RPC authentication.
   Compatibility with pre-release artifacts that lack auth configuration is also
   out of scope.

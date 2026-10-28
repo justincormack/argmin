@@ -8,7 +8,7 @@
 >
 > The main remaining unported areas are no longer one integration-framework task:
 > - auth/header/public-access remainder is tracked in `plans/aws-auth-compat-plan.md`
-> - encryption coverage is tracked in `plans/encryption-compat-plan.md`
+> - encryption coverage is tracked in `plans/deferred/encryption-compat-plan.md`
 >
 > Treat this document as the historical plan for creating `crates/s3-tests`, not
 > as the current roadmap for remaining compatibility work.

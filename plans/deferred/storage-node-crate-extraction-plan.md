@@ -3,7 +3,11 @@
 
 # Storage-Node Crate Extraction
 
-Status: proposed; not started.
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when compile
+> dependencies or ownership boundaries begin blocking development; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
+Design status: proposed; not started.
 
 ## Goal
 
@@ -19,10 +23,10 @@ migrations, or new external production dependencies as part of extraction.
 
 ## Existing Groundwork
 
-The completed [compiler-enforcement plan](completed/storage-boundary-compiler-enforcement-plan.md#node-implementation-boundary)
+The completed [compiler-enforcement plan](../completed/storage-boundary-compiler-enforcement-plan.md#node-implementation-boundary)
 introduced a private `node_runtime` parent around the engine, PgStore, node
 clients, server, and raw storage traits. It also recorded an
-[optional crate split](completed/storage-boundary-compiler-enforcement-plan.md#optional-crate-boundary).
+[optional crate split](../completed/storage-boundary-compiler-enforcement-plan.md#optional-crate-boundary).
 Those module boundaries are already useful; extraction must preserve them,
 not replace private modules with broadly public crate APIs.
 
@@ -122,7 +126,7 @@ layer rather than adding a reverse crate dependency.
   route/proof publication in `storage`; expose node-owned source export and
   destination import only through scoped semantic operations.
 - [ ] Map every affected format to its new owner in the
-  [format ledger](../guides/storage-format-ledger.md), including nested command,
+  [format ledger](../../guides/storage-format-ledger.md), including nested command,
   proof, checkpoint, digest, RPC, and filesystem formats.
 - [ ] Inventory test-only raw access and feature propagation. Keep impossible
   database states and physical corruption assertions with the node owner;
@@ -203,7 +207,7 @@ distributed operations use its scoped interfaces without raw implementation acce
 
 ## Format and Verification Rules
 
-Follow the [versioning guide](../guides/versioning.md). A pure move preserves
+Follow the [versioning guide](../../guides/versioning.md). A pure move preserves
 bytes and versions: schema catalogues, enum tags, command encoding, checksums,
 digest domains, authentication transcripts, and persisted paths must remain
 identical. Preserve the frozen fixtures and their full version vectors when

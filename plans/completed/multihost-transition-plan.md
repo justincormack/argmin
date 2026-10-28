@@ -1836,7 +1836,7 @@ Proposed slices:
      routed to the same metadata PG, and it needs a command-log, retry,
      partial-failure, and AWS per-object error design before implementation.
      Track that work in
-     [delete-objects-batch-command-plan.md](../delete-objects-batch-command-plan.md).
+     [delete-objects-batch-command-plan.md](../deferred/delete-objects-batch-command-plan.md).
    - measure every slice before and after:
      - full `cargo nextest run` wall time
      - summed libtest per-test seconds grouped by server-core authz model,
@@ -2395,7 +2395,7 @@ Completed:
       here unless new production-shaped measurements show a concrete
       regression.
     - `DeleteObjects` storage-level batching has been moved to
-      [delete-objects-batch-command-plan.md](../delete-objects-batch-command-plan.md)
+      [delete-objects-batch-command-plan.md](../deferred/delete-objects-batch-command-plan.md)
       because it is a semantic API change that needs separate cost/benefit and
       failure-mode analysis before implementation
 
@@ -3614,7 +3614,7 @@ Proposed subphases:
         correct.
         A future optimization for classifying publish-ready durable write
         reservations without waiting is tracked separately in
-        [DeleteBucket Reservation Classification Optimization](../delete-bucket-reservation-classification-plan.md).
+        [DeleteBucket Reservation Classification Optimization](../deferred/delete-bucket-reservation-classification-plan.md).
       - crash/restart rules:
         - drain fence present, no `MarkBucketDeleting`, owner alive: writers
           continue to wait/retry
@@ -7788,7 +7788,7 @@ Shard repair design:
   generation through metadata, and leave the old corrupt generation for reclaim.
   That would need schema, read-path, scavenger, and cleanup invariants and is
   deliberately left open rather than folded into this UAT coverage slice. See
-  [versioned physical shard files option](../versioned-physical-shard-files-option.md)
+  [versioned physical shard files option](../deferred/versioned-physical-shard-files-option.md)
   for the standalone evaluation note.
 
 PG backfill and migration design notes:
@@ -9099,7 +9099,7 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     retry AWS-compatible retryable responses, but they must not hide server
     `InternalError`; local 500s during cleanup are bugs and should continue to
     fail the run with enough diagnostics;
-11. status: open. Update [`delete-bucket-reservation-classification-plan.md`](../delete-bucket-reservation-classification-plan.md)
+11. status: open. Update [`delete-bucket-reservation-classification-plan.md`](../deferred/delete-bucket-reservation-classification-plan.md)
     if the audit shows synchronous begin work is still too conservative. The
     optimization should remain secondary to correctness: `DeleteBucket` must not
     return success while visible object/MPU state can still appear, but it should
@@ -12052,7 +12052,7 @@ Phase 12.4 proposed scope:
   explicit recovery restores serving and survives old-leader loss. DCC-2 is
   closed; independent-host clock fault runs remain pre-release validation.
 - Add the shared internal control-plane identity/auth foundation described in
-  [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md),
+  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   and enforce it first on the Raft control-plane peer transport. The Phase 12.3
   identity envelope proves cluster/source/target fields match the configured
   peer map, but any process with socket access can still claim those fields.
@@ -12624,7 +12624,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   Saturation coverage composes one ordinary authenticated TLS request with a
   subsequent stateful metadata-command session at that minimum limit.
 - Shared authenticated test helpers are implemented in
-  [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md),
+  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   allowing replicated process and UAT tests to configure authenticated Unix
   sockets without duplicating scoped-credential setup. Migration of remaining
   fixtures to shared manifest builders is cleanup rather than an activation

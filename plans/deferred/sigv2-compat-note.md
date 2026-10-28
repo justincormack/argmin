@@ -1,5 +1,9 @@
 # SigV2 Compatibility Note
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate only if a supported
+> deployment requires legacy SigV2 interoperability; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 This is a short future-work note, not an implementation plan.
 
 ## Current position

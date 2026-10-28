@@ -41,7 +41,7 @@ The public boundary is the typed logical operation; SQL, database filenames, wir
 numeric wire tags, raw persisted records, and implementation-specific errors remain private
 to the owner.
 
-Topology resize is tracked separately in [`storage-topology-resize-plan.md`](../storage-topology-resize-plan.md). Some durable
+Topology resize is tracked separately in [`storage-topology-resize-plan.md`](../deferred/storage-topology-resize-plan.md). Some durable
 format/version decisions will be prerequisites for resize, but resize also changes live
 placement semantics and needs its own topology-generation design.
 
@@ -1854,7 +1854,7 @@ Requirements and open questions:
 - Can metadata PG schema upgrades happen independently per PG, or must the whole cluster be
   quiesced?
 - How does rolling binary upgrade interact with topology resize? See
-  [`storage-topology-resize-plan.md`](../storage-topology-resize-plan.md); a cluster should not run resize operations across
+  [`storage-topology-resize-plan.md`](../deferred/storage-topology-resize-plan.md); a cluster should not run resize operations across
   binaries that disagree on placement-generation semantics.
 - What is the rollback story after a node has written a newer format?
 

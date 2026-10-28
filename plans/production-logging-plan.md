@@ -1,5 +1,9 @@
 # Production Logging Plan
 
+> Roadmap status: **Next** as of 2026-10-28. Start with a small structured
+> event API and deterministic test sink for high-value runtime failures; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
 ## Context
 
 We currently have several observability mechanisms, but not a coherent
@@ -9,7 +13,7 @@ Existing pieces:
 
 - `crates/observability` provides request trace context, a bounded flight
   recorder, summary metrics, and local/deep tracing support.
-- `plans/production-observability-migration-plan.md` covers production
+- `plans/completed/production-observability-migration-plan.md` covers production
   profiling, metrics, and the move away from dense always-on tracing.
 - `guides/observability-formatting.md` defines escaping and redaction rules for
   trace and future log output.

@@ -9,7 +9,7 @@ remaining optimization-only follow-up that used to live here as Phase 11
 (policy residualization) and Phase 12 (lifecycle fast-path specialization) has
 been extracted to:
 
-- `plans/coordinator-storage-hot-path-optimization-plan.md`
+- `plans/deferred/coordinator-storage-hot-path-optimization-plan.md`
 
 The original in-progress file has been retired so the remaining work is scoped
 only to those optimization stages.

@@ -1,5 +1,9 @@
 # Multihost Production Follow-up Plan
 
+> Roadmap status: **Active** as of 2026-10-28. Refresh landed replacement and
+> capability work, then define and execute the remaining outage/rejoin release
+> gate; see [`plans/README.md`](README.md#active-plan-inventory).
+
 Status: active
 
 Started: 2026-08-05
@@ -10,12 +14,12 @@ Related documents:
 - [static cluster configuration plan](completed/static-cluster-configuration-plan.md)
 - [distributed correctness review, July 2026](completed/distributed-correctness-review-2026-07.md)
 - [distributed correctness confidence review, July 2026](completed/distributed-correctness-confidence-review-2026-07.md)
-- [control-plane authentication and identity plan](control-plane-auth-identity-plan.md)
+- [control-plane authentication and identity plan](completed/control-plane-auth-identity-plan.md)
 - [storage boundary compiler-enforcement plan](completed/storage-boundary-compiler-enforcement-plan.md)
-- [immutable placement capacity weights](immutable-placement-capacity-weights.md)
+- [immutable placement capacity weights](deferred/immutable-placement-capacity-weights.md)
 - [production backpressure plan](production-backpressure-plan.md)
-- [DeleteBucket reservation classification](delete-bucket-reservation-classification-plan.md)
-- [versioned physical shard files option](versioned-physical-shard-files-option.md)
+- [DeleteBucket reservation classification](deferred/delete-bucket-reservation-classification-plan.md)
+- [versioned physical shard files option](deferred/versioned-physical-shard-files-option.md)
 
 ## Purpose
 

@@ -1,5 +1,9 @@
 # Shard Write Group Commit
 
+> Roadmap status: **Next, measurement-gated** as of 2026-10-28. Measure file
+> and directory synchronization costs on target filesystems before selecting a
+> prototype; see [`plans/README.md`](README.md#active-plan-inventory).
+
 ## Problem
 
 The remaining write-path gap is now in durable shard-file commit cost, not in
@@ -24,7 +28,7 @@ For the traced `256 KiB` `PUT` run:
 So almost all of the remaining traced `PUT` time is in shard durability.
 
 The disk-backed versioning reproducer in
-`plans/metadata-write-amplification-plan.md` points in the same direction. In
+`plans/deferred/metadata-write-amplification-plan.md` points in the same direction. In
 an EC 4+2 local run, `6006` local shard writes generated `6006` temp-file
 `fdatasync` calls and `6006` parent-directory `fsync` calls. The shard bytes
 were only about `24 KiB` total, but the shard sync calls accounted for about

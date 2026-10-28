@@ -1,6 +1,10 @@
 # Production Backpressure Plan
 
-Status: draft
+> Roadmap status: **Blocked** as of 2026-10-28. Resume after the multihost gate,
+> bounded background-worker metrics, and representative workload profiles are
+> available; see [`plans/README.md`](README.md#active-plan-inventory).
+
+Design status: draft.
 
 ## Context
 

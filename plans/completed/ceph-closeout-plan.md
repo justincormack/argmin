@@ -16,7 +16,7 @@ Out of scope:
 - bucket logging
 - `SSE-KMS`
 - the remaining encryption roadmap already tracked in
-  `plans/encryption-compat-plan.md`
+  `plans/deferred/encryption-compat-plan.md`
 - the bucket-policy owner-root carveout tracked in
   `plans/completed/bucket-policy-root-principal-compat-plan.md`
 - any Ceph-only RGW extensions or non-AWS namespace behavior
@@ -32,7 +32,7 @@ Ceph tests:
 - multipart "edge case" coverage is not missing in the way older estimates
   suggested
 - `SSE-S3 default encryption` should not be tracked here as a generic Ceph gap;
-  encryption follow-up is already split into `plans/encryption-compat-plan.md`
+  encryption follow-up is already split into `plans/deferred/encryption-compat-plan.md`
 
 Evidence for that reassessment:
 - the only active commented-out conformance test in `crates/s3-tests/tests` is
@@ -118,7 +118,7 @@ These should not stay on the closeout list:
 - multipart edge cases as a generic category
 - bucket-policy `NotPrincipal` rejection
 - bucket-policy owner-root self-deny / root carveout behavior
-- encryption rows that belong to `plans/encryption-compat-plan.md`
+- encryption rows that belong to `plans/deferred/encryption-compat-plan.md`
 
 ## AWS Verification Fallout
 

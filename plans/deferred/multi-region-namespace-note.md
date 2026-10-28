@@ -1,5 +1,9 @@
 # Multi-Region Namespace Note
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when multi-region
+> namespace behavior becomes an explicit product goal; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 This is a short future-work note, not an implementation plan.
 
 ## Current position

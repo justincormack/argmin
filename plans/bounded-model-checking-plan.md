@@ -3,6 +3,10 @@
 
 # Bounded Distributed Model-Checking Plan
 
+> Roadmap status: **Active companion work** as of 2026-10-28. Apply it to the
+> selected cleanup ownership protocol and multihost convergence work; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
 Status: local explorer selected; Stateright and the temporary comparison adapter
 removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
 are retained. The follow-on publication model has started at the durable

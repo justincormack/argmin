@@ -1,5 +1,9 @@
 # Storage Topology Resize Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate after replacement,
+> outage convergence, and operator recovery APIs are stable; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: draft
 
 ## Context

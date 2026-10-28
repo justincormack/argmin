@@ -1,5 +1,9 @@
 # Immutable Placement Capacity Weights
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when the target
+> production topology requires heterogeneous capacity weighting; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: proposed
 
 ## Goal

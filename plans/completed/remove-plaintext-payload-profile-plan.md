@@ -44,7 +44,7 @@ fallback reader.
   and requires incompatible nested-format changes to advance every unversioned containing format.
 - [`guides/storage-format-ledger.md`](../../guides/storage-format-ledger.md) owns the exact version
   vector and immutable representation evidence that this change must update.
-- [`encryption-compat-plan.md`](../encryption-compat-plan.md) continues to own future SSE-KMS behavior.
+- [`encryption-compat-plan.md`](../deferred/encryption-compat-plan.md) continues to own future SSE-KMS behavior.
   Adding another managed encryption mode must extend the encrypted state, not recreate plaintext.
 
 ## Goals

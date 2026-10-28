@@ -1,5 +1,9 @@
 # DeleteObjects Storage Batch Command Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when measurements
+> show same-PG batching is common and metadata publication is the limiting
+> cost; see [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: deferred standalone plan.
 
 This plan tracks possible storage-layer batching for S3 `DeleteObjects`. It was

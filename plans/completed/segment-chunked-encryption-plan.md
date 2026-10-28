@@ -2361,7 +2361,7 @@ Implementation must update:
 - `plans/storage-upgrade-versioning-plan.md` for the nested encryption and immutable payload edge;
 - `plans/unified-staged-write-publication-plan.md` for identity allocation before encryption and
   common staging subjects; and
-- `plans/encryption-compat-plan.md` for the selected SSE-S3/SSE-C internal payload profile.
+- `plans/deferred/encryption-compat-plan.md` for the selected SSE-S3/SSE-C internal payload profile.
 
 The final security review should cover the exact context encoding, nonce/salt lifecycle, maximum
 messages per input key, key commitment, partial-plaintext release boundary, error handling, and

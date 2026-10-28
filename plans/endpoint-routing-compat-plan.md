@@ -1,5 +1,10 @@
 # Endpoint Routing Compatibility Plan
 
+> Roadmap status: **Next** as of 2026-10-28. First reconcile this plan with the
+> trusted endpoint-family and S3 Control routing already implemented, then
+> isolate virtual-hosted-style routing; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
 ## Summary
 
 Argmin currently exposes one S3 API endpoint and largely treats requests as
@@ -38,7 +43,7 @@ Related references:
 
 - [guides/aws-compatibility.md](/home/justin/src/github.com/justincormack/argmin/guides/aws-compatibility.md)
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
-- [plans/website-behavior-note.md](/home/justin/src/github.com/justincormack/argmin/plans/website-behavior-note.md)
+- [website behavior note](deferred/website-behavior-note.md)
 
 ## Scope
 

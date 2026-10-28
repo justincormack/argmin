@@ -1,5 +1,9 @@
 # Persistent Account And Credential Management
 
+> Roadmap status: **Next** as of 2026-10-28. Turn the introductory sketch into
+> the durable account, credential, rotation, and administration design before
+> broad STS expansion; see [`plans/README.md`](README.md#active-plan-inventory).
+
 ## Scope
 
 This plan will cover the transition from the current process-local static
@@ -27,7 +31,7 @@ Out of scope:
 - STS or federation APIs
 
 The initial STS issuance work is tracked separately in
-[sts-assume-role-issuance.md](sts-assume-role-issuance.md). That plan should
+[sts-assume-role-issuance.md](deferred/sts-assume-role-issuance.md). That plan should
 establish provider and identity seams that this durable plan can later
 implement without coupling persistence to the HTTP or SigV4 layers.
 

@@ -1,5 +1,9 @@
 # S3 Annotations Implementation Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when product demand
+> justifies a new durable and authorized annotations subsystem; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 AWS announced S3 Annotations in June 2026. Annotations are mutable, named,
 queryable text payloads attached to a specific object version. They are larger
 and more numerous than object tags, and should be treated as a separate

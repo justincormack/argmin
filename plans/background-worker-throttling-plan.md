@@ -1,5 +1,9 @@
 # Background Worker Throttling Plan
 
+> Roadmap status: **Active** as of 2026-10-28. The next slice bounds work
+> within one PG and adds worker resource metrics; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
 ## Context
 
 The shard scavenger is now audit-only and no longer scans shard files while

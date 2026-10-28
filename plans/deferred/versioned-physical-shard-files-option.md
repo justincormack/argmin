@@ -1,5 +1,9 @@
 # Versioned Physical Shard Files Option
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate if repair or
+> replacement evidence shows current physical fencing is insufficient; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: option to evaluate, not an accepted design.
 
 Current shard repair keeps the existing logical shard path model. A logical

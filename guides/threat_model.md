@@ -108,7 +108,7 @@ S3 authorization boundary through `auth::ConfiguredOrAnonymousAuth`; this
 includes S3 Control and upload adapters. Neither this code nor an AWS-only
 oracle establishes usable STS or IAM support. Future support requires its own
 AWS/local tests and an updated threat model; see the
-[STS issuance plan](../plans/sts-assume-role-issuance.md).
+[STS issuance plan](../plans/deferred/sts-assume-role-issuance.md).
 
 Policies, ACLs, Block Public Access, ownership controls, retention, and legal
 hold must apply to the actual operation and resource version, including

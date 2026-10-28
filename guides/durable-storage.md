@@ -512,7 +512,7 @@ this guide as part of their implementation:
   proposes durable multipart cleanup roots and staging leases. These belong in
   per-PG SQLite, but add new cross-store ownership and acknowledgement
   boundaries with shard files.
-- [Versioned physical shard files](../plans/versioned-physical-shard-files-option.md)
+- [Versioned physical shard files](../plans/deferred/versioned-physical-shard-files-option.md)
   would replace the current one-logical-key/one-path assumption with a durable
   logical-to-physical generation mapping.
 - [Persistent accounts and credentials](../plans/persistent-account-and-credential-management.md)

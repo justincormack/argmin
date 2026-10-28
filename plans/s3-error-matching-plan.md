@@ -1,6 +1,10 @@
 # S3 Operation Error Matching Plan
 
-Status: Proposed
+> Roadmap status: **Next** as of 2026-10-28. Begin with effective-operation
+> classification and a complete error-rendering boundary inventory; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
+Design status: proposed.
 
 ## Problem
 

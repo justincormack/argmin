@@ -1,5 +1,9 @@
 # DeleteBucket Reservation Classification Optimization
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate after DeleteBucket
+> convergence is stable and measurements justify classification changes; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 ## Goal
 
 Reduce unnecessary synchronous `DeleteBucket` waiting without weakening the
@@ -13,7 +17,7 @@ reservations to empty. This plan describes a future refinement that can return
 that decision is mechanically provable.
 
 Background: [Phase 9.4.4 in the completed multihost transition
-plan](completed/multihost-transition-plan.md#phase-9-replace-process-local-coordination)
+plan](../completed/multihost-transition-plan.md#phase-9-replace-process-local-coordination)
 keeps the conservative return boundary while DeleteBucket begin is made durable
 and recoverable.
 
@@ -174,7 +178,7 @@ Phase 11 soak failures have clustered around `DeleteBucket`. Treat that as a
 correctness and retry-semantics signal, not just benchmark noise.
 
 The concrete Phase 11 close-out checklist now lives in
-[`multihost-followup-plan.md`](multihost-followup-plan.md#21-close-deletebucket-attempt-convergence).
+[`multihost-followup-plan.md`](../multihost-followup-plan.md#21-close-deletebucket-attempt-convergence).
 Revisit this reservation
 classification optimization only after those correctness, retry-semantics, and
 cleanup-stress items are stable.

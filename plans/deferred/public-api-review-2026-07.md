@@ -1,5 +1,11 @@
 # Public API Consistency Review — July 2026
 
+> Roadmap status: **Deferred revalidation** as of 2026-10-28. This is a
+> historical review ledger, not a current linear work queue. Revalidate its
+> residual unchecked items against current code and move real findings to the
+> owning plan before archiving it; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 ## Context
 
 A workspace-wide review of the public (cross-crate) API surface, prompted by
@@ -18,7 +24,8 @@ smaller per-crate items.
 
 ## Status
 
-In progress. Everything above the "Smaller items" section is done except S5
+Deferred for revalidation as of 2026-10-28. Everything above the "Smaller
+items" section is done except S5
 (deferred to the topology-resize plan): A1-A10, S1-S4, S6, K1-K4, H1-H8,
 P1-P6, RR1-RR16, and V1-V6. A second verification pass on 2026-07-09
 confirmed the V1-V6, P3-tail, and P4-P6 fixes against the code (crate checks
@@ -839,7 +846,7 @@ steps it performs.
   It is a real topology-resize hazard: if the metadata PG set changes between
   crash and resume, the index silently re-targets different PGs, skipping
   cleanup on some. Track this under
-  `plans/storage-topology-resize-plan.md` H5. Superseded by the tombstone-free
+  `plans/deferred/storage-topology-resize-plan.md` H5. Superseded by the tombstone-free
   multipart replay design: completed-upload rows, the cross-PG cleanup scan,
   and its persisted resume cursor have been removed. Replay state now lives on
   retained object versions, so no completed-MPU cleanup cursor exists.

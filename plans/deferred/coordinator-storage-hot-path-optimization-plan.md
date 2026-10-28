@@ -1,5 +1,9 @@
 ## Coordinator / Storage Hot-path Optimization Follow-up
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate only when a
+> production profile identifies this boundary as a material request-path cost;
+> see [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: deferred optimization candidate; requires a measurement pass before
 implementation
 

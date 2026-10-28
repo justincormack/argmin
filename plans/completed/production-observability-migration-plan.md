@@ -1,5 +1,11 @@
 # Production Observability Migration Plan
 
+> Roadmap status: **Completed** as of 2026-10-28. Production now uses bounded
+> semantic telemetry and optional local deep tracing. The eBPF staging pilot
+> and possible deletion of remaining local trace sites are operational
+> follow-ups, not migration completion gates; see
+> [`plans/README.md`](../README.md#recently-archived-plans).
+
 ## Context
 
 Our current observability path is a custom in-process trace/event system. It is
@@ -31,7 +37,9 @@ telemetry. We still need a small amount of in-process observability for:
 
 ## Status
 
-In progress.
+Completed for the production migration as of 2026-10-28. The optional staging
+profiling pilot and possible deletion of remaining local-only trace sites do not
+block this completion classification.
 
 Completed:
 
@@ -42,7 +50,7 @@ Completed:
   - `request_finish`
   - `request_error`
   - `slow_request`
-- [Multihost transition Phase 10.9](completed/multihost-transition-plan.md#phase-109-multihost-stabilization-gate)
+- [Multihost transition Phase 10.9](multihost-transition-plan.md#phase-109-multihost-stabilization-gate)
   adds bounded, redacted storage race diagnostics for:
   - `metadata_command_conflict`
   - `metadata_command_pending_slot_action`
@@ -82,7 +90,7 @@ Completed:
   frontend, storage-node, and all-in-one panics dump the same bounded,
   redacted flight-recorder ring before the normal panic output.
 
-Remaining:
+Optional follow-up:
 
 - run the eBPF/OpenTelemetry profiling pilot in staging
 - remove or demote the remaining dense `trace_scope!` callsites in

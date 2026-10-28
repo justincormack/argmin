@@ -1,6 +1,10 @@
 # Unified Staged Write Publication Plan
 
-Status: Proposed
+> Roadmap status: **Blocked** as of 2026-10-28. Resume only after the shared
+> durable cleanup ownership and late-write fencing contract is fixed; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
+Design status: proposed.
 
 ## Context
 

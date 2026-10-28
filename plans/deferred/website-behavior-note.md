@@ -1,10 +1,14 @@
 # Website Behavior Note
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when S3 website
+> hosting becomes an explicit compatibility target; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 This is a short future-work note, not an implementation plan.
 
 Completed plan for the narrower REST metadata surface:
 
-- [plans/completed/object-redirect-metadata-rest-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/object-redirect-metadata-rest-plan.md)
+- [object redirect metadata REST plan](../completed/object-redirect-metadata-rest-plan.md)
 
 ## Current position
 
@@ -126,7 +130,7 @@ The important gaps and ambiguities are:
 The REST object redirect metadata surface is now in better shape:
 
 - local native coverage exists in
-  [website_redirect.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/website_redirect.rs)
+  [website_redirect.rs](../../crates/s3-tests/tests/website_redirect.rs)
 - the embedded-server suite now runs that coverage locally instead of skipping
 - request parsing, persistence, readback, copy, multipart, POST, versioning,
   metadata size errors, and POST policy error shapes are covered

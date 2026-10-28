@@ -1752,7 +1752,7 @@ mode preserves R1. The 18 WAL unit tests pass.
 Crash fault-injection is well advanced (WAL suffix restore, peer
 pre-response crash via unwritable state dir, checkpoint-pause coverage) but
 lacks clock-regression-election and compaction-during-replay crash points.
-Peer auth is documented only (`plans/control-plane-auth-identity-plan.md`);
+Peer auth is documented only (`plans/completed/control-plane-auth-identity-plan.md`);
 nothing on the transport. Lease/skew semantics have guards and regression
 tests but no skew-margin design — and INT-1 showed the guards actively need
 that design. The Raft retry/confirmation contract is not implemented.
@@ -1783,7 +1783,7 @@ peer-auth failures, and retry-confirmation diagnostics are missing.
 
 Re-review of the work between `25f47480` (interim re-review commit) and HEAD
 `09805ad6` (~153 commits). The range is dominated by the control-plane
-authentication slice (plans/control-plane-auth-identity-plan.md, slices A-C)
+authentication slice (plans/completed/control-plane-auth-identity-plan.md, slices A-C)
 plus S3-conformance and golden-test work; the distributed-correctness-relevant
 changes were verified individually. Method: two parallel verification passes
 (auth protocol + Raft; fix verification + open-item sweep), with the

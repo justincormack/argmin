@@ -1,5 +1,9 @@
 # Metadata Write Amplification Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when measurements
+> show metadata durability, rather than shard durability, is the limiting
+> write cost; see [`plans/README.md`](../README.md#deferred-inventory).
+
 ## Context
 
 This plan tracks a performance-only follow-up discovered while investigating

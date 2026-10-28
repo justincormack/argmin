@@ -1,5 +1,9 @@
 # Encryption Compatibility Follow-Up Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when SSE-KMS is a
+> roadmap priority and its key-management architecture has been selected; see
+> [`plans/README.md`](../README.md#deferred-inventory).
+
 ## Scope
 
 This is a stub plan for the remaining S3 encryption compatibility surface after
@@ -73,7 +77,7 @@ Server-managed keys for per-object encryption.
 Status: implemented.
 
 `SSE-S3` is complete enough to be tracked as finished by
-[plans/completed/sse-s3-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/sse-s3-plan.md).
+[SSE-S3 plan](../completed/sse-s3-plan.md).
 
 That work established the current service-managed encryption model used for the
 implemented non-`KMS` managed-encryption surface.

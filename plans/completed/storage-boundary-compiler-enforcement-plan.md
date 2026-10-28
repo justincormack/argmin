@@ -5,7 +5,7 @@ Status: complete — Phases 0–6 complete
 Related plans:
 
 - [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
-- [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md)
+- [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
 - [multihost-followup-plan.md](../multihost-followup-plan.md)
 - [storage-upgrade-versioning-plan.md](../storage-upgrade-versioning-plan.md)
 

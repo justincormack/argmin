@@ -1,5 +1,10 @@
 # Storage Upgrade And Mixed-Version Compatibility Plan
 
+> Roadmap status: **Next, pre-release gate** as of 2026-10-28. Approve the
+> compatibility policy and build the generic immutable-evidence and crash
+> harness before the first supported release; see
+> [`plans/README.md`](README.md#active-plan-inventory).
+
 Status: design and implementation not started. Current binaries still accept only current
 internal formats and homogeneous protocol versions.
 
@@ -14,10 +19,10 @@ internal formats and homogeneous protocol versions.
 - [`multihost-transition-plan.md`](completed/multihost-transition-plan.md#phase-12-replicated-control-plane)
   records the completed Phase 12 replicated-control-plane work that the old plan referenced
   without a link.
-- [`storage-topology-resize-plan.md`](storage-topology-resize-plan.md) owns live PG-set and
+- [`storage-topology-resize-plan.md`](deferred/storage-topology-resize-plan.md) owns live PG-set and
   placement-topology changes. A rolling software upgrade must interlock with it but must not
   implement resize implicitly.
-- [`versioned-physical-shard-files-option.md`](versioned-physical-shard-files-option.md) records an
+- [`versioned-physical-shard-files-option.md`](deferred/versioned-physical-shard-files-option.md) records an
   unaccepted alternative physical-shard design. This plan must not assume that option was chosen.
 
 ## Goal

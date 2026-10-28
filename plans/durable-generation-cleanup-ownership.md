@@ -3,6 +3,10 @@
 
 # Durable Cleanup Ownership — Unresolved Findings
 
+> Roadmap status: **Active, highest priority** as of 2026-10-28. Implement the
+> shared write/cleanup exclusion contract and enable all six ignored
+> regressions; see [`plans/README.md`](README.md#active-plan-inventory).
+
 Status: regression evidence only. The unfinished fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under

@@ -1,5 +1,9 @@
 # Internal Copy Pacing Plan
 
+> Roadmap status: **Deferred** as of 2026-10-28. Reactivate when measured copy
+> workloads interfere with foreground traffic after shared admission is in
+> place; see [`plans/README.md`](../README.md#deferred-inventory).
+
 Status: planned, refreshed after shared admission/backpressure work
 
 ## Problem

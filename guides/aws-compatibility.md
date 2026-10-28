@@ -313,7 +313,7 @@ yet.
 
 Related plan:
 
-- [plans/encryption-compat-plan.md](../plans/encryption-compat-plan.md)
+- [plans/encryption-compat-plan.md](../plans/deferred/encryption-compat-plan.md)
 
 ### 3. Bucket logging is not implemented
 
@@ -346,7 +346,7 @@ endpoint, not the website endpoint or bucket website configuration APIs.
 
 Related note:
 
-- [plans/website-behavior-note.md](../plans/website-behavior-note.md)
+- [plans/website-behavior-note.md](../plans/deferred/website-behavior-note.md)
 
 ### 5. Alternate AWS access URL forms are not supported
 
@@ -490,7 +490,7 @@ In practice:
 
 Related note:
 
-- [plans/sigv2-compat-note.md](../plans/sigv2-compat-note.md)
+- [plans/sigv2-compat-note.md](../plans/deferred/sigv2-compat-note.md)
 
 ### 11. Account-level Block Public Access is not implemented
 
