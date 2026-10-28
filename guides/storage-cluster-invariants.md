@@ -570,8 +570,13 @@ the authenticated empty terminal record first. If a later systematic range or
 physical witness check fails, the existing complete reconstruction path
 resumes after the exact plaintext prefix already emitted. An unrecoverable
 failure exposes no bytes from the failing record and terminates an already
-committed response. Historical whole-segment codec bytes are rejected at the
-current format boundary; there is no compatibility reader.
+committed response. Returning an authenticated frame from the HTTP body does
+not acknowledge delivery to the client: when a later body error aborts the
+transport, the socket may deliver none, part, or all of that earlier frame.
+Every delivered byte must still be a prefix of records that authenticated
+before the failure, and the declared response must remain incomplete.
+Historical whole-segment codec bytes are rejected at the current format
+boundary; there is no compatibility reader.
 
 ### Degraded range-read reconstruction policy
 

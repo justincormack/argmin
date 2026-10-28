@@ -611,8 +611,11 @@ headers as an optimization, but correctness must not depend on buffering the com
 
 Tests must distinguish pre-header failure from post-header failure with a raw client. They verify
 the former receives the selected S3 error, while the latter receives an unmistakably incomplete or
-reset response containing only complete previously authenticated chunks. SDK-level tests verify a
-retry never concatenates bytes across attempts and never reports the partial response as success.
+reset response containing only a wire prefix of bytes from previously authenticated chunks. A body
+frame returned to the HTTP stack is not a socket-delivery acknowledgement: transport abort may
+deliver none, part, or all of an earlier authenticated frame, but no byte from the failing or
+withheld chunk. SDK-level tests verify a retry never concatenates bytes across attempts and never
+reports the partial response as success.
 
 ### Protocol and supported-client behavior for committed response failures
 
@@ -635,8 +638,9 @@ The closure evidence is deliberately factored rather than repeated for every SDK
 
 1. crypto and storage tests inject each malformed layout, authentication failure, physical fault,
    and transport failure at the exact verification/effect boundary;
-2. raw HTTP/1.x tests are authoritative for header commitment, exact `Content-Length`, complete
-   authenticated-prefix exposure, connection closure, and absence of an appended XML body; and
+2. raw HTTP/1.x tests are authoritative for header commitment, exact `Content-Length`, confinement
+   to the previously authenticated byte prefix, connection closure, and absence of an appended XML
+   body; and
 3. the pinned Rust SDK test is authoritative for the supported client's consumption behavior for
    incomplete full and ranged successful responses.
 
@@ -655,9 +659,9 @@ the cross-layer cases needed to prove response commitment and client consumption
 | --- | --- |
 | Invalid durable profile, subject, geometry, header, or key commitment before response commitment | Normal contract-mapped S3 error; no successful headers, shard read when validation can precede IO, or payload bytes. |
 | Unrecoverable first selected record after `200`/`206` commitment | Exact successful headers remain visible, zero payload bytes from that record, and transport ends before the declared length. |
-| Unrecoverable middle record within one segment after an authenticated prefix | Only complete earlier records may be visible; no byte from the failing or later records; transport ends short. |
+| Unrecoverable middle record within one segment after an authenticated prefix | Any wire prefix of bytes from earlier authenticated records may be visible; no byte from the failing or later records; transport ends short. |
 | Unrecoverable terminal record, malformed terminal length, truncation, or trailing data | The terminal verification unit is withheld and the response cannot complete its declared length. Canonical-layout failures discovered before commitment remain ordinary S3 errors. |
-| Failure in a later segment or multipart part | Earlier complete authenticated segments/parts may be visible; the failing unit is absent and the response terminates short. |
+| Failure in a later segment or multipart part | Any wire prefix of earlier authenticated segments/parts may be visible; the failing unit is absent and the response terminates short. |
 | Missing, short, long, corrupt, or disconnected shard with sufficient durable evidence/redundancy | Exact fallback reconstruction succeeds, returns each logical byte once, and schedules only evidence-authorized repair. |
 | The same physical failures beyond tolerance, on both current and retained routes | Failure follows the uncommitted/committed response rule for its actual discovery point; lease-release or diagnostic errors never mask the primary classification. |
 | AEAD succeeds but a complete-shard CRC later disagrees | Follow the documented physical-diagnostic policy: schedule evidence-authorized repair without retroactively treating authenticated logical bytes as corrupt. |
@@ -682,9 +686,12 @@ Coverage audit completed 2026-10-28:
   durable subject, geometry, and profile rejection before payload effects.
 - `cobblestone_integrity_failures_abort_committed_socket_responses` pins a committed `206` failure
   at the first selected record with zero exposed bytes and a later-segment `200` failure with
-  exactly one complete segment exposed. `cobblestone_record_failures_abort_at_same_segment_boundaries`
-  pins second-record and terminal-record failures within one segment, including the terminal
-  record sharing a coalesced authenticated window with a preceding record that must be withheld.
+  every observed byte confined to the authenticated first-segment prefix.
+  `cobblestone_record_failures_abort_at_same_segment_boundaries` pins second-record and
+  terminal-record failures within one segment, confines every observed byte to the authenticated
+  first-record prefix, and covers the transport-valid zero-byte outcome. The terminal record shares
+  a coalesced authenticated window with a preceding record that must be withheld. Exact reader
+  counters prove the selected failure and fallback even when transport abort suppresses a frame.
   All cases retain the declared successful response length and terminate the transport short.
 - The raw-socket record tests remove parity separately, first prove that the unchanged systematic
   payload still returns exact bytes without fallback, and only then corrupt the selected record's
@@ -1826,8 +1833,10 @@ Implementation update (2026-10-25, committed raw-HTTP failure semantics):
   response.
 - A complementary promoted-PUT canary publishes two Cobblestone segments, makes only the final
   segment unrecoverable through an opaque beyond-parity loss scenario, and issues a raw full GET.
-  The response commits normal `200` headers, emits exactly the complete authenticated first segment,
-  then closes short of the declared object length. No bytes from the failing segment are exposed.
+  The body worker authenticates the complete first segment before discovering the later failure;
+  the raw response commits normal `200` headers, confines every observed body byte to that first
+  segment, and closes short of the declared object length. Transport scheduling may deliver none,
+  part, or all of the already-authenticated prefix. No bytes from the failing segment are exposed.
 - These canaries pin the server/Hyper behavior on both sides of first-byte commitment. The
   official-client incomplete-body canary and chunk-at-a-time full GET emission with fused physical
   CRC accounting remain open before Phase 4 is complete.
@@ -2266,9 +2275,9 @@ and copy paths.
 - Tag failure triggers diagnostic fallback without emitting the failing chunk or repairing an
   unproven target; pre-header and post-header failures follow their distinct response semantics.
 - Raw HTTP canaries prove that unrecoverable post-header failures at every required discovery
-  position expose only complete authenticated prefixes and terminate before the declared length.
-  The pinned Rust SDK canary proves incomplete full and ranged successful responses are reported as
-  body errors rather than clean EOF.
+  position expose only a wire prefix of bytes from records authenticated before failure and
+  terminate before the declared length. The pinned Rust SDK canary proves incomplete full and
+  ranged successful responses are reported as body errors rather than clean EOF.
 - Initial-path canaries prove a missing required systematic range selects the full fallback rather
   than an unreviewed parity-range path.
 - If the optional partial EC path is implemented, separate tests cover every known-erasure

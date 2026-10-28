@@ -1344,12 +1344,11 @@ Connection: close\r\n\r\n",
         );
 
         let full_key = "full";
-        let full_payload = vec![
-            b'f';
-            crate::coordinator::INTERNAL_SEGMENT_SIZE
-                + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
-                + 37
-        ];
+        let full_payload: Vec<u8> = (0..crate::coordinator::INTERNAL_SEGMENT_SIZE
+            + 2 * argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN
+            + 37)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
         let full_uri = format!("/{bucket}/{full_key}");
         let signed_put = sign_streaming_headers("PUT", &full_uri, &addr, full_payload.len(), &[]);
         let aws_chunked = build_signed_chunked_body(&signed_put, &full_payload);
@@ -1399,14 +1398,26 @@ x-amz-content-sha256: {}\r\n\
 Connection: close\r\n\r\n",
             signed_get.authorization, signed_get.amz_date, signed_get.amz_content_sha256,
         );
+        let full_metrics_before = observability::metrics_snapshot();
         let full_response = send_raw_http_request_until_transport_end(&addr, &get_request, &[]);
+        let full_metrics_after = observability::metrics_snapshot();
         let (full_headers, full_body) = split_raw_http_response(&full_response);
         assert!(full_headers.starts_with("HTTP/1.1 200"), "{full_headers}");
         assert_eq!(response_content_length(full_headers), full_payload.len());
+        assert!(
+            full_body.len() <= crate::coordinator::INTERNAL_SEGMENT_SIZE,
+            "the later-segment failure exposed bytes from the failing segment"
+        );
         assert_eq!(
             full_body,
-            &full_payload[..crate::coordinator::INTERNAL_SEGMENT_SIZE],
-            "the transport must expose only the complete authenticated prefix before the later segment failure"
+            &full_payload[..full_body.len()],
+            "the transport exposed bytes outside the authenticated first-segment prefix"
+        );
+        assert_eq!(
+            full_metrics_after.payload_read_repair_fallback_total
+                - full_metrics_before.payload_read_repair_fallback_total,
+            1,
+            "the later-segment loss did not reach full-segment reconstruction"
         );
     }
 
@@ -1418,7 +1429,9 @@ Connection: close\r\n\r\n",
         create_test_bucket(&frontend, bucket);
         let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
         let chunk_len = argmin_crypto::cobblestone::COBBLESTONE_CHUNK_LEN;
-        let payload = vec![b'c'; 2 * chunk_len + 37];
+        let payload: Vec<u8> = (0..2 * chunk_len + 37)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
 
         for (key, terminal, expected_aead_attempts, expected_decrypted_bytes) in [
             ("second-record", false, 2, chunk_len),
@@ -1495,12 +1508,15 @@ Connection: close\r\n\r\n",
             let (headers, body) = split_raw_http_response(&response);
             assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
             assert_eq!(response_content_length(headers), payload.len());
-            assert_eq!(
-                body.len(),
-                chunk_len,
-                "{key} failure exposed bytes outside the first completed response window"
+            assert!(
+                body.len() <= chunk_len,
+                "{key} failure exposed bytes from the failing or withheld record"
             );
-            assert_eq!(body, &payload[..chunk_len]);
+            assert_eq!(
+                body,
+                &payload[..body.len()],
+                "{key} failure exposed bytes outside the authenticated first-record prefix"
+            );
             assert_eq!(
                 metrics_after.payload_read_aead_records_total
                     - metrics_before.payload_read_aead_records_total,
