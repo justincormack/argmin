@@ -1,9 +1,9 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: Implementation complete; compatibility validation open (the Rust official-client
-late-body-failure canary is pinned; Python/Boto3, Go v2, Java v2, JavaScript v3, and AWS CLI probes
-remain required before archival. Partial EC reconstruction remains an optional, separately
-measured follow-up.)
+Status: Implementation complete; response-failure coverage audit open (the supported Rust AWS SDK
+late-body-failure canary is pinned, while the exhaustive failure-position matrix below must be
+mapped to named tests before archival. Additional SDK/CLI probes are optional diagnostics, not a
+closure requirement. Partial EC reconstruction remains an optional, separately measured follow-up.)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -614,7 +614,7 @@ the former receives the selected S3 error, while the latter receives an unmistak
 reset response containing only complete previously authenticated chunks. SDK-level tests verify a
 retry never concatenates bytes across attempts and never reports the partial response as success.
 
-### Official-client behavior for committed response failures
+### Protocol and supported-client behavior for committed response failures
 
 Do not assume that closing a response is sufficient. Successful full and ranged GET responses must
 retain their exact `Content-Length`; after a committed body failure, the HTTP implementation must
@@ -624,36 +624,63 @@ or XML error body. This is what lets an SDK distinguish a failed body read from 
 object. Streaming-operation dispatch success is not object-read success: the consumer must observe
 and handle the body error.
 
-The repository's locked Rust AWS S3 SDK already carries upstream tests in which `GetObject.send()`
-succeeds and `ByteStream::collect()` then fails for premature EOF and both short and long
-`Content-Length` mismatches. Botocore's `StreamingBody` likewise compares bytes consumed with
-`Content-Length` at EOF and raises `IncompleteReadError`. Preserve these as permanent integration
-canaries against Argmin, using exact pinned SDK versions rather than relying only on source review.
+The repository's locked Rust AWS S3 SDK is the supported-client canary. Preserve a permanent test
+in which `GetObject.send()` succeeds with committed `200` and `206` metadata, while consuming the
+declared body reports premature EOF rather than clean success. The test must also prove that the
+server received only one request, so a client retry cannot concatenate bytes from separate
+attempts. A caller that deliberately abandons the body early is not evidence either way: no
+protocol can force an application to observe an error after it stops reading.
 
-Before declaring client compatibility complete, archiving this plan, or shipping the first release,
-run and record the equivalent behavior for the official AWS SDKs for Rust, Python/Boto3, Go v2,
-Java v2, and JavaScript v3, plus the AWS CLI:
+The closure evidence is deliberately factored rather than repeated for every SDK language:
 
-- headers and at least one authenticated body chunk are received successfully;
-- a deterministic later body error terminates below the declared full or `206` range length;
-- consuming or collecting the body reports failure rather than clean EOF;
-- no SDK silently concatenates bytes from an automatic retry with the first attempt;
-- file-oriented helpers do not publish a successful complete destination; and
-- callers that explicitly stop reading early are not counted as evidence, because no protocol can
-  force an application to observe an error after it abandons the body.
+1. crypto and storage tests inject each malformed layout, authentication failure, physical fault,
+   and transport failure at the exact verification/effect boundary;
+2. raw HTTP/1.x tests are authoritative for header commitment, exact `Content-Length`, complete
+   authenticated-prefix exposure, connection closure, and absence of an appended XML body; and
+3. the pinned Rust SDK test is authoritative for the supported client's consumption behavior for
+   incomplete full and ranged successful responses.
 
-Keep raw HTTP/1.x framing tests authoritative for the server behavior and representative official
-client tests authoritative for consumption behavior. A future HTTP/2 implementation needs the same
-matrix with an error/reset stream rather than a clean short DATA sequence.
+Other official SDK and CLI probes are useful diagnostics when investigating a reported client bug
+or adding a new transport, but they are not a release or archival gate. Server correctness is a
+wire-protocol property, and repeating the same short-body assertion across HTTP stacks provides
+less assurance than exhaustively testing every server-side discovery position. A future HTTP/2
+implementation must add raw stream-reset coverage and one supported-client canary for that
+transport; it must not assume the HTTP/1.x close behavior transfers automatically.
 
-Completion audit (2026-10-27): this remains an explicit compatibility gate rather than an inferred
-property of HTTP libraries. The locked Rust client is covered by
-`aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets`, which proves `send()` exposes
-committed `200`/`206` headers and `ByteStream::collect()` rejects the short body. Equivalent pinned
-probes for Python/Boto3, Go v2, Java v2, JavaScript v3, and AWS CLI have not yet been recorded.
-Consequently, the codec implementation and sole-writer transition are complete, but this plan is
-not closed or ready to archive until those five client families pass the same full/range and
-file-helper matrix. Source inspection alone does not satisfy this gate.
+Before archiving this plan, map every row below to a named deterministic test and add any missing
+case. Test the shared reader once at the lowest layer that can prove the invariant, then add only
+the cross-layer cases needed to prove response commitment and client consumption:
+
+| Failure/discovery position | Required result |
+| --- | --- |
+| Invalid durable profile, subject, geometry, header, or key commitment before response commitment | Normal contract-mapped S3 error; no successful headers, shard read when validation can precede IO, or payload bytes. |
+| Unrecoverable first selected record after `200`/`206` commitment | Exact successful headers remain visible, zero payload bytes from that record, and transport ends before the declared length. |
+| Unrecoverable middle record within one segment after an authenticated prefix | Only complete earlier records may be visible; no byte from the failing or later records; transport ends short. |
+| Unrecoverable terminal record, malformed terminal length, truncation, or trailing data | The terminal verification unit is withheld and the response cannot complete its declared length. Canonical-layout failures discovered before commitment remain ordinary S3 errors. |
+| Failure in a later segment or multipart part | Earlier complete authenticated segments/parts may be visible; the failing unit is absent and the response terminates short. |
+| Missing, short, long, corrupt, or disconnected shard with sufficient durable evidence/redundancy | Exact fallback reconstruction succeeds, returns each logical byte once, and schedules only evidence-authorized repair. |
+| The same physical failures beyond tolerance, on both current and retained routes | Failure follows the uncommitted/committed response rule for its actual discovery point; lease-release or diagnostic errors never mask the primary classification. |
+| AEAD succeeds but a complete-shard CRC later disagrees | Follow the documented physical-diagnostic policy: schedule evidence-authorized repair without retroactively treating authenticated logical bytes as corrupt. |
+| Consumer cancellation after any emitted prefix | All deletion-exclusion leases, buffers, and worker tasks are released; cancellation is not reported as successful complete consumption. |
+
+Factor the matrix across SSE-S3 and SSE-C, full and ranged GETs, standard-object and multipart
+provenance, `1+0` and redundant EC, and current and retained routes. Compiler-enforced shared paths
+need one positive/crossed-subject canary per dimension rather than the full Cartesian product. The
+raw-socket response tests must cover at least zero-byte committed failure, a later record in the
+same segment, a later segment/part, and the terminal boundary. The Rust SDK canary must cover
+incomplete full and `206` bodies; it need not duplicate every injected storage fault.
+
+Coverage audit (2026-10-28): `cobblestone_integrity_failures_abort_committed_socket_responses`
+already pins a committed range failure with zero exposed bytes and a later-segment full-read
+failure with exactly one complete segment exposed.
+`aws_sdk_rejects_incomplete_success_bodies_for_full_and_ranged_gets` proves that the locked Rust
+SDK exposes committed `200`/`206` metadata and rejects both short bodies during collection. Crypto,
+storage, retained-route, and fallback tests cover many lower-layer rows, but the named audit above
+must be completed—particularly same-segment later-record and terminal-boundary socket behavior,
+plus an explicit request counter proving each Rust SDK canary sends exactly one request and does
+not retry or concatenate attempts—before this plan is closed or moved to `plans/completed/`. The
+current one-accept test server is not itself evidence of the request count because it does not
+observe a retry attempt after serving the first connection.
 
 ### Full reads
 
@@ -2089,7 +2116,7 @@ Implementation update (2026-10-27, sole current payload codec):
   storage-only suite passed 3,517 tests with six declared skips. Workspace all-target/all-feature
   checking, Clippy with warnings denied, storage doctests, the storage boundary checker,
   formatting, and diff checks close the codec implementation slice. They do not satisfy the
-  separate official-client release/archival gate above.
+  separate response-failure coverage audit above.
 
 ### Optional follow-up: Partial EC reconstruction
 
@@ -2204,8 +2231,10 @@ and copy paths.
 - Exact leased-subset enforcement: no partial read from an unleased current or historical location.
 - Tag failure triggers diagnostic fallback without emitting the failing chunk or repairing an
   unproven target; pre-header and post-header failures follow their distinct response semantics.
-- Raw HTTP and pinned official-client canaries prove that an unrecoverable post-header failure
-  produces an incomplete/error body, never a successful short full or ranged GET.
+- Raw HTTP canaries prove that unrecoverable post-header failures at every required discovery
+  position expose only complete authenticated prefixes and terminate before the declared length.
+  The pinned Rust SDK canary proves incomplete full and ranged successful responses are reported as
+  body errors rather than clean EOF.
 - Initial-path canaries prove a missing required systematic range selects the full fallback rather
   than an unreviewed parity-range path.
 - If the optional partial EC path is implemented, separate tests cover every known-erasure
@@ -2312,6 +2341,10 @@ every path that can construct or resume an encryption subject.
   route transitions.
 - Pre-header integrity failures return a normal S3 error; post-header failures emit no failing
   chunk and terminate the transport without pretending the partial body succeeded.
+- The named response-failure matrix covers first, middle, terminal, later-segment/part, recoverable
+  and unrecoverable physical faults, retained routes, and cancellation. Raw HTTP pins the wire
+  response, while the supported Rust SDK pins incomplete full and ranged body consumption;
+  additional SDK/CLI probes are optional diagnostics.
 - Ring and OpenSSL produce and consume one byte-identical persistent profile in both directions.
 - S3-visible checksum and encryption behavior is unchanged.
 - Retired and current persisted profiles are never confused, and the format/version ledger
