@@ -288,6 +288,8 @@ enum ChunkedDecoderState {
     ExpectingDataCrlf { seen_cr: bool },
     /// Reading trailers after terminal chunk.
     ReadingTrailers,
+    /// A decoding error is terminal; partially consumed state cannot be resumed.
+    Failed,
     /// Decoding complete.
     Done,
 }
@@ -330,7 +332,23 @@ impl IncrementalChunkedDecoder {
     /// Production callers should feed bounded wire slices. The decoder does not
     /// retain chunk payload bytes between calls, but the returned payload is
     /// owned so async callers never hold a decoder borrow across `.await`.
-    pub fn feed(&mut self, mut wire: &[u8]) -> Result<Vec<u8>, ServerError> {
+    /// Any decoding error is terminal. Later calls return an error without
+    /// consuming input or releasing payload.
+    pub fn feed(&mut self, wire: &[u8]) -> Result<Vec<u8>, ServerError> {
+        if matches!(self.state, ChunkedDecoderState::Failed) {
+            return Err(ServerError::MalformedChunkedBody {
+                reason: "chunked decoder previously failed".to_string(),
+            });
+        }
+        let result = self.feed_inner(wire);
+        if result.is_err() && !self.done {
+            self.state = ChunkedDecoderState::Failed;
+            self.current_chunk_hash = None;
+        }
+        result
+    }
+
+    fn feed_inner(&mut self, mut wire: &[u8]) -> Result<Vec<u8>, ServerError> {
         if self.done {
             return Err(ServerError::MalformedChunkedBody {
                 reason: "data after chunked body complete".to_string(),
@@ -533,6 +551,9 @@ impl IncrementalChunkedDecoder {
                         }
                     }
                     break;
+                }
+                ChunkedDecoderState::Failed => {
+                    unreachable!("feed rejects failed decoders before processing input")
                 }
                 ChunkedDecoderState::Done => break,
             }
@@ -936,6 +957,37 @@ mod tests {
         let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
 
         (ctx, chunk_sig, terminal_sig)
+    }
+
+    #[test]
+    fn incremental_signature_failure_is_terminal() {
+        let (ctx, _, _) = signed_chunk_fixture(b"x");
+        let mut decoder = IncrementalChunkedDecoder::new(Some(ctx), false);
+        let wire = format!("1;chunk-signature={}\r\nx", "0".repeat(64));
+        assert!(matches!(
+            decoder.feed(wire.as_bytes()),
+            Err(ServerError::Auth(auth::AuthError::SignatureMismatch { .. }))
+        ));
+        for wire in [b"\r\n".as_slice(), b"", b"0\r\n\r\n"] {
+            assert!(decoder.feed(wire).is_err());
+            assert!(!decoder.is_done());
+        }
+    }
+
+    #[test]
+    fn incremental_malformed_input_failure_is_terminal() {
+        for wire in [
+            b"invalid\r\n".as_slice(),
+            b"1\r\nx!",
+            b"0\r\nbad-trailer\r\n",
+        ] {
+            let mut decoder = IncrementalChunkedDecoder::new(None, false);
+            assert!(decoder.feed(wire).is_err());
+            for subsequent in [b"".as_slice(), b"1\r\nx\r\n0\r\n\r\n"] {
+                assert!(decoder.feed(subsequent).is_err());
+                assert!(!decoder.is_done());
+            }
+        }
     }
 
     #[test]
