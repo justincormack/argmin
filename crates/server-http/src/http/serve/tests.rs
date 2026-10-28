@@ -1298,16 +1298,19 @@ Connection: close\r\n\r\n",
         let range_response =
             send_raw_http_request_until_transport_end(&addr, &range_request, &[]);
         let range_metrics_after = observability::metrics_snapshot();
-        let (range_headers, range_body) = split_raw_http_response(&range_response);
-        assert!(
-            range_headers.starts_with("HTTP/1.1 206"),
-            "{range_headers}"
-        );
-        assert_eq!(response_content_length(range_headers), 8);
-        assert!(
-            range_body.is_empty(),
-            "a failed selected-record read exposed plaintext after response commitment"
-        );
+        // The body error can abort before Hyper flushes the response headers.
+        if !range_response.is_empty() {
+            let (range_headers, range_body) = split_raw_http_response(&range_response);
+            assert!(
+                range_headers.starts_with("HTTP/1.1 206"),
+                "{range_headers}"
+            );
+            assert_eq!(response_content_length(range_headers), 8);
+            assert!(
+                range_body.is_empty(),
+                "a failed selected-record read exposed plaintext after response commitment"
+            );
+        }
         assert_eq!(
             range_metrics_after.payload_read_aead_records_total
                 - range_metrics_before.payload_read_aead_records_total,
@@ -1401,18 +1404,23 @@ Connection: close\r\n\r\n",
         let full_metrics_before = observability::metrics_snapshot();
         let full_response = send_raw_http_request_until_transport_end(&addr, &get_request, &[]);
         let full_metrics_after = observability::metrics_snapshot();
-        let (full_headers, full_body) = split_raw_http_response(&full_response);
-        assert!(full_headers.starts_with("HTTP/1.1 200"), "{full_headers}");
-        assert_eq!(response_content_length(full_headers), full_payload.len());
-        assert!(
-            full_body.len() <= crate::coordinator::INTERNAL_SEGMENT_SIZE,
-            "the later-segment failure exposed bytes from the failing segment"
-        );
-        assert_eq!(
-            full_body,
-            &full_payload[..full_body.len()],
-            "the transport exposed bytes outside the authenticated first-segment prefix"
-        );
+        // Hyper may encounter the body error before flushing even the headers.
+        // An empty wire response is valid; any delivered body must still be an
+        // authenticated prefix. The metrics below require reaching the failure.
+        if !full_response.is_empty() {
+            let (full_headers, full_body) = split_raw_http_response(&full_response);
+            assert!(full_headers.starts_with("HTTP/1.1 200"), "{full_headers}");
+            assert_eq!(response_content_length(full_headers), full_payload.len());
+            assert!(
+                full_body.len() <= crate::coordinator::INTERNAL_SEGMENT_SIZE,
+                "the later-segment failure exposed bytes from the failing segment"
+            );
+            assert_eq!(
+                full_body,
+                &full_payload[..full_body.len()],
+                "the transport exposed bytes outside the authenticated first-segment prefix"
+            );
+        }
         assert_eq!(
             full_metrics_after.payload_read_repair_fallback_total
                 - full_metrics_before.payload_read_repair_fallback_total,
@@ -1505,18 +1513,22 @@ Connection: close\r\n\r\n",
             let metrics_before = observability::metrics_snapshot();
             let response = send_raw_http_request_until_transport_end(&addr, &request, &[]);
             let metrics_after = observability::metrics_snapshot();
-            let (headers, body) = split_raw_http_response(&response);
-            assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
-            assert_eq!(response_content_length(headers), payload.len());
-            assert!(
-                body.len() <= chunk_len,
-                "{key} failure exposed bytes from the failing or withheld record"
-            );
-            assert_eq!(
-                body,
-                &payload[..body.len()],
-                "{key} failure exposed bytes outside the authenticated first-record prefix"
-            );
+            // Hyper can buffer the headers and first record, then abort on
+            // the next body poll without flushing either to the socket.
+            if !response.is_empty() {
+                let (headers, body) = split_raw_http_response(&response);
+                assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+                assert_eq!(response_content_length(headers), payload.len());
+                assert!(
+                    body.len() <= chunk_len,
+                    "{key} failure exposed bytes from the failing or withheld record"
+                );
+                assert_eq!(
+                    body,
+                    &payload[..body.len()],
+                    "{key} failure exposed bytes outside the authenticated first-record prefix"
+                );
+            }
             assert_eq!(
                 metrics_after.payload_read_aead_records_total
                     - metrics_before.payload_read_aead_records_total,

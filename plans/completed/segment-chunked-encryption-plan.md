@@ -1836,7 +1836,8 @@ Implementation update (2026-10-25, committed raw-HTTP failure semantics):
   The body worker authenticates the complete first segment before discovering the later failure;
   the raw response commits normal `200` headers, confines every observed body byte to that first
   segment, and closes short of the declared object length. Transport scheduling may deliver none,
-  part, or all of the already-authenticated prefix. No bytes from the failing segment are exposed.
+  part, or all of the already-authenticated prefix, or abort before any headers reach the socket.
+  No bytes from the failing segment are exposed.
 - These canaries pin the server/Hyper behavior on both sides of first-byte commitment. The
   official-client incomplete-body canary and chunk-at-a-time full GET emission with fused physical
   CRC accounting remain open before Phase 4 is complete.
@@ -2276,7 +2277,9 @@ and copy paths.
   unproven target; pre-header and post-header failures follow their distinct response semantics.
 - Raw HTTP canaries prove that unrecoverable post-header failures at every required discovery
   position expose only a wire prefix of bytes from records authenticated before failure and
-  terminate before the declared length. The pinned Rust SDK canary proves incomplete full and
+  terminate before the declared length. A body error may abort before Hyper flushes even the
+  headers, so these canaries also accept an empty wire response while still requiring the
+  failure-path metrics. The pinned Rust SDK canary proves incomplete full and
   ranged successful responses are reported as body errors rather than clean EOF.
 - Initial-path canaries prove a missing required systematic range selects the full fallback rather
   than an unreviewed parity-range path.

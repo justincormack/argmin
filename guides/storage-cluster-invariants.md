@@ -573,6 +573,8 @@ failure exposes no bytes from the failing record and terminates an already
 committed response. Returning an authenticated frame from the HTTP body does
 not acknowledge delivery to the client: when a later body error aborts the
 transport, the socket may deliver none, part, or all of that earlier frame.
+Hyper may also encounter the body error before flushing any response headers,
+so a committed response can produce an entirely empty wire response.
 Every delivered byte must still be a prefix of records that authenticated
 before the failure, and the declared response must remain incomplete.
 Historical whole-segment codec bytes are rejected at the current format
