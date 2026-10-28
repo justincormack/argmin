@@ -573,6 +573,41 @@ failure exposes no bytes from the failing record and terminates an already
 committed response. Historical whole-segment codec bytes are rejected at the
 current format boundary; there is no compatibility reader.
 
+### Degraded range-read reconstruction policy
+
+The complete-segment fallback is deliberate, not unfinished correctness work.
+A healthy range reads only its intersecting Cobblestone records, but any
+missing, unavailable, malformed, unauthenticated, or witness-inconsistent
+required range enters complete witness-backed segment reconstruction. The
+fallback supplies one uniform diagnostic boundary: it validates every physical
+shard against durable evidence, identifies known erasures, reconstructs the
+complete ciphertext when at least `k` valid shards remain, authenticates it,
+and schedules repair only from complete evidence.
+
+Partial EC reconstruction is deferred because its benefit depends on both the
+workload and the fault shape. It is most useful when requests repeatedly touch
+small, sparse ranges and the failed bytes are already attributable to a narrow
+known erasure. An isolated small range can still benefit while a complete shard
+is unavailable, but repeated partial reconstruction can do more total work when
+that failure persists and callers eventually cover most of a segment through
+many requests. The same is true for individually large ranges or broadly
+corrupt extents. Suspect bytes discovered by AEAD or witness failure
+additionally require the complete diagnostic path before storage may identify
+a corrupt shard or authorize repair; treating them as an assumed erasure would
+weaken that boundary.
+
+Do not add partial reconstruction merely because the EC library supports it.
+Revisit it only if production-like measurements show that full fallback is a
+material cost for the observed combination of range sizes, cumulative segment
+coverage, fallback frequency, fault cause and extent, and fault duration. Any
+future optimization must remain restricted to already-known erasures, hold
+deletion-exclusion leases for every selected survivor, authenticate all
+reconstructed records before exposure, and fall back to complete validation on
+short, malformed, suspect, or unauthenticated results. It is an IO optimization
+and must not change durable encryption bytes or the recovery guarantee. The
+current measured healthy and degraded costs are recorded in the
+[performance guide](performance.md#multihost-and-degraded-payload-reads).
+
 `ObjectPayloadLease::release` is the current active token release path. It must
 release against the actual storage-node sessions captured at acquisition time
 and must not depend on the frontend's current cluster epoch or runtime-map

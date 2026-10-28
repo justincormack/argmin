@@ -1,11 +1,12 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: Implementation and response-failure coverage complete; ready for archival. Additional
-SDK/CLI probes are optional diagnostics, not a closure requirement. Partial EC reconstruction
-remains an optional, separately measured follow-up.
+Status: Completed and archived on 2026-10-28. Additional SDK/CLI probes are optional diagnostics,
+not a closure requirement. Partial EC reconstruction remains deliberately deferred unless
+production-like workload and fault measurements justify it; the continuing policy is recorded in
+[`storage-cluster-invariants.md`](../../guides/storage-cluster-invariants.md#degraded-range-read-reconstruction-policy).
 
 The completed
-[`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
+[`remove-plaintext-payload-profile-plan.md`](remove-plaintext-payload-profile-plan.md)
 removed the unreachable `ObjectEncryption::None` state before this plan's profile-interface work.
 Accordingly, this plan covers only encrypted payload codecs paired with SSE-S3 or SSE-C. References
 to plaintext below mean decrypted logical data, not a supported unencrypted durable profile.

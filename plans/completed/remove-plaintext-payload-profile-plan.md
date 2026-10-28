@@ -35,7 +35,7 @@ fallback reader.
 
 ## Relationship To Other Plans And Guides
 
-- [`segment-chunked-encryption-plan.md`](../segment-chunked-encryption-plan.md) should assume only
+- [`segment-chunked-encryption-plan.md`](segment-chunked-encryption-plan.md) should assume only
   encrypted payload codecs after this work. This removal should land before its profile-interface
   implementation.
 - [`storage-upgrade-versioning-plan.md`](../storage-upgrade-versioning-plan.md) remains future work and
