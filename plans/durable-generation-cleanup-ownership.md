@@ -1797,3 +1797,50 @@ Validation: both focused writer/independent-reader tests passed. Full Nextest
 passed all 9,036 tests with six existing ignored regressions in 254.679 seconds.
 Strict workspace Clippy, storage boundary checks, formatting and `git diff --check`
 passed. No production schema or encoding changed.
+
+## Checked Local Allocation Foundation — 2026-10-29
+
+The first production component is deliberately smaller than the complete
+reserve/create/append owner integration. The private
+[`segment_vid_window.rs`](../crates/storage/src/pg_store/metadata/segment_vid_window.rs)
+implements checked finite local VID intervals and is now used by the existing
+single-VID preparation path. It is **not a replicated window reservation or a
+write capability**. No production block size, issuer grant, cleanup cutoff or
+new schema field is selected by this step.
+
+Both bounds of `[start, end)` must fit the SQLite signed-integer domain, because
+`end` is itself the persisted next cursor. The SQL update checks that condition
+before mutation; Rust projects the resulting checked interval. Normal preparation
+still consumes exactly one VID with one `UPDATE ... RETURNING`, without an added
+pre-read, transaction, commit or RPC. An enclosing apply transaction remains in
+charge of its commit/rollback. Local allocation still cannot establish replica
+discovery or authorize replacement-primary continuation.
+
+The implementation also fixes a statement-completion hazard: reading only the
+first `RETURNING` row can report success before SQLite completes the statement.
+The new path steps to completion and propagates a late failure instead of dropping
+the statement and losing its error. An owner-local trace/interrupt regression
+first demonstrates that SQLite returns a candidate row and then rolls back on
+the next step; the production allocator must return an error and preserve the
+complete session. This is not a simulated power loss or proof against every
+filesystem/commit failure.
+
+Eight focused tests cover interval arithmetic, signed/unsigned overflow,
+all-or-nothing exhaustion with complete same-PG session canaries, local-store
+reopen, joining and rolling back an outer transaction, unchanged missing/terminal
+session errors, the actual post-row interruption, and SQL tracing of the
+single-statement successful path. Metadata-only session fixtures write no shard
+payload. The reopen test closes the original store before reopening it; it does
+not introduce a second runtime over live files. The tracing assertion pins SQL
+statement count, not a measured syscall/fsync count.
+
+The full owner/window schema, command and export/digest integration remains next.
+Its replicated reserved end must remain distinct from this consumed local cursor;
+it cannot substitute this helper for the owner/issuer/placement/deadline checks
+specified above. No ignored cleanup regression is enabled by this slice, and the
+current format versions remain unchanged.
+
+Validation: all eight focused allocator tests passed. Full Nextest passed all
+9,044 tests with six existing ignored regressions in 252.299 seconds. Strict
+workspace Clippy, storage boundary checks, formatting and `git diff --check`
+passed.

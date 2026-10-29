@@ -5682,30 +5682,8 @@ impl PgMetadataStore for PgStore {
         &self,
         session_id: &SessionId,
     ) -> Result<GenerationId, MetadataError> {
-        let allocated = self
-            .conn
-            .query_row(
-                "UPDATE stream_uploads \
-                 SET next_segment_vid = next_segment_vid + 1 \
-                 WHERE session_id = ?1 AND state = ?2 \
-                 RETURNING next_segment_vid - 1",
-                params![session_id.as_str(), StreamUploadState::InProgress as u8],
-                |row| Self::parse_generation_id(row.get::<_, i64>(0)?, 0, "next_segment_vid"),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "allocate stream segment VID",
-                source: e.into(),
-            })?;
-        match allocated {
-            Some(vid) => Ok(vid),
-            None => match self.get_stream_upload(session_id) {
-                Ok(session) => Err(MetadataError::StreamSessionNotInProgress {
-                    state: session.state as u8,
-                }),
-                Err(error) => Err(error),
-            },
-        }
+        self.allocate_stream_segment_vid_window(session_id, std::num::NonZeroU32::MIN)
+            .map(|window| window.start)
     }
 
     #[cfg(test)]

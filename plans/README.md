@@ -80,7 +80,7 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Commit the independent current-command byte baseline, then implement the retained-owner/window reserve/create/append slice with replica/replay/export canaries. Settle remote grant confirmation and finite bounds before enabling physical writes. | Six ignored regressions remain unresolved. Target no added ordinary PUT/segment commit; retaining window metadata/routes is an explicit tradeoff. No production protocol implemented yet. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Current-command bytes are preserved; checked local allocation now reports post-RETURNING failures. Next implement the distinct replicated owner/window reserve/create/append state with replica/replay/export canaries. | Six ignored regressions remain unresolved. No added ordinary PUT/segment commit is the target. Local allocation is not replicated authority; remote grants and finite bounds remain open. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |

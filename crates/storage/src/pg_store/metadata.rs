@@ -4,6 +4,9 @@
 use super::*;
 use crate::metadata_command::DeleteFinalizedBucketCommand;
 
+#[path = "metadata/segment_vid_window.rs"]
+mod segment_vid_window;
+
 include!("metadata/support.rs");
 include!("metadata/command_apply.rs");
 include!("metadata/command_mutations.rs");
