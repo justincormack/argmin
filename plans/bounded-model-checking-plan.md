@@ -39,6 +39,12 @@ and adds separate pending-install, publication-marker, witness/primary/trailing
 dispatch/apply/reply, abandonment handoff, and terminal release events. This is an
 abstract composition, separate from the production-connected publication pilots
 below; it does not yet compose two-node closure or owner renewal.
+The subsequent interface composition executes that publication model's transitions
+with two data targets and one durable renewal. Explicit install/apply macro steps
+and conservative expiry barriers keep the cross-product bounded; this is not a
+refinement proof for all interleavings or production clock semantics. The cleanup
+plan now maps its assumed boundaries to current source and identifies missing
+durable horizon, write-exclusion, and cleanup-handoff contracts.
 
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.

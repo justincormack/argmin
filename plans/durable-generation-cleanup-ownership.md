@@ -259,11 +259,12 @@ renewal extension separately covers one durable horizon extension, delayed
 renewal replies, and abstract detected clock faults/trusted resynchronization.
 The publication extension composes three metadata replicas and recovery with
 the initial physical-cleanup model, including publication-start, lost replies,
-and safe abandonment. Before selecting a production protocol, combine that
-composition with renewal/all-node closure; exercise production clock binding/health
-and authority
-re-establishment; extend renewal to multiple append horizons and compose it with
-all-node closure; add owner creation and crash-before-session windows;
+and safe abandonment. The interface-composition extension below adds one renewal
+and two-target closure, with explicitly collapsed install/apply steps and clock
+barriers. This is not a proof of the unrestricted cross-product. Before production
+integration, specify the concrete owner/closure contract using the source audit;
+exercise production clock binding/health and authority re-establishment; extend
+renewal to multiple append horizons; add owner creation and crash-before-session windows;
 multiple subjects and generations;
 route/history changes; whole-MPU abort; revocation retirement; and bounded healthy
 recovery tails. File-sync failure, orphan discovery, ENOSPC and physical filesystem
@@ -536,3 +537,120 @@ select a production owner schema, or resolve any of the six ignored regressions.
 Slice validation: all 15 cleanup-model tests passed. Full Nextest passed all
 9,023 tests (one slow, six skipped) in 234.486 seconds. Workspace all-targets /
 all-features Clippy with `-D warnings`, formatting, and `git diff --check` passed.
+
+## Renewal / All-Target / Publication Interface Composition — 2026-10-29
+
+[`publication/composition.rs`](../crates/storage/src/cleanup_ownership_model/publication/composition.rs)
+executes the publication model's existing transitions alongside two physical data
+targets and one durable horizon extension. Both targets initially hold the same
+already-staged payload's respective shards. Target 0 has an old duplicate write in
+transport; target 1 may receive a renewed authorization for an exact duplicate.
+This is not a second object, generation, or newly appended segment.
+
+### Bounds and deliberate abstractions
+
+- Three metadata replicas retain the parent model's marker, exact application,
+  confirmation, abandonment, release, and slot-clear semantics. One command is
+  installed and every modeled successful apply loses its original reply; exact
+  observation confirms it later.
+- Installation is a macro step executing parent dispatch, durable acceptance,
+  and lost reply. Each replica apply is a macro step executing dispatch, apply,
+  and lost reply. These call the parent's actual transition generator and guards.
+  Interleavings **inside** these sequences are omitted from this graph, not
+  claimed safe by composition; the preceding model explores those boundaries
+  separately. No automatic refinement or partial-order-reduction proof is claimed.
+- Time has three states: before the original cutoff, original cutoff passed,
+  renewed cutoff passed. These are conservative global expiry barriers, abstracting
+  away clock conversion/skew. Passing the original barrier also expires the
+  original terminal admission. Clock faults and receiver-local rebinding remain
+  separate evidence, not production logic exercised by this composition.
+- Renewal persists before its reply can be delivered. Cancellation, terminal
+  installation, or original expiry closes fresh renewal. Already-granted authority
+  can still arrive after abandonment, frontend loss, publication, or cleanup.
+  Primary restart retains the maximum horizon; it never extends the old write.
+- Data targets independently admit writes, persist files and acknowledgements,
+  finish IO, close admission, report closure, delete, and report deletion. Cutoff
+  closure waits for the maximum granted horizon, including undelivered grants;
+  revocation can close earlier. Both drain in-flight IO and require **every**
+  target's closure reply before claiming cleanup.
+- Target 1 can be unavailable and restart once. In-flight local IO ends on crash;
+  durable file/ack/revocation state survives. The owner persists through incomplete
+  closure, missing deletion replies, and release failure. A failed target does not
+  prevent the other target's closure progress. No fairness or eventual-delivery
+  guarantee is asserted.
+
+Closure/deletion replies recorded in the model are treated as durable owner
+evidence and survive primary reopen. The implementation must either persist that
+exact evidence or reacquire it before advancing cleanup; retaining an ordinary
+process-local reply cache across a real restart would not realize this assumption.
+
+Publication protection is checked against **both actual target states**, not just
+the parent's aggregate payload projection. Aggregate deletion advances only after
+both deletion replies, then exact reservation release and owner retirement use
+the parent transitions. Restart/IO durability and exact-duplicate identity remain
+assumptions. Revocation evidence survives owner retirement in this model: safe
+tombstone retirement is still an open design obligation.
+
+### Evidence
+
+Both correct graphs exhaust below the 750,000-state cap: cutoff has 162,432 states /
+693,684 transitions; revocation has 252,180 states / 1,143,918 transitions. Required
+witnesses include partial closure with an unavailable target after renewal,
+renewed publication converging through recovery, and abandoned renewed ownership
+finishing cleanup after target restart.
+
+Five independent unsafe variants detect: using the original cutoff for a renewed
+owner, ignoring admitted IO, accepting partial closure, forgetting the delivered
+renewal on primary restart, and retiring before all deletion replies. Ordered
+canaries additionally pin:
+
+1. A renewed write admits after the original cutoff, blocks closure past its own
+   cutoff until IO ends, and leaves cleanup pending while its node is unavailable.
+   A primary restart retains the horizon; missing deletion replies and release
+   failure retain ownership independently.
+2. Publication-start with no replica rows protects both targets after renewal,
+   frontend loss, primary restart, and both cutoffs. Recovery applies the original
+   command and committed metadata still protects both targets after slot removal.
+3. Revocation completes cleanup before **either** cutoff, then a renewal reply
+   arrives after owner retirement and target restart. The target rejects that
+   still-time-valid write because durable revocation remains, not because time
+   happened to expire.
+
+All 20 cleanup-model tests passed in focused validation. Full Nextest passed
+all 9,028 tests (one slow, six skipped) in 236.897 seconds. Workspace all-targets /
+all-features Clippy with `-D warnings`, formatting, and `git diff --check` passed.
+No production format, mutation path, or ignored test changed.
+
+## Production Boundary Audit — 2026-10-29
+
+This is a source mapping, not an assertion that the modeled protocol exists.
+The six ignored production regressions remain the acceptance gate.
+
+| Required boundary | Current owner / source | What exists and what is still needed |
+| --- | --- | --- |
+| Durable owner before dispatch; maximum issued horizon | [`pg_store/schema.rs`](../crates/storage/src/pg_store/schema.rs), `object_generation_reservations` and `stream_uploads` | Reservations retain ID, bucket/key, generation and creation time; sessions additionally retain `cleanup_after` and bucket-write proof fields. Neither is the modeled common maximum-issued-shard-cutoff/cancellation/closure record. Specify the owner incarnation, grant ordering, renewal serialization, and cleanup state before changing schema. |
+| Effect deadline at append preparation | [`node_client/local.rs`](../crates/storage/src/node_client/local.rs), `prepare_stream_segment_append_inner`; [`cluster/payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs), `prepare_stream_segment_append_with_route_validation` | Session/generation authority is compared under the object-PG guard and the effect fence precedes segment-ID allocation. This does not persist an outstanding shard-write horizon or provide data-node exclusion for the later IO. |
+| Portable request deadline | [`types.rs`](../crates/storage/src/types.rs), `AdmittedRouteEffectFence`; [`storage_node_server/session.rs`](../crates/storage/src/storage_node_server/session.rs), `admitted_route_effect_fence` | Absolute conservative wall cutoffs are rebound to receiver-local monotonic deadlines. Reuse that representation; do not send durations or monotonic timestamps. Production clock health/re-establishment must be tested against the proposed cleanup eligibility rule, not assumed from the abstract barriers. |
+| Data-node write admission through acknowledgement persistence | [`node_client/local.rs`](../crates/storage/src/node_client/local.rs), `LocalPlacedShardRoute::write_placed_shard_with_effect_fence`; [`storage_node_server/routes.rs`](../crates/storage/src/storage_node_server/routes.rs), `StorageNodeActiveShardRoute::write_if_absent`; [`node.rs`](../crates/storage/src/node.rs), shard-file writers | Current paths check route/effect validity before physical IO. They do not acquire the modeled attempt-bound staging exclusion guard lasting through file and acknowledgement persistence. A route permit is not proof that cleanup cannot delete this attempt. |
+| Exact remote staging authority and all-target closure | [`storage_rpc/types.rs`](../crates/storage/src/storage_rpc/types.rs), `StorageRpcShardWriteRequest`; [`node.rs`](../crates/storage/src/node.rs), `try_begin_object_payload_reclaim` | Shard writes carry location, key, expected bytes/checksum and optional route deadline, not the proposed durable staging-owner authority. Existing generation read leases/reclaim fences protect reads and cannot be assumed to fence prepared writes; their registry is process-local. Define the write guard/closure RPC and restart contract, not an unfenced cross-PG lookup. |
+| Terminal installation versus cleanup adoption | [`node_client/local.rs`](../crates/storage/src/node_client/local.rs), fenced pending-slot insertion; [`pg_store/command_log.rs`](../crates/storage/src/pg_store/command_log.rs) | Exact pending slots and effect checks under the PG guard exist. The proposed owner-state check and cleanup-claim transition must share serialization with insertion; adding a coordinator precheck alone cannot implement this modeled boundary. |
+| Irrevocable publication and abandonment handoff | [`pg_store/command_log.rs`](../crates/storage/src/pg_store/command_log.rs), `mark_pending_metadata_command_publication_started` and `record_metadata_command_abandoned`; [`guides/metadata-command-stream.md`](../guides/metadata-command-stream.md) | Exact durable publication marking and transactional abandonment records exist. The common cancelled-owner handoff does not. Specify its transaction/replication relationship to abandonment and pending-slot removal; only authoritatively unstarted commands may take that path. |
+| Retryable deletion and reservation release | [`cluster/operation_routes.rs`](../crates/storage/src/cluster/operation_routes.rs), `DirectPutPayloadWrite::cleanup_on_owner` and `DirectPutGenerationReservation::release_on_owner` | Cleanup currently disarms its process-local handle before deletion/release and ignores release failure. Retain a discoverable durable obligation through all target replies and exact release. This is the existing lost-cleanup finding, not a newly fixed path. |
+| Historical route ownership | [`pg_store.rs`](../crates/storage/src/pg_store.rs), `cluster_map_history_reference_summary` and `cluster_map_history_route_references` | Current retention covers live segments, backfill, pending command resources, bucket reservations and reclaim claims. A future cleanup owner must retain its exact object/data/bucket-PG route dependencies after session/pending-state removal until cleanup and reservation release converge. The abstract fixed topology cannot prove this. |
+
+### Next design decision
+
+The audit still favors evaluating an extension of existing reservation/session
+ownership with bounded write authority first: existing effect deadlines are useful
+building blocks, but do **not** supply the durable horizon or in-flight exclusion.
+Explicit revocation additionally needs durable data-node admission tombstones and
+a safe retirement proof; keep it as a measured alternative rather than silently
+implementing a hybrid.
+
+Next specify the concrete owner schema and state machine, how authority is minted
+before dispatch, where all-target closure drains writes, and how abandonment and
+cleanup transfer/release responsibility. Include exact historical route references,
+replica-deterministic apply, format/version evidence, worker recovery/ENOSPC, and
+small-PUT command/fsync cost. Then review that contract before production changes
+and replay the six ignored regressions plus the new cross-boundary schedules.
+The model counts are not a reason to skip the remaining gates above.

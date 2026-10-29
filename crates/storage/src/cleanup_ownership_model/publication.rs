@@ -9,6 +9,8 @@
 use super::{Cleanup, Command, Mutation, Protocol, State as Payload, Step, Write};
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
+mod composition;
+
 const PRIMARY: usize = 0;
 const WITNESS: usize = 1;
 const TRAILING: usize = 2;
