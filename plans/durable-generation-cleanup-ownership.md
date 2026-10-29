@@ -1395,3 +1395,121 @@ Full Nextest passed all 9,030 tests, with six existing ignored regressions, in
 238.792 seconds. Strict workspace Clippy, storage boundary checks, formatting
 and `git diff --check` passed. These checks do not validate the proposed window
 protocol, which is not implemented.
+
+## Bounded Lookahead Model — 2026-10-29
+
+The independent, test-only
+[`lookahead.rs`](../crates/storage/src/cleanup_ownership_model/lookahead.rs)
+uses the existing bounded explorer to evaluate the reservation-window candidate.
+It exhausts **26,312 states and 94,554 transitions** under a hard 100,000-state
+cap. Exhaustion and every required witness must succeed; reaching the cap is a
+failure, not a partial proof. No production commands, schemas, RPCs or dependencies
+change in this slice.
+
+### Explicit bounds and atomic boundaries
+
+- One owner, two retry identities in its first segment window and one
+  representative identity in the next segment window. These are complete symbolic
+  physical keys, not production VID constants or a chosen production block size.
+- Two object-metadata replicas with independent allocation floors. Initial owner/
+  window creation is assumed replicated. Preparation changes only the issuing
+  primary's floor; ghost issued-identity history detects reuse but is never used
+  to enumerate cleanup candidates or choose a new identity.
+- Separate append dispatch, pending install, irrevocable marker, witness apply,
+  primary apply and slot clearance. Each apply atomically records its selected
+  manifest and next window while preserving prior scope. One lost append response
+  does not erase any durable grant. Fresh next-window issuance waits for settled
+  publication in this candidate; this is conservative, not a claim that every
+  weaker handoff is unsafe.
+- One primary replacement fences fresh append publication. The replacement does
+  **not** allocate from its stale floor. The old issuer may still allocate unused
+  slots within its initial delegated window, even after the successor seals the
+  owner, but cannot extend scope or cutoff. Already prepared/delayed file and ack
+  requests also survive failover. This deliberately tests a stronger discovery
+  obligation than merely enumerating the preparations visible at failure time.
+- File dispatch/admission/persistence and ack dispatch/admission/persistence are
+  separate actions and exclusion guards, with one delivery of each effect per
+  symbolic key. A file can finish after cutoff; an ack
+  can arrive after file cleanup and must then be rejected. No continuous lease
+  across two remote participants is assumed.
+- One global conservative cutoff, no renewal, and one symbolic placement-epoch
+  advance. Discovery reads the surviving replica's retained scopes and references,
+  not the old primary's counter or current placement. Clock skew, lease rebinding
+  and actual route-history admission remain separate obligations.
+- Cancellation, part finalization and replacement represent already-converged
+  metadata transitions. They retain window provenance. Cleanup is an atomic batch
+  over exact discovered keys after the cutoff and both effect guards drain; the
+  model does not claim atomic physical deletion across real nodes.
+
+An unresolved command remains protected after failover. In particular, the model
+does not manufacture an absent/unstarted certificate from the surviving replica's
+empty manifest. Witness-only application, or even both replicas having applied
+without authoritative slot clearance, can remain blocked indefinitely when the
+old primary is unavailable. This is a safety model, not a proof that the existing
+recovery protocol can always produce the required authoritative resolution.
+
+### Non-vacuity, mutations and ordered canaries
+
+Eight required reachability witnesses cover: cleaning both unknown initial
+preparations with the replica's floor still zero; retry exhaustion; next-window
+use after a lost append response; partial publication protection after failover
+and expiry; cleanup after part replacement with all three identities issued;
+rejected late effects; retained-placement discovery after failover; and cleanup
+of an allocation made by the stale old issuer after failover.
+
+Each of nine unsafe variants runs independently and must produce its expected
+counterexample:
+
+| Deliberately removed boundary | Required failure |
+| --- | --- |
+| Stop replacement allocation from a stale floor | An uncertain identity is allocated twice. |
+| Enforce the first window's allocation bound | An issued identity has no surviving durable scope. |
+| Replicate the next window before allowing use | Issuance from an installed-but-unapplied append escapes replica discovery. |
+| Preserve prior retry windows on append | A non-selected issued retry disappears from discoverable scope. |
+| Protect unresolved pending commands | Cleanup deletes payload still owned by an installed command. |
+| Drain admitted file IO | File persistence recreates payload after completed cleanup. |
+| Drain admitted acknowledgement IO | Ack persistence recreates durable state after completed cleanup. |
+| Use recorded rather than current placement | Issued historical identities become undiscoverable. |
+| Wait out the immutable cutoff | A transport-delayed file request is admitted after cleanup and recreates payload. |
+
+Ordered canaries use the same successor generator and pin both positive and
+disabled actions: initial exhaustion and stale-floor rejection; a stale issuer
+allocating after cancellation; witness-only publication with cleanup/abandonment
+disabled; both-applied publication without permission to clear the old slot after
+failover; each file/ack guard independently blocking cleanup; and a live part
+remaining protected before replacement. The replacement canary retains the
+selected payload, a file-only earlier retry and a future-window request in
+transport, then checks exact absence and rejection after closure/cleanup.
+
+### Decision supported, and what remains unproved
+
+Within these bounds, **replicated window coverage is sufficient to discover
+unknown preparations without recovering the old primary's allocation counter**.
+The window must bound all issuable identities, not just acknowledgements or the
+selected manifest. Preservation of prior windows and immutable cutoffs remains
+necessary after successful publication as well as cancellation.
+
+This supports continuing with bounded lookahead as the first low-barrier candidate
+for a concrete schema/transaction review. It does not measure fsync savings or
+prove arbitrary block sizes, hash collisions/subject substitution, all-participant
+EC closure, durable release, renewal, clock health, real route transitions,
+authenticated grant transport or multi-primary publication fencing. The older
+clock/fanout/publication models are complementary independent evidence, not a
+composed end-to-end proof of this new candidate. Fresh non-overlapping block
+acquisition after exhaustion/failover is not modelled; this slice chooses the
+safe stop-and-retain behavior instead of assuming continuation is free.
+
+Next specify the exact owner/window fields, persistent allocation high-water
+rules, compact retention of earlier windows and route references, and how they
+fit the existing reserve/create/append/terminal transactions. Include the RPC
+authority checks that keep stale issuers within their delegated scope. Review
+that integration before implementing it; do not add a command on every normal
+append merely because exceptional renewal/replacement needs durable progress.
+Actual primary replacement, Unix/TLS delayed requests, the six original cleanup
+regressions, DUR-3/DUR-5 and real-filesystem cost measurements remain open gates.
+
+Slice validation: all five focused model tests passed, including the nine
+independent unsafe variants. Full Nextest passed all 9,035 tests, with six existing
+ignored regressions, in 249.861 seconds. Strict workspace Clippy, storage boundary
+checks, formatting and `git diff --check` passed. This validates the bounded model
+and repository regression suite, not a deployed window protocol.

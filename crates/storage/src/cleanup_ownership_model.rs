@@ -8,11 +8,14 @@
 //! The fanout child adds independent data-node closure and healthy clock offsets;
 //! The renewal child models durable horizons and abstract clock-health fencing.
 //! The publication child composes these physical transitions with abstract
-//! witness/primary/trailing publication. Route migration remains unmodelled.
+//! witness/primary/trailing publication. The independent lookahead child adds
+//! replica discovery of bounded allocation windows and symbolic placement epochs;
+//! production route migration remains unmodelled.
 
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
 mod fanout;
+mod lookahead;
 mod publication;
 mod renewal;
 

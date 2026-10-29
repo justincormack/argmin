@@ -46,6 +46,13 @@ refinement proof for all interleavings or production clock semantics. The cleanu
 plan now maps its assumed boundaries to current source and identifies missing
 durable horizon, write-exclusion, and cleanup-handoff contracts.
 
+The independent [bounded-lookahead model](durable-generation-cleanup-ownership.md#bounded-lookahead-model--2026-10-29)
+tests the lower-barrier candidate against separate primary/replica allocation
+state. It covers preserved retry scopes, late old-issuer allocation, append
+replication and file/ack exclusion. It assumes fresh-publication fencing and a
+conservative shared expiry boundary; it does not implement election, complete
+unavailable-primary recovery, or compose the earlier clock/fanout models.
+
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.
 Start with a small production-connected model, demonstrate detection of a
