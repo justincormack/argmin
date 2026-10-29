@@ -99,3 +99,7 @@ include!("storage_rpc/decoder.rs");
 include!("storage_rpc/encoder.rs");
 
 include!("storage_rpc/tests.rs");
+
+#[cfg(test)]
+#[path = "storage_rpc/stream_creation_format_tests.rs"]
+mod stream_creation_format_tests;

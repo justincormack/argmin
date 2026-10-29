@@ -726,6 +726,24 @@ The evidence audit proceeded in this bounded order after ownership containment c
    evidence append-only, and must not add a fallback reader before the upgrade plan defines
    compatibility.
 
+### Stream-Creation RPC Evidence Before Cleanup Ownership Changes
+
+`crates/storage/src/storage_rpc/testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex`
+retains 35 exact complete frames for the current stream-creation/matching grammar.
+Its SHA-256 is
+`9ae72c95f79a464e1711ad0a645b508ecc4609b1cf9c376289226221ad24dd58`.
+Owner-local writer and independent literal-reader tests cover PUT/UploadPart,
+optional expected commands and cleanup deadlines, the current creation
+preconditions and reservation booleans, current-object alternatives, command-build
+outcomes, match booleans and error envelopes. These are metadata-only specimens.
+
+The expected command inside a match request is a **raw RPC carrier**: its layout
+is owned by RPC v27, not the metadata-command envelope version. Build responses
+instead include a self-describing v11 command. A generation-ownership change must
+advance whichever containing grammars change and retain these exact frames
+unchanged as historical evidence. This targeted corpus supplements, rather than
+replaces, the existing frame, nested-encryption and metadata-command specimens.
+
 ## Baseline Closeout Audit (2026-08-22)
 
 The completed matrix was re-audited against every production format/version constant and its

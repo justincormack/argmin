@@ -15,6 +15,9 @@ proposal's additional publishers and per-segment intents are not selected.
 The [concrete window/transaction candidate](#concrete-window-and-transaction-candidate--2026-10-29)
 now specifies the retained owner, separate allocation bounds, and integration
 gates. It is a design for review, not an implemented or fully proven protocol.
+The [stream-creation refinement](#stream-creation-transaction-refinement-and-rpc-evidence--2026-10-29)
+below proposes combining stream generation reservation with session creation
+before adding the retained owner/window records.
 The unfinished production fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under
@@ -1887,3 +1890,99 @@ Validation: all 12 focused allocator/append tests passed. Full Nextest passed
 all 9,048 tests with six existing ignored regressions in 250.601 seconds. Strict
 workspace Clippy, storage boundary checks, formatting and `git diff --check`
 passed.
+
+## Stream Creation Transaction Refinement And RPC Evidence — 2026-10-29
+
+The next transaction audit found a smaller candidate for the stream pre-session
+gap. Today streamed PUT and UploadPart publish a standalone
+`ReserveObjectGeneration` and then `CreateStreamUpload`:
+
+- [`multipart_operations.rs`](../crates/storage/src/cluster/request_ops/multipart_operations.rs)
+  calls `reserve_put_object_generation_with_route_validation` before building
+  session creation in its PUT and UploadPart workflows;
+- [`payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs),
+  `create_put_object_stream_session_record_under_reservation`, does the same;
+- [`local.rs`](../crates/storage/src/node_client/local.rs),
+  `build_create_stream_upload_command_for_route`, checks that the reservation
+  exists but does not put its exact generation into the creation command; and
+- [`command_mutations.rs`](../crates/storage/src/pg_store/metadata/command_mutations.rs)
+  already reserves an MPU's generation and inserts its upload record inside one
+  transaction in `create_multipart_upload_explicit`. Stream creation does not
+  yet use that pattern.
+
+**Recommended next implementation:** make the stream creation command carry the
+exact selected payload generation and apply its reservation/high-water update
+alongside the session in the existing apply/log transaction. Remove the preceding
+standalone stream reservation command once the builder, apply, matching, recovery
+and all production callers use that binding. This can remove one command from
+healthy stream creation without adding a new durability barrier. It does not
+remove Direct PUT's reservation command or claim a measured fsync reduction yet.
+
+This refines the earlier two-command stream candidate: the intended new command
+has no durable generation-only gap requiring a separate pre-session stream owner.
+The bucket-PG proof is still acquired separately, so failed/ambiguous creation
+must retain its existing exact release/convergence semantics. Retained owners and
+windows must still outlive successful session removal; atomic creation does not
+solve delayed physical writes, unused retry discovery, or Direct PUT cancellation.
+
+The implementation gates are:
+
+1. Select the generation under the authoritative object-PG lock before command
+   construction; do not perform an unrecorded generation allocation or add a
+   pre-install durable effect. Keep captured deadline validation at the existing
+   builder/installation boundaries.
+2. Apply validates the target, exact bucket-proof subject, session and selected
+   generation before committing the reservation, high-water, session and applied
+   log record together. Rejected commands leave all of them unchanged, including
+   when invoked through decoded recovery. Replicas use immutable command/row
+   evidence rather than local clocks.
+3. Matching and replay bind the generation as well as the session/encryption/
+   cleanup deadline. Contention rebuilds from fresh authoritative state; it must
+   not adopt an unrelated pre-existing reservation merely because its session ID
+   matches. Preserve one-contender draining, work budgets and immutable admission.
+4. Request failure before installation leaves neither generation reservation nor
+   session. An ambiguous or irrevocable installation converges the exact command;
+   cleanup must not release a reservation that this command still owns.
+5. Cover PUT and UploadPart over embedded and installed Unix paths, two concurrent
+   same-key sessions, failed apply/rollback, exact replay, replica application and
+   reopen. Prove both the generation and session are present/absent together and
+   count the actual healthy-path commands before claiming the cost reduction.
+
+The command needs a containing metadata-command version advance. The raw
+`CreateStreamUploadCommand` embedded in `StorageRpcStreamUploadMatchRequest` is
+separately governed by the RPC frame version; it is **not** protected by the
+metadata-command envelope's marker. Changing that raw field or the creation
+precondition grammar also requires an RPC version advance. Reusing existing
+reservation/session tables alone would not change their schema or digest grammar;
+later retained-owner/window fields still require the full format review above.
+Recalculate affected framed request/response limits for the added fields and pin
+exact-at-cap admission; a command that fits its own limit must still fit its RPC
+carrier, including request-only overhead.
+
+Before either advance, this evidence-only slice freezes 35 complete current frames
+at `(RPC v27, metadata-command v11, SSE-S3 state v5)` in
+[`stream_creation_rpc_v27_command_v11_sse_s3_v5.hex`](../crates/storage/src/storage_rpc/testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex).
+The previous exact RPC example pinned only a missing expected command. The new
+corpus pins:
+
+- PUT and UploadPart match requests with no expected command, or a complete
+  expected command with either cleanup-deadline arm;
+- every current stream-creation precondition variant, both reservation booleans,
+  absent/live/delete-marker current-object alternatives, and both deadline arms;
+- versioned creation-command build responses for both targets/deadline arms,
+  stale/missing/conflict outcomes, true/false match responses and error envelopes.
+
+Separate tests compare writer bytes and decode the literal frames directly, with
+exact named-inventory comparison and duplicate rejection. The fixtures are
+metadata-only: synthetic encryption material is not used to write or read shard
+payload. This is targeted stream-creation grammar evidence, not a claim that every
+unrelated RPC field combination is covered. The temporary capture helper is not
+retained; future changes must append version-indexed evidence, not regenerate
+this file. No production behavior, owner record, format version or ignored
+regression changes in this slice.
+
+Validation: both focused format tests passed; the full `cargo nextest run
+--offline` passed 9,050 tests (one slow, six skipped) in 253.000 seconds.
+`cargo clippy --offline --all-targets --all-features -- -D warnings`,
+`./scripts/check-storage-cluster-boundaries`, formatting and `git diff --check`
+also passed. The six skipped cleanup regressions remain unresolved.
