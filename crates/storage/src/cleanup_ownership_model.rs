@@ -5,9 +5,12 @@
 //! One owner/shard, two exact duplicate deliveries, one cutoff, one frontend
 //! crash and one data-node restart. Each action is a proposed atomic boundary.
 //! Ordered object-PG decisions and durable data-node closure are assumptions;
-//! replica fanout, clock rebinding and route migration require later models.
+//! The fanout child adds independent data-node closure and healthy clock offsets;
+//! metadata-replica fanout, clock faults and route migration remain unmodelled.
 
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
+
+mod fanout;
 
 #[derive(Clone, Copy, Debug)]
 enum Protocol {

@@ -24,6 +24,10 @@ adds an independent abstract comparison of bounded-cutoff and durable-revocation
 protocols using this explorer. It includes per-delivery physical write phases,
 restart, pending ownership, and independent unsafe mutations. It does not execute
 production transitions or resolve the six ignored production regressions.
+Its data-node fanout extension adds two target locations, partial closure and
+deletion replies, one unavailable/restarted target, fixed healthy clock offsets,
+abstract absolute-deadline rebinding, and raw-route renewal. It is not a composed
+metadata-replication or production-clock proof.
 
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.

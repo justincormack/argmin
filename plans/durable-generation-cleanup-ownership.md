@@ -252,8 +252,10 @@ progress with successful scheduled delivery and release.
 
 ### Remaining modelling gates
 
-Before selecting a production protocol, add multi-node fanout and partial durable
-closure; real independent-clock/skew/rebinding assumptions; owner renewal and
+The fanout extension below now covers two data nodes, partial durable closure,
+and fixed healthy clock offsets with abstract absolute-cutoff rebinding. Before
+selecting a production protocol, add metadata-replica fanout; production clock
+binding/health, clock faults, and authority re-establishment; owner renewal and
 bounded append horizons; owner creation and crash-before-session windows;
 publication-start/response-loss/abandonment; multiple subjects and generations;
 route/history changes; whole-MPU abort; revocation retirement; and bounded healthy
@@ -270,3 +272,91 @@ cutoff candidate exhausted 2,043 states / 5,810 transitions; the revocation
 candidate exhausted 3,488 states / 11,003 transitions. All six unsafe mutations
 produced their independently expected counterexamples. These counts apply only
 to the explicit assumptions and bounds above, not production safety or liveness.
+
+## Data-Node Fanout and Clock Extension — 2026-10-29
+
+[`cleanup_ownership_model/fanout.rs`](../crates/storage/src/cleanup_ownership_model/fanout.rs)
+is a separate abstract submodel starting with a cancelled durable owner and one
+already-dispatched write for each of two shard locations. It explores two
+different shard locations, not a metadata replication quorum. The parent model
+retains command installation/application and duplicate-write coverage; these
+models are not yet one composed proof.
+
+### Added boundaries
+
+- Revocation, draining admitted IO, receiving the closure reply, deleting a
+  shard, and receiving the deletion reply are independent events per target.
+  Cleanup requires **all** target closure replies, not quorum evidence. Owner
+  retirement requires all deletion replies. Reservation-release retry remains
+  in the parent model; the fanout model abstracts that step after confirmed
+  physical deletion.
+- Node 1 can become unavailable and restart once. Other-node closure/deletion
+  continues where enabled, but unavailable-target work remains owned. Restart
+  terminates admitted local IO, retains durable revocation/file/ack state, and
+  discards process-local deadline bindings. An unadmitted request survives and
+  can arrive after restart. Reply delivery in this submodel requires an online
+  node; arbitrary in-flight response delivery across a crash remains future work.
+- Both nodes use distinct monotonic origins; node 1 changes origin on restart.
+  Deadline binding and write admission are separate actions. A delayed frame
+  binds its immutable **absolute** portable cutoff against receiver wall time,
+  not a transported duration or a sender-monotonic timestamp.
+- One raw-route renewal is allowed, but cannot change the captured write cutoff.
+  This tests separation from raw-route renewal, not durable owner/append lease
+  renewal, which still needs a model.
+
+### Clock assumptions and cleanup proof
+
+Time has nine values (ticks 0 through 8). Healthy clocks advance at equal rates
+with fixed offsets; the pairwise skew bound is two abstract units. Three explicit
+offset profiles place either target behind the cleaner by the full skew budget,
+or put the cleaner behind a target. These are boundary cases, not an exhaustive
+clock-fault model. Monotonic origins are 100 and 10,000, changing to 1,000 for
+node 1 after restart. Arithmetic is model-owned, not the production binder or
+wire codec, and does not redefine their shortening policy.
+
+Let `D` be the already-issued portable write cutoff. A receiver admits only before
+its bound local deadline. To prove every receiver has passed `D` using the
+cleaner's healthy clock alone, cutoff cleanup waits for `cleaner_wall >= D + skew`.
+It then obtains per-node quiescence acknowledgements. The extra cleanup margin
+accounts for a cleaner ahead of a data node; it is not another shortening of the
+write's admission deadline. Revocation permits earlier cleanup after every node
+has durably closed admission and drained IO, while ordinary deadline enforcement
+still applies to requests. Neither candidate treats expiry/revocation as cancelling
+an already-admitted filesystem operation.
+
+### Independent evidence
+
+Required reachable states include partial closure while node 1 is unavailable,
+successful persistence on both nodes, deleted shards with no deletion replies,
+and completed cleanup after restart plus raw-route renewal. Ordered canaries pin
+the slow-node admission window at the cleaner's numerical cutoff, rejection after
+the conservative boundary, binding before renewal, rebinding after restart, and
+early revocation cleanup without advancing time. They also assert that partial
+closure cannot claim cleanup and missing deletion acknowledgement cannot retire
+the owner.
+
+Six separate negative controls must produce their named violation: omitted
+cleanup skew, partial closure acceptance, borrowing the renewed route deadline,
+restarting the original duration on receipt, losing revocation on restart, and
+retiring the owner before deletion replies. The resource cap is 750,000 states
+per exploration, and exhaustion of that cap fails the test.
+
+This does not model quorum metadata apply, clock jumps/unhealthy clocks, raw TLS
+transport, dynamic route changes, tombstone retirement, deletion durability after
+power loss (DUR-3), or eventual recovery under fair scheduling. Successfully
+persisted effects remain durable by assumption. No production fix is claimed.
+
+Focused validation (2026-10-29): all seven parent/fanout tests passed, including
+all twelve independent unsafe variants and the ordered boundary canaries.
+
+| Protocol | Cleaner / data-node offsets | States | Transitions |
+| --- | --- | ---: | ---: |
+| Cutoff | +1 / (-1, 0) | 34,676 | 129,212 |
+| Cutoff | +1 / (0, -1) | 36,838 | 136,377 |
+| Cutoff | -1 / (+1, 0) | 35,704 | 127,308 |
+| Revocation | +1 / (-1, 0) | 71,916 | 287,442 |
+| Revocation | +1 / (0, -1) | 75,086 | 298,173 |
+| Revocation | -1 / (+1, 0) | 97,612 | 389,176 |
+
+Each graph exhausted below the resource cap. These counts are coverage of the
+declared abstraction, not comparative production performance measurements.
