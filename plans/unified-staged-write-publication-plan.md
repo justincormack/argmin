@@ -51,6 +51,13 @@ their metadata commands with each other.
 
 ### Shared cleanup investigation before further implementation
 
+The [2026-10-29 design evaluation](durable-generation-cleanup-ownership.md#design-evaluation--2026-10-29)
+compares extending existing ownership records against a dedicated staging owner,
+and bounded write cutoffs against explicit data-node revocation. Its initial
+safety model is abstract only. Select the common contract before treating the
+multipart-root design below as an implementation prescription; publication
+unification and the small-part optimization remain outside the first fix slice.
+
 The [durable cleanup findings](durable-generation-cleanup-ownership.md) must be resolved through
 this plan rather than a direct-PUT-only physical write lifecycle. The unfinished metadata-owner
 and node-ticket prototypes have been removed. Only issue documentation and permanent regression

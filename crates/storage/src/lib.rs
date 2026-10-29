@@ -24,6 +24,8 @@
 
 #[cfg(test)]
 mod bounded_explorer;
+#[cfg(test)]
+mod cleanup_ownership_model;
 /// Storage layer for argmin2.
 ///
 /// Request-serving code enters storage through [`StorageCluster`]. Storage

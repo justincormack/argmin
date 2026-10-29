@@ -1,6 +1,6 @@
 # Plans and Current Roadmap
 
-Last reviewed: 2026-10-28.
+Last reviewed: 2026-10-28. Cleanup design/model progress updated: 2026-10-29.
 
 This file is the authoritative entry point for repository plans. It records
 which work is current, what should happen next, and why other proposals are
@@ -80,7 +80,7 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Implement shared write/cleanup exclusion and enable all six ignored regressions. | Highest-priority known correctness gap. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Compare cutoff/revocation protocols in the initial abstract safety model; next add partial fanout and independent-clock/renewal cases before selecting a production contract. | Highest-priority known correctness gap; all six ignored production regressions remain unresolved. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |

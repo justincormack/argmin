@@ -7,7 +7,8 @@
 > shared write/cleanup exclusion contract and enable all six ignored
 > regressions; see [`plans/README.md`](README.md#active-plan-inventory).
 
-Status: regression evidence only. The unfinished fix has been removed; no new
+Status: production regression evidence plus initial abstract design modelling.
+The unfinished production fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
@@ -104,3 +105,168 @@ ticket, or scanner design in the unification plan before production integration.
 Measure changes to small-PUT metadata cost and follow the versioning guide for
 any eventual durable or wire-format changes. Fix-only tests for the removed
 prototype are not retained as evidence for existing production behavior.
+
+## Design Evaluation — 2026-10-29
+
+No production protocol is selected yet. Evaluate two independent obligations:
+durable cleanup ownership after caller loss, and physical exclusion of delayed
+writes after cleanup. A cleanup record alone does not establish exclusion.
+
+### Durable owner alternatives
+
+1. **Extend existing reservations/sessions (preferred starting point).** Persist
+   exact attempt/generation and bucket-incarnation identity, owner authority,
+   cancellation/expiry evidence, command ownership, cleanup/release responsibility,
+   and required historical route references with the existing creation operation.
+   Reusing bucket-write authority is a candidate, not permission to make an
+   unfenced cross-PG check followed by deletion. Cancellation is an acceleration
+   signal; loss before that signal persists must still leave discoverable work.
+2. **Dedicated staging owner.** Create a common durable staging record before
+   writes, separate from stream progress. This makes ownership explicit but may
+   add replicated metadata work to every small PUT. Compare piggybacking creation
+   on the existing reservation transaction against a separate command.
+3. **Retry queues/scanning alone: insufficient.** Process-local retries vanish on
+   restart; an intent written only after failure has a crash gap; age does not
+   distinguish a slow live owner from an abandoned one. Scanners are discovery
+   aids and must obtain authoritative exclusion before deletion.
+
+Neither owner representation by itself closes the physical file/manifest crash
+window. Safe orphan discovery remains necessary, including files without rows.
+
+### Physical exclusion alternatives
+
+| Candidate | Required contract | Cost / open question |
+| --- | --- | --- |
+| Explicit revocation | Each target durably closes the exact staging identity, serializes closure against write admission, drains admitted writes, and rejects delayed duplicates after restart. | Extra durable state/RPCs; revocation evidence cannot be retired until old messages are independently inadmissible. |
+| Bounded write authority | An immutable cutoff bounds every dispatched write; cleanup waits until no node can admit it and drains admitted operations through file and acknowledgement persistence. | Delayed reclamation, clock-health assumptions, and retention of the maximum outstanding authorization horizon. |
+| Hybrid | Explicit revocation allows early cleanup; cutoff supplies a recovery backstop. | Both protocols and their proof obligations; defer unless measured cleanup latency justifies it. |
+
+Compare existing-record ownership with each of the first two exclusion options.
+The initial preference is bounded authority if bounded delayed reclamation is
+acceptable, not a final architecture decision. Ordinary route/owner renewal must
+not extend a previously dispatched write's cutoff. Stream appends may need
+separately bounded authorities whose outstanding horizon survives abort.
+
+Transport uses the established absolute conservative wall-clock upper bound,
+shortened for inter-host skew and rebound to receiver-local monotonic time, never
+a remaining duration or a serialized monotonic timestamp. Clock uncertainty
+defers reclamation. A write admitted before expiry can still finish afterward:
+local exclusion must last through file publication and acknowledgement persistence.
+Replica apply compares immutable command evidence and does not evaluate clocks
+or perform availability-dependent cross-PG reads.
+
+### Ownership and completion rules
+
+- Persist responsibility before effects requiring cleanup, not inside Drop.
+- Serialize fresh terminal installation against cleanup adoption on the object
+  PG; exact pending/committed commands protect their payload through ambiguity.
+- Retain durable retry responsibility through deletion and exact reservation
+  release, including unavailable nodes and multiple route transitions.
+- Missing or unavailable ownership observations do not authorize reclamation.
+- An unavailable target must not retain frontend admission indefinitely or starve
+  unrelated PGs. Physical cleanup can remain durably pending.
+- Distinguish cancellation acceptance from completed physical cleanup. A cutoff
+  design must not quietly weaken the existing release/abort regression contract.
+- Data-node revocation retirement, if used, needs an independent proof that old
+  messages cannot regain authority; process-local locks or finite tombstone age
+  are not that proof.
+
+### Evaluation gates
+
+1. **Safety model:** explicitly separate dispatch, remote admission, file
+   publication, acknowledgement persistence/delivery, pending installation,
+   publication-start, cancellation, expiry, cleanup, and release. Explore
+   delayed delivery before admission as well as already-admitted writes.
+2. **Production replay:** enable the six ignored regressions without manual
+   maintenance retries. Add live-owner, pre-session cancellation, restart,
+   response-loss/partial-fanout, whole-MPU-abort, delayed-duplicate, and multi-route
+   transition cases. Assert files and durable rows independently.
+3. **Recovery progress:** state healthy-delivery, scheduling, and clock-progress
+   assumptions. Bound work per PG, preserve obligations on errors, and include
+   ENOSPC/recovery-headroom requirements from DUR-5.
+4. **Cost:** measure metadata commands, replica writes, fsyncs and RPCs per attempt,
+   retained state, cleanup delay/abandoned bytes, 4 KiB PUT, and 8 MiB UploadPart.
+
+Keep terminal publisher unification and small-UploadPart optimization out of the
+first correctness slice. Update the detailed unification proposal after selecting
+the shared contract; its multipart-root design is not an implemented prerequisite.
+
+## Initial Safety Model
+
+The storage-owned, test-only
+[`cleanup_ownership_model.rs`](../crates/storage/src/cleanup_ownership_model.rs)
+uses the existing bounded explorer to compare cutoff and explicit-revocation
+protocols. This is an **independent abstract model**, not an implementation test
+or evidence that either protocol is production-ready. The six production bug
+regressions remain ignored and unresolved.
+
+### State and atomic boundaries
+
+The initial state assumes one already-durable owner/reservation, one exact
+payload/shard, and two possible duplicate write deliveries. Durable file and
+acknowledgement state are separate. Each delivery advances independently through
+dispatch, data-node admission, file persistence, acknowledgement persistence,
+local exclusion release, and optional frontend receipt delivery. An admitted
+operation can finish after the cutoff: this deliberately exercises the stronger
+requirement to drain in-flight IO, rather than assuming expiry cancels IO.
+
+Cancellation persistence is separate from frontend loss. Frontend loss does not
+persist cancellation or withdraw transport messages. One data-node restart
+terminates admitted volatile operations but preserves files, acknowledgements,
+and durable revocation; messages not yet admitted can still arrive. One release
+failure preserves the owner, followed by optional restart and successful retry.
+
+Object-PG terminal installation and cleanup claiming are assumed serialized.
+Pending installation immediately protects the exact payload; application is a
+separate event and can succeed after frontend loss. The model deliberately does
+not allow abandoning a pending command, conservatively protecting it until later
+modelling separates authoritatively unstarted and irrevocable publication.
+
+For cutoff cleanup, the one expiry event represents the point after which all
+healthy nodes must reject this immutable write authority. For revocation, closure
+is a durable data-node event serialized against admission, followed by draining
+existing exclusion holders. No revocation retirement is modelled.
+
+### Properties and negative controls
+
+- Pending/committed payload retains both its file and acknowledgement and cannot
+  be claimed for cleanup.
+- Deleted payload cannot reappear, including delayed duplicate requests.
+- Reservation-release responsibility cannot disappear while the reservation exists.
+- Required reachable states cover live staging, command application after caller
+  loss, admitted IO across cutoff, rejected deliveries with completed cleanup,
+  retry/restart after release failure, and cancellation before any physical write.
+- Explicit ordered traces additionally pin delivery rejection **after** cleanup
+  and restart, and prevent cleanup while the second duplicate still holds exclusion.
+
+Independent mutations remove cutoff waiting, in-flight draining, durable
+revocation across restart, durable responsibility on release failure, pending
+ownership protection, or the terminal-install/cleanup exclusion. Each must produce
+its own expected safety violation; a shared failing fixture is not sufficient.
+
+The graph is explored to exhaustion with a 250,000-state resource cap per run;
+hitting the cap is a failure, not a successful bounded proof. Time has two
+values (before/after cutoff); no allocation identity wraps. There is no fairness
+or eventual-progress proof. Cleanup reachability only demonstrates possible
+progress with successful scheduled delivery and release.
+
+### Remaining modelling gates
+
+Before selecting a production protocol, add multi-node fanout and partial durable
+closure; real independent-clock/skew/rebinding assumptions; owner renewal and
+bounded append horizons; owner creation and crash-before-session windows;
+publication-start/response-loss/abandonment; multiple subjects and generations;
+route/history changes; whole-MPU abort; revocation retirement; and bounded healthy
+recovery tails. File-sync failure, orphan discovery, ENOSPC and physical filesystem
+recovery remain production replay/UAT obligations. The model currently assumes
+successful persistence actions are durable and that restart ends local IO.
+
+```bash
+cargo nextest run -p storage -E 'test(cleanup_ownership_model)' --success-output immediate
+```
+
+Initial focused validation (2026-10-29): all three tests passed. The correct
+cutoff candidate exhausted 2,043 states / 5,810 transitions; the revocation
+candidate exhausted 3,488 states / 11,003 transitions. All six unsafe mutations
+produced their independently expected counterexamples. These counts apply only
+to the explicit assumptions and bounds above, not production safety or liveness.

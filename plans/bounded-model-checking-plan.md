@@ -19,6 +19,12 @@ remain open; overlapping payloads and concurrent recovery are not yet modelled.
 
 ## Goal
 
+2026-10-29: the [cleanup ownership design evaluation](durable-generation-cleanup-ownership.md#initial-safety-model)
+adds an independent abstract comparison of bounded-cutoff and durable-revocation
+protocols using this explorer. It includes per-delivery physical write phases,
+restart, pending ownership, and independent unsafe mutations. It does not execute
+production transitions or resolve the six ignored production regressions.
+
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.
 Start with a small production-connected model, demonstrate detection of a
