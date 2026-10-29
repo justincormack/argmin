@@ -218,9 +218,10 @@ failure preserves the owner, followed by optional restart and successful retry.
 
 Object-PG terminal installation and cleanup claiming are assumed serialized.
 Pending installation immediately protects the exact payload; application is a
-separate event and can succeed after frontend loss. The model deliberately does
-not allow abandoning a pending command, conservatively protecting it until later
-modelling separates authoritatively unstarted and irrevocable publication.
+separate event and can succeed after frontend loss. The initial model deliberately
+does not allow abandoning a pending command, conservatively protecting it. The
+later publication extension separates authoritatively unstarted abandonment from
+irrevocable publication and composes those events with its physical transitions.
 
 For cutoff cleanup, the one expiry event represents the point after which all
 healthy nodes must reject this immutable write authority. For revocation, closure
@@ -256,11 +257,14 @@ The fanout extension below covers two data nodes, partial durable closure,
 and fixed healthy clock offsets with abstract absolute-cutoff rebinding. The
 renewal extension separately covers one durable horizon extension, delayed
 renewal replies, and abstract detected clock faults/trusted resynchronization.
-Before selecting a production protocol, compose metadata-replica fanout and
-publication recovery; exercise production clock binding/health and authority
+The publication extension composes three metadata replicas and recovery with
+the initial physical-cleanup model, including publication-start, lost replies,
+and safe abandonment. Before selecting a production protocol, combine that
+composition with renewal/all-node closure; exercise production clock binding/health
+and authority
 re-establishment; extend renewal to multiple append horizons and compose it with
 all-node closure; add owner creation and crash-before-session windows;
-publication-start/response-loss/abandonment; multiple subjects and generations;
+multiple subjects and generations;
 route/history changes; whole-MPU abort; revocation retirement; and bounded healthy
 recovery tails. File-sync failure, orphan discovery, ENOSPC and physical filesystem
 recovery remain production replay/UAT obligations. The model currently assumes
@@ -441,4 +445,94 @@ No production mutation path, format, or ignored regression changes in this slice
 
 Slice validation: all 11 cleanup-model tests passed; full Nextest passed all
 9,019 tests (one slow, six skipped) in 239.080 seconds. Workspace all-targets /
+all-features Clippy with `-D warnings`, formatting, and `git diff --check` passed.
+
+## Publication/Recovery Composition — 2026-10-29
+
+[`cleanup_ownership_model/publication.rs`](../crates/storage/src/cleanup_ownership_model/publication.rs)
+reuses the initial model's actual physical-transition generator, replacing only
+its atomic install/apply abstraction. It adds the publication ordering described
+in [metadata-command-stream.md](../guides/metadata-command-stream.md#normal-flow).
+This remains an **abstract design model**, not execution of the production
+publisher or the separate production-connected publication pilots.
+
+### State and boundaries
+
+The initial state contains one durable owner/reservation, one already-written
+payload with file and acknowledgement present, and one duplicate write in
+transport. Metadata has three fixed replicas: witness, primary, and trailing.
+There is one exact command identity and no competing command or route change.
+
+- Frontend pending-install dispatch, primary acceptance, and reply delivery/loss
+  are separate events. Acceptance rechecks the captured expiry and cleanup state;
+  a response lost before acceptance does not withdraw the request. Acceptance can
+  still occur after frontend loss, leaving a discoverable exact pending owner.
+- The primary publication-start marker persists before any witness dispatch.
+  Marking alone forbids abandonment, even with no replica rows or dispatched apply.
+  Recovery of a marked command continues after request expiry and cancellation;
+  these are not fresh publication authority.
+- Replica dispatch, apply, reply receipt/loss, and exact-row observation are
+  separate events. Lost replies can precede remote apply or follow durable apply.
+  Witness confirmation precedes primary dispatch, which precedes trailing dispatch.
+  Observation certifies exact durable application without requiring the original
+  response. Absence of a replica row cannot undo a publication marker.
+- One primary restart preserves pending intent, marker, and replica rows while
+  discarding cached confirmations. It does not retract in-flight remote requests.
+  Frontend loss and activating an authorized recovery worker are separate events;
+  the model assumes that recovery authority is valid.
+- Authoritatively unstarted abandonment atomically records the terminal decision,
+  retains the existing durable owner as cancelled cleanup work, and removes the
+  pending slot. It does **not** revoke shard authority or waive cutoff waiting.
+  Physical cleanup and reservation release then use the earlier model's events,
+  including release failure and data-node restart.
+- Applied metadata continues protecting the payload after slot removal. Slot
+  removal requires all replica confirmations and successful reservation release;
+  failed release retains the slot and its retry responsibility.
+
+The model treats abandonment's durable decision/cleanup handoff as one atomic
+ownership boundary. It does not yet model replication of abandonment tombstones
+or the implementation of that transaction. Primary restart is an atomic reopen
+event, not a model of metadata-node downtime, torn writes, or election. Existing
+physical restart terminates local IO and preserves files/acknowledgements by
+assumption. Unknown/crossed command evidence is not represented: all observations
+refer to the one exact command. These assumptions must be checked during production
+realization, not inferred from graph exhaustion.
+
+### Independent checks and evidence
+
+Invariants protect payloads whenever the pending slot or **any** applied replica
+references them, prohibit abandonment after publication-start, retain the slot
+through partial replica convergence, and require a durable witness before primary
+publication. The parent invariants additionally prohibit payload resurrection and
+loss of reservation-release responsibility.
+
+Required witnesses cover lost installation replies after frontend loss, marked
+intent without replica rows after restart, lost witness replies, recovery of
+trailing replicas, terminal release failure, and abandoned cleanup after release
+failure/data restart. Ordered canaries independently check marker-only protection
+before any dispatch, an in-flight apply with no visible row, exact recovery after
+lost replies at all three replicas, release failure retaining the slot, and no
+cleanup of committed payload after slot removal. The abandonment canary verifies
+that neither safe abandonment nor a delayed install bypasses physical closure;
+the delayed duplicate is rejected after cleanup and data restart.
+
+Seven separate unsafe variants must produce their expected violations: treating a
+lost install reply as release of ownership, abandoning marked intent with no rows,
+forgetting the marker on restart, dropping the owner during abandonment, clearing
+the slot before convergence, forgetting committed ownership, and installing during
+cleanup. These are independent runs, not one shared failing schedule.
+
+Focused graph evidence (2026-10-29): cutoff exhausted 714,270 states / 3,914,237
+transitions; revocation exhausted 717,708 states / 3,929,534 transitions. Both are
+below the explicit 750,000-state cap; exceeding it fails the test. The explored
+bound includes one frontend loss, one primary reopen, one data-node restart,
+one release failure, and one dispatch per replica. Exact-row observation stands
+in for idempotent recovery; repeated RPC delivery is not independently modelled.
+
+This composes publication with the original physical cleanup model, **not yet**
+with two-target fanout, clock faults, or owner renewal. It does not prove liveness,
+select a production owner schema, or resolve any of the six ignored regressions.
+
+Slice validation: all 15 cleanup-model tests passed. Full Nextest passed all
+9,023 tests (one slow, six skipped) in 234.486 seconds. Workspace all-targets /
 all-features Clippy with `-D warnings`, formatting, and `git diff --check` passed.

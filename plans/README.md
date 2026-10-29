@@ -80,7 +80,7 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Abstract closure, clock-fault, and durable owner-renewal models added; next compose metadata publication/recovery, then connect clock and cleanup assumptions to production before selecting a contract. | Highest-priority known correctness gap; all six ignored production regressions remain unresolved. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Abstract publication/recovery now composes with physical cleanup; next combine renewal/all-target closure and audit production realization of the assumed boundaries before selecting a contract. | Highest-priority known correctness gap; all six ignored production regressions remain unresolved. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |

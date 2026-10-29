@@ -34,6 +34,11 @@ restart, forward/backward clock faults, and an abstract health latch/trusted
 resynchronization boundary. Its six unsafe variants each require an independently
 named counterexample. Production clock monitoring and authority recovery are
 assumptions here, not implementations exercised by the model.
+The publication extension reuses the initial cleanup model's physical transitions
+and adds separate pending-install, publication-marker, witness/primary/trailing
+dispatch/apply/reply, abandonment handoff, and terminal release events. This is an
+abstract composition, separate from the production-connected publication pilots
+below; it does not yet compose two-node closure or owner renewal.
 
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.
