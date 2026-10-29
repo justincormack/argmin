@@ -508,10 +508,16 @@ this guide as part of their implementation:
   a durability batcher and, in a later design, append-only shard logs. An append
   log would be a new authoritative format with offsets, tail recovery,
   compaction, and garbage-collection rules.
+- [Durable cleanup ownership](../plans/durable-generation-cleanup-ownership.md#proposed-production-contract--2026-10-29)
+  proposes common per-object-PG owner/grant/segment-intent records and cutoff-based
+  exclusion for both shard-file writes and separate acknowledgement registration.
+  It retains closure provenance through publication/reclaim and depends on durable
+  unlink confirmation (DUR-3) and capacity/recovery headroom (DUR-5). This is a review
+  proposal, not the current protocol.
 - [Unified staged write publication](../plans/unified-staged-write-publication-plan.md)
-  proposes durable multipart cleanup roots and staging leases. These belong in
-  per-PG SQLite, but add new cross-store ownership and acknowledgement
-  boundaries with shard files.
+  remains blocked on that shared contract. Its multipart optimization roots must
+  be reconciled with the accepted owner protocol, not implemented as a second
+  cleanup mechanism.
 - [Versioned physical shard files](../plans/deferred/versioned-physical-shard-files-option.md)
   would replace the current one-logical-key/one-path assumption with a durable
   logical-to-physical generation mapping.

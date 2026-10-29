@@ -58,6 +58,15 @@ safety model is abstract only. Select the common contract before treating the
 multipart-root design below as an implementation prescription; publication
 unification and the small-part optimization remain outside the first fix slice.
 
+The later [concrete cleanup contract proposal](durable-generation-cleanup-ownership.md#proposed-production-contract--2026-10-29)
+uses common object-PG owner/grant/segment-intent records, finite staging cutoffs,
+and closure of both file-writing and acknowledgement-registration participants.
+It also retains writer-closure provenance through successful publication and
+subsequent reclaim. It is for review, not an implemented or approved protocol.
+The multipart-root/state-machine subsections below remain blocked optimization
+candidates: reconcile them with the accepted shared contract before resuming,
+rather than introducing a second owner or physical exclusion protocol.
+
 The [durable cleanup findings](durable-generation-cleanup-ownership.md) must be resolved through
 this plan rather than a direct-PUT-only physical write lifecycle. The unfinished metadata-owner
 and node-ticket prototypes have been removed. Only issue documentation and permanent regression
@@ -124,12 +133,13 @@ retained cleanup authority, and durably installs the multipart cleanup root desc
 capability then accumulates the exact shard-write acknowledgements while that root remains the
 crash-safe cleanup owner.
 
-`StagedStandardObjectPayload` preserves the existing request-owned standard-object protocol:
-exact shard-write acknowledgements, reference-checked cleanup after ambiguous installation, and
-ownership transfer to `CommitStandardObject`. Unifying its terminal publisher must not add a
-cleanup-root command or another metadata cycle to small PutObject. Replacing that ownership
-protocol would require a separate measured design change; it is not implied by the multipart
-root introduced here.
+`StagedStandardObjectPayload` preserves the request-owned single-segment **fast path**, not the
+currently incomplete cleanup protocol. Its exact acknowledgements and publication transfer must
+use the shared durable ownership/exclusion contract once accepted. The current proposal piggybacks
+direct owner/grant/intent creation on the existing generation-reservation command, but adds cold
+confirmation and later closure work that must be measured. Terminal unification itself must not
+incidentally add another small-PUT metadata cycle. These correctness changes are separately
+reviewed under the cleanup plan, not implied by the multipart optimization root below.
 
 ### One standard-object publisher
 

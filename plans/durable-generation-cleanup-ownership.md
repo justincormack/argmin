@@ -7,7 +7,8 @@
 > shared write/cleanup exclusion contract and enable all six ignored
 > regressions; see [`plans/README.md`](README.md#active-plan-inventory).
 
-Status: production regression evidence plus initial abstract design modelling.
+Status: production regression evidence, bounded design modelling, and a concrete
+[contract proposal for review](#proposed-production-contract--2026-10-29).
 The unfinished production fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under
@@ -654,3 +655,354 @@ replica-deterministic apply, format/version evidence, worker recovery/ENOSPC, an
 small-PUT command/fsync cost. Then review that contract before production changes
 and replay the six ignored regressions plus the new cross-boundary schedules.
 The model counts are not a reason to skip the remaining gates above.
+
+## Proposed Production Contract — 2026-10-29
+
+**Review proposal, not approved architecture or implemented behavior.** Use a
+common object-PG durable owner, created with existing allocation/session commands,
+and finite write-authority cutoffs. Do not add early data-node revocation in the
+first implementation. Cancellation stops new grants, but physical deletion waits
+for the maximum granted cutoff and quiescence of every effect participant.
+
+This replaces the assumption that a live frontend cleanup handle is sufficient.
+It is a separately measured correctness change, not permission to unify terminal
+publishers or optimize UploadPart in the same slice. The abstract models support
+parts of this contract; they do not yet cover the full schema/protocol below.
+
+### 1. Durable records and ownership identity
+
+Evolve the existing generation-reservation storage into a common
+`payload_staging_owners` relation on the object's metadata PG. Stream sessions
+reference that owner rather than being its only lifetime anchor. A row must
+survive removal of its session or pending slot when cleanup is unfinished.
+
+The exact immutable subject is `(bucket, bucket_incarnation, key, generation,
+attempt_id, target)`. `target` is a closed enum: direct PutObject, streamed
+PutObject, or UploadPart with exact upload ID and part number. Attempt IDs are
+storage-minted; generation allocation remains durable and non-recycling. Neither
+same-key generation substitution nor a renewed route creates another owner.
+
+The owner stores:
+
+- its creation command identity, origin object-PG/epoch, target, and immutable
+  subject; creation/retry compares the complete identity;
+- the exact stable bucket-write reservation identity and bucket-PG route needed
+  for eventual release; mutable heartbeat deadlines are not reservation identity;
+- owner state, grant sequence and monotone maximum **issued-or-issuable** portable
+  wall cutoff; a durable grant counts even if its reply is lost;
+- the authoritative terminal-command binding when applicable, and cleanup claim
+  identity/generation; primary-local pending-slot ownership is distinguished from
+  replicated owner state;
+- exact cleanup participant identities and durable progress, or references to
+  the child records below. Failure diagnostics do not replace progress evidence.
+
+Add owner-scoped grant and segment-intent child relations in the same SQLite PG.
+A grant records sequence, immutable cutoff, allowed target/placement domain and
+allocation bounds. A segment intent records exact segment identity, codec/size
+geometry, EC shape, placement epoch/data PG, file locations, and acknowledgement
+metadata locations. Intent creation precedes physical dispatch. Distinguish a
+file-owning node from the data-PG primary that registers its acknowledgements.
+
+For direct single-segment PUT, piggyback owner, initial grant, and segment-zero
+intent on `ReserveObjectGeneration`; the request supplies codec/size/EC inputs
+and storage derives locations after allocating the generation. Encryption may
+follow allocation; the initial intent need not know ciphertext CRC. It must bind
+the exact allowed byte length and identity, while write validation and the later
+integrity witness bind the actual bytes. This needs **no separate owner-creation
+command** on the successful small-PUT path.
+
+For streamed PUT and UploadPart, piggyback owner/initial grant on the existing
+generation/session creation workflow. Replace primary-local append-ID allocation
+with a replicated `AuthorizePayloadSegment` command that allocates the exact
+segment identity and persists its intent before returning write authority. It may
+also extend the grant horizon. This is one command per prepared segment, not per
+shard; it is an explicit additional streaming cost, not a free fixture change.
+Do not claim cross-replica recovery from a primary-only allocator update.
+
+Original owners, grants, and intents participate in metadata digests/checkpoints.
+Roots/children are never reconstructed from filesystem age or caller-supplied
+shard lists. This records intended final paths even when a caller dies before
+publishing a completed segment manifest. Orphan/tmp-file scanning remains needed
+for artifacts outside that inventory; this is not an assertion of cross-store
+transactions or elimination of all orphan windows.
+
+### 2. Owner states and primary serialization
+
+Use closed typed states with schema constraints, not independent permissive flags:
+
+| State | Permitted progress / retained responsibility |
+| --- | --- |
+| `Open` | Authorize segments/renew grants, install an exact terminal command, or seal against future grants. |
+| `SealedUnpublished` | No new grants or terminal installation. Preserve all previously granted cutoffs and segment intents until physical closure. |
+| `PublishedDraining` | Payload has been published; retain writer closure and all live/reclaim references, including after a later overwrite removes the live reference. No physical deletion or fresh grants. |
+| `ClosedPublished` | All staging effects are closed; retain exact closure provenance while live/history/MPU metadata still references payload. |
+| `CleanupReady` | Writes are closed and authoritative local metadata proves the selected intent set unreferenced; durable cleanup may be claimed. |
+| `Cleaning` | Claim owns exact file/ack locations and retains retries across failures. |
+| `PayloadDeleted` | Every required file/row deletion is confirmed durable; exact reservation release and final retirement remain. |
+
+Only the primary decides clock-dependent expiry before installing a transition.
+Replicas validate exact owner/grant sequence, immutable cutoff, state, and command
+evidence without consulting their clocks or doing remote shard reads. Old grants
+cannot be forgotten when advancing state. Transitions and proofs cannot switch
+bucket incarnation, generation, attempt, upload, part, or authorized target set.
+
+Under the same object-PG command serialization and SQLite transaction boundary:
+
+- terminal installation checks `Open`, exact owner/intents, and its immutable
+  admitted effect fence, then installs the owner-bound pending command;
+- grant extension and cancellation/expiry adoption inspect that same pending
+  state; they cannot grant fresh authority or claim cleanup around an unresolved
+  terminal command;
+- an exact pending command protects its owner regardless of response delivery;
+  unavailable or contradictory observations are not an absent command;
+- publication-start, any accepted apply, or ambiguous apply requires convergence
+  of that command, not expiry-driven abandonment;
+- only authoritatively unstarted abandonment can atomically record abandonment,
+  preserve/seal the cleanup owner and intents, and remove the pending slot. If
+  cross-replica abandonment is partial, the slot remains recoverable until the
+  handoff is established; never clear it first and enqueue work afterward.
+
+Pending installation is primary-local. Terminal replica apply must therefore
+accept the exact replicated `Open` owner/intents and atomically produce published
+metadata plus `PublishedDraining`; it must not require a primary-only pending
+state on replicas. Exact replay validates the same command/owner relationship.
+After publication, metadata owns the payload but the owner row still carries
+outstanding-write and reservation-release responsibilities.
+
+### 3. Finite authority, renewal and transport
+
+Every staging grant has a finite absolute conservative wall-clock cutoff, even
+on static clusters whose route itself is unbounded. Bound a new grant by both
+the captured route authority and a named maximum staging window `W`. `W` is a
+configuration/schema decision with a finite maximum; choose its default from
+measured admission latency and acceptable cleanup delay before implementation.
+It is not a remaining duration transported to a receiver.
+
+Grant extension is replicated and converged before its authority can escape.
+`AuthorizePayloadSegment` may extend the horizon for the next segment; an idle
+session renewal uses an explicit registered `RenewPayloadStagingAuthority`
+command if needed. Existing bucket-reservation heartbeats alone cannot extend
+physical-write authority. The stored maximum covers every possible outstanding
+grant; losing a reply or restarting never shrinks it. A newly renewed grant does
+not change old prepared writes' deadlines.
+
+For this first candidate, the current grant horizon also bounds the live owner's
+lease. Idle-body keepalives therefore durably renew that lease/grant before it
+expires, even if no new shard is ready; their extra replication cost is explicit.
+Renewal requires a still-live `Open` owner and fresh admitted authority at its
+installation boundary. An expired owner cannot be resurrected merely because
+the sweeper has not yet sealed it. The worker must not infer abandonment from
+`created_at` or from an older individual write's cutoff while a newer owner grant
+is live. Separating idle-owner leases from write grants is a later optimization,
+not an unstated second source of liveness authority.
+
+Frontend preparation returns a storage-owned capability binding owner, grant,
+segment, exact location/ack scope, operation, byte geometry, and cutoff. Node
+clients must not accept free-form combinations of those fields. The wire carries
+the canonical subject and portable cutoff, never process-local monotonic time.
+Receivers validate and bind it once using the established deadline machinery,
+then revalidate under the local effect-admission lock immediately before IO.
+
+For the first protocol, authenticate grants by exact owner-primary confirmation
+over existing authenticated RPC, not by trusting a caller's serialized Rust
+token or introducing an unspecified new signature format. The confirmation binds
+the authenticated requesting participant, owner/grant sequence, segment, operation,
+placement and cutoff to the converged durable record. Positive confirmations may
+be cached for that immutable tuple until its cutoff; absence/timeout is never
+permission. No cross-PG lock is held across the confirmation RPC. Recheck local
+deadline/clock health after it returns and before admitting an effect.
+
+This adds cold confirmation RPCs and availability dependence on the owner
+authority; measure them. A later self-contained signed grant would be a separate
+security/performance design, not an assumed property of ordinary RPC auth.
+Sealing does not invalidate outstanding confirmed grants before their cutoff,
+so caching cannot race early deletion. Cold confirmation after restart still
+requires exact durable evidence and valid current/retained authority; it does
+not mint or renew a grant. An owner missing after retirement cannot confirm one.
+
+### 4. File and acknowledgement effects are separate participants
+
+Use an owner/intent-bound node-local effect registry. Entry validation and guard
+acquisition serialize with closure; every admitted effect holds its guard until
+its local mutation and durability work have finished. No await/network operation
+while holding the registry mutex. A process crash ends local IO; restart cannot
+admit an expired grant merely because its in-memory registry is empty.
+
+Two distinct effect classes must use this protocol:
+
+1. Physical shard creation: guard spans temporary-file IO, final publication and
+   required syncs. Embedded and Unix/TLS staging both use write-if-absent with
+   exact existing-byte validation; delayed writes must not overwrite another
+   value at a published identity.
+2. Acknowledgement registration: the actual acknowledgement-metadata participant
+   acquires its own guard under the **same grant cutoff** through SQLite commit.
+   A delayed registration is a durable effect, not a harmless retry exempt from
+   expiry. Unknown/ambiguous registration retains the owner for inspection.
+
+These are not one imaginary guard held across two different machines. Between
+them, the durable grant and maximum horizon preserve responsibility; cleanup
+cannot start before their common cutoff and must drain **both** effect classes.
+An expired registration may fail after file creation; the durable intent then
+owns that unregistered file's cleanup. Successful acknowledgements remain
+self-contained integrity evidence for terminal command construction; replica
+apply does not synchronously inspect data-PG acknowledgement rows.
+
+Before implementation, inventory maintenance/repair/transfer writers too. Their
+existing retained authorities must interlock with physical deletion through their
+own exact live-reference/reclaim guards; they cannot use an unfenced staging
+fallback or be treated as a fresh grant on a closed owner.
+
+### 5. Closure, publication, and later reclaim
+
+Sealing is a durable command, not completed cleanup. Once the primary can safely
+establish that the maximum portable cutoff has elapsed (including the supported
+cleaner/receiver skew bound), it requests closure from **every** file and
+acknowledgement participant named by the intents. Each participant checks exact
+sealed-owner evidence, its own healthy-clock expiry, and drains admitted effects
+before replying. No quorum shortcut. Uncertain clocks or unavailable targets
+leave durable work pending; they do not keep frontend admission indefinitely.
+
+Closure receipts bind owner/grant horizon, participant and scope. Persist them
+under the owner, or reacquire them after restart before advancement. The
+clock-dependent decision occurs before command installation; replication records
+immutable evidence without independently testing wall time. With cutoff-only
+admission, no durable data-node revocation tombstone is needed: after cutoff and
+quiescence, neither an old request nor restart can admit another staging effect.
+
+Crucially, publication cannot erase this obligation. A published object may be
+immediately overwritten, its version deleted, or its multipart upload aborted
+while an old write is still in transport. Terminal publication records the
+staging-owner provenance in the committed segment/part descriptors. Subsequent
+reclaim inherits it and requires closure of the originating writer **as well as**
+the existing reader/reclaim exclusions. `ClosedPublished` is retained as durable
+closure evidence until the last live/historical/MPU reference and reclaim
+obligation is gone; absence of an owner is not an invented closure receipt.
+
+Multipart completion can assemble parts from several staging owners. It must
+preserve each part's provenance, not replace it with the completed object's
+generation. Part overwrite and whole-MPU abort must hand off all relevant owners
+before removing the only discoverable session/part records. Orphan cleanup must
+not delete an intent referenced by any pending or committed command/version.
+
+### 6. Deletion, release, and API completion
+
+After closure and exact unreferenced-state validation, claim cleanup in the
+object-PG stream. Delete only recorded targets; verify durable row **and** file
+absence independently. Deletion acknowledgement must include the durable unlink
+contract in DUR-3, not just a live `exists() == false`. Data-PG acknowledgement
+deletion and each file location are separate retriable obligations. Record all
+replies before `PayloadDeleted`; on reply loss, repeat exact idempotent deletion
+or observation. Do not retire the owner after a best-effort loop.
+
+Release the exact stable bucket-write reservation through its owning bucket PG.
+Persist confirmation before dropping its route reference. Generation allocation
+authority is sealed with the owner; retain the cleanup record even if a logical
+reservation lookup no longer returns an active reservation. Final owner removal
+requires no references, all deletion confirmations, and no outstanding release.
+Confirmation means exact successful release or authoritative exact-identity
+absence at the required route; a generic bucket-not-found or unavailable-history
+response is not release evidence.
+Published owners may release their terminal reservation after convergence while
+retaining closure provenance; release is not permission to delete their payload.
+
+Keep these return contracts distinct:
+
+- `CancelAccepted`: durable handoff exists; physical work may remain. Drop is
+  bounded and best effort only in delivering this hint, because creation/expiry
+  already made the owner discoverable without it.
+- `CleanupComplete`: all physical/release obligations are durably complete. The
+  existing explicit release/abort regression entry points must retain this
+  meaning on success. They may drive/wait for bounded-cutoff closure without
+  holding frontend publication admission; on exhaustion report pending/failure,
+  never a successful no-op. Do not weaken the six tests to accept cancellation.
+
+The shard cutoff is independent of route validity, so the six delayed-write
+regressions can still assert that the original route remains valid after cleanup.
+Add deterministic owner-local clock/closure controls, not arbitrary sleeps or
+manual release retries. SSE behavior and S3 abort/error precedence remain unchanged.
+
+### 7. Recovery, routes, and capacity
+
+A storage-owned worker discovers owners by durable state/horizon, not by a
+frontend retry queue. Process bounded work per owner/PG, retain the first error
+while attempting unrelated eligible work, and persist progress. Reuse the
+authorized exact-command recovery path for pending/partially published commands;
+the cleanup worker must not forge static or historical recovery authority.
+
+Owner/intents retain exact object-PG epochs, every data/ack route epoch, and the
+bucket-PG reservation epoch until each responsibility is discharged. Include them
+in both route-reference enumeration and compact retention summaries. Test at
+least two map transitions, restart, and a changed primary with outstanding writes
+and release work. Closure observations cannot be transported to a different
+owner incarnation or participant set.
+
+ENOSPC can block the command needed to authorize cleanup or persist release.
+Fail closed; do not unlink unowned candidates to make space. Add admission
+backpressure and explicitly budget recovery headroom for owner transitions,
+command/WAL growth, checkpoints and deletion bookkeeping. Emergency reserve and
+operator recovery policy remain coordinated with DUR-5. The implementation cannot
+claim recovery progress under arbitrary full-disk conditions until that test
+matrix passes; enlarging the cluster is not assumed to be possible without a
+control-plane write.
+
+### 8. Publisher classes, formats, costs, and implementation slices
+
+Owner creation and segment authorization are fresh `SnapshotSensitive` publishers:
+validate exact live subject and admission, drain at most one contender per owner
+iteration, and respect the shared budget. Same-request exact retries converge
+without allocating another owner/segment or extending its cutoff accidentally.
+Publication-start or ambiguous dispatch makes an installed grant command
+irrevocable; recovery first converges it, then seals/cleans if its caller vanished.
+
+Register a sealed owner-transition maintenance family for seal/expiry, closure
+evidence, cleanup claim, deletion progress, and retirement. Its authority is an
+exact durable owner and validated predecessor state, not a raw unbounded request
+fence. Exhaustive outcomes distinguish exact convergence, a single contender,
+stale owner/proof, not-yet-eligible closure, and unavailable retained authority.
+It uses joined exact-command recovery and a bounded worker budget. Add canonical
+IDs/classification to the registry, checker evidence and metadata-command guide
+when implementing; ordinary terminal publisher unification remains deferred.
+
+No version constants change in this documentation slice. Implementation changes
+the PG schema, owner/segment/session/command encodings, checkpoint/digest inputs,
+and storage-RPC payloads/registry. Audit each owning grammar and containing
+version vector under `guides/versioning.md` and `guides/storage-format-ledger.md`;
+advance affected outer versions when their grammar changes. Append manifests,
+complete request/success/error fixtures and resealed rejection evidence; never
+rewrite historical bytes or add compatibility readers/migrations.
+
+| Path | Proposed incremental cost to measure |
+| --- | --- |
+| Successful small direct PUT | More fields/rows in existing reservation/publication transactions; no standalone owner-creation command. Cold participant-to-owner confirmations and later closure work are new. Retaining published closure provenance costs durable space. |
+| Streamed PUT / UploadPart | Replicated segment authorization replaces primary-local preparation; up to one extra command per segment. Piggyback horizon extension where possible; explicit idle renewal has its own cost. |
+| Cancellation/reclaim | Cutoff wait plus all-participant drain, durable progress, deletion and exact release retries. No per-shard consensus command is proposed, but batching progress cannot skip ownership evidence. |
+
+Do not infer that preserving command count preserves fsyncs or latency. Measure
+4 KiB direct PUT and 8 MiB parts, command count, SQLite transactions/fsyncs,
+confirmation/closure RPCs, retained rows/bytes, cleanup latency, unavailable-node
+behavior and recovery throughput. Approve `W` and its limits from these results.
+
+Implement in reviewable slices after contract review:
+
+1. Versioned owner/grant/intent state and exhaustive transition/apply/restart
+   tests, including pre-session crashes and independent cross-subject negatives.
+2. Fenced file **and acknowledgement** effects plus portable deadline confirmation,
+   all-participant closure, and Unix/TLS delayed-admission/IO/restart regressions.
+3. Owner-bound terminal installation, atomic abandonment handoff, and committed
+   provenance through overwrite, version deletion, MPU completion/abort and reclaim.
+4. Discoverable bounded worker, route retention, durability/capacity evidence,
+   and unchanged completion assertions in all six previously ignored regressions.
+5. Cost measurements and acceptance review before enabling the contract across
+   all staging paths. Keep the new path unavailable until its full safety chain
+   exists; format acceptance must not expose a partially implemented owner protocol.
+
+Review gates still include the finite window value, cold-confirmation cost,
+replicated append-preparation cost, exact retained-owner authorization after
+primary changes, successful-publication/overwrite schedules, and DUR-3/DUR-5.
+The model has not proved these production obligations, and this proposal does
+not resolve the six ignored regressions.
+
+Documentation-slice validation: full Nextest passed all 9,028 tests (one slow,
+six skipped) in 237.441 seconds. Strict workspace Clippy, formatting and
+`git diff --check` passed. This verifies the unchanged code baseline, not the
+unimplemented contract described above.
