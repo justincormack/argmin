@@ -28,6 +28,12 @@ Its data-node fanout extension adds two target locations, partial closure and
 deletion replies, one unavailable/restarted target, fixed healthy clock offsets,
 abstract absolute-deadline rebinding, and raw-route renewal. It is not a composed
 metadata-replication or production-clock proof.
+The separate owner-renewal extension explores persistence before grant delivery,
+cancellation serialization, delayed replies, a durable maximum cutoff across
+restart, forward/backward clock faults, and an abstract health latch/trusted
+resynchronization boundary. Its six unsafe variants each require an independently
+named counterexample. Production clock monitoring and authority recovery are
+assumptions here, not implementations exercised by the model.
 
 Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.

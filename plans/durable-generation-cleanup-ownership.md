@@ -252,11 +252,14 @@ progress with successful scheduled delivery and release.
 
 ### Remaining modelling gates
 
-The fanout extension below now covers two data nodes, partial durable closure,
-and fixed healthy clock offsets with abstract absolute-cutoff rebinding. Before
-selecting a production protocol, add metadata-replica fanout; production clock
-binding/health, clock faults, and authority re-establishment; owner renewal and
-bounded append horizons; owner creation and crash-before-session windows;
+The fanout extension below covers two data nodes, partial durable closure,
+and fixed healthy clock offsets with abstract absolute-cutoff rebinding. The
+renewal extension separately covers one durable horizon extension, delayed
+renewal replies, and abstract detected clock faults/trusted resynchronization.
+Before selecting a production protocol, compose metadata-replica fanout and
+publication recovery; exercise production clock binding/health and authority
+re-establishment; extend renewal to multiple append horizons and compose it with
+all-node closure; add owner creation and crash-before-session windows;
 publication-start/response-loss/abandonment; multiple subjects and generations;
 route/history changes; whole-MPU abort; revocation retirement; and bounded healthy
 recovery tails. File-sync failure, orphan discovery, ENOSPC and physical filesystem
@@ -360,3 +363,82 @@ all twelve independent unsafe variants and the ordered boundary canaries.
 
 Each graph exhausted below the resource cap. These counts are coverage of the
 declared abstraction, not comparative production performance measurements.
+
+## Owner Renewal and Clock-Health Extension — 2026-10-29
+
+[`cleanup_ownership_model/renewal.rs`](../crates/storage/src/cleanup_ownership_model/renewal.rs)
+is a separate cutoff-candidate submodel with one durable owner, one data node,
+one old write and one potentially renewed write. It starts before cancellation
+with no pending or committed metadata command. It does not compose the parent
+publication model or the two-node fanout model yet.
+
+### Proposed renewal contract under test
+
+- The owner durably records the maximum cutoff it may issue **before** a renewal
+  reply can escape. Persistence, reply issuance, and delivery/dispatch are
+  distinct events. A lost reply cannot shorten that durable horizon.
+- Renewal persistence and cancellation serialize on the same owner. Cancellation
+  prohibits further horizon extension, but cannot retract a reply already
+  authorized by a preceding durable grant. Such a reply may arrive and dispatch
+  a write after cancellation; cleanup must still honor its cutoff.
+- Renewing the owner gives the new write a later immutable cutoff. It does not
+  extend the old write. This is different from the fanout model's raw-route
+  renewal, which cannot extend either captured write's authority.
+- Cleanup uses the maximum durable horizon plus the cleaner/data-node skew
+  margin, then waits for admitted IO through acknowledgement persistence. It
+  does not use the original cutoff, receipt delivery, or cancellation as proof
+  that all write authority has ended.
+- Owner restart retains the horizon. Data-node IO is independent and can finish
+  while the owner is down. This slice ends at physical deletion; owner retirement
+  and reservation-release retries remain separately covered by the earlier model.
+
+The finite schedule allows one renewal and one owner restart. Reply issuance and
+delivery require an online owner in this submodel; already dispatched data IO
+does not. Delivery of buffered renewal replies during owner downtime remains a
+transport-composition case, rather than a tested guarantee here.
+
+### Clock scope and assumptions
+
+The model explores ticks 0–10, initial/renewed portable cutoffs 14/17, a wall base
+of 10, cleaner offset +1 and data-node offset -1 (pairwise skew 2). One cleaner
+wall jump of either +8 or -8 can occur. Write admission at the healthy data node
+uses the unchanged absolute cutoff; the fanout model separately covers binding
+to receiver-local monotonic clocks. Neither model transports a remaining duration
+or a process-local monotonic timestamp.
+
+Each clock fault is assumed detected at effect admission and latches the owner
+clock unhealthy. Wall correction alone does not restore trust. Owner restart
+enters an unbound clock state, rather than resetting the clock to healthy.
+One explicit **trusted resynchronization** event may restore the original skew
+bound without changing durable horizons or issued cutoffs. This is an assumption
+on the future recovery protocol, not a proposal to clear the existing process
+clock-health latch in place. The model calls neither the production health monitor
+nor the production lease binder. Establishing how fresh authority is obtained,
+handling unavailable clock-health sources, receiver clock faults, and proving
+this abstraction against production are still open gates.
+
+### Evidence and limits
+
+The correct graph must reach delayed renewal delivery after cancellation,
+completed cleanup despite an undelivered durable renewal, and cleanup after both
+restart and clock recovery. Ordered canaries independently pin old-write expiry,
+continued validity of the renewed write, waiting for its in-flight IO, the clock
+latch blocking renewal on an open owner before its initial cutoff, and wall
+correction/restart being insufficient to authorize cleanup.
+
+Six negative controls require their own named violation: issue before persistence,
+lose the horizon on restart, clean using the original cutoff, renew after
+cancellation, trust an unhealthy clock, and trust a clock merely because its
+process restarted. The cleanup-time invariant compares against the independent
+data-node clock, not the cleaner's health flag or chosen cleanup cutoff.
+
+Focused validation (2026-10-29): each healthy-protocol graph exhausted 25,036
+states / 95,567 transitions for the forward and backward jump cases. All six
+negative controls produced their expected counterexamples. The cap remains
+750,000 states per graph; reaching it fails the test. These are bounded safety
+checks and reachable progress witnesses, **not** fairness/eventual-cleanup proofs.
+No production mutation path, format, or ignored regression changes in this slice.
+
+Slice validation: all 11 cleanup-model tests passed; full Nextest passed all
+9,019 tests (one slow, six skipped) in 239.080 seconds. Workspace all-targets /
+all-features Clippy with `-D warnings`, formatting, and `git diff --check` passed.

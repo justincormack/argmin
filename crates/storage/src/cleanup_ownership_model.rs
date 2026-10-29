@@ -6,11 +6,13 @@
 //! crash and one data-node restart. Each action is a proposed atomic boundary.
 //! Ordered object-PG decisions and durable data-node closure are assumptions;
 //! The fanout child adds independent data-node closure and healthy clock offsets;
-//! metadata-replica fanout, clock faults and route migration remain unmodelled.
+//! The renewal child models durable horizons and abstract clock-health fencing.
+//! Metadata-replica fanout and route migration remain unmodelled.
 
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
 mod fanout;
+mod renewal;
 
 #[derive(Clone, Copy, Debug)]
 enum Protocol {
