@@ -1844,3 +1844,46 @@ Validation: all eight focused allocator tests passed. Full Nextest passed all
 9,044 tests with six existing ignored regressions in 252.299 seconds. Strict
 workspace Clippy, storage boundary checks, formatting and `git diff --check`
 passed.
+
+## Checked Replicated Append Floor — 2026-10-29
+
+Reviewing the next owner/window integration exposed a prerequisite defect in the
+existing replicated append path. A selected VID of `i64::MAX` fits the segment
+row, but its next cursor does not fit SQLite. The old floor update checked only
+unsigned overflow and cast the result to `i64`: the resulting negative value
+left the old floor unchanged. A focused regression against the old implementation
+confirmed that application nevertheless succeeded and advanced the applied log
+to index 1. Local allocation's check alone did not protect decoded/recovered
+commands.
+
+The checked interval is now a private-field value used by both local allocation
+and append application. Append constructs it before any segment mutation; floor
+advancement accepts that checked value rather than independently performing
+unchecked signed conversion. Both fresh insertion and matching-segment replay
+use the same validated end. This establishes arithmetic validity, **not** owner,
+issuer, placement, deadline or replicated-window authority.
+
+Four added owner-local regressions cover:
+
+- canonical decoded commands at the signed boundary and beyond it: exact
+  invariant error, no segment/floor SQL writes, complete session canaries,
+  unchanged digest and log; a valid command proves the SQL observer sees writes;
+- a correctly checksummed malformed pending command reopened twice: the shared
+  apply-and-record path rejects it without changing the slot, sessions or log;
+- the last representable allocation, its persisted exhausted cursor, matching
+  segment replay and recorded-command replay across reopen; and
+- a primary with a locally consumed cursor ahead of the selected VID and a
+  replica with the initial cursor: append/replay raises but never rewinds either
+  floor, preserving their existing distinction rather than claiming discovery of
+  unreplicated allocations.
+
+These are metadata-only fixtures; no synthetic ciphertext is exposed as a
+readable payload. The change adds no SQL statement, transaction, commit, RPC or
+format revision. The retained owner/window reserve/create/append integration
+remains next, with the format/export/digest and remote-authority requirements
+above unchanged. The six ignored cleanup regressions remain unresolved.
+
+Validation: all 12 focused allocator/append tests passed. Full Nextest passed
+all 9,048 tests with six existing ignored regressions in 250.601 seconds. Strict
+workspace Clippy, storage boundary checks, formatting and `git diff --check`
+passed.

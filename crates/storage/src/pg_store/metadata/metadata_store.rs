@@ -5683,7 +5683,7 @@ impl PgMetadataStore for PgStore {
         session_id: &SessionId,
     ) -> Result<GenerationId, MetadataError> {
         self.allocate_stream_segment_vid_window(session_id, std::num::NonZeroU32::MIN)
-            .map(|window| window.start)
+            .map(|window| window.start())
     }
 
     #[cfg(test)]

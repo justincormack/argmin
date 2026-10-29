@@ -1,11 +1,11 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Checked arithmetic shared by local consumption and future replicated windows.
-//! This range is a value, NOT write authority: it proves neither replication nor
-//! issuer identity, placement, a deadline, or deletion exclusion.
+//! Checked intervals for local consumption and replicated append floors.
+//! An interval is a value, NOT write authority: it proves neither a replicated
+//! window reservation nor issuer identity, placement, a deadline, or exclusion.
 
-use std::{num::NonZeroU32, ops::Range};
+use std::num::NonZeroU32;
 
 use rusqlite::params;
 
@@ -25,17 +25,33 @@ fn exhausted_window() -> MetadataError {
 /// Both bounds must be representable in SQLite: the exclusive end is itself the
 /// persisted next-allocation cursor. In particular, allocating i64::MAX is not
 /// valid even though that individual identity fits in a SQLite INTEGER.
-fn checked_segment_vid_window(
+#[derive(Debug)]
+pub(super) struct CheckedSegmentVidWindow {
+    start: GenerationId,
+    end: GenerationId,
+}
+
+impl CheckedSegmentVidWindow {
+    pub(super) fn start(&self) -> GenerationId {
+        self.start
+    }
+
+    pub(super) fn end(&self) -> GenerationId {
+        self.end
+    }
+}
+
+pub(super) fn checked_segment_vid_window(
     start: GenerationId,
     count: NonZeroU32,
-) -> Result<Range<GenerationId>, MetadataError> {
+) -> Result<CheckedSegmentVidWindow, MetadataError> {
     let end = start
         .get()
         .checked_add(u64::from(count.get()))
         .filter(|end| *end <= i64::MAX as u64)
         .and_then(GenerationId::new)
         .ok_or_else(exhausted_window)?;
-    Ok(start..end)
+    Ok(CheckedSegmentVidWindow { start, end })
 }
 
 impl PgStore {
@@ -48,7 +64,7 @@ impl PgStore {
         &self,
         session_id: &SessionId,
         count: NonZeroU32,
-    ) -> Result<Range<GenerationId>, MetadataError> {
+    ) -> Result<CheckedSegmentVidWindow, MetadataError> {
         let count_sql = i64::from(count.get());
         let allocated = (|| -> rusqlite::Result<Option<GenerationId>> {
             let mut statement = self.conn.prepare_cached(
@@ -97,6 +113,10 @@ impl PgStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::{
+        AppendStreamSegmentCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload,
+    };
     use crate::{BucketName, CreateStreamUploadReq, ObjectKey, StreamUploadTarget};
 
     fn session(store: &PgStore, hex: &str) -> SessionId {
@@ -111,6 +131,265 @@ mod tests {
             })
             .unwrap();
         session_id
+    }
+
+    // Metadata-only command fixture: no ciphertext or physical shards are written.
+    fn append_command(
+        store: &PgStore,
+        session_id: &SessionId,
+        segment_vid: u64,
+        log_index: u64,
+    ) -> MetadataCommandEnvelope {
+        let session = store.get_stream_upload(session_id).unwrap();
+        let ec = crate::EcShape { k: 2, m: 1 };
+        let size = 64;
+        let stored_size = session.encryption.segment_stored_size(size).unwrap();
+        let (segment_crc64, shard_integrity) =
+            crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(ec, stored_size);
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                crate::ClusterEpoch::INITIAL,
+                crate::PgId::new(0),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                bucket: session.bucket,
+                key: session.key,
+                target: session.target,
+                segment: crate::StreamUploadSegmentRecord {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size,
+                    segment_crc64,
+                    payload_crc64: 0,
+                    segment_okh: [0x65; 16],
+                    segment_vid: GenerationId::new(segment_vid).unwrap(),
+                    data_pg_id: 0,
+                    placement_cluster_epoch: crate::ClusterEpoch::INITIAL,
+                    ec_k: ec.k,
+                    ec_m: ec.m,
+                    shard_integrity: Some(shard_integrity),
+                },
+            })),
+        )
+    }
+
+    #[test]
+    fn stream_segment_vid_windows_append_rejects_unrepresentable_next_cursor() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let dir = test_util::tempdir();
+        let mut store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        let other = session(&store, "22");
+        let before = store.get_stream_upload(&first).unwrap();
+        let other_before = store.get_stream_upload(&other).unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        let replica_before = store.metadata_command_replica_state().unwrap();
+        let digest_before = store.metadata_state_digest().unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&mutations);
+        store
+            .conn
+            .trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(move |event: TraceEvent<'_>| {
+                    if let TraceEvent::Stmt(_, sql) = event {
+                        let sql = sql.trim_start();
+                        if sql.starts_with("INSERT INTO stream_upload_segments")
+                            || sql.starts_with("UPDATE stream_uploads")
+                        {
+                            observed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        for vid in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            let command = append_command(&store, &first, vid, 1);
+            let decoded = crate::metadata_command::decode_metadata_command_envelope(
+                &command.command_bytes(),
+                &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+            )
+            .unwrap();
+            assert_eq!(decoded, command);
+            let result = store.apply_metadata_command_and_record(0, &decoded);
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::BucketSnapshotLoadError::Metadata(
+                        MetadataError::InvariantViolation {
+                            context: "allocate stream segment VID range",
+                            ..
+                        }
+                    ))
+                ),
+                "append must reject VID {vid} before mutation: {result:?}"
+            );
+            assert_eq!(mutations.load(Ordering::Relaxed), 0);
+            assert_eq!(store.get_stream_upload(&first).unwrap(), before);
+            assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+            assert!(store.list_stream_segments(&first).unwrap().is_empty());
+            assert_eq!(
+                store.metadata_command_replica_state().unwrap(),
+                replica_before
+            );
+            assert_eq!(store.metadata_state_digest().unwrap(), digest_before);
+            assert_eq!(
+                store
+                    .max_metadata_command_log_index(crate::ClusterEpoch::INITIAL)
+                    .unwrap(),
+                0
+            );
+        }
+
+        // Positive control proves that the observer actually sees both writes;
+        // rollback-only checks would miss mutation attempted before rejection.
+        let valid = append_command(&store, &first, 7, 1);
+        store.apply_metadata_command_and_record(0, &valid).unwrap();
+        assert_eq!(mutations.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            store
+                .get_stream_upload(&first)
+                .unwrap()
+                .next_segment_vid
+                .get(),
+            8
+        );
+        assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+    }
+
+    #[test]
+    fn stream_segment_vid_windows_recovered_append_cannot_advance_invalid_pending_slot() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        let other = session(&store, "22");
+        let before = store.get_stream_upload(&first).unwrap();
+        let other_before = store.get_stream_upload(&other).unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+        let command = append_command(&store, &first, i64::MAX as u64, 1);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(command.bucket_name()))
+            .unwrap();
+        let slot_before = store.pending_metadata_command_slot_any_epoch(0).unwrap();
+        let replica_before = store.metadata_command_replica_state().unwrap();
+        let digest_before = store.metadata_state_digest().unwrap();
+        let log_before = store
+            .max_metadata_command_log_index(crate::ClusterEpoch::INITIAL)
+            .unwrap();
+        drop(store);
+
+        // Recover only persisted bytes, not the request's in-memory command.
+        for _ in 0..2 {
+            let store = PgStore::open(dir.path(), 0).unwrap();
+            let recovered = store
+                .pending_metadata_command_envelope_any_epoch(0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered, command);
+            assert!(matches!(
+                store.apply_metadata_command_and_record(0, &recovered),
+                Err(crate::BucketSnapshotLoadError::Metadata(
+                    MetadataError::InvariantViolation {
+                        context: "allocate stream segment VID range",
+                        ..
+                    }
+                ))
+            ));
+            assert_eq!(store.get_stream_upload(&first).unwrap(), before);
+            assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+            assert!(store.list_stream_segments(&first).unwrap().is_empty());
+            assert_eq!(
+                store.pending_metadata_command_slot_any_epoch(0).unwrap(),
+                slot_before
+            );
+            assert_eq!(
+                store.metadata_command_replica_state().unwrap(),
+                replica_before
+            );
+            assert_eq!(store.metadata_state_digest().unwrap(), digest_before);
+            assert_eq!(
+                store
+                    .max_metadata_command_log_index(crate::ClusterEpoch::INITIAL)
+                    .unwrap(),
+                log_before
+            );
+        }
+    }
+
+    #[test]
+    fn stream_segment_vid_windows_last_representable_append_survives_replay_and_reopen() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        store.refresh_metadata_command_state_digest().unwrap();
+        let command = append_command(&store, &first, i64::MAX as u64 - 1, 1);
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+        let after = store.get_stream_upload(&first).unwrap();
+        assert_eq!(after.next_segment_vid.get(), i64::MAX as u64);
+        let segments = store.list_stream_segments(&first).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_vid.get(), i64::MAX as u64 - 1);
+        let state = store.metadata_command_replica_state().unwrap();
+        drop(store);
+
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        // Exercise both payload-level idempotence and already-recorded replay.
+        store.apply_metadata_command(&command).unwrap();
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+        assert!(matches!(
+            store.allocate_stream_segment_vid(&first),
+            Err(MetadataError::InvariantViolation {
+                context: "allocate stream segment VID range",
+                ..
+            })
+        ));
+        assert_eq!(store.get_stream_upload(&first).unwrap(), after);
+        assert_eq!(store.list_stream_segments(&first).unwrap(), segments);
+        assert_eq!(store.metadata_command_replica_state().unwrap(), state);
+    }
+
+    #[test]
+    fn stream_segment_vid_windows_append_replay_does_not_rewind_consumed_cursor() {
+        let primary_dir = test_util::tempdir();
+        let replica_dir = test_util::tempdir();
+        let primary = PgStore::open(primary_dir.path(), 0).unwrap();
+        let replica = PgStore::open(replica_dir.path(), 0).unwrap();
+        let first = session(&primary, "11");
+        assert_eq!(session(&replica, "11"), first);
+        primary
+            .allocate_stream_segment_vid_window(&first, NonZeroU32::new(8).unwrap())
+            .unwrap();
+        let command = append_command(&primary, &first, 3, 1);
+        for (store, expected_floor) in [(&primary, 9), (&replica, 4)] {
+            store.refresh_metadata_command_state_digest().unwrap();
+            store
+                .apply_metadata_command_and_record(0, &command)
+                .unwrap();
+            let before_replay = store.get_stream_upload(&first).unwrap();
+            assert_eq!(before_replay.next_segment_vid.get(), expected_floor);
+            store.apply_metadata_command(&command).unwrap();
+            store
+                .apply_metadata_command_and_record(0, &command)
+                .unwrap();
+            assert_eq!(store.get_stream_upload(&first).unwrap(), before_replay);
+            assert_eq!(store.list_stream_segments(&first).unwrap().len(), 1);
+        }
+        // This deliberately retains the existing local-cursor distinction. It
+        // is not evidence of replicated windows or safe replacement issuance.
+        assert_eq!(
+            primary.list_stream_segments(&first).unwrap(),
+            replica.list_stream_segments(&first).unwrap()
+        );
     }
 
     #[test]

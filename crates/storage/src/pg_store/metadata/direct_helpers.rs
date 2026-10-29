@@ -219,16 +219,8 @@ impl PgStore {
     fn advance_stream_segment_vid_floor(
         &self,
         session_id: &SessionId,
-        segment_vid: GenerationId,
+        window: &segment_vid_window::CheckedSegmentVidWindow,
     ) -> Result<(), MetadataError> {
-        let next_vid =
-            segment_vid
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::InvariantViolation {
-                    context: "advance stream segment VID floor overflow",
-                    reason: "metadata state does not satisfy the operation invariant".into(),
-                })?;
         self.conn
             .execute(
                 "UPDATE stream_uploads \
@@ -237,7 +229,7 @@ impl PgStore {
                      ELSE next_segment_vid \
                  END \
                  WHERE session_id = ?2",
-                params![next_vid as i64, session_id.as_str()],
+                params![window.end().get() as i64, session_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "advance stream segment VID floor",

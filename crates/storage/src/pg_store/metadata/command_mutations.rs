@@ -275,6 +275,13 @@ impl PgStore {
         &self,
         command: &AppendStreamSegmentCommand,
     ) -> Result<(), MetadataError> {
+        // Validate decoded/recovered commands before inserting any segment row.
+        // A VID may fit SQLite while its required next cursor does not. Carry
+        // the checked interval through both fresh and idempotent application.
+        let window = segment_vid_window::checked_segment_vid_window(
+            command.segment.segment_vid,
+            std::num::NonZeroU32::MIN,
+        )?;
         self.with_immediate_txn(
             "append stream segment command (begin txn)",
             "append stream segment command (commit txn)",
@@ -338,7 +345,7 @@ impl PgStore {
                     Some(existing) if existing == command.segment => store
                         .advance_stream_segment_vid_floor(
                             &command.segment.session_id,
-                            command.segment.segment_vid,
+                            &window,
                         ),
                     Some(_) => Err(MetadataError::StreamSegmentConflict {
                         segment_index: command.segment.segment_index,
@@ -347,7 +354,7 @@ impl PgStore {
                         store.append_stream_segment_direct(&command.segment)?;
                         store.advance_stream_segment_vid_floor(
                             &command.segment.session_id,
-                            command.segment.segment_vid,
+                            &window,
                         )
                     }
                 }
