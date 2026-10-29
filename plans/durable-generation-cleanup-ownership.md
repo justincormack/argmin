@@ -1766,3 +1766,34 @@ six existing ignored regressions in 246.024 seconds. Strict workspace Clippy,
 storage boundary checks, formatting and `git diff --check` passed. These results
 are regression checks, not implementation evidence for the proposed records or
 remote grant protocol.
+
+## Pre-Implementation Command Evidence — 2026-10-29
+
+Before adding owner/window fields, preserve the current command corpus at a
+separate unchanged-writer commit boundary, following
+[`versioning.md`](../guides/versioning.md#commit-boundaries-are-evidence-boundaries).
+The existing checksum guards are valuable evidence, but several historical
+tests reconstruct bytes from current command structs. An incompatible field
+addition cannot use that technique to preserve the predecessor grammar without
+retaining a second encoder. Independent bytes avoid that dependency.
+
+This slice freezes the 30 existing object/session specimens for command v11 /
+SSE-S3 state v5, checks their exact bytes against the unchanged writer and their
+unchanged checksum constants, and independently exercises both decoders on the
+frozen inputs. The [format ledger](../guides/storage-format-ledger.md#cleanup-owner-transition-baseline-2026-10-29)
+records the file digest, scope and future rejection treatment. The current PG
+schema v9 already has its independent complete catalogue; neither its version
+nor the command/RPC/digest versions advance here.
+
+This is a prerequisite evidence slice, **not the owner/window state-machine
+implementation**. No owner rows, grant issuance, cleanup worker, physical fencing
+or new production dependencies are added. It does not resolve the six ignored
+regressions or settle remote confirmation and finite policy bounds. After this
+baseline is committed, proceed with the reserve/create/append transaction slice
+and its containing-format evidence together; retain these bytes unchanged as
+rejection evidence when advancing the command format.
+
+Validation: both focused writer/independent-reader tests passed. Full Nextest
+passed all 9,036 tests with six existing ignored regressions in 254.679 seconds.
+Strict workspace Clippy, storage boundary checks, formatting and `git diff --check`
+passed. No production schema or encoding changed.

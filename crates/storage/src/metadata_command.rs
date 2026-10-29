@@ -5652,6 +5652,103 @@ mod tests {
         }
     }
 
+    // Append-only evidence for the existing object/session corpus. Keep these
+    // checksums and its independent byte fixture when the owner/window formats
+    // advance; do not reconstruct this vector using the replacement structs.
+    const IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS: [u64; 30] = [
+        1_823_888_188_837_738_123,
+        12_530_097_086_218_595_292,
+        1_783_846_759_543_017_215,
+        1_596_200_477_502_775_117,
+        18_344_400_800_674_143_463,
+        3_506_871_500_002_470_127,
+        13_610_686_504_679_361_641,
+        6_621_870_101_727_758_425,
+        9_413_645_625_304_074_522,
+        2_588_941_653_116_204_339,
+        13_728_027_982_590_338_563,
+        8_953_971_771_838_591_472,
+        10_310_589_748_364_560_869,
+        5_031_596_208_149_928_306,
+        2_799_663_565_977_786_734,
+        4_122_412_684_973_717_769,
+        6_215_483_639_263_487_507,
+        3_156_890_018_081_359_938,
+        65_095_186_959_146_435,
+        9_573_292_260_627_646_549,
+        7_069_855_164_291_583_981,
+        14_918_179_802_415_316_361,
+        17_598_587_499_391_051_976,
+        15_555_201_368_631_162_286,
+        852_872_343_901_668_487,
+        16_379_006_855_824_226_457,
+        6_183_517_103_309_104_107,
+        1_158_514_066_553_217_883,
+        15_431_799_212_681_859_503,
+        585_700_342_204_918_605,
+    ];
+
+    fn immutable_v11_sse_s3_v5_object_command_bytes() -> Vec<Vec<u8>> {
+        let specimens = include_str!("metadata_command_v11_sse_s3_v5_object_corpus.hex")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .enumerate()
+            .map(|(index, line)| {
+                let mut fields = line.split_ascii_whitespace();
+                assert_eq!(
+                    fields
+                        .next()
+                        .expect("fixture index")
+                        .parse::<usize>()
+                        .unwrap(),
+                    index,
+                    "frozen corpus has a missing, duplicated or reordered case"
+                );
+                let checksum = u64::from_str_radix(fields.next().expect("fixture checksum"), 16)
+                    .expect("hexadecimal fixture checksum");
+                assert_eq!(checksum, IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS[index]);
+                let bytes = decode_fixture_hex(fields.next().expect("fixture bytes"));
+                assert_eq!(fields.next(), None, "fixture has trailing fields");
+                assert_eq!(checksum::crc64::checksum(&bytes), checksum);
+                bytes
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            specimens.len(),
+            IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS.len()
+        );
+        specimens
+    }
+
+    #[test]
+    fn immutable_v11_sse_s3_v5_object_specimens_decode_independently_of_builders() {
+        // This reader starts with frozen bytes, not today's Rust command structs.
+        // On an outer-format advance, retain the file/checksums and change this
+        // acceptance assertion to exact UnsupportedVersion rejection evidence.
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 11);
+        for (index, bytes) in immutable_v11_sse_s3_v5_object_command_bytes()
+            .iter()
+            .enumerate()
+        {
+            let header = decode_metadata_command_log_entry_header(bytes).unwrap();
+            let command = decode_metadata_command_envelope_for_test(bytes).unwrap();
+            assert_eq!(header.kind(), MetadataCommandLogEntryKind::Applied);
+            assert_eq!(header.id(), command.id());
+            assert_eq!(command.id().cluster_epoch().get(), 1);
+            assert_eq!(command.id().pg_id().get(), 4);
+            assert_eq!(command.id().log_index().get(), 40 + index as u64);
+            assert_eq!(
+                header.command_kind_name(),
+                Some(command.payload().kind_name())
+            );
+            assert_eq!(command.command_bytes(), *bytes);
+            assert_eq!(
+                command.checksum_crc64(),
+                IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS[index]
+            );
+        }
+    }
+
     fn decode_fixture_hex(encoded: &str) -> Vec<u8> {
         assert_eq!(encoded.len() % 2, 0, "hex fixture must contain whole bytes");
         encoded
@@ -7624,6 +7721,8 @@ mod tests {
             ),
         ];
 
+        let frozen_commands = immutable_v11_sse_s3_v5_object_command_bytes();
+        assert_eq!(payloads.len(), frozen_commands.len());
         let mut checksums = Vec::new();
         for (offset, payload) in payloads.into_iter().enumerate() {
             let id = MetadataCommandId::new(
@@ -7642,6 +7741,11 @@ mod tests {
             assert_every_encryption_carrier_rejects_malformed_profile(
                 &envelope,
                 &sse_s3_encryption,
+            );
+            assert_eq!(
+                envelope.command_bytes(),
+                frozen_commands[offset],
+                "object/session case {offset} changed without new version-vector evidence"
             );
             assert_immutable_v10_sse_s3_v1_command_is_rejected(
                 &envelope,
@@ -7680,41 +7784,7 @@ mod tests {
             }
             checksums.push(envelope.checksum_crc64());
         }
-        assert_eq!(
-            checksums,
-            [
-                1_823_888_188_837_738_123,
-                12_530_097_086_218_595_292,
-                1_783_846_759_543_017_215,
-                1_596_200_477_502_775_117,
-                18_344_400_800_674_143_463,
-                3_506_871_500_002_470_127,
-                13_610_686_504_679_361_641,
-                6_621_870_101_727_758_425,
-                9_413_645_625_304_074_522,
-                2_588_941_653_116_204_339,
-                13_728_027_982_590_338_563,
-                8_953_971_771_838_591_472,
-                10_310_589_748_364_560_869,
-                5_031_596_208_149_928_306,
-                2_799_663_565_977_786_734,
-                4_122_412_684_973_717_769,
-                6_215_483_639_263_487_507,
-                3_156_890_018_081_359_938,
-                65_095_186_959_146_435,
-                9_573_292_260_627_646_549,
-                7_069_855_164_291_583_981,
-                14_918_179_802_415_316_361,
-                17_598_587_499_391_051_976,
-                15_555_201_368_631_162_286,
-                852_872_343_901_668_487,
-                16_379_006_855_824_226_457,
-                6_183_517_103_309_104_107,
-                1_158_514_066_553_217_883,
-                15_431_799_212_681_859_503,
-                585_700_342_204_918_605,
-            ]
-        );
+        assert_eq!(checksums, IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS);
 
         assert_eq!(IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
         assert_eq!(IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS.len(), checksums.len());

@@ -272,6 +272,36 @@ self-describing inside the metadata-command log. Materialized metadata checkpoin
 either command-log representation. The later storage-RPC audit must still verify that its containers
 do not bypass the inner applied-envelope decoder before dispatching the contained command.
 
+### Cleanup-owner transition baseline (2026-10-29)
+
+Before changing the reservation/session/append layouts for cleanup windows,
+[`metadata_command_v11_sse_s3_v5_object_corpus.hex`](../crates/storage/src/metadata_command_v11_sse_s3_v5_object_corpus.hex)
+preserves all 30 specimens from `metadata_command_object_encoding_is_stable` as
+independent canonical **command bytes**, without the additional checksum trailer
+returned by `MetadataCommandEnvelope::canonical_bytes`. Each line records its
+case index and the existing CRC64-NVME checksum, retained unchanged in
+`IMMUTABLE_V11_SSE_S3_V5_OBJECT_CHECKSUMS`.
+The source writer is the unchanged implementation at `bf558e38`; capture used
+the existing test's deterministic inputs, not a reconstruction of a retired
+writer. The original checksum assertions passed during capture.
+
+The file SHA-256 is
+`ddeda94e9370300e44e2b38b24e808542251bc9db59dfdb01965767f28b4c9be`.
+The unchanged production writer must match every specimen exactly. A separate
+reader test starts from the immutable bytes, checks header/full decoding,
+command identity, checksum and canonical re-encoding, without first building a
+current Rust command. On an incompatible outer advancement retain this file and
+its checksum constants, and assert exact unsupported-version rejection instead
+of regenerating its bytes with the new structs.
+
+This is the representative object/session corpus, including reservation, release,
+stream creation, append, abort and terminal publication. It is **not** a new claim
+of every optional branch, every command kind, or every RPC/checkpoint container;
+the existing family evidence and containing-format audit remain required. These
+are codec specimens, not payload-bearing fixtures or proof that each decoded
+command can be applied to arbitrary durable state. No format version or production
+writer changes in this evidence-only slice.
+
 ### Metadata checkpoint and canonical-state evidence inventory (2026-08-08)
 
 The former combined checkpoint/canonical-state row contains a serialized checkpoint payload and a
