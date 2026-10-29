@@ -513,7 +513,10 @@ this guide as part of their implementation:
   exclusion for both shard-file writes and separate acknowledgement registration.
   It retains closure provenance through publication/reclaim and depends on durable
   unlink confirmation (DUR-3) and capacity/recovery headroom (DUR-5). This is a review
-  proposal, not the current protocol.
+  proposal, not the current protocol. The subsequent
+  [transaction review](../plans/durable-generation-cleanup-ownership.md#minimum-contract-and-transaction-review--2026-10-29)
+  prioritizes attaching ownership to existing commits; per-segment intent commands
+  are not selected, pending discovery/renewal feasibility and measured sync costs.
 - [Unified staged write publication](../plans/unified-staged-write-publication-plan.md)
   remains blocked on that shared contract. Its multipart optimization roots must
   be reconciled with the accepted owner protocol, not implemented as a second

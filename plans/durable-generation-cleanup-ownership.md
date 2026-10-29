@@ -9,6 +9,9 @@
 
 Status: production regression evidence, bounded design modelling, and a concrete
 [contract proposal for review](#proposed-production-contract--2026-10-29).
+The subsequent [minimum-contract and transaction review](#minimum-contract-and-transaction-review--2026-10-29)
+sets the current direction: reuse existing durability barriers; the earlier
+proposal's additional publishers and per-segment intents are not selected.
 The unfinished production fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under
@@ -664,6 +667,13 @@ and finite write-authority cutoffs. Do not add early data-node revocation in the
 first implementation. Cancellation stops new grants, but physical deletion waits
 for the maximum granted cutoff and quiescence of every effect participant.
 
+**Review disposition:** the [transaction review below](#minimum-contract-and-transaction-review--2026-10-29)
+supersedes this proposal as an implementation prescription. In particular,
+replicated per-segment preparation, idle grant commands, cold confirmation RPCs,
+and separately persisted progress states require independent justification.
+The safety obligations remain; this complete but more expensive candidate is
+retained for comparison, not approved by its level of detail.
+
 This replaces the assumption that a live frontend cleanup handle is sufficient.
 It is a separately measured correctness change, not permission to unify terminal
 publishers or optimize UploadPart in the same slice. The abstract models support
@@ -1006,3 +1016,258 @@ Documentation-slice validation: full Nextest passed all 9,028 tests (one slow,
 six skipped) in 237.441 seconds. Strict workspace Clippy, formatting and
 `git diff --check` passed. This verifies the unchanged code baseline, not the
 unimplemented contract described above.
+
+## Minimum Contract and Transaction Review — 2026-10-29
+
+**Design review, not an implementation or a claim that the bugs are fixed.**
+The cost objective is **no additional durability barrier on ordinary successful
+small PUT, or per streamed segment**, where the necessary evidence can be added
+to an existing transaction. Count SQLite commits, replicated command phases and
+file/directory syncs separately. Adding rows to an existing transaction increases
+WAL bytes and may increase checkpoint work even without adding a commit. Do not
+trade away a required durability barrier or promise zero additional total fsyncs.
+
+### Smallest complete safety contract
+
+The following obligations are necessary; the eight-state owner machine, child
+tables and publisher names in the earlier proposal are possible implementations,
+not separate requirements.
+
+1. **An owner exists before writes can escape.** Durable, non-recycling attempt
+   identity binds bucket incarnation, key, generation and PUT/session/part target.
+   It retains exact reservation-release responsibility and enough placement
+   provenance for recovery. Caller loss before session creation must be covered,
+   not only loss after a session exists. Ambiguous owner creation is recovered as
+   the exact existing command, not replaced by another allocation.
+2. **Every effect has a finite, owner-covered authority.** Durable evidence must
+   bound the maximum cutoff of all issued or issuable grants and their scope;
+   this may be a conservative upper bound, not an individually recorded grant.
+   File writes and separate acknowledgement writes both enforce that bound at
+   their own admission boundary and hold local exclusion through durable effect
+   completion. Neither a route renewal nor an old caller can extend it. Remote
+   authorization must be authenticated and subject-bound, not just an opaque
+   Rust value serialized by the caller. Clock uncertainty fails closed.
+3. **Publication and cleanup cannot both own the same payload.** Grant extension,
+   terminal install and cleanup adoption serialize on the object PG. An exact
+   pending command protects payload through lost replies. Publication-start,
+   possible apply and partial fanout require exact convergence. Authoritatively
+   unstarted abandonment preserves cleanup responsibility before removing the
+   pending slot. Replica apply uses immutable evidence and local state, not clocks
+   or remote data-PG reads.
+4. **Deletion cannot be followed by an old write.** Cleanup waits past the entire
+   authorized horizon with the supported clock-skew margin, then drains every
+   relevant file/ack participant, not a quorum. This includes transport-delayed
+   writes and IO admitted before expiry. Restart must not reopen that authority.
+   Repair/transfer writers and reader leases retain their own exact exclusions;
+   they cannot bypass this with a generic staging grant.
+5. **Ownership survives publication and removal of references.** Terminal commit,
+   overwrite, version delete, part replacement, MPU completion and abort transfer
+   the original writer's horizon/provenance with payload ownership. Immediate
+   reclaim of a successfully published payload must also obey obligation 4.
+   Removing a session or reservation is not evidence that its writes have stopped.
+6. **Cleanup remains discoverable until all obligations are discharged.** Files,
+   ack rows, and exact reservation release are independently retriable. Preserve
+   required object/data/ack/bucket route history across restart and primary change.
+   Unknown outcomes or unavailable targets retain responsibility; workers use
+   bounded work and do not hold frontend admission indefinitely. Successful
+   `CleanupComplete` still means durable completion, not cancellation accepted.
+   Unrecorded files need a defined discovery owner; a missing manifest is neither
+   deletion authority nor proof that cleanup is complete.
+
+These obligations cover all six retained regressions **and** late acknowledgement
+registration, caller loss, restart, partial publication and immediate overwrite/
+reclaim. Passing only the six tests is not sufficient. DUR-3 durable unlink and
+DUR-5 recovery headroom remain requirements, not costs waived by this review.
+
+### Existing transaction map
+
+This is a source audit, not a measured syscall count. The common
+`apply_metadata_command_and_record_with_commit_guard` in
+[`command_apply.rs`](../crates/storage/src/pg_store/metadata/command_apply.rs)
+opens one `BEGIN IMMEDIATE`, applies the payload and records its log/digest state,
+then commits. `with_immediate_txn` in
+[`support.rs`](../crates/storage/src/pg_store/metadata/support.rs)
+reuses an already-open transaction; nested mutation helpers do not imply a
+second commit. A replicated command still has other durable phases such as
+pending-slot install, publication-start and terminal slot removal.
+
+| Existing boundary | Evidence/work that can share it | Limit on the reuse claim |
+| --- | --- | --- |
+| Bucket-write reservation acquisition | Existing exact bucket proof and release identity. | Different PG from object ownership; this is not one atomic cross-PG transaction. Pre-owner crash recovery of this reservation remains with its bucket authority. |
+| `ReserveObjectGeneration` apply | Owner identity, initial finite horizon, placement scope, stable bucket proof and pre-session cleanup responsibility. Direct PUT can include its one exact segment intent here. | Extend the command inputs; the current row has only reservation ID, bucket/key, generation and creation time. Do not wait for a later session to make this discoverable. |
+| `CreateStreamUpload` apply | Bind session, target and encryption to that already-created owner; persist initial stream scope/grant. | Generation reservation and session creation are currently separate commands. Cover their gap rather than claiming creation is already atomic. |
+| Primary-local `allocate_stream_segment_vid` | Local preparation/intent fields can share this existing SQLite update if changed to one explicit transaction. | This is not replicated preparation. Surviving the local restart is not evidence that a new primary can enumerate all prepared segments. |
+| Shard temporary-file write, file sync and final-name directory sync | An owner-identifying file envelope, if selected, could share existing file persistence. Effect admission/draining can be process-local under immutable cutoff semantics. | No new sidecar may be assumed free. Current files contain raw shard bytes, not a recoverable owner envelope. Changing this requires versioned format, read-path and checksum design. |
+| `register_written_shards_batch_exact` / batch acknowledgement transaction | Owner/grant provenance can accompany ack rows in their existing transaction. | This happens after file publication and may be on a different node; it cannot cover a file-only crash window or replace file-node exclusion. |
+| `AppendStreamSegment` apply | Completed segment ownership, cumulative horizon, and a grant/scope extension for **future** segments. | This runs after the current segment's writes. It cannot retroactively authorize those writes or make their pre-append crash window disappear. |
+| `CommitDirectPutObject` / `CommitStreamPart` apply | Transfer writer cutoff/provenance to published state in the same transaction as object/part metadata and session removal. | Leave any unresolved cleanup responsibility discoverable. Do not add an unconditional `MarkPublishedDrained` command to every healthy PUT. |
+| Existing abort, delete/reclaim and generation-release commands | Hand off/seal ownership before removing session/reservation/reference rows; reuse the pending command or a retained owner for retries. | Logical removal cannot also mean physical completion before cutoff/drain/deletion. Preserve publication rules and existing external completion semantics. |
+| Existing unstarted-abandonment/tombstone and slot cleanup | Preserve the durable cleanup handoff within the owner transaction before slot removal. | If these are separate commits today, retain the earlier responsibility through the gap; do not invent a cross-replica atomic transaction. |
+| Final cleanup/release | Retire owner with an existing eligible release/reclaim command where possible. Reacquire closure observations and repeat exact idempotent deletes after restart. | Release on the bucket PG remains separate. If no existing transaction remains, later owner retirement is additional maintenance work and must be counted. |
+
+Relevant implementation anchors:
+
+- [`metadata_helpers.rs`](../crates/storage/src/pg_store/metadata/metadata_helpers.rs):
+  reservation insertion and durable generation high-water advancement.
+- [`command_mutations.rs`](../crates/storage/src/pg_store/metadata/command_mutations.rs):
+  create, append, abort and part-commit transactions; abort/commit currently remove
+  the stream session.
+- [`local.rs`](../crates/storage/src/node_client/local.rs):
+  `prepare_stream_segment_append_inner` validates the captured session/generation
+  under the PG lock, then performs the primary-local allocator update.
+- [`payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs):
+  reserve/install/fanout and append flows; ack registration precedes append apply.
+- [`shards.rs`](../crates/storage/src/pg_store/shards.rs):
+  file durability and separate acknowledgement SQL transactions.
+
+### Preferred low-barrier candidate, and its unresolved part
+
+Evaluate **owner-level finite grants**, initially persisted with existing owner/
+session creation, rather than mandating one replicated intent command before
+every segment. An existing append may persist the next grant while publishing
+the preceding segment. Authority escapes only after the required publication/
+recovery guarantee for that exact command is established. An installed or
+possibly applied extension counts toward the cleanup horizon even if its reply
+is lost. Old writes retain their old cutoff.
+
+The grant must cover a storage-derived, finite identity and placement scope
+before dispatch. A broad owner grant cannot silently permit arbitrary shard keys,
+new placement epochs or unrecorded participant sets. Grant changes need durable
+coverage before use; current retained-route machinery does not automatically
+retain routes for segments which have not been recorded. Do not weaken the
+existing non-recycling generation/nonce or append-authority guarantees to avoid
+replication.
+
+Also evaluate a **seal-time upper bound** before deciding that every grant renewal
+needs durable horizon advancement: if issuance has a strictly enforced maximum
+lifetime `W`, and a durable seal definitively stops all issuers, cleanup can wait
+until the seal time plus `W` and the necessary clock margin. That can share the
+existing abort/release transaction without recording each grant. This is only a
+candidate: prove that an old primary, cached issuer authority, or delayed grant
+request cannot mint a fresh cutoff after the seal. An old primary's still-live
+authority may require an additional bounded wait or stronger fencing. Persist
+the resulting absolute cleanup bound with the seal, never restart the wait from
+receipt time. Live-owner detection and crash adoption still need a sound lease;
+this does not make idle liveness free. The existing renewal model assumes a
+persisted horizon and does **not** establish this alternative's safety.
+
+**The unresolved issue is discovery, not just the cutoff.** Complete exact intents
+before writes give cheap, direct enumeration but add replicated streaming work.
+Without them, one of the following must be justified:
+
+- A bounded, storage-derived superset of all possible locations/identities is
+  recoverably enumerable from the initial owner and subsequent committed grants.
+  Cleanup scans that scope after closure, verifies exact ownership/references,
+  and retains the owner until enumeration and deletion finish. Overbroad scope
+  increases scan cost, route retention and unavailable-node dependencies.
+- Each physical artifact carries recoverable owner provenance in its **existing**
+  durable publication, with a complete storage-owned discovery protocol, including
+  file-only artifacts and ack-only remnants. This is a format/discovery change,
+  not a free use of current raw shard files or a claim that the full scavenger
+  already exists. Its discovery scope and history-retention proof are still needed.
+
+A local preparation row plus later replicated append is useful evidence but is
+not a complete substitute: loss of that primary before append must not lose the
+only cleanup index. An age scan and current metadata absence are also insufficient.
+If neither lower-barrier discovery option is supportable, retain replicated
+pre-write intents as the explicit fallback and measure their cost. Do not declare
+the common fix complete by silently leaving unenumerable payload behind, or make
+the scanner authorize deletion independently of the durable owner.
+
+This is a separate decision from remote grant verification. Existing authenticated
+RPC transport does not prove an arbitrary caller-supplied grant matches durable
+owner state. Cold owner confirmation is one read-only option (latency/availability
+cost, not intrinsically a new fsync); a self-contained authenticated grant needs
+its own security design. Neither is approved merely to finish this document.
+
+### Costs that cannot honestly be called piggybacked
+
+- **Idle renewal:** there is no append to carry a horizon extension during a long
+  body pause. The existing PUT heartbeat updates the bucket reservation and then
+  the object-PG primary's proof separately
+  ([`bucket_delete.rs`](../crates/storage/src/cluster/request_ops/bucket_delete.rs),
+  `heartbeat_put_object_stream_session_with_route_validation`). It is not an
+  already-replicated owner-horizon update. Either choose a finite lifetime with
+  justified timeout behavior, or explicitly budget occasional durable renewal.
+  Extending it opportunistically from wall time after restart is unsafe. Test long
+  healthy uploads before selecting a window; do not introduce arbitrary S3 errors.
+- **Crash/cancellation maintenance:** foreground transactions may never happen.
+  Workers must sometimes persist ownership transitions themselves. Prefer retaining
+  the existing owner and batching/retrying cleanup, not a commit per receipt or
+  per state name. After restart re-establish closure before more effects; persist
+  any evidence that cannot safely be reacquired. Batch only within a valid owner/
+  PG transaction, not across independent stores by convention.
+- **Physical unlink durability:** directory syncs required by DUR-3 remain real
+  costs even if logical cleanup shares an existing metadata command. Measure and
+  consider safe directory batching separately; do not substitute row absence.
+- **Retained state:** carrying compact horizon/provenance in published metadata
+  can defer closure checks until reclaim. An outstanding orphan/release obligation
+  still needs its own durable anchor. Eventual retirement/checkpoint work belongs
+  in the cost report, not hidden outside request latency measurements.
+
+### Decision and next bounded step
+
+Approve the six safety obligations and the reuse-first cost objective for further
+design. Do **not** yet approve replicated `AuthorizePayloadSegment`, one durable
+record per grant/receipt, or a separate closure command on every successful PUT.
+
+**Priority clarification:** replacement-primary discovery is the next design gate.
+Slow/idle uploads need a bounded resource policy, not the same performance budget
+as healthy uploads. Occasional durable renewal on that exceptional path is
+acceptable; sufficiently stalled requests can be terminated under an explicit,
+tested timeout/progress policy. Preserve the correct S3/transport error behavior
+and durable cleanup after termination. Distinguish a large, steadily progressing
+upload from a stalled connection; this is not an arbitrary short total-upload
+limit. No timeout duration is selected here, and cutoff safety remains mandatory.
+Do not delay the discovery decision to optimize idle renewals.
+
+The next bounded step is a **replacement-primary discovery feasibility spike**, not broad
+production integration: work through exact direct PUT and two-segment UploadPart
+identities against current placement, filenames and allocator state; kill the
+frontend/primary between allocation, file sync, ack registration and append.
+Specify what a replacement primary can enumerate, which historical routes remain
+pinned, and where the next authority horizon becomes durable (or how a seal-time
+bound safely covers all issuers without a per-renewal commit). Include idle expiry
+and immediate published-part replacement. Reject any design that needs forgotten
+frontend state or an unavailable old primary's private allocator to finish.
+
+Then select the discovery representation, with a conservative bounded renewal/
+timeout policy rather than an optimized idle path, and amend the model's
+atomic boundaries to match those actual transactions, and implement a narrow
+end-to-end slice. Before extending it, measure a real-filesystem 4 KiB PUT and
+8 MiB part: foreground and eventual background SQLite commits, command phases,
+file/directory syncs, bytes written, RPCs, and retained-space/cleanup latency.
+Record incremental counts against the unchanged baseline; model state counts
+and tmpfs throughput do not establish fsync cost. The preferred acceptance target
+is no added ordinary-path commit; any exception needs an explicit review rather
+than being hidden inside a new helper.
+
+#### Initial replacement-primary evidence audit
+
+The important crash boundary is **file publication before replicated append**,
+not merely frontend failure after a completed append:
+
+- Session creation and generation reservation supply replicated starting state.
+  Completed append commands carry exact segment records and advance the replica's
+  allocator floor in `apply_append_stream_segment_command`.
+- Preparation's `allocate_stream_segment_vid` advances only the primary's local
+  session row. A replacement cannot treat its own lower floor as proof that no
+  later segment identity was prepared or written.
+- The shard filename encodes a 16-byte segment hash, segment VID and shard index
+  ([`ShardKey`](../crates/storage/src/types.rs)); the stream hash is derived from
+  session ID and segment index
+  ([`shard_key_hash.rs`](../crates/storage/src/shard_key_hash.rs)). It does not
+  directly expose the session or segment index. Known candidate indices can be
+  hashed, but recovery still needs a justified enumeration bound and placement
+  scope; it cannot recover these by inverting the hash.
+- Ack registration is later and separate. Files may exist with no ack row, so
+  listing acknowledgements alone cannot establish cleanup completeness.
+
+Evaluate the lower-barrier alternatives against this exact gap: recoverably
+bounded identities/placement granted by existing commands, or owner-identifiable
+artifacts published using the existing file sync. Keep replicated pre-write
+intents as the comparison/fallback. For each, require discovery without the old
+primary or frontend, reference-safe deletion, delayed-write exclusion, retained
+route coverage and bounded scan cost. This audit identifies missing evidence;
+it is not yet a production failover experiment or proof that either alternative
+is sufficient.

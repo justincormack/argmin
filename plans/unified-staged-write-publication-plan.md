@@ -63,6 +63,10 @@ uses common object-PG owner/grant/segment-intent records, finite staging cutoffs
 and closure of both file-writing and acknowledgement-registration participants.
 It also retains writer-closure provenance through successful publication and
 subsequent reclaim. It is for review, not an implemented or approved protocol.
+The [minimum-contract transaction review](durable-generation-cleanup-ownership.md#minimum-contract-and-transaction-review--2026-10-29)
+now prioritizes sharing existing durability barriers. Replicated per-segment
+intents and additional renewal/progress publishers are comparison options, not
+selected prerequisites; discovery and idle-renewal feasibility remain open.
 The multipart-root/state-machine subsections below remain blocked optimization
 candidates: reconcile them with the accepted shared contract before resuming,
 rather than introducing a second owner or physical exclusion protocol.
