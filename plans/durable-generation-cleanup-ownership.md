@@ -1271,3 +1271,127 @@ primary or frontend, reference-safe deletion, delayed-write exclusion, retained
 route coverage and bounded scan cost. This audit identifies missing evidence;
 it is not yet a production failover experiment or proof that either alternative
 is sufficient.
+
+## Replacement-Primary Discovery Evidence — 2026-10-29
+
+The next experiment uses production storage phases in
+[`cleanup_discovery.rs`](../crates/storage/src/cluster/local/tests/cleanup_discovery.rs).
+For each of streamed PUT and UploadPart, it publishes a real encrypted 8 MiB
+first segment, then stops the second segment after preparation, file publication,
+ack registration or append. Two preparations of the second index model a lost
+preparation reply: the old primary consumes two VIDs, not one. Object metadata
+has primary node 0; both data/ack PGs have primary node 1. After dropping all
+runtimes, the test reopens **only node 1**, never node 0.
+
+| Last completed second-segment phase | Replica object-PG evidence after reopen | Surviving physical evidence |
+| --- | --- | --- |
+| Preparation | Original session/floor, first manifest and command state unchanged. | No second-segment file or ack. |
+| Files | Same unchanged replica metadata. | A second-segment file on the surviving node, no second-segment ack rows. |
+| Acknowledgements | Same unchanged replica metadata. | File plus all three ack rows on the independent data-PG primary. |
+| Append | Exact second manifest and advanced floor/log position. | File and ack rows, with successful full ciphertext reconstruction before reopen. |
+
+The tests independently compare complete pre-append session/manifest/command
+state, positive file and ack counts, discovered VID, data PG, ciphertext geometry
+and append placement epoch. They scan actual filenames across the surviving
+node's PGs; they do not reopen paths supplied by the lost preparation. Filtering
+by the hash of known session/index 1 is an **experimental candidate**, not proof
+that production currently authorizes or bounds that index. Expected prepared
+records are retained only as assertion canaries.
+
+This establishes which durable evidence is available without the old primary.
+It is **not** SIGKILL/power-loss testing, a control-plane election, a route-history
+transition, or a cleanup implementation. Stores are closed before reopen; no
+second runtime is opened over live SQLite files. The two evidence tests do not
+resolve or unignore the six cleanup regressions. Direct PUT was source-audited
+here, not added to this restart matrix: its single segment hash is derivable
+from the reservation ID and index zero, and its VID is the reserved generation;
+the owner still needs durable placement/EC scope, cutoff and release responsibility.
+
+### First candidate to test: replicated bounded lookahead
+
+Prefer evaluating a **bounded reservation window carried by existing commands**
+before adding a file envelope or replicated preparation command. Current HTTP
+PUT, POST and UploadPart loops wait for each append before processing the next
+segment; the buffered PUT and copy loops also append serially. This makes a
+one-segment lookahead plausible. It is not presently a storage-enforced invariant:
+the node preparation boundary accepts a supplied index and checks duplicates,
+not a durable authorized frontier. Future parallelism must obtain explicit wider
+windows, not silently bypass the bound.
+
+The proposed window consists of exact owner/session identity, segment index/hash,
+a finite pre-reserved retry-VID interval, codec/EC and maximum byte geometry,
+placement epoch, data PG, file/ack participants and an immutable authority bound.
+All these are storage-derived or validated; the cleanup set is not supplied by
+the failed frontend. For a window of `B` VIDs and `k+m` shards, at most
+`B * (k+m)` final shard keys need checking at the recorded locations, regardless
+of how many files share the PG. `B` is not chosen by this audit.
+
+A narrower alternative records the authorized index/hash but discovers all VIDs
+by scanning filenames, without reserving a fixed retry block. The current
+`list_scavenger_shard_files` walks the PG's directories; it is not a bounded
+per-owner lookup. Compare that option too, including scan completion while
+unrelated owners mutate the directory, unavailable participants, and safe
+continuation without the old allocator. The block's justification is predictable
+exact-key discovery and allocation bounds, not a claim that hashes cannot match
+files without it.
+
+1. **Initial window:** extend existing generation/session creation so segment
+   zero's window is durable before its first physical dispatch. Direct PUT has
+   its one exact segment in the existing generation-reservation command. Cover
+   the crash between reservation and session creation without inventing a session.
+2. **Advance:** append `i` records its selected complete manifest **and** reserves
+   the window for `i+1` in the same existing replicated command/apply transaction.
+   Local preparation may consume only within the replicated window. A pending or
+   ambiguously applied append already protects the future window until exact
+   recovery; its reply is not the source of cleanup ownership.
+3. **Retries and primary change:** a local allocator floor cannot prove which
+   slots in the window are unused on a replacement primary. Do not recycle its
+   VIDs, mint overlapping allocation authority, or resume from the stale floor.
+   Retire the uncertain block and obtain a fresh non-overlapping durable block
+   through an exceptional operation, or stop that attempt and clean it safely.
+   Exhaustion, route/EC changes and slow-upload renewal likewise need explicit
+   exceptional progress; they are not reasons for a command on every normal append.
+4. **Keep prior windows:** committing one chosen VID does not prove other VIDs
+   were never issued. Persist or compact their complete reservation coverage and
+   deadlines with the owner, including through session finalization, part overwrite
+   and object reclaim. Until closure, an old write may still target a non-selected
+   VID. Cleanup excludes exact pending/committed references and checks every other
+   authorized key. No dropping an old window merely because the next one exists.
+5. **Closure and completeness:** pin the exact recorded historical participants;
+   wait out authority and drain both effect classes before deletion. Unavailable
+   participants retain work. Do not infer an empty window from one replica's empty
+   manifest, ack absence, or the local counter. Temporary-file residue keeps its
+   separate bounded cleanup rules; this window concerns final shard keys.
+
+This preserves raw shard-file layout and avoids a mandatory extra replicated
+preparation command. It still adds command/schema fields and durable bytes, may
+reserve unused identifiers, and requires checking unused slots during cleanup.
+Background retirement/progress commits are not free. Speculatively reserving the
+next window may retain one otherwise unused route and extend the conservative
+cleanup scope even when EOF makes that window unnecessary. Compare these costs
+with owner-tagged files (format/read-path change and discovery scans) and exact
+pre-write intents (extra normal-path replicated command). Do not claim a measured
+fsync saving from this structural comparison.
+
+### Next acceptance gate
+
+Model the bounded-window candidate with **independent primary and replica
+allocator state** and exact pending/apply boundaries. Required counterexamples
+include lost preparation replies, exhaustion, failover reusing a slot, issuing an
+out-of-window identity, forgotten prior windows, delayed ack/file effects and a
+part overwritten immediately after publication. Include absent/partial append
+publication and retained-route changes. The model must reject each unsafe variant
+independently, while a replacement discovers every authorized final key without
+consulting the old primary.
+
+Only then review the concrete window schema and its piggyback transactions.
+Actual primary replacement and delayed Unix/TLS requests remain production
+integration gates, as do the six original regressions and real-filesystem cost
+measurements. This slice adds evidence and a preferred candidate for modelling;
+it does not select a deployed protocol or add persistence/RPC formats.
+
+Slice validation: both focused evidence tests passed (eight phase/target cases).
+Full Nextest passed all 9,030 tests, with six existing ignored regressions, in
+238.792 seconds. Strict workspace Clippy, storage boundary checks, formatting
+and `git diff --check` passed. These checks do not validate the proposed window
+protocol, which is not implemented.

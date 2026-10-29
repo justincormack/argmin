@@ -2009,6 +2009,7 @@ fn set_route_state(map: &mut LocalClusterMap, pg_id: u32, state: PgState) {
 
 mod bucket_commands;
 mod bucket_delete;
+mod cleanup_discovery;
 mod command_fanout;
 mod command_recovery;
 mod direct_put;
