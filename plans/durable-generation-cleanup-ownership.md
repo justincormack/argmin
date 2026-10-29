@@ -12,6 +12,9 @@ Status: production regression evidence, bounded design modelling, and a concrete
 The subsequent [minimum-contract and transaction review](#minimum-contract-and-transaction-review--2026-10-29)
 sets the current direction: reuse existing durability barriers; the earlier
 proposal's additional publishers and per-segment intents are not selected.
+The [concrete window/transaction candidate](#concrete-window-and-transaction-candidate--2026-10-29)
+now specifies the retained owner, separate allocation bounds, and integration
+gates. It is a design for review, not an implemented or fully proven protocol.
 The unfinished production fix has been removed; no new
 ownership tables, worker, staging tickets, RPC operations, or format versions are
 part of this slice. A shared fix will be designed and reviewed separately under
@@ -1513,3 +1516,253 @@ independent unsafe variants. Full Nextest passed all 9,035 tests, with six exist
 ignored regressions, in 249.861 seconds. Strict workspace Clippy, storage boundary
 checks, formatting and `git diff --check` passed. This validates the bounded model
 and repository regression suite, not a deployed window protocol.
+
+## Concrete Window And Transaction Candidate — 2026-10-29
+
+This source-backed review advances the bounded model into a proposed physical
+representation. The acceptance target remains **no additional ordinary-path
+metadata command or SQLite commit**. Extra rows, WAL bytes, retained routes and
+eventual cleanup are costs, not free work. No production formats change here.
+
+### What the existing transactions actually provide
+
+- [`schema.rs`](../crates/storage/src/pg_store/schema.rs):
+  `object_generation_reservations` contains identity, generation and creation
+  time, but no placement, finite write horizon or bucket-proof obligation.
+  `stream_uploads` has the local `next_segment_vid`, optional `cleanup_after`
+  and optional bucket proof; its segment rows cascade on session deletion.
+- [`local.rs`](../crates/storage/src/node_client/local.rs),
+  `prepare_stream_segment_append_inner`, validates the loaded session and reserved
+  generation under the PG lock, then calls `allocate_stream_segment_vid`.
+  [`metadata_store.rs`](../crates/storage/src/pg_store/metadata/metadata_store.rs)
+  implements that allocation as a local `UPDATE ... RETURNING`. It is neither a
+  replicated window reservation nor a bound on the supplied segment index.
+- [`command_mutations.rs`](../crates/storage/src/pg_store/metadata/command_mutations.rs),
+  `apply_append_stream_segment_command`, records the selected segment and raises
+  the allocator floor from that selected VID. The floor does not record unused
+  or uncertain retries. `apply_commit_stream_part_command` and stream abort delete
+  the session; [`direct_helpers.rs`](../crates/storage/src/pg_store/metadata/direct_helpers.rs),
+  `delete_stream_upload_in_open_txn`, also deletes its generation reservation.
+- [`command_apply.rs`](../crates/storage/src/pg_store/metadata/command_apply.rs),
+  `apply_metadata_command_and_record_with_commit_guard`, surrounds effects and
+  the applied command record with one immediate transaction. Nested
+  `with_immediate_txn` calls reuse it
+  ([`support.rs`](../crates/storage/src/pg_store/metadata/support.rs)). Adding owner
+  rows **inside that transaction** need not introduce another commit. This does
+  not collapse the existing install, publication-start, replica and slot-retirement
+  phases into one distributed transaction.
+- `next_generation_id` already includes `object_write_counters`' durable generation
+  high-water, advanced by reservation apply. Preserve it. A segment-window bound
+  is a different, session-scoped allocator obligation; do not replace either with
+  `MAX(live rows)` or the selected segment's VID.
+
+### Proposed representation: retained owner plus bounded windows
+
+Use an object-PG-owned anchor which can outlive both generation reservation and
+stream session. Working table names are `payload_staging_owners` and
+`payload_staging_windows`; they are proposals, not new public APIs. A child window
+may cascade from its owner, but **neither table cascades from the session,
+reservation, multipart upload or live object**. Deleting any of those must leave
+the cleanup obligation or atomically transfer it. Table separation is not a
+requirement for a separate transaction.
+
+| Record | Required durable information and binding |
+| --- | --- |
+| Owner | Storage-minted reservation/session identity; bucket and incarnation; key; object PG and originating authority epoch; target (`DirectPut`, streamed PUT, or exact upload ID/part number); reserved payload generation. UploadPart also binds the enclosing upload generation: placement uses that generation, while the distinct part generation binds encryption authority. |
+| Owner lifecycle | Explicit pre-session/staging, published, or retiring disposition; immutable owner revision and finite maximum issued-write cutoff; monotone reserved-VID high-water; exact outstanding resource identities and release responsibility. No nullable cutoff meaning infinite write authority. |
+| Resource obligation | Exact stable bucket-write proof identity and its bucket PG/original epoch when this owner is responsible for it, plus the generation reservation identity. Mutable heartbeat deadlines are not resource identity. Exact release is idempotent; absence must be authoritatively confirmed, not inferred from a missing session. |
+| Window | Owner/revision, segment index and derived hash, nonempty checked VID interval, designated allocation issuer, immutable conservative cutoff, payload codec and maximum stored/shard geometry, EC shape, exact data PG/placement epoch and canonical file/ack participants. Multiple exceptional windows for one index have disjoint intervals and distinct identities. |
+| Published binding | Exact selected physical keys and their object/part-generation ownership, or a durable relation to manifests retaining that identity. An object key or upload/part number alone is insufficient after overwrite. Unselected retry windows remain owned separately from selected payload. |
+
+The window is authority for a bounded **physical** effect, not permission to
+replace encryption metadata or bypass the existing storage-minted encryption
+subject. Direct PUT reserves before its process-local encryption binding; extend
+the reservation request with the information necessary to bound placement and
+geometry, but do not claim a complete encrypted object already exists there.
+Keep the current immutable encryption/subject validation at encryption, append
+and terminal publication.
+
+Direct PUT needs one exact `(hash(reservation, 0), reserved generation)` key per
+shard, not a speculative stream retry block. For streams, generation reservation
+may create a **pre-session owner with no physical-write permission**; creation
+then atomically binds the session and first window. A crash between those
+commands leaves a discoverable release obligation with an empty write set.
+This avoids pretending a session exists, or authorizing writes from its
+generation reservation alone. Carry the original bucket-proof responsibility
+through this gap; do not turn UploadPart's short-lived create proof into an
+indefinitely held session proof.
+
+Start with explicit window rows. Compact only adjacent intervals whose complete
+subject, index/hash, placement, issuer and cutoff agree; merging different
+indices requires an equally exact, versioned derivation, not a wider unchecked
+range. Do not pick a production block size `B` from the model's two retry slots.
+Bounded lookup costs `B * (k+m)` final keys per window; count empty probes, not
+just discovered files. Existing object/part limits and explicit exceptional-window
+limits must bound retained rows and scan work as well as each individual block.
+
+### Allocation and replacement-primary rules
+
+Maintain two different values: **replicated reserved end** and **local consumed
+cursor**. Creation reserves `[start, end)` and advances the former in its existing
+command. Preparation validates the complete expected subject/window and issuer,
+checks the immutable effect fence immediately before mutation, and consumes one
+slot below `end` in the existing local allocation transaction. Never allocate an
+out-of-window index or use an overflowed interval.
+
+Append `i` atomically verifies the selected record belongs to an authorized
+window, stores its manifest, and reserves index `i+1` from the reserved end—not
+`selected_vid + 1`. It retains every earlier window, including unused slots and
+any exceptional retry blocks. Exact replay must match the same next window and
+must neither reserve another interval nor rewind an already advanced local
+cursor. Next-window issuance requires the publication/convergence evidence
+specified by the existing command protocol; mere pending-slot installation or
+an isolated witness row is not sufficient.
+
+Replacement authority must not be inferred from the replica's consumed cursor.
+The first implementation should **stop allocation for the affected attempt on
+primary change or uncertain issuer continuity**, retain its windows, and recover
+or clean it. Old prepared requests remain covered until their recorded cutoff.
+An old issuer may consume only its already delegated finite window; it cannot
+extend its deadline or reserve another block after losing publication authority.
+An issuer binding must distinguish authority lifetimes even when a node returns
+as primary in the same topology; node ID alone is not exclusive allocation
+authority. Preserve local durable allocation on restart, but do not assume that
+a reopened replica's floor proves it was the sole previous allocator.
+
+Resuming an affected attempt requires an explicit exceptional command which
+reserves a disjoint block from the replicated high-water and binds a new issuer.
+That continuation is deferred, not silently supplied by a normal preparation RPC.
+The same applies to exhaustion or an incompatible placement/EC change. Keep
+failures inside existing typed request/recovery handling and test AWS-visible
+outcomes; do not invent a new S3 error or abandon an irrevocable publication.
+
+### Integration by existing transaction
+
+| Existing boundary | Candidate added effects | Added ordinary-path commit target |
+| --- | --- | --- |
+| `ReserveObjectGeneration` apply | Insert owner and resource responsibility with reservation/high-water. Direct PUT also records its exact physical window; streams remain pre-session. | None. Inputs/build response/command must carry the exact checked binding. |
+| `CreateStreamUpload` apply | Bind that owner to the exact session/target and reserve the initial window with its finite cutoff. | None. Reservation and creation remain two existing commands; both gap states are recoverable. |
+| Local prepare | Consume the issuer's slot and validate the durable window under the mutation lock. | None beyond the current local allocator update. This is not replica discovery evidence. |
+| File publication and acknowledgement registration | Validate exact owner/window authority separately at both effect owners; hold local exclusion through file durability and through ack-transaction completion respectively. | No sidecar or per-effect durable ticket proposed. Existing file/directory sync and ack transaction remain. |
+| `AppendStreamSegment` apply | Store selected manifest plus the next immutable window, reserved high-water and cumulative horizon in the same apply/log transaction. | None. Additional command bytes and row writes must be measured. |
+| `CommitDirectPutObject` / `CommitStreamPart` apply | Bind selected manifests to the retained owner and mark it published before removing session/reservation rows. Preserve earlier retries and unused lookahead. | None; no unconditional successful-PUT closure command. |
+| Existing abort/release and payload-displacement/reclaim commands | Seal issuance or transfer the exact selected-generation reference and leave owner/window cleanup responsibility before removing other rows. | Reuse those transactions; deletion cannot start until cutoff/exclusion and reference protection permit it. |
+| Authoritatively unstarted abandonment | Retain the owner across tombstone/slot removal; seal only through a legitimate owner transition. | Do not add a second command solely to copy an obligation already anchored before the write. Ambiguous/started publication still converges. |
+
+Terminal and recovery apply must check these relationships centrally, including
+for malformed decoded envelopes; request-side capability checks alone are not
+enough. Replica apply compares immutable command/row evidence, never local expiry
+clocks. Primary-side expiry selection and local physical admission evaluate time.
+Witness-first and primary-later apply need identical valid effects: do not require
+a primary-only pending-slot mutation to have changed an owner row on every replica.
+
+Sealing/retirement must compare the exact owner revision under the **same object-PG
+serialization as pending-slot installation**. A fresh append or terminal install
+must reject a retiring owner; a cleanup worker cannot merely observe no references
+and race a new command adopting a candidate key. Resolve already pending/ambiguous
+commands through the existing publication protocol before sealing their scope.
+Once an owner is published, do not allow a second terminal command to adopt one
+of its leftover retries. Expiry adoption is a conditional maintenance transition,
+not an inference from current time plus row absence on one replica.
+
+### Successful publication, retention and cleanup cost
+
+Do not erase a window when one slot commits. The initial low-barrier candidate
+retains the owner/windows alongside the published payload, so finalization does
+not wait for cutoff and does not add a closure command. Unselected attempts can
+be cleaned after closure, but **a selected live or pending reference is never
+classified as an orphan**. CompleteMultipartUpload must preserve the owner link
+when parts become object segments; overwrite, version removal, MPU abort and
+payload reclaim must transfer it before removing the old manifest. Record these
+links explicitly rather than reconstructing an owner from an irreversible hash.
+
+This conservative choice retains metadata and historical route references for
+potentially long-lived objects. It is not the final space optimization. Early
+retirement requires transferring a durable closed-write proof to surviving
+payload metadata and preserving any other cleanup/release obligations in one
+object-PG transaction. Prefer piggybacking that on a later eligible mutation;
+if pressure requires a standalone batched maintenance command, count its commits.
+Do not claim zero eventual overhead, or start a new retirement command per
+healthy PUT by default. Actual unlink directory syncs remain DUR-3 work.
+
+Cancellation/crash cleanup retains the anchor until exact files **and** ack rows
+have been removed at all historical participants and its resource releases are
+confirmed. Retries may repeat safe deletes/releases instead of persisting one
+receipt per key; after restart they must re-establish closure, not trust a lost
+process-local observation. Workers must be budgeted and allow unrelated owners/
+PGs to progress when one participant is unavailable. Explicit cleanup-complete
+still means physical completion; a request which can only hand off cleanup must
+not report that stronger result.
+
+Retaining published window evidence does not extend a bucket reservation's live
+lease until object deletion. Preserve existing terminal release timing and exact
+identity checks; only unresolved release responsibility remains outstanding. A
+retained proof can be rechecked/released idempotently and compacted with later
+owner work. Distinguish that conservative retained evidence from live mutation
+authority, and retain its historical release route until confirmation.
+
+Route retention must include all window data-PG epochs (even without manifest or
+ack rows), owner/recovery object-PG epochs, and each exact bucket-PG reservation
+epoch until release is confirmed. Update both summary and exact-reference paths
+in [`pg_store.rs`](../crates/storage/src/pg_store.rs), including pending commands
+which introduce future windows. Existing live-segment and reservation queries
+do not automatically cover this anchor. Migration/backfill/export must preserve
+these rows and their references before a replacement can use them.
+
+### Remaining protocol gates and next implementation slice
+
+The row layout does **not** yet authenticate a remote write grant. Before changing
+production shard RPCs, specify one exact validation protocol. The baseline to
+evaluate is read-only, scoped confirmation of an applied/usable owner window by
+its authoritative metadata route, with bounded caching only until that immutable
+grant's cutoff. This costs RPCs/availability, not inherently another fsync.
+Transport credentials or a caller-provided interval alone are not evidence.
+No new signing key/certificate scheme is assumed. Confirmation must not hold a
+data-PG lock across the object-PG RPC; physical admission must recheck the bound
+under its local exclusion lock after confirmation and before mutation.
+
+Both file and ack owners use the existing portable **absolute conservative
+wall-clock upper bound**, shortened for supported inter-host skew and bound once
+to the receiver's monotonic clock. Never transmit a remaining duration or absolute
+monotonic value. Intersect grant, request and receiving-route authority. Cached
+confirmation cannot extend any bound; early cancellation cannot make already
+dispatched grants vanish. Cleanup waits out the full durable cutoff and drains
+both independently admitted effect classes, including after reconnect/restart.
+
+Next implement a small **storage-owned owner/window state-machine slice** at the
+existing reserve/create/append/apply boundaries, before granting any new remote
+write authority. Its review must include schema, command and export/digest
+membership together, not just new structs. First canaries:
+
+1. Reserve then crash before session creation: empty physical scope, exact retained
+   release obligation on another replica.
+2. Two preparations and a lost reply: replica keeps the reserved end while its
+   consumed floor is stale; no replacement or same-node/new-authority reuse.
+3. Append a non-final slot: next interval starts beyond the **entire** old block;
+   replay preserves both blocks without duplicate allocation.
+4. Abort/finalize/overwrite and complete-MPU: session deletion never cascades away
+   old retry scopes; selected live and pending references remain exact.
+5. Invalid/crossed window, participant, cutoff or resource identity: reject before
+   allocation, command installation or apply mutation, including decoded recovery.
+6. Two route transitions plus object-PG export/reopen: every pre-append placement
+   and historical bucket-release route remains recoverable.
+
+Choose `B`, finite grant/progress limits and the remote confirmation protocol
+before enabling physical writes through these fields. Do not expose dormant
+fields as an already-enforced capability or enable the six ignored regressions
+until the end-to-end exclusion/recovery contract is implemented.
+
+All eventual format work follows [`versioning.md`](../guides/versioning.md) and
+the [format ledger](../guides/storage-format-ledger.md): SQLite catalogue,
+affected command and RPC grammars, digest membership, snapshot/export containment,
+and append-only old/new version-vector evidence. Do not preassign version numbers
+in this design. Existing publisher classes remain authoritative; exceptional
+window/retirement publishers require explicit registry classification, exact-match
+and one-contender retry semantics, finite work budgets and recovery tests.
+
+Review-slice validation: source/transaction audit and plan changes only; no
+production behavior or format changes. Full Nextest passed all 9,035 tests with
+six existing ignored regressions in 246.024 seconds. Strict workspace Clippy,
+storage boundary checks, formatting and `git diff --check` passed. These results
+are regression checks, not implementation evidence for the proposed records or
+remote grant protocol.

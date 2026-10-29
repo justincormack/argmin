@@ -80,7 +80,7 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Bounded lookahead model passes, including uncertain/stale-primary allocation and delayed file/ack effects. Next review concrete window/owner fields and exact existing transaction integration before production implementation. | Six ignored regressions remain unresolved. Target no added ordinary PUT/segment commit; idle renewal is exceptional work. Abstract model is not a production failover proof. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Review the concrete retained-owner/window candidate, then implement its reserve/create/append state-machine slice with replica/replay/export canaries. Settle remote grant confirmation and finite bounds before enabling physical writes. | Six ignored regressions remain unresolved. Target no added ordinary PUT/segment commit; retaining window metadata/routes is an explicit tradeoff. No production protocol implemented yet. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |

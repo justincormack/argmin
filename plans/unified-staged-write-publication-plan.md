@@ -67,6 +67,13 @@ The [minimum-contract transaction review](durable-generation-cleanup-ownership.m
 now prioritizes sharing existing durability barriers. Replicated per-segment
 intents and additional renewal/progress publishers are comparison options, not
 selected prerequisites; discovery and idle-renewal feasibility remain open.
+The subsequent [window/transaction candidate](durable-generation-cleanup-ownership.md#concrete-window-and-transaction-candidate--2026-10-29)
+proposes a retained owner independent of session lifetime, bounded replicated
+retry windows, and separate local allocation cursors. It reuses reserve/create/
+append/terminal apply transactions and initially retains windows with published
+payload rather than adding successful-PUT closure commands. Remote grant
+confirmation, finite bounds and actual replacement-primary integration still
+need validation; no shared physical protocol is implemented yet.
 The multipart-root/state-machine subsections below remain blocked optimization
 candidates: reconcile them with the accepted shared contract before resuming,
 rather than introducing a second owner or physical exclusion protocol.
