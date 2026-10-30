@@ -148,6 +148,144 @@ fn assert_present(store: &PgStore, create: &CreateStreamUploadCommand) {
 }
 
 #[test]
+fn decoded_stream_creation_rejects_forged_initial_cursor_before_mutation() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let mut store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        let before = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&writes);
+        store
+            .conn
+            .trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(move |event: TraceEvent<'_>| {
+                    if let TraceEvent::Stmt(_, sql) = event {
+                        let sql = sql.trim_start();
+                        if (sql.starts_with("INSERT")
+                            || sql.starts_with("UPDATE")
+                            || sql.starts_with("DELETE"))
+                            && [
+                                "object_generation_reservations",
+                                "object_write_counters",
+                                "stream_uploads",
+                            ]
+                            .iter()
+                            .any(|table| sql.contains(table))
+                        {
+                            observed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        for cursor in [2, 641, i64::MAX as u64, u64::MAX] {
+            let mut invalid = create.clone();
+            invalid.initial_next_segment_vid = GenerationId::new(cursor).unwrap();
+            let encoded = envelope(&invalid, 1);
+            let decoded = decode_metadata_command_envelope(
+                &encoded.command_bytes(),
+                &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+            )
+            .unwrap();
+            assert_eq!(decoded, encoded);
+            let error = store
+                .apply_metadata_command_and_record(0, &decoded)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                        context: "create stream upload command initial allocator mismatch",
+                        ..
+                    })
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                writes.load(Ordering::Relaxed),
+                0,
+                "rollback must not mask attempted mutation"
+            );
+            assert_absent(&store, &create);
+            assert_eq!(
+                store
+                    .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                    .unwrap(),
+                before
+            );
+        }
+        // Pin the observer and the valid origin independently of rejection.
+        store
+            .apply_metadata_command_and_record(0, &envelope(&create, 1))
+            .unwrap();
+        assert_present(&store, &create);
+        assert!(writes.load(Ordering::Relaxed) >= 3);
+    }
+}
+
+#[test]
+fn recovered_stream_creation_cannot_install_a_forged_initial_cursor() {
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        let mut invalid = create.clone();
+        invalid.initial_next_segment_vid = GenerationId::new(2).unwrap();
+        let command = envelope(&invalid, 1);
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(command.bucket_name()))
+            .unwrap();
+        let slot = store.pending_metadata_command_slot_any_epoch(0).unwrap();
+        // Checkpoint export deliberately rejects a pending slot. Observe the
+        // materialized state and applied prefix without bypassing that guard.
+        let state_digest = store.metadata_state_digest().unwrap();
+        let replica_state = store.metadata_command_replica_state().unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = PgStore::open(dir.path(), 1).unwrap();
+            let recovered = store
+                .pending_metadata_command_envelope_any_epoch(0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered, command);
+            let error = store
+                .apply_metadata_command_and_record(0, &recovered)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                        context: "create stream upload command initial allocator mismatch",
+                        ..
+                    })
+                ),
+                "{error:?}"
+            );
+            assert_absent(&store, &create);
+            assert_eq!(store.metadata_state_digest().unwrap(), state_digest);
+            assert_eq!(
+                store.metadata_command_replica_state().unwrap(),
+                replica_state
+            );
+            assert_eq!(
+                store.pending_metadata_command_slot_any_epoch(0).unwrap(),
+                slot
+            );
+        }
+    }
+}
+
+#[test]
 fn stream_creation_reservation_session_and_log_commit_or_rollback_together() {
     for part in [false, true] {
         let tmp = test_util::tempdir();

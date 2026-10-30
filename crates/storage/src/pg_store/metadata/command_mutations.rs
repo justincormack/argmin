@@ -266,6 +266,15 @@ impl PgStore {
         &self,
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
+        // Builders select the first physical slot; decoded/recovered commands
+        // must not invent a different allocator origin. A new session has no
+        // appended prefix from which a higher cursor could have been consumed.
+        if command.initial_next_segment_vid != GenerationId::MIN {
+            return Err(MetadataError::InvariantViolation {
+                context: "create stream upload command initial allocator mismatch",
+                reason: "a new stream must start at the first segment VID".into(),
+            });
+        }
         match &command.session.target {
             StreamUploadTarget::PutObject => {
                 if command.session.state == StreamUploadState::InProgress {

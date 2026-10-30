@@ -43,6 +43,9 @@ and central append application, without adding owner/window rows yet.
 The [single outstanding preparation slice](#single-outstanding-local-preparation--2026-10-30)
 now bounds local speculative allocation as well. This is not replicated window
 authority or permission for a replacement primary to reuse a slot.
+The [creation-origin and placement-input audit](#creation-origin-and-placement-input-audit--2026-10-30)
+closes decoded creation's unchecked initial cursor and specifies the captured
+placement input needed before adding durable first-window records.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2863,3 +2866,121 @@ weakening the production guard. The first full run passed 9,097 tests but was
 interrupted after diagnosing two coordinator race tests blocked on that obsolete
 barrier; they expected both preparations to succeed before either could proceed.
 No unrelated process was stopped. All six ignored cleanup regressions remain open.
+
+## Creation Origin And Placement Input Audit — 2026-10-30
+
+### Central creation validation (implemented)
+
+Creation builders always set `initial_next_segment_vid` to `GenerationId::MIN`,
+and their request matcher requires it. Central apply previously accepted a
+decoded creation with a different initial cursor. Such a session has no appended
+prefix to justify that cursor and cannot prepare its first segment under the
+one-slot rule. Require the initial cursor to equal the first VID before any
+reservation, high-water or session mutation, for PUT and UploadPart alike.
+This preserves the existing writer's contract, not a new allocation format.
+
+The regressions use correctly checksummed, decoded commands varying only the
+initial cursor: 2, 641, the SQLite integer maximum and the `u64` maximum. They
+require the specific creation-origin diagnostic, compare the complete checkpoint,
+and observe SQL writes to reject a mutate-then-rollback implementation. A valid
+creation proves the observer detects real reservation/counter/session writes.
+Separate persisted-pending tests reopen twice and require the malformed command
+to leave the exact slot, session absence, reservation absence, high-water and
+applied prefix unchanged. Rejecting this envelope does not authorize its
+abandonment; ordinary recovery authority still governs that decision.
+
+### Inputs for a durable first window (implementation decision)
+
+The existing creation transaction is the right durability boundary, but its
+current builder does not yet receive all the inputs needed by the proposed
+window. Do not fill them later from whichever runtime map is then current.
+
+| Fact | Current owner and point of availability | Required integration |
+| --- | --- | --- |
+| Exact session, target, bucket incarnation and creation proof | Scoped creation request and loaded object/MPU precondition | Preserve the existing subject/proof validation; derive the window's subject from those checked values. |
+| PUT/part payload generation | `LocalStorageNodeClient::build_create_stream_upload_command_for_route` selects it read-only under the object-PG lock | Resolve first-window placement after this selection, within the same builder; do not reintroduce a preceding generation-reservation command. |
+| UploadPart placement generation | Loaded enclosing upload's `object_generation_id` | Keep it distinct from the selected part payload generation; bind both. |
+| PG topology and default EC shape | `SharedStorageNode` | These identify a data PG and geometry, but not its acting set, epoch or acknowledgement owner. They are not a complete placement authority. |
+| Captured data routes | Embedded admitted cluster map; installed server's captured config includes all current PG routes | Supply an opaque, immutable placement context to creation, append/lookahead and Direct PUT reservation builders. Do not use a caller-implemented callback or perform a route refresh while holding the PG lock. |
+| Allocation issuer | Actual metadata primary's `PgStore` allocation lifetime, read under its lock | Persist that node/lifetime identity. A frontend's Unix/TCP shadow runtime must never mint it. |
+| File and acknowledgement participants | Existing placed-shard derivation and data-PG acknowledgement route | Derive both explicitly from the selected captured data route, not from acting-set positions or the object-PG primary. |
+| Finite cutoff | Captured effective admission/receiving-route bounds plus the selected physical-window horizon | Compute an immutable minimum with checked arithmetic; `cleanup_after` is not a substitute for physical write authority. |
+
+Source boundaries:
+
+- [`local.rs`](../crates/storage/src/node_client/local.rs),
+  `build_create_stream_upload_command_for_route`, selects the generation after
+  checking session/reservation absence. Its client currently holds only node ID
+  and `SharedStorageNode`; it has no admitted data-route catalogue.
+- [`routes.rs`](../crates/storage/src/storage_node_server/routes.rs),
+  `build_create_stream_upload_command`, opens that local route from an already
+  validated storage-node primary route. Its captured handler config is the
+  installed server's source for placement context.
+- [`config.rs`](../crates/storage/src/storage_node_server/config.rs),
+  `from_runtime_map`, copies all current PG routes, not just the object route.
+  The context must retain that captured version rather than reload config later.
+- [`local.rs`](../crates/storage/src/cluster/local.rs),
+  `place_payload_shards_for_pg_route`, runs the canonical placement algorithm;
+  copying acting-set order into shard indices is not equivalent.
+- [`payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs),
+  `register_validated_payload_shard_acks`, registers the batch at the data-PG
+  metadata primary. That acknowledgement owner is distinct from each file owner.
+
+The context must be minted from the already authorized operation, bound to its
+publication domain, epoch, metadata subject and effective deadline. Project or
+share the immutable route catalogue before taking the object-PG lock. Under that
+lock, generation selection, issuer capture and placement derivation must be
+read-only local computation; no network call or control-plane lookup is needed.
+Reuse the ordinary placement algorithm and reject an unavailable/unplaceable
+selected route rather than invent participants. Other unrelated PGs need not be
+Active merely because the catalogue contains them.
+
+For Unix/TLS, the server derives its context from its admitted frame and actual
+store. Client-supplied participants or an issuer nonce are not authority. The
+frontend validates the returned descriptor against its own original admitted
+placement context after learning the selected generation, before installation or
+physical writes. A changed map, crossed subject, wrong EC shape, wrong issuer
+node or noncanonical participant assignment must fail closed. Transport only the
+existing absolute conservative wall-clock cutoff representation; bind it at the
+receiver and intersect it with the server's captured authority. Do not transport
+a monotonic value or renew the cutoff after a retry.
+
+Replica apply must compare the command's immutable subject, interval, issuer and
+placement evidence against its local object-PG state. It must not choose a new
+generation, substitute its own lifetime, consult current wall clocks, or query
+data-PG shard rows. Witness-first apply and reissued-command recovery must produce
+the same owner/window rows as primary apply.
+
+### Next complete state slice
+
+First thread this context through the shared builder boundary and introduce the
+retained owner/first window together with append's next window and terminal
+ownership retention. Preserve both current creation entry points and the lower
+record-under-reservation workflow; cover PUT/POST, UploadPart and copy users.
+Direct PUT's reservation builder needs the same captured-placement contract.
+Keep immutable intervals and terminal exhaustion explicit; index 640 cannot
+become another payload allocation merely because a lookahead is represented.
+
+Schema/table catalogue, canonical digest membership, checkpoint/export/import,
+command/RPC descriptors and route-history summary/exact references must be
+reviewed together. In particular, keep the original bucket-PG proof route until
+its release is confirmed, and retain pre-append data routes even when no segment
+or ack row exists. Preserve the already-frozen parent-version evidence and append
+the new complete version-vector specimens; do not assign version numbers in this
+design entry.
+
+Acceptance must include a route change between creation and first preparation,
+same-epoch renewal past the captured cutoff, unsorted acting sets with a distinct
+ack primary, crossed frontend/server placement, and replacement-primary issuer
+rejection. These supplement the previously listed crash, exact-replay, terminal
+retention and export/reopen tests. No durable owner/window tables, placement
+context API, or physical grants are implemented by this audit. All six cleanup
+regressions remain unresolved. No additional normal-path commit is proposed.
+
+Validation: all 24 focused creation/allocator tests passed. The full Nextest
+suite passed 9,101 tests (3 slow, 6 skipped) in 333.178s. Strict all-target,
+all-feature Clippy, the storage boundary checker, formatting and diff checks
+passed. The first focused recovery test correctly hit checkpoint export's
+pending-slot prohibition; its observation was corrected to compare the
+materialized-state digest, exact replica state and pending slot without weakening
+that export guard.
