@@ -26,6 +26,147 @@ use crate::{
 };
 
 #[test]
+fn unix_direct_put_reservation_rejects_unavailable_captured_placement_before_remote_mutation() {
+    let (_serial, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let epoch = ClusterEpoch::INITIAL;
+    let ec = EcShape { k: 1, m: 0 };
+    let pg_ids = (0..8).collect::<Vec<_>>();
+    let socket = tmp.path().join("sockets/reservation.sock");
+    private_socket_dir(socket.parent().unwrap());
+    let config = StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: tmp.path().join("remote"),
+        default_ec_shape: ec,
+        pg_ids: pg_ids.clone(),
+        socket_path: socket.clone(),
+        pg_routes: pg_ids
+            .iter()
+            .map(|&pg_id| StorageNodePgRoute {
+                pg_id,
+                cluster_epoch: epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![node_id],
+            })
+            .collect(),
+        pending_metadata_command_recoveries: vec![],
+        historical_pg_routes: vec![],
+    };
+    let server = StorageNodeServer::bind(config).unwrap();
+    let remote = server.test_storage_node();
+    let _server = spawn_storage_node_server(server);
+    let mut map = LocalClusterMap::open_with_configs(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join("frontend"),
+        )],
+        &pg_ids,
+        ec,
+    )
+    .unwrap();
+    map.install_unix_metadata_command_clients([LocalUnixMetadataCommandNodeClientConfig::new(
+        node_id,
+        socket.clone(),
+    )])
+    .unwrap();
+    map.install_unix_object_generation_metadata_clients([
+        LocalUnixObjectGenerationMetadataNodeClientConfig::new(node_id, socket),
+    ])
+    .unwrap();
+    let bucket = crate::tests::bucket_name("unix-reservation-placement");
+    let key = (0..1000)
+        .map(|n| crate::tests::object_key(format!("key-{n}")))
+        .find(|key| {
+            map.object_generation_segment_data_pg(&bucket, key, GenerationId::MIN, 0)
+                .get()
+                != map.pg_topology().object_pg_for(&bucket, key)
+        })
+        .unwrap();
+    let object_pg = map.pg_topology().object_pg_for(&bucket, &key);
+    let data_pg = map
+        .object_generation_segment_data_pg(&bucket, &key, GenerationId::MIN, 0)
+        .get();
+    assert_ne!(object_pg, data_pg);
+    let healthy_map = Arc::new(map);
+    let healthy = StorageCluster::from_static_local_map(healthy_map.clone()).unwrap();
+    let restricted_map = healthy_map
+        .test_clone_with_pg_routes(
+            epoch,
+            healthy_map.pg_routes.values().map(|route| {
+                PgRouteSnapshot::reconstructed(
+                    epoch,
+                    route.pg_id(),
+                    route.primary_node_id(),
+                    route.acting_set().to_vec(),
+                    if route.pg_id().get() == data_pg {
+                        PgState::Peering
+                    } else {
+                        PgState::Active
+                    },
+                )
+            }),
+            [],
+        )
+        .unwrap();
+    let restricted = StorageCluster::from_static_local_map(Arc::new(restricted_map)).unwrap();
+    let id = crate::tests::stream_session_id("unix-place");
+    let observe = || {
+        let pg = remote.get_pg(object_pg).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &id),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert!(pg
+            .pending_metadata_command_envelope(node_id.as_u32(), epoch)
+            .unwrap()
+            .is_none());
+        (
+            pg.metadata_command_replica_state().unwrap(),
+            pg.max_metadata_command_log_index(epoch).unwrap(),
+            crate::PgMetadataStore::next_generation_id(&*pg, &bucket, &key).unwrap(),
+        )
+    };
+    let before = observe();
+    assert!(
+        matches!(restricted.reserve_put_object_generation(&bucket, &key, &id),
+        Err(crate::ObjectPgActionError::Store(StoreError::PgNotActive { pg_id, .. })) if pg_id == data_pg)
+    );
+    assert_eq!(observe(), before);
+    assert_eq!(
+        healthy
+            .reserve_put_object_generation(&bucket, &key, &id)
+            .unwrap(),
+        GenerationId::MIN
+    );
+    let pg = remote.get_pg(object_pg).unwrap();
+    assert_eq!(
+        crate::PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &id)
+            .unwrap(),
+        GenerationId::MIN
+    );
+    assert_eq!(
+        pg.max_metadata_command_log_index(epoch).unwrap(),
+        before.1 + 1
+    );
+    let shadow = healthy_map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_generation_reservation(&*shadow, &bucket, &key, &id),
+        Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+    ));
+}
+
+#[test]
 fn unix_stream_creation_atomically_publishes_generation_and_session_with_one_command() {
     let (_serial, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);

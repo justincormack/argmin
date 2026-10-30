@@ -226,7 +226,7 @@ fn preparation_rejects_before_allocation(remote: bool, checks: PreparationChecks
                                 reason,
                             }),
                             0,
-                        ) => reason.starts_with("stream preparation placement:"),
+                        ) => reason.starts_with("captured payload placement:"),
                         (
                             ObjectPgActionError::Store(StoreError::ClusterPgNotFound {
                                 pg_id: 0,

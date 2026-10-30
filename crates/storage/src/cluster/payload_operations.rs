@@ -792,6 +792,7 @@ impl StorageCluster {
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("reserve_object_generation")
                 .for_pg(pg_id);
+        let placement = PayloadPlacementInput::from_local_map(&self.local_map);
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
@@ -907,6 +908,17 @@ impl StorageCluster {
                     .map_err(ObjectPgActionError::Store)?;
                 continue;
             }
+            // Validate only fresh issuance. An exact already-pending command
+            // must still converge even when its data route is no longer active.
+            // This is captured-map preflight, not durable cleanup ownership or
+            // permission to write shards after reservation/publication.
+            let data_pg = self.local_map.object_generation_segment_data_pg(
+                bucket, key, generation_id, 0,
+            );
+            placement.require_segment_placement(
+                self.operation_epoch(), data_pg.get(), self.default_payload_ec_shape(),
+                &crate::direct_put_segment_key_hash(reservation_id, 0), generation_id,
+            )?;
             self.maybe_run_before_metadata_command_pending_install_hook();
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(

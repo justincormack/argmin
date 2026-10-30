@@ -208,7 +208,7 @@ impl<'a> PayloadPlacementInput<'a> {
         place_payload_shards_for_pg_route(epoch, data_pg_id, ec, &placement_key, acting_set)
             .map(|_| ())
             .map_err(|error| StoreError::PayloadShardSetMismatch {
-                reason: format!("stream preparation placement: {error}"),
+                reason: format!("captured payload placement: {error}"),
             })
     }
 }

@@ -3131,3 +3131,53 @@ passed 9,111 tests (two slow, six skipped) in 270.172s. Strict all-target/all-fe
 Clippy, the storage boundary checker, formatting and diff checks passed. Existing
 metadata-only builder fixtures now provide placeable catalogues consistent with
 their EC shapes; no payload fixtures or historical encoding specimens changed.
+
+## Direct PUT Reservation Placement Preflight — 2026-10-30
+
+Fresh Direct PUT generation reservations now resolve index-zero placement using
+the already captured cluster map before entering fresh command-ID/pending-slot
+installation. The key is the ordinary Direct PUT reservation-ID hash and the
+selected generation is both the placement generation and shard VID; do not use
+the stream session's initial VID-one convention here. This prevents knowingly
+reserving a generation whose selected data PG is inactive or unplaceable.
+
+Keep the existing stale-generation reinspection before this check. If another
+request reserves the candidate first, the outer retry selects a new generation
+and recomputes its data PG and exact placement. A previous candidate's successful
+preflight must not authorize the next candidate. The normal fresh pending-slot
+effect fence and central reservation apply conflict checks remain unchanged.
+
+Preflight applies only to fresh issuance. An exact pending reservation command
+must still converge, and an already materialized exact reservation must still
+be observable, when its data route is no longer Active. Neither result grants
+physical write authority; the subsequent payload write retains its own current
+route/effect checks. Do not turn a placement preflight into an abandonment rule
+for a command that might already have published.
+
+New multi-replica regressions pin rejection before the pending-install hook and
+compare replica state, log position, next generation, reservation absence and
+empty pending slots. A healthy positive control must reach that hook and reserve
+the original generation. A deterministic competing reservation advances the
+candidate from a usable PG to a different Peering PG; the losing attempt must
+reject without further mutation. An exact pending-command canary converges on
+every replica despite the unusable data route. An installed-Unix case checks the
+actual remote store remains unchanged on frontend preflight rejection, then
+reserves successfully through the healthy map and verifies no reservation was
+written to frontend shadow storage.
+
+This is **frontend captured-map preflight**, not an atomic storage-node reservation
+builder or a persisted placement witness. Direct PUT currently selects/rechecks
+the generation via scoped reads and builds its reservation command in the
+cluster. The durable owner/window slice must still move complete generation,
+issuer, cutoff and descriptor minting to the actual metadata-primary boundary,
+validate the returned descriptor, and retain it through apply/recovery. This
+slice adds no RPC, schema/encoding change, transaction or fsync. All six ignored
+cleanup regressions remain unresolved.
+
+Validation: all 39 focused reservation, race, recovery and Unix tests passed.
+Full Nextest passed 9,115 tests (one slow, six skipped) in 246.259s. Strict
+all-target/all-feature Clippy, storage boundary checks, formatting and diff
+checks passed. The first focused run caught a positive-control observer scoped
+only to the restricted map; the healthy control now installs its own observer
+and demonstrably reaches pending installation. Production behavior was not
+changed to accommodate that fixture failure.

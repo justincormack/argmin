@@ -10,6 +10,9 @@ mod payload_model;
 #[path = "direct_put_overlap_model.rs"]
 mod overlap_model;
 
+#[path = "direct_put_reservation_placement.rs"]
+mod reservation_placement;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,
