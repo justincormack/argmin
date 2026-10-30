@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
-use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
+use placement::NodeId;
 
 use super::{AcquiredObjectPayloadNodeLeases, ProcessLocalRegistryKey, ShardLocation};
 use crate::control_plane::{
@@ -50,19 +50,23 @@ use crate::node_client::{
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
+use crate::node_runtime::payload_placement::{
+    build_local_placement_map, place_payload_shards_for_pg_route, validate_local_payload_placement,
+};
 use crate::pg_store::MetadataCommandStartupDisposition;
 #[cfg(test)]
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc_transport::{StorageRpcClientEndpoint, StorageRpcEndpointAuthorityIdentity};
 use crate::types::{AdmittedRouteEffectFence, PlacedSegmentShardRepairWorkItem};
+#[cfg(test)]
+use crate::ShardIndex;
 use crate::{
     BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
     GenerationId, MetadataError, ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId,
-    PgState, ReclaimWorkItem, RouteMapValidity, ShardIndex, ShardKey, WriteAck, WrittenShardAck,
+    PgState, ReclaimWorkItem, RouteMapValidity, ShardKey, WriteAck, WrittenShardAck,
 };
 
-const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
 const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v3";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
@@ -6333,44 +6337,13 @@ impl LocalClusterMap {
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
         self.require_current_epoch_for_placement(operation_epoch, data_pg_id.pg_id())?;
         let route = self.require_active_pg_for_placement(data_pg_id.pg_id())?;
-        Self::place_payload_shards_for_pg_route(
+        place_payload_shards_for_pg_route(
             operation_epoch,
             data_pg_id,
             ec_shape,
             stable_placement_key,
             route.acting_set(),
         )
-    }
-
-    pub(crate) fn place_payload_shards_for_pg_route(
-        cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        ec_shape: EcShape,
-        stable_placement_key: &[u8],
-        acting_set: &[NodeId],
-    ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
-        let ec_config = ec_config_for_shape(ec_shape)?;
-        let total_shards = ec_config.total_shards();
-        let placement_map = build_local_placement_map(acting_set.iter().copied())?;
-        let placer = local_payload_placer(&placement_map, ec_shape)?;
-        let placement_key = payload_shard_placement_key(data_pg_id, stable_placement_key);
-        let mut node_ids = vec![NodeId::new(0); total_shards];
-        placer
-            .place(&placement_key, &mut node_ids)
-            .map_err(|error| placement_error_for_shape(ec_shape, error))?;
-
-        Ok(node_ids
-            .into_iter()
-            .enumerate()
-            .map(|(shard_index, node_id)| {
-                ShardLocation::new(
-                    cluster_epoch,
-                    data_pg_id,
-                    ShardIndex::new(shard_index as u8),
-                    node_id,
-                )
-            })
-            .collect())
     }
 
     #[cfg(test)]
@@ -6562,7 +6535,7 @@ impl LocalClusterMap {
         segment_vid: GenerationId,
     ) -> Result<LocalPlacedSegmentShardSubject, StoreError> {
         let placement_key = super::segment_payload_placement_key(segment_okh, segment_vid);
-        let locations = Self::place_payload_shards_for_pg_route(
+        let locations = place_payload_shards_for_pg_route(
             route.cluster_epoch(),
             data_pg_id,
             ec,
@@ -7842,86 +7815,6 @@ fn validate_embedded_local_topology(
         pg_ids,
         configs: validated_configs,
     })
-}
-
-fn validate_local_payload_placement(
-    placement_map: &placement::ClusterMap,
-    default_ec_shape: EcShape,
-) -> Result<(), ClusterBuildError> {
-    local_payload_placer(placement_map, default_ec_shape)?;
-    Ok(())
-}
-
-fn local_payload_placer(
-    placement_map: &placement::ClusterMap,
-    ec_shape: EcShape,
-) -> Result<placement::Placer, ClusterBuildError> {
-    let ec_config = ec_config_for_shape(ec_shape)?;
-    let placement_config = placement::PlacementConfig::new(ec_config.total_shards())
-        .map_err(|error| invalid_ec_shape_error(ec_shape, error))?;
-    placement::Placer::new(placement_config, placement_map, PlacementConstraint::none())
-        .map_err(|error| placement_error_for_shape(ec_shape, error))
-}
-
-fn ec_config_for_shape(ec_shape: EcShape) -> Result<ec::EcConfig, ClusterBuildError> {
-    ec::EcConfig::new(ec_shape.k, ec_shape.m)
-        .map_err(|error| invalid_ec_shape_error(ec_shape, error))
-}
-
-fn invalid_ec_shape_error(ec_shape: EcShape, error: impl std::fmt::Display) -> ClusterBuildError {
-    ClusterBuildError::InvalidEcShape {
-        data_shards: ec_shape.k,
-        parity_shards: ec_shape.m,
-        reason: error.to_string(),
-    }
-}
-
-fn placement_error_for_shape(ec_shape: EcShape, error: PlacementError) -> ClusterBuildError {
-    match error {
-        PlacementError::TooFewNodes { shards, nodes } => ClusterBuildError::UnplaceableEcShape {
-            data_shards: ec_shape.k,
-            parity_shards: ec_shape.m,
-            required_nodes: shards,
-            node_count: nodes,
-        },
-        other => ClusterBuildError::InvalidLocalPlacement {
-            reason: other.to_string(),
-        },
-    }
-}
-
-fn build_local_placement_map(
-    node_ids: impl IntoIterator<Item = NodeId>,
-) -> Result<placement::ClusterMap, ClusterBuildError> {
-    let placement_nodes: Vec<placement::NodeInfo> = node_ids
-        .into_iter()
-        .map(local_placement_node_info)
-        .collect();
-    placement::ClusterMap::new(&placement_nodes).map_err(|error| {
-        ClusterBuildError::InvalidLocalPlacement {
-            reason: error.to_string(),
-        }
-    })
-}
-
-fn payload_shard_placement_key(data_pg_id: DataPgId, stable_placement_key: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN.len()
-            + std::mem::size_of::<u32>()
-            + stable_placement_key.len(),
-    );
-    key.extend_from_slice(PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN);
-    key.extend_from_slice(&data_pg_id.get().to_be_bytes());
-    key.extend_from_slice(stable_placement_key);
-    key
-}
-
-fn local_placement_node_info(node_id: NodeId) -> placement::NodeInfo {
-    placement::NodeInfo {
-        id: node_id,
-        location: TopologyKey::rack_machine(node_id.as_u32(), node_id.as_u32()),
-        weight: 1.0,
-    }
 }
 
 fn prepare_local_node_data_dir(

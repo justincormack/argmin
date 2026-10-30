@@ -46,6 +46,9 @@ authority or permission for a replacement primary to reuse a slot.
 The [creation-origin and placement-input audit](#creation-origin-and-placement-input-audit--2026-10-30)
 closes decoded creation's unchecked initial cursor and specifies the captured
 placement input needed before adding durable first-window records.
+The [shared placement resolver](#shared-placement-resolver--2026-10-30) extracts
+the existing computation for reuse by installed builders; captured placement
+authority and durable descriptors are not implemented by that extraction.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2984,3 +2987,46 @@ passed. The first focused recovery test correctly hit checkpoint export's
 pending-slot prohibition; its observation was corrected to compare the
 materialized-state digest, exact replica state and pending slot without weakening
 that export guard.
+
+## Shared Placement Resolver — 2026-10-30
+
+As a preparatory refactor for the next complete state slice, move the existing
+canonical file-placement computation out of `LocalClusterMap` into the private
+node-runtime implementation at
+[`payload_placement.rs`](../crates/storage/src/payload_placement.rs). Current
+active and historical placement, repair, deletion and topology validation now
+use that shared implementation. Storage-node builders can reuse it without
+constructing a frontend cluster or copying the placement algorithm.
+
+The resolver is pure computation, **not a capability**. It takes already
+captured inputs and performs no runtime-map lookup, clock read, database access
+or network call. Existing callers keep their active/retained route validation.
+In particular, accepting an epoch and acting set does not authorize either writes
+or cleanup. Do not use its result as a substitute for the future admitted
+placement context, durable window, settled-prefix confirmation or exclusion.
+
+Keep the placement key domain, big-endian data-PG prefix, node topology/weights,
+placement constraint and error mapping unchanged. The placement engine scans
+canonical NodeId order, but its candidate replacement order determines shard
+indices when there are more nodes than shards; do not sort the final result or
+index the acting set directly. The acknowledgement participant remains the
+captured data-PG metadata primary, independently of file placement.
+
+Coverage pins the literal key framing, all six permutations of a three-node
+acting set, keyed selection from an eight-node set for 1+0/2+1/4+2, and invalid,
+duplicate or insufficient nodes. An embedded production-path canary uses acting
+set `[4, 2, 3]` with primary `3`, verifies the independently expected shard-index
+mapping `[2, 3, 4]`, writes files and registers acknowledgements, then checks each
+file exists only at its assigned node and every acknowledgement exists only at
+the metadata primary. Existing explicit historical-route coverage remains.
+
+This slice adds no durable rows, schema/encoding changes, extra transactions or
+fsyncs. Capturing authoritative builder inputs and integrating owner/window state
+with creation, append and terminal commands remains the next state-changing
+slice; all six ignored cleanup regressions remain unresolved.
+
+Validation: all 11 focused placement tests passed. Full Nextest passed 9,106
+tests (one slow, six skipped) in 274.562s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and diff checks passed. The initial
+focused run exposed the fixture's use of a convenience constructor requiring
+node 0; it now uses the explicit-primary constructor for its `[4, 2, 3]` nodes.

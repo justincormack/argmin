@@ -368,7 +368,7 @@ impl StorageCluster {
         stable_placement_key: &[u8],
         acting_set: &[NodeId],
     ) -> Result<Vec<ShardLocation>, ClusterBuildError> {
-        LocalClusterMap::place_payload_shards_for_pg_route(
+        crate::node_runtime::payload_placement::place_payload_shards_for_pg_route(
             cluster_epoch,
             data_pg_id,
             ec_shape,

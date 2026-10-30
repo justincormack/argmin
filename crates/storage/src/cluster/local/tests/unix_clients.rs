@@ -12092,7 +12092,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let segment_okh = [0x7b; 16];
     let segment_vid = GenerationId::new(3).unwrap();
     let placement_key = crate::cluster::segment_payload_placement_key(&segment_okh, segment_vid);
-    let locations = LocalClusterMap::place_payload_shards_for_pg_route(
+    let locations = place_payload_shards_for_pg_route(
         historical_epoch,
         data_pg_id,
         ec_shape,

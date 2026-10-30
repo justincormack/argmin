@@ -432,6 +432,9 @@ mod engine;
 #[path = "node_client.rs"]
 mod clients;
 
+#[path = "payload_placement.rs"]
+pub(crate) mod payload_placement;
+
 #[path = "storage_node_server.rs"]
 mod server;
 

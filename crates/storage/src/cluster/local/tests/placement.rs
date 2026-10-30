@@ -548,6 +548,85 @@ fn placed_segment_deleter_rejects_crossed_segment_keys() {
 }
 
 #[test]
+fn payload_placement_keeps_file_owners_distinct_from_acknowledgement_primary() {
+    let tmp = test_util::tempdir();
+    let acting = [4, 2, 3].map(NodeId::new);
+    let ec = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open_with_configs(
+        NodeId::new(2),
+        acting.map(|id| LocalNodeStoreConfig::new(id, tmp.path().join(id.as_u32().to_string()))),
+        &[0],
+        ec,
+    )
+    .unwrap();
+    let original = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let epoch = ClusterEpoch::new(9).unwrap();
+    let primary = NodeId::new(3);
+    let route = PgRouteSnapshot::reconstructed(
+        epoch,
+        PgId::new(0),
+        primary,
+        acting.to_vec(),
+        PgState::Active,
+    );
+    let cluster = original
+        .test_clone_with_pg_routes(epoch, [route], [])
+        .unwrap();
+    let pg = DataPgId::new_for_test(PgId::new(0));
+    let hash = [0x47; 16];
+    let vid = GenerationId::new(5).unwrap();
+    let locations = cluster
+        .place_payload_shards(
+            pg,
+            ec,
+            &crate::cluster::segment_payload_placement_key(&hash, vid),
+        )
+        .unwrap();
+    assert_eq!(
+        locations
+            .iter()
+            .map(ShardLocation::node_id)
+            .collect::<Vec<_>>(),
+        [2, 3, 4].map(NodeId::new)
+    );
+    assert_ne!(locations[0].node_id(), acting[0]);
+    assert_ne!(locations[0].node_id(), primary);
+    assert_ne!(acting[0], primary);
+
+    let mut written = Vec::new();
+    for location in &locations {
+        let key = ShardKey::new(&hash, vid.get(), location.shard_index().get());
+        let ack = cluster
+            .write_payload_shard(*location, &key, b"physical shard fixture")
+            .unwrap();
+        written.push(WrittenShardAck { key, ack });
+    }
+    cluster
+        .test_register_payload_shard_acks(pg.get(), &written)
+        .unwrap();
+    for (location, written) in locations.iter().zip(&written) {
+        for node_id in acting {
+            let node = cluster.local_map.node(node_id).unwrap().storage_node();
+            let file = node.read_shard_file(pg.get(), &written.key);
+            if node_id == location.node_id() {
+                assert_eq!(file.unwrap(), b"physical shard fixture");
+            } else {
+                assert!(matches!(file, Err(StoreError::NotFound)));
+            }
+            let acknowledgement = node
+                .get_pg(pg.get())
+                .unwrap()
+                .validate_written_shard_ack(&written.key, written.ack);
+            if node_id == primary {
+                acknowledgement.unwrap();
+            } else {
+                assert!(matches!(acknowledgement, Err(StoreError::NotFound)));
+            }
+        }
+    }
+}
+
+#[test]
 fn places_payload_shards_for_explicit_pg_route_without_current_route_lookup() {
     let tmp = test_util::tempdir();
     let node_ids = [
