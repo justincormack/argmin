@@ -26,6 +26,9 @@ preserves literal current-format bytes before changing state-table membership.
 The [confirmation and issuer-lifetime refinement](#window-confirmation-and-issuer-lifetime--2026-10-30)
 defines the remote authority handoff and adds bounded counterexample checks;
 these are design/model evidence, not implemented grants or schema integration.
+The [settled-prefix review](#settled-prefix-confirmation-decision--2026-10-30)
+selects materialized-window confirmation rather than indefinitely retaining an
+introducing-command receipt, and pins the existing compaction/import behavior.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2258,3 +2261,152 @@ variants produced their required counterexample. Full
 skipped) in 235.323 seconds. Strict workspace Clippy, storage boundary checks,
 formatting and `git diff --check` passed. The six skipped cleanup regressions
 remain unresolved; these results do not certify the unimplemented protocol.
+
+## Settled-Prefix Confirmation Decision — 2026-10-30
+
+**Selected direction:** confirm the exact materialized owner/window through the
+current authoritative object-PG primary at a settled prefix. Do not require its
+original introducing envelope or exact terminal receipt to remain available
+forever, and do not add a separate durable publication receipt for each window.
+The window's immutable descriptor/revision is its identity; log positions are
+publication/recovery evidence, not that identity.
+Settlement requires matching primary/witness prefix evidence (or the corresponding
+certified transfer proof), not merely local row presence and an empty primary slot.
+
+This resolves the previous section's introduction/reissue/checkpoint design
+question. It does not implement the confirmation RPC or a new route capability.
+
+### Source-backed reasons
+
+- `compact_metadata_command_log_with_receipt_retention` in
+  [`command_log.rs`](../crates/storage/src/pg_store/command_log.rs) removes
+  checkpoint-covered log rows and bounds terminal receipts. After both are
+  pruned, `applied_metadata_command_log_entry_hashes` returns `None`, even though
+  the materialized session/reservation still exists. An old exact-command retry
+  correctly fails closed rather than inferring its envelope identity from rows.
+- `install_metadata_transfer_checkpoint_base` preserves the checkpoint's complete
+  materialized state/digest but installs it at the destination epoch with applied
+  index/hash zero. An old command's epoch/index is therefore not a permanent
+  lookup key for a transferred owner/window.
+- `validate_metadata_command_checkpoint_state_read_only` already requires the
+  selected epoch, absence of a pending slot, a valid checkpoint/log suffix, no
+  unresolved tail, and the matching state digest. This supplies useful local
+  settled-prefix semantics, **not** primary authority or a global publication
+  certificate. An applied witness may pass it while the primary still has an
+  unresolved slot. It must never be used alone to mint a grant.
+- The existing exact-command publication protocol and peering certification
+  establish which primary/state may serve. The new owner/window must participate
+  in that canonical state, checkpoint and transfer protocol rather than adding
+  an independently synced confirmation journal.
+
+### Concrete confirmation rule for implementation
+
+1. Enter through a current active-primary, exact object-PG route capability with
+   its immutable admission fence. A retained historical inspection route, a
+   standalone witness checkpoint, or possession of a node credential is not
+   sufficient. A successor confirms old windows only after its ordinary
+   certified transfer/recovery and active-primary admission have completed.
+2. Under the existing object-PG/metadata-command serialization boundary, reject
+   an unresolved pending slot or unapplied tail before returning a positive
+   result. Do not wait for an unbounded all-command drain. A typed retry/unavailable
+   result lets the existing bounded publisher/recovery workflow settle it.
+   The same rule applies if an unrelated command currently occupies the slot;
+   the initial implementation prefers a conservative, simple prefix boundary.
+3. Read the exact owner/window and compare all requested subject, scope, resource,
+   cutoff, geometry, participant and lifecycle fields in that same protected
+   observation. Validate the local replica's epoch/prefix against the admitted
+   primary route and obtain matching epoch/index/log-hash/state-digest evidence
+   from its designated publication witness, or validate the equivalent certified
+   imported-prefix evidence. A singleton route has no independent witness; preserve
+   its existing single-node publication semantics. Bind the witness identity to
+   the admitted acting set. Identical owner/window rows at different prefixes do
+   not suffice. Do not release primary serialization between selecting the prefix,
+   checking settlement and capturing the descriptor. The bounded metadata-witness
+   inspection runs while primary serialization remains held, following the existing
+   held-primary inspection order; no data-PG/physical lock is held across that
+   network call. Replica apply of future owner/window commands
+   and checkpoint semantic validation must enforce the immutable relationships.
+4. Return an opaque confirmed physical scope bounded by the descriptor's original
+   cutoff and the request/receiving-route fences. The later file/ack owner still
+   performs its own guarded admission check. This result does not let the caller
+   allocate another VID or reconstitute an issuer lifetime.
+
+Use the existing settled-prefix invariants, not full checkpoint generation or a
+complete table scan on every confirmation. The implementation must demonstrate a
+bounded lookup using owner-local validated/cached prefix state, plus a no-write
+canary. Holding metadata serialization for the lookup adds contention, not a new
+commit. The metadata-witness inspection is the permitted network call under
+primary serialization and must respect the captured deadline and work budget.
+Release primary serialization after capturing the confirmed descriptor, before
+physical IO or data-node calls. No data-PG or physical-effect lock may be held
+across a network call.
+
+Same-payload reissue must preserve the owner/window descriptor. An old pending
+command is still resolved using its exact authorized recovery chain before the
+current prefix can serve; the new confirmation path must not invent a second
+reissue validator or treat `None` from an old-envelope lookup as proof of absence.
+After authorized transfer, canonical row membership plus the new route's
+settled-prefix authority replaces the obsolete log identity for confirmation.
+No support for old-format readers or schema migration is introduced.
+
+### Runtime lifetime integration points
+
+The source audit also rules out reusing the existing managed storage-node
+incarnation counter as the sole allocation-lifetime proof: it does not describe
+every in-process PG replacement/import or every embedded runtime. The nonce
+proposal in the previous section remains selected.
+
+- Mint the local PG lifetime on opening its storage-owned runtime/store. Cloning
+  `LocalNodeRuntime` shares its `Arc<SharedStorageNode>`; it must not create an
+  independent allocator or mint another lifetime for the same live PG.
+- Checkpoint-base replacement and
+  `adopt_metadata_transfer_state_from_rebased_commands` both invalidate prior
+  local allocation authority, including adoption that does not rewrite session
+  rows. Perform invalidation under the same PG serialization; on failure, keeping
+  old authority invalid is conservative. No post-error path may silently remint
+  the old identity from persisted owner/window fields.
+- Restart opens a fresh lifetime. Ordinary command apply, heartbeat renewal and
+  same-runtime route-view clones do not recreate or extend a grant. Primary-loss
+  and subsequent activation must distinguish new allocation admission from old
+  bounded in-flight work, as specified above.
+
+These hooks and their actual runtime/Unix tests remain implementation work; the
+new store tests below do not assert that today's allocator is already fenced.
+
+### Production-store regression evidence
+
+[`stream_creation_evidence_tests.rs`](../crates/storage/src/pg_store/metadata/stream_creation_evidence_tests.rs)
+adds three tests, each covering PUT and UploadPart:
+
+- Apply real creation and a later command, checkpoint, then run the production
+  compactor with a one-receipt retention bound. Assert that the creation's log and
+  receipt disappear while the complete session, reserved generation/high-water
+  and checkpoint remain exact, including after reopen. An attempted old-envelope
+  replay must fail without SQL mutation, slot/log advance or row changes.
+- Import that compacted checkpoint into epoch two, assert index/hash zero and
+  exact state digest/table blocks, generation and session, then reopen. No
+  original envelope receipt is manufactured. This is the production **store
+  import** path, not an end-to-end control-plane transfer authorization test.
+- Apply creation witness-first with the primary's real pending/publication-start
+  state. Pin that the witness can export a valid local checkpoint while primary
+  export remains rejected, both before and after primary apply. Rejection does
+  not mutate SQL state or clear the publication marker. Only after slot removal
+  does primary checkpoint export succeed. Both stores start from the same base;
+  prefix proofs differ before primary apply and match afterward. A later witness
+  command then proves that exact stream-row equality can coexist with divergent
+  prefix proofs. The test does not claim that calling the store's slot-removal
+  primitive independently proves distributed settlement.
+
+The fixtures are metadata-only and write no shard payload. The next production
+slice is still owner/window schema/command integration with issuer invalidation,
+followed by the scoped confirmation and physical-exclusion paths. Finite window
+size/horizon policy remains to be selected before write grants are enabled.
+No extra ordinary-path commit, production format or ignored-test change lands
+in this evidence/decision slice; the six cleanup regressions remain unresolved.
+
+Validation: all three focused store tests passed for both targets. The full
+`cargo nextest run --offline --no-fail-fast` passed 9,069 tests (one slow, six
+skipped) in 237.810 seconds after the primary/witness-prefix canary was
+strengthened. Strict workspace Clippy, storage boundary checks, formatting and
+`git diff --check` passed. This validates the existing store behavior used in the
+design decision, not an implemented window-confirmation or cleanup protocol.
