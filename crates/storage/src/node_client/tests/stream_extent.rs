@@ -221,7 +221,7 @@ fn preparation_rejects_invalid_extents(remote: bool) {
         }
         let request = PrepareStreamUploadSegmentAppendReq {
             session_id: session_id.clone(),
-            segment_index: crate::payload_limits::MAX_STREAM_SEGMENTS - 1,
+            segment_index: 0,
             size: crate::INTERNAL_SEGMENT_SIZE as u64,
             segment_crc64: 0,
             payload_crc64: 0,
@@ -254,6 +254,36 @@ fn preparation_rejects_invalid_extents(remote: bool) {
                 .get(),
             segment.segment_vid.get() + 1
         );
+        // A successful preparation with its reply ignored has consumed the
+        // local slot. Neither repeating it nor skipping ahead may allocate.
+        let prepared = observe();
+        for segment_index in [0, 1] {
+            let retry = PrepareStreamUploadSegmentAppendReq {
+                segment_index,
+                ..request.clone()
+            };
+            let error = positive
+                .prepare_segment_append_with_expected_append_state(&retry, Some(expected), fence)
+                .unwrap_err();
+            if remote {
+                assert!(
+                    matches!(
+                        error,
+                        ObjectPgActionError::Store(StoreError::StorageRpc {
+                            failure: StorageRpcErrorCode::PayloadDecode,
+                            ..
+                        })
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(error, ObjectPgActionError::InvalidRequest { reason }
+                    if reason.contains("unconsumed local slot"))
+                );
+            }
+            assert_eq!(observe(), prepared);
+        }
     }
 }
 

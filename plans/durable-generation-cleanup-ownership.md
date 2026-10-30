@@ -40,6 +40,9 @@ durable window/allocator binding remains outstanding. The
 [storage-owned extent limits](#storage-owned-stream-extent-limits--2026-10-30)
 enforce the selected per-attempt segment bound before preparation allocation
 and central append application, without adding owner/window rows yet.
+The [single outstanding preparation slice](#single-outstanding-local-preparation--2026-10-30)
+now bounds local speculative allocation as well. This is not replicated window
+authority or permission for a replacement primary to reuse a slot.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2789,3 +2792,74 @@ fixture; refreshing that digest made its positive command control reach apply.
 The slow `raft_production_shaped_heartbeat_write_amplification_gate` passed in
 87.325 seconds. Strict workspace Clippy, storage boundary checks, formatting and
 `git diff --check` passed.
+
+## Single Outstanding Local Preparation — 2026-10-30
+
+Enforce the chosen one-slot policy at the existing local allocator update before
+adding durable owner/window authority. Production PUT and UploadPart preparation
+now require the requested index to follow the locally applied segment prefix,
+remain below the storage-owned segment bound, and have an unconsumed local VID.
+The latter compares `next_segment_vid - 1` with the maximum locally appended VID
+(zero for an empty session). The subtraction avoids overflowing a corrupt maximum
+VID. A successful preparation advances the cursor once. Until its append applies,
+neither repeating that index nor skipping ahead can allocate another candidate.
+
+All predicates are part of the same `UPDATE ... RETURNING`; successful allocation
+still steps through statement completion before returning. There is no additional
+write statement, transaction, command, format change or fsync. The subqueries add
+bounded local inspection of at most 640 segment rows. The unrestricted interval
+allocator remains only a storage-unit-test arithmetic fixture; production node
+clients use the bounded entry point. Rejected preparation uses the existing
+invalid-request outcome (Unix `PayloadDecode`), not a new AWS-facing error.
+
+This is intentionally **local consumption**, not the planned replicated reserved
+end. In particular, a replacement replica with a stale cursor can still appear to
+have a free slot; these checks do not establish issuer continuity. Nor does an
+isolated appended row prove publication has settled. The future owner/window
+confirmation path must enforce those obligations before granting physical write
+authority. Do not infer cleanup coverage or a finite write cutoff from this local
+predicate, and do not replace the proposed explicit retained windows with
+`MAX(live rows)`. Retained history, replica discovery, terminal ownership transfer,
+finite cutoffs and file/ack exclusion all remain outstanding.
+
+Coverage includes:
+
+- lost preparation reply modelled by ignoring its successful result, then
+  rejecting a second allocation both before and after reopening the same store;
+- an independent already-open store observing the consumed cursor, with the
+  retry using the same index so a skipped-index check cannot mask the assertion;
+- first-index and last-index success, next-index rejection before append, and
+  rejection of the unused terminal lookahead after a complete 640-segment prefix;
+- injected allocation-update failure preserving the free slot;
+- applied append unlocking one next preparation, followed by exact append replay
+  that neither allocates nor rewinds an already consumed cursor;
+- embedded and installed-Unix PUT/UploadPart duplicate-preparation rejection,
+  preserving complete session/reservation and command-log observations; and
+- the production append-publication collision tests still consuming exactly one
+  VID while retrying command publication, with exact encrypted readback; and
+- same-PG/cross-PG coordinator races holding the successful preparation before
+  payload writes, requiring the competing request to reject while it is held,
+  then verifying one staged winner and exact finalized plaintext. Bounded channel
+  waits and a release-on-drop guard replace the obsolete two-preparation barrier.
+
+The replica-discovery experiments now assert rejection of the second speculative
+preparation and retain their independent file/ack/manifest observations. The
+unrelated-pending duplicate cleanup canary uses an explicitly malformed
+storage-owned conflicting record: its cleanup and preservation assertions still
+run after physical staging, rather than being replaced by early rejection alone.
+
+Validation: 15 focused storage/model/workflow checks and both corrected
+coordinator race tests passed. The final full
+`cargo nextest run --offline --no-fail-fast` passed 9,099 tests (one slow, six
+skipped) in 235.301 seconds. The Raft production-shaped write-amplification gate
+passed in 114.468 seconds. Strict workspace Clippy, boundary checks, formatting
+and `git diff --check` passed.
+
+The initial focused run exposed the two discovery tests'
+old multiple-preparation assumption; the storage run exposed four more fixtures
+with that assumption (reopen, already-open handle, durable allocator and duplicate
+cleanup). Those fixtures were migrated to the selected one-slot policy without
+weakening the production guard. The first full run passed 9,097 tests but was
+interrupted after diagnosing two coordinator race tests blocked on that obsolete
+barrier; they expected both preparations to succeed before either could proceed.
+No unrelated process was stopped. All six ignored cleanup regressions remain open.

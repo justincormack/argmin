@@ -365,7 +365,7 @@ impl LocalStorageNodeClient {
                 if let Some(effect_fence) = effect_fence {
                     effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
                 }
-                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                let segment_vid = allocate_stream_segment_for_preparation(&pg, request)?;
                 (
                     segment_vid,
                     pg_topology
@@ -403,7 +403,7 @@ impl LocalStorageNodeClient {
                 if let Some(effect_fence) = effect_fence {
                     effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
                 }
-                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                let segment_vid = allocate_stream_segment_for_preparation(&pg, request)?;
                 (
                     segment_vid,
                     pg_topology

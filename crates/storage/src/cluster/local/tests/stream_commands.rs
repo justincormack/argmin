@@ -2896,7 +2896,7 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
         .unwrap();
     let conflicting_payload = b"unreferenced conflicting stream segment";
     let conflicting_encrypted = crate::tests::sse_s3_segment_test_fixture(conflicting_payload, 0);
-    let (_target, conflicting_segment) = cluster
+    let duplicate = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -2908,7 +2908,21 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
                 payload_crc64: conflicting_encrypted.payload_crc64,
             },
         )
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(duplicate, crate::ObjectPgActionError::InvalidRequest { reason }
+        if reason.contains("unconsumed local slot"))
+    );
+    // Owner-local malformed-state fixture: production preparation cannot mint
+    // a second candidate now. Preserve the recovery/cleanup canary by injecting
+    // an unreferenced conflicting physical record, not by widening allocation.
+    let conflicting_segment = crate::StreamUploadSegmentRecord {
+        segment_vid: crate::GenerationId::new(published_segment.segment_vid.get() + 1).unwrap(),
+        size: conflicting_encrypted.logical_size,
+        segment_crc64: conflicting_encrypted.storage_crc64,
+        payload_crc64: conflicting_encrypted.payload_crc64,
+        ..published_segment.clone()
+    };
     assert_ne!(
         published_segment.segment_vid,
         conflicting_segment.segment_vid
@@ -9310,14 +9324,20 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
     let (_target, first) = cluster
         .prepare_stream_segment_append(&bucket, &key, &req)
         .unwrap();
-    let (_target, second) = cluster
+    let second = cluster
         .prepare_stream_segment_append(&bucket, &key, &req)
-        .unwrap();
+        .unwrap_err();
 
     assert_eq!(first.segment_vid, crate::GenerationId::MIN);
-    assert_eq!(second.segment_vid, crate::GenerationId::new(2).unwrap());
-    assert_eq!(first.segment_okh, second.segment_okh);
-    assert_eq!(first.segment_index, second.segment_index);
+    assert!(
+        matches!(second, crate::ObjectPgActionError::InvalidRequest { reason }
+        if reason.contains("unconsumed local slot"))
+    );
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let primary = map
+        .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+        .unwrap();
+    assert_stream_next_segment_vid(&map, primary.node_id(), pg_id.get(), &session_id, 2);
 }
 
 #[test]

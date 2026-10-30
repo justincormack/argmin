@@ -889,6 +889,7 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<(), MetadataError>;
 
     /// Allocate a durable, per-session stream segment payload generation.
+    #[cfg(test)]
     fn allocate_stream_segment_vid(
         &self,
         session_id: &SessionId,

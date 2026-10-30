@@ -867,25 +867,28 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
 
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
-    let (_target, second) = cluster
+    let second = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
-                segment_index: 1,
+                segment_index: 0,
                 size: 32,
                 segment_crc64: 2,
                 payload_crc64: 2,
             },
         )
-        .unwrap();
-    assert_eq!(second.segment_vid, crate::GenerationId::new(2).unwrap());
+        .unwrap_err();
+    assert!(
+        matches!(second, crate::ObjectPgActionError::InvalidRequest { reason }
+        if reason.contains("unconsumed local slot"))
+    );
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
         .unwrap()
         .node_id();
-    assert_stream_next_segment_vid(&map, primary, 2, &session_id, 3);
+    assert_stream_next_segment_vid(&map, primary, 2, &session_id, 2);
 }
 
 #[test]
@@ -933,28 +936,31 @@ fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
             },
         )
         .unwrap();
-    let (_target, second) = second_cluster
+    let second = second_cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
-                segment_index: 1,
+                segment_index: 0,
                 size: 32,
                 segment_crc64: 2,
                 payload_crc64: 2,
             },
         )
-        .unwrap();
+        .unwrap_err();
 
     assert_eq!(first.segment_vid, crate::GenerationId::MIN);
-    assert_eq!(second.segment_vid, crate::GenerationId::new(2).unwrap());
+    assert!(
+        matches!(second, crate::ObjectPgActionError::InvalidRequest { reason }
+        if reason.contains("unconsumed local slot"))
+    );
     for map in [&first_map, &second_map] {
         let primary = map
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
             .unwrap()
             .node_id();
-        assert_stream_next_segment_vid(map, primary, 2, &session_id, 3);
+        assert_stream_next_segment_vid(map, primary, 2, &session_id, 2);
     }
 }
 

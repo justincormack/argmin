@@ -55,29 +55,65 @@ pub(super) fn checked_segment_vid_window(
 }
 
 impl PgStore {
+    /// One outstanding local preparation, until its append is applied. This
+    /// bounds speculative allocation only: replica cursors do not establish
+    /// exclusive issuer continuity or durable cleanup authority.
+    pub(in crate::node_runtime) fn allocate_stream_segment_vid_for_append(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+    ) -> Result<Option<GenerationId>, MetadataError> {
+        self.allocate_stream_segment_vid_window_inner(
+            session_id,
+            NonZeroU32::MIN,
+            Some(segment_index),
+        )
+        .map(|window| window.map(|window| window.start()))
+    }
+
     /// Consumes a finite interval from this node's local allocator. It is not a
     /// replicated reserved end and cannot authorize replacement-primary reuse.
     /// The one-statement bound is checked by SQLite before the update; Rust only
     /// projects the checked result. Keep the normal single-VID path one statement
     /// with no extra transaction or pre-read between admission and mutation.
+    #[cfg(test)]
     pub(super) fn allocate_stream_segment_vid_window(
         &self,
         session_id: &SessionId,
         count: NonZeroU32,
     ) -> Result<CheckedSegmentVidWindow, MetadataError> {
+        self.allocate_stream_segment_vid_window_inner(session_id, count, None)?
+            .ok_or_else(exhausted_window)
+    }
+
+    fn allocate_stream_segment_vid_window_inner(
+        &self,
+        session_id: &SessionId,
+        count: NonZeroU32,
+        next_segment_index: Option<u32>,
+    ) -> Result<Option<CheckedSegmentVidWindow>, MetadataError> {
         let count_sql = i64::from(count.get());
         let allocated = (|| -> rusqlite::Result<Option<GenerationId>> {
             let mut statement = self.conn.prepare_cached(
                 "UPDATE stream_uploads \
              SET next_segment_vid = next_segment_vid + ?3 \
              WHERE session_id = ?1 AND state = ?2 AND next_segment_vid <= ?4 \
+             AND (?5 IS NULL OR (\
+                 ?5 < ?6 AND \
+                 ?5 = (SELECT COALESCE(MAX(segment_index) + 1, 0) \
+                       FROM stream_upload_segments WHERE session_id = ?1) AND \
+                 next_segment_vid - 1 = (SELECT COALESCE(MAX(segment_vid), 0) \
+                                        FROM stream_upload_segments WHERE session_id = ?1)\
+             )) \
              RETURNING next_segment_vid - ?3",
             )?;
             let mut rows = statement.query(params![
                 session_id.as_str(),
                 StreamUploadState::InProgress as u8,
                 count_sql,
-                i64::MAX - count_sql
+                i64::MAX - count_sql,
+                next_segment_index,
+                crate::payload_limits::MAX_STREAM_SEGMENTS,
             ])?;
             let allocated = rows
                 .next()?
@@ -96,10 +132,14 @@ impl PgStore {
             source: source.into(),
         })?;
         match allocated {
-            Some(start) => checked_segment_vid_window(start, count),
+            Some(start) => checked_segment_vid_window(start, count).map(Some),
             None => match self.get_stream_upload(session_id) {
                 Ok(session) if session.state == StreamUploadState::InProgress => {
-                    Err(exhausted_window())
+                    if session.next_segment_vid.get() > (i64::MAX - count_sql) as u64 {
+                        Err(exhausted_window())
+                    } else {
+                        Ok(None)
+                    }
                 }
                 Ok(session) => Err(MetadataError::StreamSessionNotInProgress {
                     state: session.state as u8,
@@ -172,6 +212,145 @@ mod tests {
                 },
             })),
         )
+    }
+
+    #[test]
+    fn single_slot_preparation_lost_reply_reopen_and_append_replay() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        let other = session(&store, "22");
+        store.refresh_metadata_command_state_digest().unwrap();
+        let other_before = store.get_stream_upload(&other).unwrap();
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.get_stream_upload(&first).unwrap().next_segment_vid,
+            GenerationId::MIN
+        );
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 0)
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+        let consumed = store.get_stream_upload(&first).unwrap();
+        drop(store);
+
+        // Reopening preserves local consumption even if no preparation response
+        // or append was delivered. This is not a replacement-replica proof.
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        for index in [0, 1, crate::payload_limits::MAX_STREAM_SEGMENTS, u32::MAX] {
+            assert_eq!(
+                store
+                    .allocate_stream_segment_vid_for_append(&first, index)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(store.get_stream_upload(&first).unwrap(), consumed);
+            assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+            assert!(store.list_stream_segments(&first).unwrap().is_empty());
+        }
+        let append = append_command(&store, &first, 1, 1);
+        store.apply_metadata_command_and_record(0, &append).unwrap();
+        // Lost append reply: replay must neither allocate nor rewind consumption.
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 1)
+                .unwrap(),
+            GenerationId::new(2)
+        );
+        let second_consumed = store.get_stream_upload(&first).unwrap();
+        store.apply_metadata_command_and_record(0, &append).unwrap();
+        store.apply_metadata_command(&append).unwrap();
+        assert_eq!(store.get_stream_upload(&first).unwrap(), second_consumed);
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 2)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+    }
+
+    #[test]
+    fn single_slot_preparation_rejects_update_failure_without_consumption() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        let before = store.get_stream_upload(&first).unwrap();
+        store.conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_consumption BEFORE UPDATE OF next_segment_vid ON stream_uploads \
+             BEGIN SELECT RAISE(ABORT, 'injected allocation failure'); END"
+        ).unwrap();
+        assert!(matches!(
+            store.allocate_stream_segment_vid_for_append(&first, 0),
+            Err(MetadataError::Db { .. })
+        ));
+        assert_eq!(store.get_stream_upload(&first).unwrap(), before);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_consumption")
+            .unwrap();
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 0)
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 0)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn single_slot_preparation_accepts_last_index_and_rejects_lookahead() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        // Metadata-only fixture; use the ordinary append apply transaction for
+        // each row so the high index has a complete, coherent preceding prefix.
+        for index in 0..crate::payload_limits::MAX_STREAM_SEGMENTS {
+            let vid = store
+                .allocate_stream_segment_vid_for_append(&first, index)
+                .unwrap()
+                .unwrap();
+            assert_eq!(vid.get(), u64::from(index) + 1);
+            let command = append_command(&store, &first, vid.get(), 1);
+            let MetadataCommandPayload::AppendStreamSegment(mut append) = command.payload().clone()
+            else {
+                unreachable!()
+            };
+            append.segment.segment_index = index;
+            store
+                .apply_metadata_command(&MetadataCommandEnvelope::new(
+                    command.id(),
+                    MetadataCommandPayload::AppendStreamSegment(append),
+                ))
+                .unwrap();
+        }
+        let before = store.get_stream_upload(&first).unwrap();
+        assert_eq!(store.list_stream_segments(&first).unwrap().len(), 640);
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 640)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get_stream_upload(&first).unwrap(), before);
     }
 
     #[test]

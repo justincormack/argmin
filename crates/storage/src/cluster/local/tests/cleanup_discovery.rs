@@ -32,7 +32,7 @@ fn prepare(
     encrypted: &crate::tests::SseS3SegmentTestFixture,
     index: u32,
     admission: &crate::StorageClusterRouteAdmission,
-) -> crate::StreamUploadSegmentRecord {
+) -> Result<crate::StreamUploadSegmentRecord, crate::ObjectPgActionError> {
     let expected = {
         let primary = cluster.local_map.node(NodeId::new(0)).unwrap();
         let pg = primary.storage_node().get_pg(0).unwrap();
@@ -73,8 +73,7 @@ fn prepare(
             Some(&expected),
             || admission.require_valid_now_raw(),
         )
-        .unwrap()
-        .1
+        .map(|(_, segment)| segment)
 }
 
 fn inspect_surviving_replica(target: Target, stop: StopAfter) {
@@ -184,7 +183,8 @@ fn inspect_surviving_replica(target: Target, stop: StopAfter) {
         &encrypted[0],
         0,
         &admission,
-    );
+    )
+    .unwrap();
     assert_ne!(first.data_pg_id, 0);
     let first_written = write(&first, &encrypted[0].storage_bytes);
     let batch = first_written
@@ -207,17 +207,9 @@ fn inspect_surviving_replica(target: Target, stop: StopAfter) {
     assert_eq!(first_manifest.len(), 1);
     assert_eq!(first_manifest[0].segment_vid, first.segment_vid);
 
-    // A lost preparation reply can consume another VID without an append.
-    // Do not let the experiment imply replica_floor + 1 bounds all issued VIDs.
-    let discarded = prepare(
-        &cluster,
-        &bucket,
-        &key,
-        &session_id,
-        &encrypted[1],
-        1,
-        &admission,
-    );
+    // One preparation consumes the current local slot. Losing that response
+    // does not authorize another candidate; the replica still cannot establish
+    // issuer continuity, placement or a finite physical-write cutoff from this.
     let second = prepare(
         &cluster,
         &bucket,
@@ -226,10 +218,45 @@ fn inspect_surviving_replica(target: Target, stop: StopAfter) {
         &encrypted[1],
         1,
         &admission,
+    )
+    .unwrap();
+    let primary_before_retry = cluster
+        .local_map
+        .node(nodes[0])
+        .unwrap()
+        .storage_node()
+        .get_pg(0)
+        .unwrap()
+        .get_stream_upload(&session_id)
+        .unwrap();
+    let retry = prepare(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        &encrypted[1],
+        1,
+        &admission,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(retry, crate::ObjectPgActionError::InvalidRequest { reason }
+        if reason.contains("unconsumed local slot"))
+    );
+    assert_eq!(
+        cluster
+            .local_map
+            .node(nodes[0])
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap()
+            .get_stream_upload(&session_id)
+            .unwrap(),
+        primary_before_retry
     );
     assert_ne!(second.data_pg_id, 0);
-    assert_eq!(discarded.segment_okh, second.segment_okh);
-    assert!(second.segment_vid.get() > discarded.segment_vid.get());
+    assert_eq!(second.segment_vid, before.next_segment_vid);
     let primary_floor = cluster
         .local_map
         .node(nodes[0])
@@ -304,7 +331,7 @@ fn inspect_surviving_replica(target: Target, stop: StopAfter) {
     }
     drop(pg);
 
-    // Scan actual files, not expected paths from the discarded preparation.
+    // Scan actual files, not paths supplied by the original preparation.
     // Filtering uses the known next index as an experimental candidate, NOT
     // a production-authorized frontier (none exists in the current schema).
     let hash = crate::stream_segment_key_hash(&session_id, 1);

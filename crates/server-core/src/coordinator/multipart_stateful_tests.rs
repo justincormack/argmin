@@ -11,7 +11,7 @@ use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
@@ -365,9 +365,26 @@ impl<'a> InvariantHarness<'a> {
 }
 
 struct StreamAppendRaceSync {
-    prepared_barrier: Arc<Barrier>,
+    prepared: mpsc::Receiver<()>,
+    resume: Arc<(Mutex<bool>, Condvar)>,
+    preparations: Arc<AtomicUsize>,
     _serial_guard: MutexGuard<'static, ()>,
     _guard: StreamAppendTestHookGuard,
+}
+
+impl StreamAppendRaceSync {
+    fn release(&self) {
+        let (released, wake) = &*self.resume;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+}
+
+impl Drop for StreamAppendRaceSync {
+    fn drop(&mut self) {
+        // Assertion failures must not strand an append inside a test hook.
+        self.release();
+    }
 }
 
 fn install_stream_append_race_hooks(
@@ -379,16 +396,27 @@ fn install_stream_append_race_hooks(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let prepared_barrier = Arc::new(Barrier::new(3));
-    let prepared_barrier_hook = Arc::clone(&prepared_barrier);
+    let (prepared_tx, prepared) = mpsc::channel();
+    let resume = Arc::new((Mutex::new(false), Condvar::new()));
+    let resume_hook = Arc::clone(&resume);
+    let preparations = Arc::new(AtomicUsize::new(0));
+    let preparations_hook = Arc::clone(&preparations);
     let guard = coord.install_stream_append_test_hooks(StreamAppendTestHooks {
         target: Some((session_id.as_str().to_owned(), segment_index)),
         after_prepare: Some(Arc::new(move || {
-            prepared_barrier_hook.wait();
+            preparations_hook.fetch_add(1, Ordering::SeqCst);
+            prepared_tx.send(()).unwrap();
+            let (released, wake) = &*resume_hook;
+            let (released, _) = wake
+                .wait_timeout_while(released.lock().unwrap(), Duration::from_secs(30), |v| !*v)
+                .unwrap();
+            assert!(*released, "stream append race hook was not released");
         })),
     });
     StreamAppendRaceSync {
-        prepared_barrier,
+        prepared,
+        resume,
+        preparations,
         _serial_guard: serial,
         _guard: guard,
     }
@@ -820,17 +848,47 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
     let key_b = key.clone();
     let session_a = session_id.clone();
     let session_b = session_id.clone();
+    let (finished, results) = mpsc::channel();
+    let finished_a = finished.clone();
     let t_a = std::thread::spawn(move || {
-        writer_a.append_plaintext_stream_segment_for_test("bucket", &key_a, &session_a, 0, &data_a)
+        let result = writer_a
+            .append_plaintext_stream_segment_for_test("bucket", &key_a, &session_a, 0, &data_a);
+        let _ = finished_a.send((true, result));
     });
     let t_b = std::thread::spawn(move || {
-        writer_b.append_plaintext_stream_segment_for_test("bucket", &key_b, &session_b, 0, &data_b)
+        let result = writer_b
+            .append_plaintext_stream_segment_for_test("bucket", &key_b, &session_b, 0, &data_b);
+        let _ = finished.send((false, result));
     });
 
-    sync.prepared_barrier.wait();
+    sync.prepared
+        .recv_timeout(Duration::from_secs(10))
+        .expect("one writer must reach preparation");
+    // The winner is held after allocation and before any payload/publication.
+    // The other writer must reject now, not wait for duplicate-row detection
+    // after the winner commits. Requiring two after-prepare arrivals deadlocks
+    // precisely when the one-slot boundary works.
+    let first_result = results
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the competing preparation must reject while the winner is held");
+    assert!(
+        matches!(&first_result.1, Err(ServerError::InvalidRequest { .. })),
+        "{first_result:?}"
+    );
+    assert_eq!(sync.preparations.load(Ordering::SeqCst), 1);
+    sync.release();
+    let second_result = results
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the released winner must complete");
+    t_a.join().unwrap();
+    t_b.join().unwrap();
 
-    let result_a = t_a.join().unwrap();
-    let result_b = t_b.join().unwrap();
+    assert_ne!(first_result.0, second_result.0);
+    let (result_a, result_b) = if first_result.0 {
+        (first_result.1, second_result.1)
+    } else {
+        (second_result.1, first_result.1)
+    };
     let winner = match (&result_a, &result_b) {
         (Ok(()), Err(ServerError::InvalidRequest { .. })) => b"first-segment".as_slice(),
         (Err(ServerError::InvalidRequest { .. }), Ok(())) => b"second-segment".as_slice(),

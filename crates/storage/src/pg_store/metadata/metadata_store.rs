@@ -5678,6 +5678,7 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn allocate_stream_segment_vid(
         &self,
         session_id: &SessionId,

@@ -663,6 +663,17 @@ fn reject_duplicate_stream_segment_index(
     Ok(())
 }
 
+fn allocate_stream_segment_for_preparation(
+    pg: &PgStore,
+    request: &PrepareStreamUploadSegmentAppendReq,
+) -> Result<GenerationId, ObjectPgActionError> {
+    pg.allocate_stream_segment_vid_for_append(&request.session_id, request.segment_index)?
+        .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+            reason: "stream preparation requires the next segment and an unconsumed local slot"
+                .into(),
+        })
+}
+
 fn validate_stream_put_finalize_session(
     session: &StreamUploadRecord,
     bucket: &BucketName,
