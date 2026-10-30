@@ -172,11 +172,9 @@ use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use crate::system_metadata::SystemMetadata;
 const TRACE_TARGET: &str = "server_core";
 
-/// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
-pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
-
-/// Fixed internal segment size for newly committed segmented payloads.
-pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
+// Storage owns the same bounds used at ingestion and before durable allocation.
+// The single-write limit does not cap an object assembled from MPU parts.
+pub use storage::{INTERNAL_SEGMENT_SIZE, MAX_SINGLE_WRITE_SIZE as MAX_OBJECT_SIZE};
 
 const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
 const BUCKET_FAST_PATH_MAX_ENTRIES: usize = 1024;

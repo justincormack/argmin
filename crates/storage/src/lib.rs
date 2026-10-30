@@ -4503,6 +4503,9 @@ pub(crate) use types::StreamUploadCommandRecord;
 pub(crate) use types::TerminalStreamCleanupRecord;
 #[cfg(test)]
 pub(crate) use types::UPLOAD_ID_LEN;
+mod payload_limits;
+pub use payload_limits::{INTERNAL_SEGMENT_SIZE, MAX_SINGLE_WRITE_SIZE};
+
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound, AclGrants,
     AuthorizedMultipartCompletionReplay, AuthorizedMultipartCompletionSnapshot,

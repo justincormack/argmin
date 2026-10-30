@@ -309,6 +309,15 @@ impl PgStore {
         &self,
         command: &AppendStreamSegmentCommand,
     ) -> Result<(), MetadataError> {
+        if !crate::payload_limits::stream_segment_extent_is_valid(
+            command.segment.segment_index,
+            command.segment.size,
+        ) {
+            return Err(MetadataError::InvariantViolation {
+                context: "append stream segment extent",
+                reason: "segment exceeds the single-write index or logical-size limit".into(),
+            });
+        }
         // Validate decoded/recovered commands before inserting any segment row.
         // A VID may fit SQLite while its required next cursor does not. Carry
         // the checked interval through both fresh and idempotent application.

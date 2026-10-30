@@ -8773,6 +8773,18 @@ pub struct PrepareStreamUploadSegmentAppendReq {
     pub payload_crc64: u64,
 }
 
+impl PrepareStreamUploadSegmentAppendReq {
+    pub(crate) fn validate_extent(&self) -> Result<(), crate::ObjectPgActionError> {
+        if !crate::payload_limits::stream_segment_extent_is_valid(self.segment_index, self.size) {
+            return Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "stream segment exceeds the single-write index or logical-size limit"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Logical input for writing and publishing one streaming-upload segment.
 ///
 /// Storage derives the physical payload identity, placement, erasure-coding

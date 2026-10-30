@@ -323,6 +323,91 @@ mod tests {
     }
 
     #[test]
+    fn stream_segment_extent_recovered_commands_cannot_advance_pending_slot() {
+        for (index, size) in [
+            (crate::payload_limits::MAX_STREAM_SEGMENTS, 64),
+            (1, crate::INTERNAL_SEGMENT_SIZE as u64 + 1),
+        ] {
+            let dir = test_util::tempdir();
+            let store = PgStore::open(dir.path(), 0).unwrap();
+            let first = session(&store, "11");
+            let other = session(&store, "22");
+            store.refresh_metadata_command_state_digest().unwrap();
+            // Positive control: the same command family really publishes a row.
+            let valid = append_command(&store, &first, 1, 1);
+            store.apply_metadata_command_and_record(0, &valid).unwrap();
+            let before = store.get_stream_upload(&first).unwrap();
+            let other_before = store.get_stream_upload(&other).unwrap();
+            let segments_before = store.list_stream_segments(&first).unwrap();
+            assert_eq!(segments_before.len(), 1);
+            let original = append_command(&store, &first, 2, 2);
+            let MetadataCommandPayload::AppendStreamSegment(mut append) =
+                original.payload().clone()
+            else {
+                unreachable!()
+            };
+            append.segment.segment_index = index;
+            append.segment.size = size;
+            // Keep the witness coherent, so dropping the extent guard would
+            // actually accept these metadata-only commands rather than fail
+            // later for a checksum/geometry mismatch. No payload is written.
+            let stored_size = before.encryption.segment_stored_size(size).unwrap();
+            let (crc, witness) = crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                crate::EcShape { k: 2, m: 1 },
+                stored_size,
+            );
+            append.segment.segment_crc64 = crc;
+            append.segment.shard_integrity = Some(witness);
+            let command = MetadataCommandEnvelope::new(
+                original.id(),
+                MetadataCommandPayload::AppendStreamSegment(append),
+            );
+            store
+                .try_insert_pending_metadata_command_slot(0, &command, Some(command.bucket_name()))
+                .unwrap();
+            let slot_before = store.pending_metadata_command_slot_any_epoch(0).unwrap();
+            let replica_before = store.metadata_command_replica_state().unwrap();
+            let digest_before = store.metadata_state_digest().unwrap();
+            drop(store);
+            for _ in 0..2 {
+                let store = PgStore::open(dir.path(), 0).unwrap();
+                let recovered = store
+                    .pending_metadata_command_envelope_any_epoch(0)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered, command);
+                assert!(matches!(
+                    store.apply_metadata_command_and_record(0, &recovered),
+                    Err(crate::BucketSnapshotLoadError::Metadata(
+                        MetadataError::InvariantViolation {
+                            context: "append stream segment extent",
+                            ..
+                        }
+                    ))
+                ));
+                assert_eq!(store.get_stream_upload(&first).unwrap(), before);
+                assert_eq!(store.get_stream_upload(&other).unwrap(), other_before);
+                assert_eq!(store.list_stream_segments(&first).unwrap(), segments_before);
+                assert_eq!(
+                    store.pending_metadata_command_slot_any_epoch(0).unwrap(),
+                    slot_before
+                );
+                assert_eq!(
+                    store.metadata_command_replica_state().unwrap(),
+                    replica_before
+                );
+                assert_eq!(store.metadata_state_digest().unwrap(), digest_before);
+                assert_eq!(
+                    store
+                        .max_metadata_command_log_index(crate::ClusterEpoch::INITIAL)
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stream_segment_vid_windows_last_representable_append_survives_replay_and_reopen() {
         let dir = test_util::tempdir();
         let store = PgStore::open(dir.path(), 0).unwrap();

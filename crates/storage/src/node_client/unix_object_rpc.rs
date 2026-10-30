@@ -4700,6 +4700,7 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
             }
             .into());
         }
+        request.validate_extent()?;
         let effect_deadline =
             effect_fence
                 .deadline()

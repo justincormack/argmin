@@ -312,6 +312,7 @@ impl LocalStorageNodeClient {
         expected_append_state: Option<&crate::ExpectedStreamAppendState>,
         effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        request.validate_extent()?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let session = pg.get_stream_upload(&request.session_id)?;
         validate_stream_upload_session_binding(&session, bucket, key)?;

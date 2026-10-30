@@ -35,7 +35,11 @@ writes. Allocators do not consume that identity yet; durable issuer binding,
 primary-loss invalidation and physical write/cleanup exclusion remain open.
 The subsequent [storage-node route-publication hook](#storage-node-route-publication-lifetimes--2026-10-30)
 handles issuer replacement on installed storage-node route changes. Embedded
-cluster publication and durable window/allocator binding remain outstanding.
+cluster publication is covered by the subsequent embedded-lifetime slice;
+durable window/allocator binding remains outstanding. The
+[storage-owned extent limits](#storage-owned-stream-extent-limits--2026-10-30)
+enforce the selected per-attempt segment bound before preparation allocation
+and central append application, without adding owner/window rows yet.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2738,3 +2742,50 @@ formatting and `git diff --check` passed. The first focused run exposed an inval
 hyphenated upload-ID label in the new UploadPart fixture; correcting that label
 allowed the test to reach its intended publication collision. The six ignored
 cleanup regressions remain unresolved.
+
+## Storage-Owned Stream Extent Limits — 2026-10-30
+
+The owner/window integration needs an enforced row bound, not merely the HTTP
+body limit. Move the existing 5 GiB single-write/part limit and 8 MiB logical
+segment size into storage; server-core reexports those same values for ingestion.
+This does not limit the total size of an object assembled from multipart parts.
+
+The shared extent predicate permits selected indices 0 through 639 and logical
+sizes up to 8 MiB, within the single-write limit. Index 640 is unavailable for
+payload preparation even with size zero: the proposed unused lookahead window
+is not an additional payload segment. Zero-size segments at a valid index remain
+permitted. The derived segment count has a compile-time representability check.
+
+Enforcement is deliberately at two production boundaries:
+
+- Embedded preparation validates before opening the PG or allocating a VID.
+  Unix clients reject before any transport; installed storage nodes independently
+  use the same local preparation guard.
+- Central `AppendStreamSegment` application validates before segment mutation,
+  including commands decoded from a pending slot after restart.
+  A malformed internal/recovered envelope cannot bypass the preparation guard
+  and advance the segment rows, cursor, command log or digest through apply.
+
+The regression matrix includes oversized segments, extreme integer values,
+the first forbidden index (including a zero-length request), positive boundary
+controls, PUT and UploadPart sessions, no-server sender rejection, and raw RPCs
+that bypass sender validation to exercise the installed server. Rejections compare
+complete session/reservation rows and command-log state. Reopened pending-slot
+tests use coherent integrity witnesses so they fail for the extent violation,
+not an unrelated geometry/checksum mismatch, and preserve the exact pending slot.
+
+No encoded fields, schema versions, transactions or fsyncs are added. This is a
+semantic bound on production preparation/application, not a claim that every raw
+test helper or imported row has been validated. It does not establish contiguous
+segments, exclusive one-slot consumption, finite cutoffs, durable owner/window
+records, or physical cleanup exclusion. Those remain the next integration work;
+all six ignored cleanup regressions remain unresolved.
+
+Validation: all five focused regressions passed. Full
+`cargo nextest run --offline --no-fail-fast` passed 9,096 tests (one slow, six
+skipped) in 268.521 seconds. The first focused run caught missing command-digest
+initialization after raw metadata-only session setup in the new recovery
+fixture; refreshing that digest made its positive command control reach apply.
+The slow `raft_production_shaped_heartbeat_write_amplification_gate` passed in
+87.325 seconds. Strict workspace Clippy, storage boundary checks, formatting and
+`git diff --check` passed.

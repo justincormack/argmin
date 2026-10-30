@@ -4390,5 +4390,7 @@ mod unix_metadata_rpc;
 
 #[path = "tests/publication_transport_model.rs"]
 mod publication_transport_model;
+#[path = "tests/stream_extent.rs"]
+mod stream_extent;
 #[path = "tests/unix_object_rpc.rs"]
 mod unix_object_rpc;
