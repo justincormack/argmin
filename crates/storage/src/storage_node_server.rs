@@ -5175,18 +5175,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let precondition = match &request.precondition {
-            StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation,
-            } => CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation: *require_generation_reservation,
-            },
-            StorageRpcCreateStreamUploadPrecondition::PutObject {
-                expected_current,
-                require_generation_reservation,
-            } => CreateStreamUploadPrecondition::PutObject {
-                expected_current: expected_current.as_ref(),
-                require_generation_reservation: *require_generation_reservation,
-            },
+            StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {} => {
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {}
+            }
+            StorageRpcCreateStreamUploadPrecondition::PutObject { expected_current } => {
+                CreateStreamUploadPrecondition::PutObject {
+                    expected_current: expected_current.as_ref(),
+                }
+            }
             StorageRpcCreateStreamUploadPrecondition::UploadPart { expected_upload } => {
                 CreateStreamUploadPrecondition::UploadPart { expected_upload }
             }

@@ -5354,13 +5354,18 @@ impl LocalStorageNodeClient {
                 if expected_command
                     .is_some_and(|command| stream_upload_matches_command(&existing, command)) =>
             {
-                if matches!(create.target, StreamUploadTarget::UploadPart { .. }) {
-                    PgMetadataStore::get_object_generation_reservation(
-                        &*pg,
-                        &create.bucket,
-                        &create.key,
-                        &create.session_id,
-                    )?;
+                let generation = PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &create.bucket,
+                    &create.key,
+                    &create.session_id,
+                )?;
+                if Some(generation) != expected_command.map(|command| command.payload_generation) {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "create stream upload generation mismatch",
+                        reason: "session reservation differs from the creation command".into(),
+                    }
+                    .into());
                 }
                 Ok(true)
             }
@@ -5384,10 +5389,7 @@ impl LocalStorageNodeClient {
         match (&request.request.target, request.precondition) {
             (
                 StreamUploadTarget::PutObject,
-                CreateStreamUploadPrecondition::PutObject {
-                    expected_current,
-                    require_generation_reservation,
-                },
+                CreateStreamUploadPrecondition::PutObject { expected_current },
             ) => {
                 let current = load_current_object_optional_from_pg(
                     &pg,
@@ -5397,30 +5399,11 @@ impl LocalStorageNodeClient {
                 if current.as_ref() != expected_current {
                     return Err(ObjectPgActionError::StaleObjectReadSubject);
                 }
-                if require_generation_reservation {
-                    PgMetadataStore::get_object_generation_reservation(
-                        &*pg,
-                        &request.request.bucket,
-                        &request.request.key,
-                        &request.request.session_id,
-                    )?;
-                }
             }
             (
                 StreamUploadTarget::PutObject,
-                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                    require_generation_reservation,
-                },
-            ) => {
-                if require_generation_reservation {
-                    PgMetadataStore::get_object_generation_reservation(
-                        &*pg,
-                        &request.request.bucket,
-                        &request.request.key,
-                        &request.request.session_id,
-                    )?;
-                }
-            }
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
+            ) => {}
             (
                 StreamUploadTarget::UploadPart { upload_id, .. },
                 CreateStreamUploadPrecondition::UploadPart { expected_upload },
@@ -5437,12 +5420,6 @@ impl LocalStorageNodeClient {
                     }
                     .into());
                 }
-                PgMetadataStore::get_object_generation_reservation(
-                    &*pg,
-                    &request.request.bucket,
-                    &request.request.key,
-                    &request.request.session_id,
-                )?;
             }
             _ => {
                 return Err(ObjectPgActionError::InvalidRequest {
@@ -5461,6 +5438,30 @@ impl LocalStorageNodeClient {
             Err(MetadataError::StreamSessionNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
+        // Selection is read-only. The command owns reservation/high-water and
+        // session insertion together; no independently reserved generation is
+        // adopted just because a caller reused its session ID.
+        match PgMetadataStore::get_object_generation_reservation(
+            &*pg,
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.session_id,
+        ) {
+            Ok(_) => {
+                return Err(MetadataError::InvariantViolation {
+                    context: "create stream upload pre-existing generation reservation",
+                    reason: "stream creation requires an unreserved session identity".into(),
+                }
+                .into())
+            }
+            Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let payload_generation = PgMetadataStore::next_generation_id(
+            &*pg,
+            &request.request.bucket,
+            &request.request.key,
+        )?;
         let command_id =
             self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;
         Ok(MetadataCommandEnvelope::new(
@@ -5468,6 +5469,7 @@ impl LocalStorageNodeClient {
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     request.request.clone(),
+                    payload_generation,
                     crate::clock::current_time_millis(),
                     request.cleanup_after,
                     request.bucket_write_reservation.clone(),

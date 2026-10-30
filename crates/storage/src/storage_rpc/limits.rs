@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 27;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 28;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -372,6 +372,11 @@ const STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024
 const STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+// V28 adds an exact generation to the raw expected-command arm. Preserve the
+// previous carrier budget in addition to that field. Creation build requests
+// only lose the old reservation-precondition byte and retain their existing cap.
+const STORAGE_RPC_MAX_STREAM_UPLOAD_MATCH_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_MULTIPART_UPLOAD_LOAD_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;

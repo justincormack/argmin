@@ -1680,6 +1680,19 @@ fn upload_id_from_label(label: &str) -> crate::UploadId {
     crate::UploadId::try_from(upload_id).unwrap()
 }
 
+fn next_stream_generation_for_test(
+    map: &LocalClusterMap,
+    pg_id: PgId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> GenerationId {
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    crate::PgMetadataStore::next_generation_id(&*pg, bucket, key).unwrap()
+}
+
 fn sse_s3_multipart_test_encryption() -> crate::ObjectEncryption {
     crate::tests::sse_s3_multipart_segment_test_fixture(b"", 1, 0).encryption
 }

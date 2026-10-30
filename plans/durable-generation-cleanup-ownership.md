@@ -15,12 +15,13 @@ proposal's additional publishers and per-segment intents are not selected.
 The [concrete window/transaction candidate](#concrete-window-and-transaction-candidate--2026-10-29)
 now specifies the retained owner, separate allocation bounds, and integration
 gates. It is a design for review, not an implemented or fully proven protocol.
-The [stream-creation refinement](#stream-creation-transaction-refinement-and-rpc-evidence--2026-10-29)
-below proposes combining stream generation reservation with session creation
-before adding the retained owner/window records.
-The unfinished production fix has been removed; no new
-ownership tables, worker, staging tickets, RPC operations, or format versions are
-part of this slice. A shared fix will be designed and reviewed separately under
+The [atomic stream-creation implementation](#atomic-stream-generation-and-session-creation--2026-10-29)
+combines stream generation reservation with session creation, before adding the
+retained owner/window records. It advances command/RPC encodings but reuses the
+existing tables and apply transaction. The unfinished cleanup prototype was
+removed; no retained ownership tables, worker, staging tickets or new RPC
+operations have landed. The six cleanup regressions remain unresolved.
+The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
 ## Lost Direct-PUT Reservation Cleanup
@@ -1100,8 +1101,8 @@ pending-slot install, publication-start and terminal slot removal.
 | Existing boundary | Evidence/work that can share it | Limit on the reuse claim |
 | --- | --- | --- |
 | Bucket-write reservation acquisition | Existing exact bucket proof and release identity. | Different PG from object ownership; this is not one atomic cross-PG transaction. Pre-owner crash recovery of this reservation remains with its bucket authority. |
-| `ReserveObjectGeneration` apply | Owner identity, initial finite horizon, placement scope, stable bucket proof and pre-session cleanup responsibility. Direct PUT can include its one exact segment intent here. | Extend the command inputs; the current row has only reservation ID, bucket/key, generation and creation time. Do not wait for a later session to make this discoverable. |
-| `CreateStreamUpload` apply | Bind session, target and encryption to that already-created owner; persist initial stream scope/grant. | Generation reservation and session creation are currently separate commands. Cover their gap rather than claiming creation is already atomic. |
+| Direct PUT `ReserveObjectGeneration` apply | Owner identity, initial finite horizon, placement scope, stable bucket proof and its one exact segment intent. | Extend the command inputs; the current row has only reservation ID, bucket/key, generation and creation time. Streams no longer use this preceding command. |
+| `CreateStreamUpload` apply | Insert the retained owner and initial scope/grant alongside generation reservation, session, target and encryption. | Generation reservation and session creation now share one command; retained owner/window fields are still future work. |
 | Primary-local `allocate_stream_segment_vid` | Local preparation/intent fields can share this existing SQLite update if changed to one explicit transaction. | This is not replicated preparation. Surviving the local restart is not evidence that a new primary can enumerate all prepared segments. |
 | Shard temporary-file write, file sync and final-name directory sync | An owner-identifying file envelope, if selected, could share existing file persistence. Effect admission/draining can be process-local under immutable cutoff semantics. | No new sidecar may be assumed free. Current files contain raw shard bytes, not a recoverable owner envelope. Changing this requires versioned format, read-path and checksum design. |
 | `register_written_shards_batch_exact` / batch acknowledgement transaction | Owner/grant provenance can accompany ack rows in their existing transaction. | This happens after file publication and may be on a different node; it cannot cover a file-only crash window or replace file-node exclusion. |
@@ -1586,14 +1587,13 @@ Keep the current immutable encryption/subject validation at encryption, append
 and terminal publication.
 
 Direct PUT needs one exact `(hash(reservation, 0), reserved generation)` key per
-shard, not a speculative stream retry block. For streams, generation reservation
-may create a **pre-session owner with no physical-write permission**; creation
-then atomically binds the session and first window. A crash between those
-commands leaves a discoverable release obligation with an empty write set.
-This avoids pretending a session exists, or authorizing writes from its
-generation reservation alone. Carry the original bucket-proof responsibility
-through this gap; do not turn UploadPart's short-lived create proof into an
-indefinitely held session proof.
+shard, not a speculative stream retry block. The subsequent atomic-creation
+refinement eliminates the proposed separate stream pre-session owner: stream
+generation reservation and session now share one creation command. Add the
+retained owner and first window in that same apply transaction, rather than
+reintroducing a preceding command. The separately acquired bucket proof still
+needs exact failure/ambiguity handling; do not turn UploadPart's short-lived
+create proof into an indefinitely held session proof.
 
 Start with explicit window rows. Compact only adjacent intervals whose complete
 subject, index/hash, placement, issuer and cutoff agree; merging different
@@ -1643,8 +1643,8 @@ outcomes; do not invent a new S3 error or abandon an irrevocable publication.
 
 | Existing boundary | Candidate added effects | Added ordinary-path commit target |
 | --- | --- | --- |
-| `ReserveObjectGeneration` apply | Insert owner and resource responsibility with reservation/high-water. Direct PUT also records its exact physical window; streams remain pre-session. | None. Inputs/build response/command must carry the exact checked binding. |
-| `CreateStreamUpload` apply | Bind that owner to the exact session/target and reserve the initial window with its finite cutoff. | None. Reservation and creation remain two existing commands; both gap states are recoverable. |
+| Direct PUT `ReserveObjectGeneration` apply | Insert owner and resource responsibility with reservation/high-water and its exact physical window. | None. Inputs/build response/command must carry the exact checked binding. |
+| `CreateStreamUpload` apply | Insert owner bound to the exact generation/session/target and reserve the initial window with its finite cutoff. | None. Atomic generation/session creation is implemented; extend its single transaction with owner/window state. |
 | Local prepare | Consume the issuer's slot and validate the durable window under the mutation lock. | None beyond the current local allocator update. This is not replica discovery evidence. |
 | File publication and acknowledgement registration | Validate exact owner/window authority separately at both effect owners; hold local exclusion through file durability and through ack-transaction completion respectively. | No sidecar or per-effect durable ticket proposed. Existing file/directory sync and ack transaction remain. |
 | `AppendStreamSegment` apply | Store selected manifest plus the next immutable window, reserved high-water and cumulative horizon in the same apply/log transaction. | None. Additional command bytes and row writes must be measured. |
@@ -1986,3 +1986,75 @@ Validation: both focused format tests passed; the full `cargo nextest run
 `cargo clippy --offline --all-targets --all-features -- -D warnings`,
 `./scripts/check-storage-cluster-boundaries`, formatting and `git diff --check`
 also passed. The six skipped cleanup regressions remain unresolved.
+
+## Atomic Stream Generation And Session Creation — 2026-10-29
+
+Implemented the stream-creation refinement above. The scoped builder selects the
+next payload generation read-only while holding the authoritative object-PG lock,
+rejects a pre-existing reservation under the requested session ID, and includes
+the selected generation in `CreateStreamUpload`. Application validates the target
+and commits the generation reservation/high-water, session and applied command log
+in the existing transaction. Both PUT and UploadPart replicas consume the same
+immutable generation; neither allocates independently or consults a lease clock
+during apply. Exact session matching/replay also checks the durable reservation
+against that command generation.
+
+Apply also requires reservation absence under the same transaction when the
+session is absent. A decoded/recovered creation cannot adopt an independently
+owned reservation even when every subject field and the generation match;
+idempotence is restricted to the existing exact-session branch. The regression
+seeds a separately applied reservation, decodes the creation envelope, and proves
+PUT/UploadPart rejection preserves the complete checkpoint, reservation, high-water,
+replica state and log, including after reopen. A positive canary exercises exact
+session idempotence directly rather than relying only on the applied-log shortcut.
+
+The four stream-creation workflows no longer publish a preceding
+`ReserveObjectGeneration` or release that nonexistent reservation on a failed
+build/install. Bucket-write proofs retain their existing release versus
+pending-command-convergence handling, captured effect fences, bounded retries and
+one-contender draining. Direct PUT still uses its separate reservation protocol.
+The sealed publisher IDs/classes are unchanged. Healthy stream creation now uses
+one object-PG command instead of two; this is a command-count assertion, not a
+measured fsync claim.
+
+Evidence includes:
+
+- owner-local PUT/UploadPart rollback at session insertion and transaction commit,
+  exact replay, substituted-generation rejection, independently decoded replica
+  apply, and reopen; generation, session, high-water and log move together;
+- a scoped builder canary proving selection is read-only and refuses an existing
+  reservation before command-ID allocation, plus exact/crossed matching;
+- a three-replica production cluster with four distinct same-key PUT/part sessions,
+  exact one-command creation counts and identical reservation/session ownership;
+- an installed-Unix production path for PUT and UploadPart, one-command counts,
+  exact replay matching and substituted-generation rejection;
+- coordinator CopyObject/UploadPartCopy epoch-change canaries asserting the exact
+  two-command prefix (combined creation, append) and one terminal publication;
+  stream PUT begin succeeds despite a standalone-reservation failure injector,
+  advances one command, and exposes both the session and its reservation;
+- updated contention, snapshot retry, authorization/deadline and heartbeat
+  fixtures without synthetic pre-session reservations; and
+- command v12 / RPC v28 append-only format evidence, predecessor rejection,
+  and exact-cap admission. The existing SQLite/digest/checkpoint/encryption
+  representations do not change. See the
+  [format ledger](../guides/storage-format-ledger.md#atomic-stream-creation-format-vector-2026-10-29).
+
+This closes only the generation-only pre-session gap. It does not retain an owner
+after session removal, fence delayed physical writes, discover a lost Direct PUT
+release, or solve replacement-primary/window-grant acquisition. The six ignored
+regressions remain unresolved. Next integrate the selected retained owner/window
+contract into existing transactions, with replay/export/replica evidence before
+enabling the cleanup worker.
+
+Validation: the full `cargo nextest run --offline --no-fail-fast` passed all
+9,058 tests (one slow, six skipped) in 263.014 seconds after the apply-ownership
+review correction. Strict workspace Clippy,
+storage boundary checks, formatting and `git diff --check` passed. The initial
+full run identified four fixtures still assuming standalone stream reservation;
+the corrected run retains their exact command-prefix, error-mapping and wrong-PG
+canaries. The stricter apply check also caught an old-epoch heartbeat fixture that
+pre-reserved its stream generation; it now lets creation establish the reservation
+and verifies that ownership before continuing its heartbeat assertions. The three
+focused atomic-creation tests and the corrected full suite pass. No failure was
+ignored or retried without a corresponding correction.
+The six skipped cleanup regressions are unchanged and remain unresolved.

@@ -4575,18 +4575,14 @@ impl StreamUploadCreationMetadataRoute for UnixStreamUploadCreationMetadataRoute
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         self.require_build_subject(&request)?;
         let precondition = match request.precondition {
-            CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation,
-            } => StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation,
-            },
-            CreateStreamUploadPrecondition::PutObject {
-                expected_current,
-                require_generation_reservation,
-            } => StorageRpcCreateStreamUploadPrecondition::PutObject {
-                expected_current: expected_current.cloned(),
-                require_generation_reservation,
-            },
+            CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {} => {
+                StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {}
+            }
+            CreateStreamUploadPrecondition::PutObject { expected_current } => {
+                StorageRpcCreateStreamUploadPrecondition::PutObject {
+                    expected_current: expected_current.cloned(),
+                }
+            }
             CreateStreamUploadPrecondition::UploadPart { expected_upload } => {
                 StorageRpcCreateStreamUploadPrecondition::UploadPart {
                     expected_upload: expected_upload.clone(),

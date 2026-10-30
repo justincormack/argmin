@@ -368,6 +368,7 @@ fn applied_stream_create_matching_binds_requested_cleanup_deadline_for_both_targ
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     request.clone(),
+                    crate::GenerationId::MIN,
                     10,
                     Some(100),
                     proof,
@@ -4375,9 +4376,13 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
             if injected.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let generation = cluster
-                .test_object_generation_reservation_for(&bucket, &key, &session_id)
-                .expect("stream create must reserve a generation before the race hook");
+            assert!(
+                cluster
+                    .test_object_generation_reservation_for(&bucket, &key, &session_id)
+                    .is_err(),
+                "creation must not reserve before its command applies"
+            );
+            let generation = next_stream_generation_for_test(&map, pg_id, &bucket, &key);
             captured_generation.store(generation.get(), Ordering::SeqCst);
             let contender = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "6f");
             *command_slot.lock().unwrap() = Some(contender.clone());
@@ -4450,13 +4455,11 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
         ));
         let first_generation = captured_generation.load(Ordering::SeqCst);
         assert_ne!(first_generation, 0);
-        assert_eq!(
+        assert!(
             cluster
                 .test_object_generation_reservation_for(&bucket, &key, &session_id)
-                .unwrap()
-                .get(),
-            first_generation,
-            "stream create must retain its reservation while non-owningly waiting"
+                .is_err(),
+            "waiting for an unrelated contender must not allocate a generation"
         );
         assert_eq!(
             cluster
@@ -4479,9 +4482,10 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
     let final_generation = cluster
         .test_object_generation_reservation_for(&bucket, &key, &session_id)
         .unwrap();
-    assert!(
-        final_generation.get() > first_generation,
-        "a released failed-attempt generation must remain consumed before retry"
+    assert_eq!(
+        final_generation.get(),
+        first_generation,
+        "uninstalled creation must not consume a generation"
     );
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
@@ -4512,8 +4516,8 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
             )
         });
     assert!(
-        released_before_retry,
-        "stream create must release the failed attempt's generation before retrying"
+        !released_before_retry,
+        "stream create must not release a generation it never reserved"
     );
     drop(primary_pg);
     for node_id in node_ids {

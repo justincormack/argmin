@@ -1,9 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable evidence before changing stream creation's generation ownership.
+//! Immutable evidence for stream creation's atomic generation ownership.
 //! The raw expected-command carrier has no inner command marker; its layout is
-//! owned by RPC v27, independently of the versioned build-response envelope.
+//! owned by RPC v28, independently of the versioned build-response envelope.
+//! The prior v27/v11 corpus remains literal, rejection-only evidence.
 //! These are metadata-only specimens, not readable encrypted payload fixtures.
 
 use super::*;
@@ -11,7 +12,8 @@ use crate::metadata_command::{MetadataCommandEnvelope, MetadataCommandId, Metada
 use std::collections::BTreeMap;
 
 const REQUEST_ID: u64 = 0x0102_0304_0506_0708;
-const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex");
+const RETIRED: &str = include_str!("testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex");
+const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v28_command_v12_sse_s3_v5.hex");
 
 enum Specimen {
     Match(Box<StorageRpcStreamUploadMatchRequest>),
@@ -96,19 +98,16 @@ impl Specimen {
 
 fn precondition_name(value: &StorageRpcCreateStreamUploadPrecondition) -> String {
     match value {
-        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-            require_generation_reservation,
-        } => format!("put-unchecked-reservation-{require_generation_reservation}"),
-        StorageRpcCreateStreamUploadPrecondition::PutObject {
-            expected_current,
-            require_generation_reservation,
-        } => {
+        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {} => {
+            "put-unchecked".into()
+        }
+        StorageRpcCreateStreamUploadPrecondition::PutObject { expected_current } => {
             let current = match expected_current {
                 None => "absent",
                 Some(StoredObject::Live(_)) => "live",
                 Some(StoredObject::DeleteMarker(_)) => "marker",
             };
-            format!("put-{current}-reservation-{require_generation_reservation}")
+            format!("put-{current}")
         }
         StorageRpcCreateStreamUploadPrecondition::UploadPart { .. } => "part".into(),
     }
@@ -237,7 +236,7 @@ fn specimens() -> BTreeMap<String, Specimen> {
                 "no-deadline"
             };
             let command = CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
-                request.clone(), 63, cleanup_after, proof.clone(),
+                request.clone(), GenerationId::new(61).unwrap(), 63, cleanup_after, proof.clone(),
             );
             add(
                 format!("match-{label}-command-{cleanup}"),
@@ -263,26 +262,17 @@ fn specimens() -> BTreeMap<String, Specimen> {
                 }),
             );
             let preconditions = match &target {
-                StreamUploadTarget::PutObject => [false, true]
-                    .into_iter()
-                    .flat_map(|require_generation_reservation| {
-                        std::iter::once(
-                            StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                                require_generation_reservation,
-                            },
-                        )
-                        .chain(
-                            [None, Some(live.clone()), Some(marker.clone())]
-                                .into_iter()
-                                .map(move |expected_current| {
-                                    StorageRpcCreateStreamUploadPrecondition::PutObject {
-                                        expected_current,
-                                        require_generation_reservation,
-                                    }
-                                }),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
+                StreamUploadTarget::PutObject => std::iter::once(
+                    StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
+                )
+                .chain(
+                    [None, Some(live.clone()), Some(marker.clone())]
+                        .into_iter()
+                        .map(move |expected_current| {
+                            StorageRpcCreateStreamUploadPrecondition::PutObject { expected_current }
+                        }),
+                )
+                .collect::<Vec<_>>(),
                 StreamUploadTarget::UploadPart { .. } => {
                     vec![StorageRpcCreateStreamUploadPrecondition::UploadPart {
                         expected_upload: upload.clone(),
@@ -353,9 +343,9 @@ fn specimens() -> BTreeMap<String, Specimen> {
     cases
 }
 
-fn frozen_specimens() -> BTreeMap<String, Vec<u8>> {
+fn frozen_specimens(input: &str) -> BTreeMap<String, Vec<u8>> {
     let mut cases = BTreeMap::new();
-    for line in FROZEN
+    for line in input
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
@@ -380,11 +370,11 @@ fn frozen_specimens() -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn stream_creation_rpc_v27_writers_match_frozen_command_v11_sse_s3_v5_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 27);
+fn stream_creation_rpc_v28_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 28);
     let current = specimens();
-    let frozen = frozen_specimens();
-    assert_eq!(current.len(), 35);
+    let frozen = frozen_specimens(FROZEN);
+    assert_eq!(current.len(), 27);
     assert_eq!(
         current.keys().collect::<Vec<_>>(),
         frozen.keys().collect::<Vec<_>>()
@@ -399,14 +389,29 @@ fn stream_creation_rpc_v27_writers_match_frozen_command_v11_sse_s3_v5_evidence()
 }
 
 #[test]
-fn stream_creation_rpc_v27_readers_decode_frozen_command_v11_sse_s3_v5_evidence() {
+fn stream_creation_rpc_v28_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
     let current = specimens();
-    let frozen = frozen_specimens();
+    let frozen = frozen_specimens(FROZEN);
     assert_eq!(
         current.keys().collect::<Vec<_>>(),
         frozen.keys().collect::<Vec<_>>()
     );
     for (name, bytes) in frozen {
         current[&name].assert_decodes(&bytes);
+    }
+}
+
+#[test]
+fn retired_stream_creation_rpc_v27_frames_are_rejected() {
+    let frozen = frozen_specimens(RETIRED);
+    assert_eq!(frozen.len(), 35);
+    for (name, bytes) in frozen {
+        assert!(
+            matches!(
+                decode_storage_rpc_frame(&bytes),
+                Err(StorageRpcFrameError::UnsupportedVersion(27))
+            ),
+            "{name}"
+        );
     }
 }

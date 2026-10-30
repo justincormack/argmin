@@ -2875,9 +2875,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &request,
             cleanup_after: Some(10_000),
-            precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation: false,
-            },
+            precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
             bucket_write_reservation: &proof,
         })
         .unwrap();
@@ -2918,16 +2916,14 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
         })
     ));
 
-    let mut crossed_proof = proof;
+    let mut crossed_proof = proof.clone();
     crossed_proof.operation_kind = PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
     assert!(matches!(
         route
             .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
                 request: &request,
                 cleanup_after: None,
-                precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                    require_generation_reservation: false,
-                },
+                precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
                 bucket_write_reservation: &crossed_proof,
             })
             .unwrap_err(),
@@ -2935,6 +2931,72 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
             operation: "build create stream upload command",
         })
     ));
+    {
+        let pg = storage_node.get_pg(correct_pg.get()).unwrap();
+        assert!(matches!(
+            PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &request.session_id
+            ),
+            Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
+    }
+    assert!(route
+        .matching_stream_upload_exists(&request, Some(create_command))
+        .unwrap());
+    let mut crossed_generation = create_command.as_ref().clone();
+    crossed_generation.payload_generation =
+        GenerationId::new(create_command.payload_generation.get() + 1).unwrap();
+    assert!(matches!(
+        route.matching_stream_upload_exists(&request, Some(&crossed_generation)),
+        Err(ObjectPgActionError::Metadata(
+            MetadataError::InvariantViolation {
+                context: "create stream upload generation mismatch",
+                ..
+            }
+        ))
+    ));
+    let unrelated_request = CreateStreamUploadReq {
+        session_id: crate::tests::stream_session_id("pre-reserved"),
+        ..request
+    };
+    let before = {
+        let pg = storage_node.get_pg(correct_pg.get()).unwrap();
+        PgMetadataStore::reserve_object_generation(
+            &*pg,
+            &bucket,
+            &key,
+            &unrelated_request.session_id,
+        )
+        .unwrap();
+        pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+            .unwrap()
+    };
+    assert!(matches!(
+        route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            request: &unrelated_request,
+            cleanup_after: None,
+            precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
+            bucket_write_reservation: &proof,
+        }),
+        Err(ObjectPgActionError::Metadata(
+            MetadataError::InvariantViolation {
+                context: "create stream upload pre-existing generation reservation",
+                ..
+            }
+        ))
+    ));
+    assert_eq!(
+        storage_node
+            .get_pg(correct_pg.get())
+            .unwrap()
+            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+            .unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -3307,6 +3369,7 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
         let command =
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                 request,
+                crate::GenerationId::MIN,
                 10,
                 Some(100),
                 proof.clone(),

@@ -2751,6 +2751,13 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
         .bucket_write_reservation
         .expect("stream session should carry initial bucket write proof");
     let original_command = crate::metadata_command::CreateStreamUploadCommand {
+        payload_generation: crate::PgMetadataStore::get_object_generation_reservation(
+            &*object_pg(),
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap(),
         session: crate::StreamUploadCommandRecord {
             session_id: session_id.clone(),
             bucket: bucket.clone(),
@@ -3566,7 +3573,7 @@ fn bucket_delete_stream_cleanup_rejects_wrong_pg_stream_row() {
 }
 
 #[test]
-fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
+fn stream_put_record_pending_install_race_retries_without_reserving_or_releasing_generation() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3607,17 +3614,19 @@ fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
                 .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
                 .unwrap();
             let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-            if crate::PgMetadataStore::get_object_generation_reservation(
-                &*pg,
-                &hook_bucket,
-                &hook_key,
-                &target_session,
-            )
-            .is_err()
-                || hook_ran_for_closure.swap(true, Ordering::SeqCst)
-            {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
                 return;
             }
+            assert!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &hook_bucket,
+                    &hook_key,
+                    &target_session,
+                )
+                .is_err(),
+                "creation has not applied and must not own a generation yet"
+            );
             drop(pg);
             let command = MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
@@ -3674,14 +3683,14 @@ fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         })
         .collect::<Vec<_>>();
     assert!(
-        entries.iter().any(|command| {
+        !entries.iter().any(|command| {
             matches!(
                 command.payload(),
                 MetadataCommandPayload::ReleaseObjectGeneration(release)
                     if release.matches_request(&bucket, &key, &session_id)
             )
         }),
-        "pending-install contention must release the stream create reservation before retrying"
+        "pending-install contention must not release a generation never acquired"
     );
     assert!(
         entries.iter().any(|command| {

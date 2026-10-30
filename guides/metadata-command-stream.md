@@ -936,12 +936,31 @@ floor, and avoids equality checks that have to remember to ignore allocator
 progress.
 
 `CreateStreamUpload` also avoids carrying a broad `StreamUploadRecord`. Its
-payload contains the command-owned session projection plus an explicit initial
-`next_segment_vid` floor. Retry matching must compare both pieces: session
+payload contains the command-owned session projection, an explicit initial
+`next_segment_vid` floor and the selected `payload_generation`. Retry matching
+must compare all three: session
 identity/state/encryption proves the command-owned row, while the initial floor
-proves the allocator started from the expected value. Later allocator progress
+proves the allocator started from the expected value, and the exact durable
+generation reservation proves payload ownership. Later allocator progress
 belongs to append allocation and append commands, not to generic stream-session
 equality.
+
+Stream creation selects the next generation read-only under the object-PG lock.
+The single `CreateStreamUpload` apply transaction commits the explicit generation
+reservation/high-water, session, and applied log together on each replica. PUT
+and UploadPart no longer publish an earlier `ReserveObjectGeneration`; Direct PUT
+still does. A rejected creation cannot leave a generation-only reservation, and
+request failure must not release a generation owned by an ambiguously applied
+creation. Builders reject a pre-existing reservation under the requested session
+ID. Apply independently requires reservation absence inside the creation
+transaction whenever the session is absent, including for decoded recovery
+commands. Only an existing exact session may use the idempotent branch, which
+verifies the command-selected generation. Contenders
+still return to the snapshot-sensitive owner loop to revalidate authority and
+rebuild, using the existing publisher IDs/classes and bucket-proof disposition.
+This reduces healthy stream creation by one object-PG command, not by a claimed
+measured fsync count. It does not implement retained cleanup ownership after
+session removal.
 
 We considered replacing the allocator floor with non-state allocation. A
 random `u64` segment VID is not strong enough to treat collisions as

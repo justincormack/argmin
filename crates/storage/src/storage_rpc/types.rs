@@ -1406,12 +1406,9 @@ pub(crate) struct StorageRpcInsertDeleteMarkerCommandBuildRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StorageRpcCreateStreamUploadPrecondition {
-    PutObjectNoCurrentCheck {
-        require_generation_reservation: bool,
-    },
+    PutObjectNoCurrentCheck {},
     PutObject {
         expected_current: Option<StoredObject>,
-        require_generation_reservation: bool,
     },
     UploadPart {
         expected_upload: MultipartUploadRecord,

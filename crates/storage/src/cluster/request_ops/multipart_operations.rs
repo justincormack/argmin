@@ -18,32 +18,23 @@ fn inconclusive_multipart_apply_failure_requires_uncertainty(
 impl super::StorageCluster {
     fn release_upload_part_stream_create_resources(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), ObjectPgActionError> {
-        let generation_result =
-            self.release_object_generation_reservation(bucket, key, session_id);
-        let proof_result = self
-            .release_bucket_write_reservation_proof(proof)
-            .map_err(super::bucket_snapshot_error_to_object_pg_action_error);
-        generation_result.and(proof_result)
+        // Creation owns no generation until atomic application creates the session.
+        // Once applied, only session cleanup may release its generation.
+        self.release_bucket_write_reservation_proof(proof)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
     fn release_upload_part_stream_create_resources_unless_pending_owner(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), ObjectPgActionError> {
         match self.pending_metadata_command_uses_bucket_write_reservation(pg_id, bucket, proof) {
             Ok(true) => Ok(()),
-            Ok(false) => {
-                self.release_upload_part_stream_create_resources(bucket, key, session_id, proof)
-            }
+            Ok(false) => self.release_upload_part_stream_create_resources(proof),
             Err(error) => Err(error),
         }
     }
@@ -282,92 +273,36 @@ impl super::StorageCluster {
                     .require_drained_for_unmatched_request()
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
-                self.reserve_put_object_generation_with_route_validation(
-                    route,
-                    &create.session_id,
-                    &mut require_valid_route,
-                )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-
                 #[cfg(test)]
                 maybe_run_before_stream_put_create_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
-                if let Err(error) = require_valid_route() {
-                    let _ =
-                        self.release_object_generation_reservation(bucket, key, &create.session_id);
-                    return Err(error.into());
-                }
+                require_valid_route()?;
                 let command = match stream_creation_route.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
                         request: &create,
                         cleanup_after,
                         precondition: CreateStreamUploadPrecondition::PutObject {
                             expected_current: current_object.stored.as_ref(),
-                            require_generation_reservation: true,
                         },
                         bucket_write_reservation: &proof,
                     },
                 ) {
                     Ok(command) => command,
-                    Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                        let cleanup = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        );
-                        if let Err(cleanup_error) = cleanup {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                cleanup_error,
-                            ));
-                        }
+                    Err(ObjectPgActionError::StaleObjectReadSubject) => return Ok(Ok(Attempt::Retry)),
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+                        self.drain_one_pending_object_metadata_command_waiting_for_recovery(
+                            publisher, pg_id, bucket, &mut work_budget,
+                        ).map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                         return Ok(Ok(Attempt::Retry));
                     }
-                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                        ..
-                    })) => {
-                        let drain_result = self
-                            .drain_one_pending_object_metadata_command_waiting_for_recovery(
-                                publisher,
-                                pg_id,
-                                bucket,
-                                &mut work_budget,
-                            );
-                        let cleanup_result = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        );
-                        if let Err(cleanup_error) = cleanup_result {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                cleanup_error,
-                            ));
-                        }
-                        if let Err(drain_error) = drain_result {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                drain_error,
-                            ));
-                        }
-                        return Ok(Ok(Attempt::Retry));
-                    }
-                    Err(error) => {
-                        let _ = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        );
-                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                            error,
-                        ));
-                    }
+                    Err(error) => return Err(super::object_pg_action_error_to_bucket_snapshot_error(error)),
                 };
                 #[cfg(any(test, feature = "test-hooks"))]
                 maybe_run_before_stream_put_create_pending_install_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
                 if let Err(error) = require_valid_route() {
-                    let _ =
-                        self.release_object_generation_reservation(bucket, key, &create.session_id);
                     return Err(error.into());
                 }
                 self.maybe_run_before_metadata_command_pending_install_hook();
@@ -391,11 +326,6 @@ impl super::StorageCluster {
                                 disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
                             }
                             Ok(false) => {
-                                let _ = self.release_object_generation_reservation(
-                                    bucket,
-                                    key,
-                                    &create.session_id,
-                                );
                             }
                             Err(lookup_error) => {
                                 disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
@@ -413,15 +343,6 @@ impl super::StorageCluster {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
                     super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
                     | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
-                        if let Err(cleanup_error) = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        ) {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                cleanup_error,
-                            ));
-                        }
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
@@ -433,15 +354,6 @@ impl super::StorageCluster {
                 ) {
                     Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {}
                     Ok(super::ExactPendingObjectMetadataCommandOutcome::Reinspect) => {
-                        if let Err(cleanup_error) = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        ) {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                cleanup_error,
-                            ));
-                        }
                         return Ok(Ok(Attempt::Retry));
                     }
                     Err(error) => {
@@ -452,11 +364,6 @@ impl super::StorageCluster {
                                 disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
                             }
                             Ok(false) => {
-                                let _ = self.release_object_generation_reservation(
-                                    bucket,
-                                    key,
-                                    &create.session_id,
-                                );
                             }
                             Err(lookup_error) => {
                                 disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
@@ -1580,22 +1487,6 @@ impl super::StorageCluster {
                     error,
                 ));
             }
-            if let Err(error) = self.reserve_put_object_generation_with_route_validation(
-                super::PutObjectMutationEffectRoute {
-                    bucket_pg_id: self.bucket_metadata_pg(&bucket),
-                    object_pg_id,
-                    bucket: &bucket,
-                    key: &key,
-                    effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-                },
-                &session_id,
-                || Ok(()),
-            ) {
-                release_caller_bucket_write_proof!()?;
-                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                    error,
-                ));
-            }
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
@@ -1623,9 +1514,6 @@ impl super::StorageCluster {
                 }
                 Err(error) => {
                     self.release_upload_part_stream_create_resources(
-                        &bucket,
-                        &key,
-                        &session_id,
                         &bucket_write_reservation,
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -1652,8 +1540,6 @@ impl super::StorageCluster {
                     self.release_upload_part_stream_create_resources_unless_pending_owner(
                         pg_id,
                         &bucket,
-                        &key,
-                        &session_id,
                         &bucket_write_reservation,
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -1860,26 +1746,9 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(error);
             }
-            if let Err(error) = self.reserve_put_object_generation_with_route_validation(
-                super::PutObjectMutationEffectRoute {
-                    bucket_pg_id: self.bucket_metadata_pg(bucket),
-                    object_pg_id,
-                    bucket,
-                    key,
-                    effect_fence,
-                },
-                session_id,
-                &mut require_valid_route,
-            ) {
-                release_caller_bucket_write_proof!()?;
-                return Err(error);
-            }
             macro_rules! release_caller_resources {
                 () => {{
                     self.release_upload_part_stream_create_resources(
-                        bucket,
-                        key,
-                        session_id,
                         &bucket_write_reservation,
                     )
                 }};
@@ -1984,8 +1853,6 @@ impl super::StorageCluster {
                     self.release_upload_part_stream_create_resources_unless_pending_owner(
                         pg_id,
                         bucket,
-                        key,
-                        session_id,
                         &bucket_write_reservation,
                     )?;
                     return Err(error);
@@ -2012,8 +1879,6 @@ impl super::StorageCluster {
                             self.release_upload_part_stream_create_resources_unless_pending_owner(
                                 pg_id,
                                 bucket,
-                                key,
-                                session_id,
                                 &bucket_write_reservation,
                             )?;
                         }

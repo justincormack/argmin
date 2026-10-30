@@ -5580,7 +5580,7 @@
             command: command.clone(),
         };
 
-        for unsupported_version in [8_u16, 9, 10, 12] {
+        for unsupported_version in [8_u16, 9, 10, 11, 13] {
             let command_bytes =
                 command.command_bytes_with_encoding_version_for_test(unsupported_version);
             let payload = encode_metadata_command_request_with_raw_command_for_test(
@@ -5627,7 +5627,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 28] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 29] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());

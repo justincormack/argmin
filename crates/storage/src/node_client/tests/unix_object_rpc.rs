@@ -1785,7 +1785,6 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::PutObject {
                 expected_current: current_delete_snapshot.stored.as_ref(),
-                require_generation_reservation: false,
             },
             bucket_write_reservation: &stream_proof,
         })
@@ -2262,8 +2261,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let _time = crate::clock::test_time_override_guard(1_000);
     for pg_id in [correct_pg_id, wrong_pg_id] {
         let pg = node.get_pg(pg_id).unwrap();
-        let generation =
-            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &session_id).unwrap();
+        let generation = PgMetadataStore::next_generation_id(&*pg, &bucket, &key).unwrap();
         let stream_create_command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::new(1).unwrap(),
@@ -2273,6 +2271,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     create.clone(),
+                    generation,
                     1_000,
                     Some(9_000),
                     current_proof.clone(),
@@ -2283,8 +2282,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         PgMetadataStore::create_multipart_upload(&*pg, &multipart_create).unwrap();
         PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &part_session_id).unwrap();
         PgMetadataStore::create_stream_upload(&*pg, &part_create).unwrap();
-        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &new_part_session_id)
-            .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
         if let Some(expected) = reserved_generation {
             assert_eq!(
@@ -3883,7 +3880,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             cleanup_after: Some(12_345),
             precondition: CreateStreamUploadPrecondition::PutObject {
                 expected_current: Some(&stored),
-                require_generation_reservation: false,
             },
             bucket_write_reservation: &stream_proof,
         })
@@ -3926,7 +3922,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
                     expected_current: Some(&stored),
-                    require_generation_reservation: false,
                 },
                 bucket_write_reservation: &stream_proof,
             },
@@ -3958,7 +3953,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
                     expected_current: Some(&stored),
-                    require_generation_reservation: false,
                 },
                 bucket_write_reservation: &stream_proof,
             },

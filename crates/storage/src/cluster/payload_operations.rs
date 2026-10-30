@@ -6774,7 +6774,6 @@ impl StorageCluster {
         );
         let bucket = &request.bucket;
         let key = &request.key;
-        let session_id = &request.session_id;
         if request.bucket != *route.bucket || request.key != *route.key {
             return Err(ObjectPgActionError::Store(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -6820,13 +6819,7 @@ impl StorageCluster {
             }
             applied_commands.require_drained_for_unmatched_request()?;
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
-            self.reserve_put_object_generation_with_route_validation(
-                route,
-                session_id,
-                &mut require_valid_route,
-            )?;
             if let Err(error) = require_valid_route() {
-                let _ = self.release_object_generation_reservation(bucket, key, session_id);
                 return Err(ObjectPgActionError::Store(error));
             }
             #[cfg(test)]
@@ -6837,15 +6830,12 @@ impl StorageCluster {
                 BuildCreateStreamUploadCommandReq {
                     request: &request,
                     cleanup_after,
-                    precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                        require_generation_reservation: true,
-                    },
+                    precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             ) {
                 Ok(command) => command,
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                    self.release_object_generation_reservation(bucket, key, session_id)?;
                     work_budget
                         .sleep_after_contention(
                             "put object stream create stale read retry budget exhausted",
@@ -6863,10 +6853,7 @@ impl StorageCluster {
                             bucket,
                             work_budget,
                         );
-                    let cleanup_result =
-                        self.release_object_generation_reservation(bucket, key, session_id);
                     drain_result?;
-                    cleanup_result?;
                     work_budget
                         .sleep_after_contention(
                             "put object stream create log conflict retry budget exhausted",
@@ -6875,12 +6862,10 @@ impl StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    let _ = self.release_object_generation_reservation(bucket, key, session_id);
                     return Err(error);
                 }
             };
             if let Err(error) = require_valid_route() {
-                let _ = self.release_object_generation_reservation(bucket, key, session_id);
                 return Err(ObjectPgActionError::Store(error));
             }
             #[cfg(any(test, feature = "test-hooks"))]
@@ -6900,18 +6885,6 @@ impl StorageCluster {
             );
             match install {
                 Err(error) => {
-                    if matches!(
-                        self.pending_metadata_command_uses_bucket_write_reservation(
-                            pg_id,
-                            bucket,
-                            &bucket_write_reservation,
-                        ),
-                        Ok(false)
-                    ) {
-                        self.release_object_generation_reservation_best_effort(
-                            bucket, key, session_id,
-                        );
-                    }
                     return Err(error);
                 }
                 Ok(SnapshotSensitiveInstallOutcome::Installed) => {}
@@ -6919,7 +6892,6 @@ impl StorageCluster {
                     SnapshotSensitiveInstallOutcome::ReinspectSnapshot
                     | SnapshotSensitiveInstallOutcome::ContenderDrained,
                 ) => {
-                    self.release_object_generation_reservation(bucket, key, session_id)?;
                     work_budget
                         .sleep_after_contention(
                             "put object stream create pending install retry budget exhausted",
@@ -6938,7 +6910,6 @@ impl StorageCluster {
                     return Ok(BucketWriteReservationDisposition::TransferredToCommand);
                 }
                 Ok(ExactPendingObjectMetadataCommandOutcome::Reinspect) => {
-                    self.release_object_generation_reservation(bucket, key, session_id)?;
                     work_budget
                         .sleep_after_contention(
                             "put object stream create recovery retry budget exhausted",
@@ -6947,18 +6918,6 @@ impl StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    if matches!(
-                        self.pending_metadata_command_uses_bucket_write_reservation(
-                            pg_id,
-                            bucket,
-                            &bucket_write_reservation,
-                        ),
-                        Ok(false)
-                    ) {
-                        self.release_object_generation_reservation_best_effort(
-                            bucket, key, session_id,
-                        );
-                    }
                     return Err(error);
                 }
             }

@@ -680,19 +680,14 @@ fn put_create_stream_upload_precondition(
     precondition: &StorageRpcCreateStreamUploadPrecondition,
 ) {
     match precondition {
-        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-            require_generation_reservation,
-        } => {
+        StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {} => {
             put_u8(out, 0);
-            put_bool(out, *require_generation_reservation);
         }
         StorageRpcCreateStreamUploadPrecondition::PutObject {
             expected_current,
-            require_generation_reservation,
         } => {
             put_u8(out, 1);
             put_optional_stored_object(out, expected_current.as_ref());
-            put_bool(out, *require_generation_reservation);
         }
         StorageRpcCreateStreamUploadPrecondition::UploadPart { expected_upload } => {
             put_u8(out, 2);
@@ -716,6 +711,7 @@ fn put_optional_create_stream_upload_command(
 
 fn put_create_stream_upload_command(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
     put_stream_upload_command_record(out, &command.session);
+    put_u64(out, command.payload_generation.get());
     put_u64(out, command.initial_next_segment_vid.get());
     put_optional_u64(out, command.cleanup_after);
     put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);

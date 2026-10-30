@@ -71,6 +71,15 @@ source and destination vectors. The independently versioned canonical object-enc
 currently V2; immutable V1 object, purpose, and Cobblestone context/ciphertext evidence remains
 beside V2, while production accepts only V2.
 
+Atomic stream creation subsequently advances the metadata-command envelope from
+v11 to v12 and storage-node RPC framing from v27 to v28: creation now carries the
+exact payload generation and atomically inserts its reservation and session.
+The raw expected-command RPC carrier changes too, independently of the nested
+envelope. Existing SQLite, digest, checkpoint and encryption-state grammars are
+unchanged. Exact v11/v27 specimens remain rejection evidence beside new v12/v28
+composites; this is not mixed-version support. See the normative
+[format ledger](../guides/storage-format-ledger.md#atomic-stream-creation-format-vector-2026-10-29).
+
 ## Non-Goals
 
 This plan does not version the public S3 protocol, promise Rust API stability, select a new

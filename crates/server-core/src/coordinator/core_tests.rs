@@ -8990,13 +8990,12 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
         .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
     assert!(
-        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 3),
-        "copy should have applied generation reservation, stream-session create, and segment append before the destination commit gate"
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 2),
+        "copy should have atomically created the stream and its generation, then appended before the destination commit gate"
     );
     assert_eq!(
         pre_commit_kinds.lock().unwrap().as_slice(),
         &[
-            MetadataCommandApplyTestKind::ReserveObjectGeneration,
             MetadataCommandApplyTestKind::CreateStreamUpload,
             MetadataCommandApplyTestKind::AppendStreamSegment,
         ],
@@ -9533,13 +9532,12 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
     assert!(
-        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 3),
-        "UploadPartCopy should have reserved its part generation, created a destination stream, and appended copied data before the part commit gate"
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 2),
+        "UploadPartCopy should have atomically created the stream and its generation, then appended before the part commit gate"
     );
     assert_eq!(
         pre_commit_kinds.lock().unwrap().as_slice(),
         &[
-            MetadataCommandApplyTestKind::ReserveObjectGeneration,
             MetadataCommandApplyTestKind::CreateStreamUpload,
             MetadataCommandApplyTestKind::AppendStreamSegment,
         ],
@@ -13110,7 +13108,7 @@ fn stream_put_begin_request_maps_command_log_conflict_to_slow_down() {
 }
 
 #[test]
-fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_slow_down() {
+fn stream_put_begin_does_not_publish_standalone_generation_reservation() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13131,11 +13129,24 @@ fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_slow_dow
         MetadataCommandApplyTestKind::ReserveObjectGeneration,
     );
 
-    let err = begin_stream_put_test(&coord, "bucket", "key").unwrap_err();
-    assert!(
-        matches!(err, ServerError::SlowDown),
-        "expected stream PUT begin generation reservation conflict to map to SlowDown, got {err:?}"
-    );
+    let before = storage_cluster
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let after = storage_cluster
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+    assert!(after.advanced_exactly_by(&before, 1));
+    assert!(storage::test_support::stream_upload_session_exists(
+        &storage_cluster,
+        &bucket,
+        &key,
+        &session_id,
+    )
+    .unwrap());
+    assert!(storage_cluster
+        .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
+        .unwrap());
     drop(hook_guard);
 }
 

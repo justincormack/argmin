@@ -192,35 +192,74 @@ impl PgStore {
         &self,
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
-        self.validate_create_stream_upload_command_target(command)?;
-        match self.get_stream_upload(&command.session.session_id) {
-            Ok(existing)
-                if StreamUploadCommandRecord::from(&existing) == command.session
-                    && existing.next_segment_vid == command.initial_next_segment_vid
-                    && existing.cleanup_after == command.cleanup_after
-                    && stream_upload_bucket_write_reservation_matches_command(
-                        &existing, command,
-                    ) =>
-            {
-                Ok(())
-            }
-            Ok(_) => Err(MetadataError::InvariantViolation {
-                context: "create stream upload command existing session mismatch",
-                reason: "metadata state does not satisfy the operation invariant".into(),
-            }),
-            Err(MetadataError::StreamSessionNotFound { .. }) => {
-                let bucket_write_reservation = (command.session.target
-                    == StreamUploadTarget::PutObject)
-                    .then_some(&command.bucket_write_reservation);
-                self.create_stream_upload_explicit(
-                    &command.session,
-                    command.initial_next_segment_vid,
-                    command.cleanup_after,
-                    bucket_write_reservation,
-                )
-            }
-            Err(error) => Err(error),
-        }
+        self.with_immediate_txn(
+            "create stream upload command (begin txn)",
+            "create stream upload command (commit txn)",
+            |store| {
+                store.validate_create_stream_upload_command_target(command)?;
+                match store.get_stream_upload(&command.session.session_id) {
+                    Ok(existing)
+                        if StreamUploadCommandRecord::from(&existing) == command.session
+                            && existing.next_segment_vid == command.initial_next_segment_vid
+                            && existing.cleanup_after == command.cleanup_after
+                            && stream_upload_bucket_write_reservation_matches_command(
+                                &existing, command,
+                            ) =>
+                    {
+                        let generation = store.get_object_generation_reservation(
+                            &command.session.bucket,
+                            &command.session.key,
+                            &command.session.session_id,
+                        )?;
+                        if generation != command.payload_generation {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "create stream upload command generation mismatch",
+                                reason: "session reservation differs from the creation command".into(),
+                            });
+                        }
+                        Ok(())
+                    }
+                    Ok(_) => Err(MetadataError::InvariantViolation {
+                        context: "create stream upload command existing session mismatch",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    }),
+                    Err(MetadataError::StreamSessionNotFound { .. }) => {
+                        // Reservation idempotence belongs only to the exact-session
+                        // branch above. A standalone reservation has another owner,
+                        // even if its subject and generation match this command.
+                        match store.get_object_generation_reservation_by_id(
+                            &command.session.session_id,
+                        ) {
+                            Ok(_) => {
+                                return Err(MetadataError::InvariantViolation {
+                                    context: "create stream upload command pre-existing generation reservation",
+                                    reason: "a new session cannot adopt an independently owned reservation".into(),
+                                });
+                            }
+                            Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
+                            Err(error) => return Err(error),
+                        }
+                        store.reserve_object_generation_explicit(
+                            &command.session.bucket,
+                            &command.session.key,
+                            &command.session.session_id,
+                            command.payload_generation,
+                            command.session.created_at,
+                        )?;
+                        let bucket_write_reservation = (command.session.target
+                            == StreamUploadTarget::PutObject)
+                            .then_some(&command.bucket_write_reservation);
+                        store.create_stream_upload_explicit(
+                            &command.session,
+                            command.initial_next_segment_vid,
+                            command.cleanup_after,
+                            bucket_write_reservation,
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            },
+        )
     }
 
     fn validate_create_stream_upload_command_target(
@@ -254,11 +293,6 @@ impl PgStore {
                         reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
-                self.get_object_generation_reservation(
-                    &command.session.bucket,
-                    &command.session.key,
-                    &command.session.session_id,
-                )?;
                 if command.session.state == StreamUploadState::InProgress {
                     Ok(())
                 } else {

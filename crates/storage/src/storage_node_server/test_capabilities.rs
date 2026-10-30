@@ -12,12 +12,12 @@
         });
         let bucket = crate::tests::bucket_name("active-object-route-bucket");
         let key = crate::tests::object_key("active-object-route-key");
-        let reservation_id = crate::tests::stream_session_id("active-object");
+        let direct_reservation_id = crate::tests::stream_session_id("active-object");
         let upload_id = crate::tests::multipart_upload_id("active-object-route-upload");
         let reserved_generation = crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             let generation =
-                PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &direct_reservation_id)
                     .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
             generation
@@ -82,7 +82,7 @@
         let direct_put_request = crate::CommitDirectPutObjectReq {
             bucket: bucket.clone(),
             key: key.clone(),
-            generation_reservation_id: reservation_id.clone(),
+            generation_reservation_id: direct_reservation_id.clone(),
             versioning: BucketVersioningState::Suspended,
             owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
             acl_grants: AclGrants::default(),
@@ -135,6 +135,7 @@
             last_modified: 1_000,
             checksum: None,
         };
+        let reservation_id = crate::tests::stream_session_id("active-stream");
         let stream_create_request = CreateStreamUploadReq {
             session_id: reservation_id.clone(),
             bucket: bucket.clone(),
@@ -142,9 +143,10 @@
             target: StreamUploadTarget::PutObject,
             encryption: crate::tests::metadata_only_test_encryption(),
         };
-        let expected_stream_command =
+        let mut expected_stream_command =
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                 stream_create_request.clone(),
+                crate::GenerationId::MIN,
                 1_000,
                 Some(4_000),
                 stream_proof.clone(),
@@ -170,7 +172,7 @@
             },
             encryption: crate::tests::metadata_only_test_encryption(),
         };
-        let expected_upload_part_stream_command =
+        let mut expected_upload_part_stream_command =
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                 upload_part_stream_create_request.clone(),
                 1_000,
@@ -212,20 +214,7 @@
             .unwrap();
             PgMetadataStore::create_multipart_upload(&*pg, &existing_multipart_request).unwrap();
             PgMetadataStore::upsert_multipart_part(&*pg, &terminal_multipart_part).unwrap();
-            PgMetadataStore::reserve_object_generation(
-                &*pg,
-                &bucket,
-                &key,
-                &upload_part_stream_session_id,
-            )
-            .unwrap();
-            PgMetadataStore::reserve_object_generation(
-                &*pg,
-                &bucket,
-                &key,
-                &new_upload_part_stream_create_request.session_id,
-            )
-            .unwrap();
+            expected_stream_command.payload_generation = PgMetadataStore::next_generation_id(&*pg, &expected_stream_command.session.bucket, &expected_stream_command.session.key).unwrap();
             pg.apply_metadata_command(&MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
                     config.cluster_epoch,
@@ -237,6 +226,7 @@
                 )),
             ))
             .unwrap();
+            expected_upload_part_stream_command.payload_generation = PgMetadataStore::next_generation_id(&*pg, &expected_upload_part_stream_command.session.bucket, &expected_upload_part_stream_command.session.key).unwrap();
             pg.apply_metadata_command(&MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
                     config.cluster_epoch,
@@ -290,7 +280,7 @@
         let direct_put_snapshot = crate::clock::with_time_override(1_000, || {
             assert_eq!(
                 primary_route
-                    .generation_reservation(&reservation_id)
+                    .generation_reservation(&direct_reservation_id)
                     .unwrap(),
                 reserved_generation
             );
@@ -303,7 +293,7 @@
                 VersionId::from_u64(1)
             );
             let snapshot = primary_route
-                .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+                .load_direct_put_commit_snapshot(&direct_reservation_id, reserved_generation)
                 .unwrap();
             assert_eq!(
                 snapshot.auth_snapshot.existing_etag.as_deref(),
@@ -321,7 +311,7 @@
             let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
                 panic!("active object route must build a direct PUT command");
             };
-            assert!(commit.matches_request(&bucket, &key, &reservation_id, reserved_generation));
+            assert!(commit.matches_request(&bucket, &key, &direct_reservation_id, reserved_generation));
             snapshot
         });
 
@@ -471,7 +461,7 @@
                     &stream_append_request,
                     Some(&crate::ExpectedStreamAppendState::PutObject {
                         session: session.clone(),
-                        generation_id: reserved_generation,
+                        generation_id: expected_stream_command.payload_generation,
                     }),
                     AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
@@ -1080,7 +1070,6 @@
                     &new_stream_create_request,
                     Some(4_000),
                     CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                        require_generation_reservation: false,
                     },
                     &stream_proof,
                 )
@@ -1129,7 +1118,6 @@
                 &mismatched_stream_build_request,
                 None,
                 CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                    require_generation_reservation: false,
                 },
                 &stream_proof,
             )
@@ -1168,7 +1156,6 @@
                 &new_stream_create_request,
                 None,
                 CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                    require_generation_reservation: false,
                 },
                 &mismatched_stream_build_proof,
             )
@@ -1541,7 +1528,6 @@
                     Some(4_000),
                     CreateStreamUploadPrecondition::PutObject {
                         expected_current: Some(&metadata_stored),
-                        require_generation_reservation: false,
                     },
                     &stream_proof,
                 )
@@ -1562,7 +1548,6 @@
                 Some(4_000),
                 CreateStreamUploadPrecondition::PutObject {
                     expected_current: Some(&mismatched_stream_expected_current),
-                    require_generation_reservation: false,
                 },
                 &stream_proof,
             )
@@ -1873,7 +1858,6 @@
                             &new_stream_create_request,
                             Some(4_000),
                             CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                                require_generation_reservation: false,
                             },
                             &stream_proof,
                         )
@@ -2165,7 +2149,7 @@
                 &reservation_id,
             )
             .unwrap(),
-            reserved_generation,
+            expected_stream_command.payload_generation,
             "expired active object routes must leave durable reservation state exact"
         );
         assert_eq!(

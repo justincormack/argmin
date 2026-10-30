@@ -14,6 +14,9 @@ use crate::PgTopology;
 #[path = "publication_model.rs"]
 mod publication_model;
 
+#[path = "atomic_stream_creation_tests.rs"]
+mod atomic_stream_creation;
+
 fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
 }
@@ -7338,7 +7341,7 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
 
 #[test]
 fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutation() {
-    for version in [7_u16, 8, 9, 10, 12] {
+    for version in [7_u16, 8, 9, 10, 11, 13] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -7431,7 +7434,7 @@ fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutatio
 
 #[test]
 fn recovery_rejects_resealed_unsupported_applied_command_versions_before_mutation() {
-    for version in [7_u16, 8, 9, 10, 12] {
+    for version in [7_u16, 8, 9, 10, 11, 13] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(

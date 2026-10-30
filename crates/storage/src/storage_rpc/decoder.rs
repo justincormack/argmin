@@ -1418,13 +1418,10 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<StorageRpcCreateStreamUploadPrecondition, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(
-                StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                    require_generation_reservation: self.read_bool()?,
-                },
+                StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
             ),
             1 => Ok(StorageRpcCreateStreamUploadPrecondition::PutObject {
                 expected_current: self.read_optional_stored_object()?,
-                require_generation_reservation: self.read_bool()?,
             }),
             2 => Ok(StorageRpcCreateStreamUploadPrecondition::UploadPart {
                 expected_upload: self.read_multipart_upload_record()?,
@@ -1452,6 +1449,9 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<CreateStreamUploadCommand, StorageRpcPayloadError> {
         Ok(CreateStreamUploadCommand {
             session: self.read_stream_upload_command_record()?,
+            payload_generation: GenerationId::new(self.read_u64()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream payload generation"),
+            )?,
             initial_next_segment_vid: GenerationId::new(self.read_u64()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest(
                     "invalid initial stream segment generation",

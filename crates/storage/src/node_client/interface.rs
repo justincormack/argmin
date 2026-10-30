@@ -931,12 +931,9 @@ pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
 }
 
 pub(crate) enum CreateStreamUploadPrecondition<'a> {
-    PutObjectNoCurrentCheck {
-        require_generation_reservation: bool,
-    },
+    PutObjectNoCurrentCheck {},
     PutObject {
         expected_current: Option<&'a StoredObject>,
-        require_generation_reservation: bool,
     },
     UploadPart {
         expected_upload: &'a MultipartUploadRecord,

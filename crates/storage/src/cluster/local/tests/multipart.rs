@@ -4,6 +4,96 @@
 use super::*;
 
 #[test]
+fn stream_creation_uses_one_command_for_each_put_and_part_session() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("atomic-stream-create");
+    let key = crate::tests::object_key("key");
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("atomiccreate");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::tests::metadata_only_test_encryption(),
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_, _| Ok::<_, ()>(((), create.clone())),
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let mut generations = std::collections::BTreeSet::new();
+    for (index, part) in [false, true, false, true].into_iter().enumerate() {
+        let session_id = crate::tests::stream_session_id(format!("atomic-create-{index}"));
+        let before = map.test_next_metadata_command_log_index(PgId::new(0));
+        if part {
+            cluster
+                .create_upload_part_stream_session(
+                    &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+                    1,
+                    &session_id,
+                )
+                .unwrap();
+        } else {
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    create.encryption.clone(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            map.test_next_metadata_command_log_index(PgId::new(0)).get(),
+            before.get() + 1,
+            "creation must not issue a standalone generation reservation command"
+        );
+        let mut generation = None;
+        for node_id in node_ids {
+            let node = map.node(node_id).unwrap().storage_node();
+            let pg = node.get_pg(0).unwrap();
+            assert!(crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).is_ok());
+            let found = crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap();
+            if let Some(expected) = generation {
+                assert_eq!(found, expected);
+            }
+            generation = Some(found);
+        }
+        assert!(
+            generations.insert(generation.unwrap().get()),
+            "distinct sessions reused their payload generation"
+        );
+    }
+}
+
+#[test]
 fn logical_upload_part_stream_session_count_binds_the_complete_target() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3254,7 +3344,7 @@ fn multipart_abort_retries_after_pending_install_conflict() {
                         map_for_hook.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
-                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                             crate::CreateStreamUploadReq {
                                 session_id: session_for_hook.clone(),
                                 bucket: bucket_for_hook.clone(),
@@ -3262,7 +3352,9 @@ fn multipart_abort_retries_after_pending_install_conflict() {
                                 target: crate::StreamUploadTarget::PutObject,
                                 encryption: crate::tests::metadata_only_test_encryption(),
                             },
+                            next_stream_generation_for_test(&map_for_hook, pg_id, &bucket_for_hook, &key_for_hook),
                             123,
+                            None,
                             proof_for_hook.clone(),
                         ),
                     )),
@@ -3927,9 +4019,6 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
     assert_encrypted_test_stream_segment_stored(&cluster, &second_segment, &second_encrypted);
 
     let raced_session_id = crate::SessionId::try_from("3a".repeat(16)).unwrap();
-    cluster
-        .reserve_put_object_generation(&bucket, &key, &raced_session_id)
-        .unwrap();
     let injected = Arc::new(AtomicBool::new(false));
     let injected_for_hook = Arc::clone(&injected);
     let map_for_hook = Arc::clone(&map);
@@ -3956,7 +4045,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                         map_for_hook.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
-                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                             crate::CreateStreamUploadReq {
                                 session_id: session_for_hook.clone(),
                                 bucket: bucket_for_hook.clone(),
@@ -3967,7 +4056,9 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                                 },
                                 encryption: sse_s3_multipart_test_encryption(),
                             },
+                            next_stream_generation_for_test(&map_for_hook, pg_id, &bucket_for_hook, &key_for_hook),
                             123,
+                            None,
                             proof_for_hook.clone(),
                         ),
                     )),
@@ -4566,9 +4657,6 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let pg_id = PgId::new(2);
     let requested_session_id = crate::SessionId::try_from("54".repeat(16)).unwrap();
     let winner_session_id = crate::SessionId::try_from("55".repeat(16)).unwrap();
-    cluster
-        .reserve_put_object_generation(&bucket, &key, &requested_session_id)
-        .unwrap();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let action_calls = Arc::new(AtomicUsize::new(0));
     let hook_ran_for_closure = Arc::clone(&hook_ran);
@@ -4577,9 +4665,6 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let hook_key = key.clone();
     let hook_upload_id = upload_id.clone();
     let hook_winner_session_id = winner_session_id.clone();
-    cluster
-        .reserve_put_object_generation(&bucket, &key, &winner_session_id)
-        .unwrap();
     let hook_proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
@@ -4598,7 +4683,7 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
                         hook_map.test_next_metadata_command_log_index(pg_id),
                     ),
                     MetadataCommandPayload::CreateStreamUpload(Box::new(
-                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                        crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                             crate::CreateStreamUploadReq {
                                 session_id: hook_winner_session_id.clone(),
                                 bucket: hook_bucket.clone(),
@@ -4609,7 +4694,9 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
                                 },
                                 encryption: crate::tests::metadata_only_test_encryption(),
                             },
+                            next_stream_generation_for_test(&hook_map, pg_id, &hook_bucket, &hook_key),
                             789,
+                            None,
                             hook_proof.clone(),
                         ),
                     )),
@@ -5077,9 +5164,11 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
         },
         encryption: upload.encryption.clone(),
     };
-    let part_generation = cluster
-        .reserve_put_object_generation(&bucket, &key, &session_id)
-        .unwrap();
+    let part_generation = {
+        let node = map.node(node_ids[0]).unwrap().storage_node();
+        let pg = node.get_pg(pg_id.get()).unwrap();
+        crate::PgMetadataStore::next_generation_id(&*pg, &bucket, &key).unwrap()
+    };
     let pending_command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -5087,9 +5176,11 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
                 map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     create,
+                    part_generation,
                     456,
+                    None,
                     crate::metadata_command::BucketWriteReservationProof::from(
                         &cluster
                             .acquire_durable_bucket_write_reservation(

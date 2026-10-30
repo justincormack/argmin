@@ -25,6 +25,182 @@ use crate::{
 };
 
 #[test]
+fn unix_stream_creation_atomically_publishes_generation_and_session_with_one_command() {
+    let (_serial, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let socket_path = tmp.path().join("sockets/atomic-stream.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: ClusterEpoch::INITIAL,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: tmp.path().join("remote"),
+        default_ec_shape: ec_shape,
+        pg_ids: vec![0],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: vec![node_id],
+        }],
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let remote = server.test_storage_node();
+    let _server = spawn_storage_node_server(server);
+    let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join("frontend"),
+        )],
+        &[0],
+        ec_shape,
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("unix-atomic-stream");
+    let key = crate::tests::object_key("key");
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("unixatomic");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::tests::metadata_only_test_encryption(),
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_, _| Ok::<_, ()>(((), create.clone())),
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    for (index, part) in [false, true].into_iter().enumerate() {
+        let session_id = crate::tests::stream_session_id(format!("unix-atomic-{index}"));
+        let before = remote
+            .get_pg(0)
+            .unwrap()
+            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+            .unwrap();
+        if part {
+            cluster
+                .create_upload_part_stream_session(
+                    &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+                    1,
+                    &session_id,
+                )
+                .unwrap();
+        } else {
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    create.encryption.clone(),
+                )
+                .unwrap();
+        }
+        let (request, expected) = {
+            let pg = remote.get_pg(0).unwrap();
+            assert_eq!(
+                pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                before + 1
+            );
+            let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+            let generation = crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap();
+            let entries = pg
+                .retained_metadata_command_log_entries(
+                    node_id.as_u32(),
+                    ClusterEpoch::INITIAL,
+                    MetadataCommandLogIndex::new(before + 1).unwrap(),
+                    MetadataCommandLogIndex::new(before + 1).unwrap(),
+                )
+                .unwrap();
+            let crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command) =
+                &entries[0].kind
+            else {
+                panic!("creation must be applied");
+            };
+            let MetadataCommandPayload::CreateStreamUpload(expected) = command.payload() else {
+                panic!("creation must be one combined command");
+            };
+            assert_eq!(expected.payload_generation, generation);
+            (
+                crate::CreateStreamUploadReq {
+                    session_id,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: session.target,
+                    encryption: session.encryption,
+                },
+                expected.clone(),
+            )
+        };
+        let client = map.node(node_id).unwrap().object_mutation_metadata_client();
+        let route = client
+            .open_stream_upload_creation_metadata_route(
+                ClusterEpoch::INITIAL,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+            )
+            .unwrap();
+        assert!(route
+            .matching_stream_upload_exists(&request, Some(&expected))
+            .unwrap());
+        let mut crossed = expected;
+        crossed.payload_generation =
+            GenerationId::new(crossed.payload_generation.get() + 1).unwrap();
+        assert!(route
+            .matching_stream_upload_exists(&request, Some(&crossed))
+            .is_err());
+        assert_eq!(
+            remote
+                .get_pg(0)
+                .unwrap()
+                .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                .unwrap(),
+            before + 1
+        );
+    }
+}
+
+#[test]
 fn shard_backfill_worker_executes_remote_storage_node_work() {
     let tmp = test_util::tempdir();
     let source_node_ids = [0, 1, 2, 3, 4, 5].map(NodeId::new);
@@ -4832,13 +5008,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
     {
         let object_pg = remote.get_pg(1).unwrap();
         assert_eq!(
-            crate::PgMetadataStore::reserve_object_generation(
-                &*object_pg,
-                &bucket,
-                &key,
-                &session_id,
-            )
-            .unwrap(),
+            crate::PgMetadataStore::next_generation_id(&*object_pg, &bucket, &key,).unwrap(),
             GenerationId::MIN
         );
         let create = crate::CreateStreamUploadReq {
@@ -4857,6 +5027,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
             crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(Box::new(
                 crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     create,
+                    crate::GenerationId::MIN,
                     now,
                     None,
                     initial_proof.clone(),
@@ -4864,6 +5035,16 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
             )),
         );
         object_pg.apply_metadata_command(&command).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*object_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            GenerationId::MIN,
+        );
         object_pg.refresh_metadata_command_state_digest().unwrap();
     }
     drop(remote);
