@@ -9,6 +9,9 @@ use crate::metadata_command::{
 #[path = "stream_creation_evidence_tests.rs"]
 mod evidence;
 
+#[path = "allocation_lifetime_tests.rs"]
+mod allocation_lifetime;
+
 fn fixture(store: &PgStore, part: bool) -> CreateStreamUploadCommand {
     let bucket = trusted_bucket_name("atomic-stream");
     let key = trusted_object_key("object");

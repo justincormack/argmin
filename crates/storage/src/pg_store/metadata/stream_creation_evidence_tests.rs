@@ -7,7 +7,7 @@
 
 use super::*;
 
-fn compact_creation_out_of_exact_receipt_window(
+pub(super) fn compact_creation_out_of_exact_receipt_window(
     store: &PgStore,
     create: &CreateStreamUploadCommand,
 ) -> crate::node_runtime::pg_store::MetadataCommandCheckpoint {

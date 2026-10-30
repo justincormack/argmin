@@ -2210,6 +2210,7 @@ impl PgStore {
         cluster_epoch: ClusterEpoch,
         expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
@@ -2266,6 +2267,7 @@ impl PgStore {
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
+                allocation_replacement.complete()?;
                 Ok(state)
             }
             Err(error) => {
@@ -2293,6 +2295,7 @@ impl PgStore {
             });
         }
 
+        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
@@ -2345,6 +2348,7 @@ impl PgStore {
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
+                allocation_replacement.complete()?;
                 Ok(state)
             }
             Err(error) => {
@@ -2382,6 +2386,7 @@ impl PgStore {
                 reason: format!("{error:?}"),
             })?;
 
+        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
@@ -2456,6 +2461,7 @@ impl PgStore {
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
+                allocation_replacement.complete()?;
                 Ok(state)
             }
             Err(error) => {
@@ -2479,6 +2485,7 @@ impl PgStore {
             });
         }
 
+        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
@@ -2605,6 +2612,7 @@ impl PgStore {
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
+                allocation_replacement.complete()?;
                 Ok(state)
             }
             Err(error) => {

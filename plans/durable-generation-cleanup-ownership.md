@@ -29,6 +29,10 @@ these are design/model evidence, not implemented grants or schema integration.
 The [settled-prefix review](#settled-prefix-confirmation-decision--2026-10-30)
 selects materialized-window confirmation rather than indefinitely retaining an
 introducing-command receipt, and pins the existing compaction/import behavior.
+The [local lifetime implementation](#pg-allocation-lifetime-hooks--2026-10-30)
+now tracks fresh PG-open and transfer-replacement lifetimes without persistent
+writes. Allocators do not consume that identity yet; durable issuer binding,
+primary-loss invalidation and physical write/cleanup exclusion remain open.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2370,8 +2374,9 @@ proposal in the previous section remains selected.
   and subsequent activation must distinguish new allocation admission from old
   bounded in-flight work, as specified above.
 
-These hooks and their actual runtime/Unix tests remain implementation work; the
-new store tests below do not assert that today's allocator is already fenced.
+At this evidence slice these hooks and their actual runtime/Unix tests remained
+implementation work. The subsequent local-lifetime slice implements the store
+open/transfer hooks only; neither slice asserts that today's allocator is fenced.
 
 ### Production-store regression evidence
 
@@ -2410,3 +2415,67 @@ skipped) in 237.810 seconds after the primary/witness-prefix canary was
 strengthened. Strict workspace Clippy, storage boundary checks, formatting and
 `git diff --check` passed. This validates the existing store behavior used in the
 design decision, not an implemented window-confirmation or cleanup protocol.
+
+## PG Allocation Lifetime Hooks — 2026-10-30
+
+The next schema slice needs a concrete source for its issuer binding. Implement
+that process-local source first, separately from durable window issuance, rather
+than encode node ID or a restored cursor as provisional authority.
+
+[`allocation_lifetime.rs`](../crates/storage/src/pg_store/allocation_lifetime.rs)
+owns a private 128-bit random identity per writable `PgStore` open. It uses the
+existing crypto provider, not a new dependency, file, row or separately synced
+counter. A cloned local node runtime shares the same PG store and identity;
+independent PGs, runtime opens and reopen after restart do not. Read-only shard
+inventory stores start retired and do not mint an identity.
+
+Four existing store transfer boundaries now retire the previous lifetime before
+attempting their transaction: checkpoint-base installation, rebased-command
+state adoption, and empty/matching-state initialization. The last two matter even
+when the materialized session rows are unchanged. Static input rejection (such
+as a wrong-PG checkpoint) can return before a replacement attempt begins.
+A private replacement guard
+holds a newly generated candidate; successful commit and digest validation must
+both finish before it becomes active. Entropy is acquired before SQL mutation,
+not after commit. Once replacement begins, error/rollback or dropping the guard
+leaves the lifetime retired; retry may establish a fresh identity but cannot
+revive the previous one.
+An older superseded guard cannot activate or retire its successor's identity.
+The existing PG serialization boundary remains required around these methods.
+
+No schema, command, RPC, canonical-state or checkpoint bytes change. There is no
+additional SQL statement or commit for lifetime tracking. Existing command apply,
+heartbeat inspection and log/receipt compaction leave it unchanged. This slice
+does not attach an unbounded registry to sessions or retain abandoned requests in
+memory.
+
+### Coverage and explicit limits
+
+Owner-local tests cover both PUT and UploadPart sessions across reopen,
+checkpoint replacement, rollback after destination-table clearing, and rebased
+adoption without session-row replacement. They compare complete checkpoints or
+session records, not just existence. Separate canaries cover shared runtime
+clones, foreign PG/runtime identities, empty/matching initialization, a deferred
+constraint failure at COMMIT, and superseded/dropped replacement guards.
+Heartbeat reads assert no SQL mutations. Reopen and same-state retry assertions
+pin that the local nonce does not enter canonical state or checkpoint evidence.
+
+**This remains a prerequisite, not an allocation fence.** No allocator, command
+builder or physical write consumes the identity yet, and no downstream API can
+mint grants from it. Still required:
+
+- persist and compare the issuer binding in the exact owner/window descriptor;
+- connect primary loss/reactivation to retirement under route/PG serialization;
+- enforce checked finite window bounds at allocation and preserve them on replicas;
+- implement settled-prefix confirmation and independently guarded file/ack effects;
+- integrate retained cleanup and enable the six unresolved regression schedules.
+
+Choose finite window/horizon policy before the durable window format. Integration
+must preserve existing fsync boundaries and immutable format evidence; this slice
+does not change the no-extra-ordinary-path-commit acceptance target.
+
+Validation: all nine focused lifetime tests passed. Full
+`cargo nextest run --offline --no-fail-fast` passed 9,078 tests (one slow, six
+skipped) in 250.827 seconds. Strict workspace Clippy, storage boundary checks,
+formatting and `git diff --check` passed. The six skipped cleanup regressions
+remain unresolved; no write grant or window-enforcement completion is claimed.

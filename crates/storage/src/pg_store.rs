@@ -136,6 +136,8 @@ impl crate::error::DatabaseError {
     }
 }
 
+#[path = "pg_store/allocation_lifetime.rs"]
+mod allocation_lifetime;
 #[path = "pg_store/command_log.rs"]
 mod command_log;
 #[path = "pg_store/metadata.rs"]
@@ -719,6 +721,7 @@ pub struct PgStore {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
     conn: Connection,
+    allocation_lifetime: allocation_lifetime::PgAllocationLifetime,
     clean_metadata_digest_revision: AtomicU64,
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
@@ -947,6 +950,7 @@ pub(crate) fn inspect_pg_shard_inventory(
         shards_dir,
         tmp_dir: pg_dir.join("tmp"),
         conn,
+        allocation_lifetime: allocation_lifetime::PgAllocationLifetime::retired(),
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1223,6 +1227,7 @@ impl PgStore {
             shards_dir,
             tmp_dir,
             conn,
+            allocation_lifetime: allocation_lifetime::PgAllocationLifetime::new()?,
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
