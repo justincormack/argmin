@@ -562,7 +562,8 @@ command requires adding it to the authoritative Rust registry and updating
 this table. Production publisher entry points cannot directly use
 `try_set_pending_metadata_command_for_bucket`,
 `try_install_pending_metadata_command_for_bucket`,
-`try_install_object_pg_pending_command_with_fresh_id`, and
+`try_install_object_pg_pending_command_with_fresh_id`,
+`try_install_object_pg_built_pending_command`, and
 `set_pending_metadata_command_for_bucket`; the boundary checker rejects any
 such call outside the compiler-classified typed installer implementations.
 Snapshot-sensitive publishers use
@@ -571,6 +572,19 @@ drains exactly the observed winner and returns to the caller's fresh-snapshot
 loop. The typed installer must not drain until the slot is empty: each owner
 iteration rechecks its request work budget and admitted route authority before
 handling another contender.
+Allocator/cleanup fresh-command installation delegates to
+`install_allocator_cleanup_built_metadata_command`. Its fallible builder runs
+only after the pending-slot check under frontend metadata-command PG
+serialization and a check of the caller's existing work budget. It can return
+a complete primary-built command rather than requiring the frontend to allocate
+the ID separately. A construction-time log conflict follows the same
+one-observed-contender drain and recovery-handoff outcomes as installation-time
+contention; other construction errors propagate without installing a slot.
+The returned envelope must match the PG and route epoch, and insertion retains
+the supplied immutable effect fence. This frontend serialization is not a
+substitute for primary-side transactional validation or deadline checks in a
+remote builder. Current reservation/version/release builders still use the
+fresh-ID adapter; the storage-primary Direct PUT builder is not yet implemented.
 Terminal-session publishers use
 `install_terminal_session_retry_metadata_command`, whose exhaustive result
 distinguishes installation, a matching visible contender, an unrelated visible

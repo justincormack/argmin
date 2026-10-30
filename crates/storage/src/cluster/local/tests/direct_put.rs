@@ -13,6 +13,9 @@ mod overlap_model;
 #[path = "direct_put_reservation_placement.rs"]
 mod reservation_placement;
 
+#[path = "allocator_install.rs"]
+mod allocator_install;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,

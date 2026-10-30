@@ -85,6 +85,14 @@ impl Fixture {
         install_allocator_cleanup_metadata_command_with_fresh_id();
     }
 
+    fn typed_built_allocator_without_marker_is_rejected() {
+        install_allocator_cleanup_built_metadata_command();
+    }
+
+    fn raw_built_allocator_without_marker_is_inventoried() {
+        try_install_object_pg_built_pending_command();
+    }
+
     fn typed_terminal_session_publisher_is_not_shell_inventoried() {
         crate::metadata_command::metadata_command_publisher!(TypedTerminalSessionPublisher);
         install_terminal_session_retry_metadata_command();

@@ -4588,6 +4588,26 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
     ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
+        self.try_install_object_pg_built_pending_command(pg_id, bucket, effect_fence, || {
+            let command_id = self.next_object_metadata_command_id_with_completion_admission(
+                pg_id,
+                completion_admission,
+            )?;
+            Ok(build_command(command_id))
+        })
+    }
+
+    // Construction can be a storage-primary RPC, not just a frontend closure
+    // over a separately allocated command ID. Keep the pending observation and
+    // installation serialized, and classify build-time log conflicts exactly
+    // like install-time conflicts. The caller owns retry/drain policy.
+    fn try_install_object_pg_built_pending_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
+    ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
         let pg_lock = self
             .local_map
             .runtime_state()
@@ -4596,10 +4616,8 @@ impl StorageCluster {
         if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             return Ok(ObjectPgPendingCommandInstall::Pending(command));
         }
-        let command_id = match self
-            .next_object_metadata_command_id_with_completion_admission(pg_id, completion_admission)
-        {
-            Ok(command_id) => command_id,
+        let command = match build_command() {
+            Ok(command) => command,
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
                 return Ok(ObjectPgPendingCommandInstall::LogConflict {
                     pending: self.pending_metadata_command_for_bucket(pg_id, bucket)?,
@@ -4607,7 +4625,14 @@ impl StorageCluster {
             }
             Err(error) => return Err(error),
         };
-        let command = build_command(command_id);
+        if command.id().pg_id() != pg_id
+            || command.id().cluster_epoch() != self.operation_epoch()
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "install built object metadata command",
+            }
+            .into());
+        }
         match self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
             pg_id,
             bucket,
@@ -4881,12 +4906,41 @@ impl StorageCluster {
             completion_admission,
             effect_fence,
         } = admission;
-        let (command, drained_outcome) = match self.try_install_object_pg_pending_command_with_fresh_id(
+        self.install_allocator_cleanup_built_metadata_command(
+            publisher,
             pg_id,
             bucket,
-            completion_admission,
             effect_fence,
-            build_command,
+            work_budget,
+            || {
+                let command_id = self.next_object_metadata_command_id_with_completion_admission(
+                    pg_id,
+                    completion_admission,
+                )?;
+                Ok(build_command(command_id))
+            },
+        )
+    }
+
+    fn install_allocator_cleanup_built_metadata_command(
+        &self,
+        publisher: impl crate::metadata_command::AllocatorCleanupMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut RequestWorkBudget,
+        build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
+    ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
+        let (command, drained_outcome) = match self.try_install_object_pg_built_pending_command(
+            pg_id,
+            bucket,
+            effect_fence,
+            || {
+                // The PG serialization wait can consume the caller's remaining
+                // budget. Never start fresh construction with a renewed budget.
+                work_budget.check("allocator command construction budget exhausted")?;
+                build_command()
+            },
         )? {
             ObjectPgPendingCommandInstall::Installed(command) => {
                 return Ok(AllocatorCleanupFreshInstallOutcome::Installed(Box::new(command)));

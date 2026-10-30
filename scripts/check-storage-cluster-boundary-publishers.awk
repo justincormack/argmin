@@ -278,6 +278,9 @@ function publisher_helper(line) {
     if (line ~ /try_install_object_pg_pending_command_with_fresh_id\(/) {
         return "try_install_object_pg_pending_command_with_fresh_id"
     }
+    if (line ~ /try_install_object_pg_built_pending_command\(/) {
+        return "try_install_object_pg_built_pending_command"
+    }
     if (line ~ /try_set_object_pg_pending_command_or_drain\(/) {
         return "try_set_object_pg_pending_command_or_drain"
     }
@@ -301,6 +304,9 @@ function publisher_helper(line) {
     }
     if (line ~ /install_allocator_cleanup_metadata_command_with_fresh_id\(/) {
         return "install_allocator_cleanup_metadata_command_with_fresh_id"
+    }
+    if (line ~ /install_allocator_cleanup_built_metadata_command\(/) {
+        return "install_allocator_cleanup_built_metadata_command"
     }
     if (line ~ /install_allocator_cleanup_pending_command_or_drain\(/) {
         return "install_allocator_cleanup_pending_command_or_drain"
@@ -342,6 +348,7 @@ function is_install_helper(name) {
         || name == "try_install_pending_metadata_command_for_bucket" \
         || name == "try_install_pending_metadata_command_for_bucket_with_effect_fence" \
         || name == "try_install_object_pg_pending_command_with_fresh_id" \
+        || name == "try_install_object_pg_built_pending_command" \
         || name == "try_set_object_pg_pending_command_or_drain" \
         || name == "try_install_object_pg_pending_command_or_drain" \
         || name == "try_set_bucket_pg_pending_command_or_retry" \
@@ -353,6 +360,7 @@ function is_install_helper(name) {
         || name == "install_snapshot_sensitive_bucket_control_command_or_drain" \
         || name == "install_snapshot_sensitive_bucket_pg_command_or_drain" \
         || name == "install_allocator_cleanup_metadata_command_with_fresh_id" \
+        || name == "install_allocator_cleanup_built_metadata_command" \
         || name == "install_allocator_cleanup_pending_command_or_drain" \
         || name == "install_allocator_cleanup_bucket_pg_command_or_retry" \
         || name == "install_terminal_session_retry_metadata_command" \
@@ -448,6 +456,7 @@ pending_test_cfg {
         || helper == "install_snapshot_sensitive_bucket_control_command_or_drain" \
         || helper == "install_snapshot_sensitive_bucket_pg_command_or_drain" \
         || helper == "install_allocator_cleanup_metadata_command_with_fresh_id" \
+        || helper == "install_allocator_cleanup_built_metadata_command" \
         || helper == "install_allocator_cleanup_pending_command_or_drain" \
         || helper == "install_allocator_cleanup_bucket_pg_command_or_retry" \
         || helper == "install_terminal_session_retry_metadata_command" \

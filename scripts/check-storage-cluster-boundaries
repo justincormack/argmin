@@ -80,6 +80,8 @@ publisher_fixture_required_patterns=(
     $'^TYPED_MISSING_MARKER\t.*:typed_snapshot_sensitive_bucket_control_without_marker_is_rejected:install_snapshot_sensitive_bucket_control_command_or_drain$'
     $'^TYPED_MISSING_MARKER\t.*:typed_snapshot_sensitive_bucket_pg_without_marker_is_rejected:install_snapshot_sensitive_bucket_pg_command_or_drain$'
     $'^TYPED_MISSING_MARKER\t.*:typed_allocator_cleanup_publisher_without_marker_is_rejected:install_allocator_cleanup_metadata_command_with_fresh_id$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_built_allocator_without_marker_is_rejected:install_allocator_cleanup_built_metadata_command$'
+    $'^PUBLISHER\t.*:raw_built_allocator_without_marker_is_inventoried:<missing>:try_install_object_pg_built_pending_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_terminal_session_publisher_without_marker_is_rejected:install_terminal_session_retry_metadata_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_matching_outcome_publisher_without_marker_is_rejected:install_matching_outcome_retry_metadata_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_apply_validated_publisher_without_marker_is_rejected:install_apply_validated_metadata_command_with_fresh_id$'

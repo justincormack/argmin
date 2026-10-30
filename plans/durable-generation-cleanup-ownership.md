@@ -3181,3 +3181,45 @@ checks passed. The first focused run caught a positive-control observer scoped
 only to the restricted map; the healthy control now installs its own observer
 and demonstrably reaches pending installation. Production behavior was not
 changed to accommodate that fixture failure.
+
+## Fallible Allocator Command Installation Boundary — 2026-10-30
+
+The next actual-primary Direct PUT builder cannot use the simpler prebuilt
+allocator installer unchanged: that path creates a separate drain budget and
+does not expose the fresh installer's exact recovery-handoff outcomes. First
+separate command construction from ID allocation without weakening those
+outcomes.
+
+`install_allocator_cleanup_built_metadata_command` now accepts a fallible
+complete-envelope builder. Existing fresh-ID allocator publishers delegate to
+it, retaining their current builders and command formats. The raw primitive
+checks the pending slot under the same frontend metadata-command PG
+serialization before invoking construction. The typed allocator layer checks
+the original request work budget after that serialization wait. A visible
+contender skips construction; a build-time log conflict reobserves the slot;
+either case drains at most the observed command and returns to the owner loop.
+Transferred/awaiting-recovery results carry that exact contender. Other build
+errors propagate without installing anything. Successful envelopes must match
+the selected PG and epoch; pending installation still receives the original
+effect fence.
+
+The boundary checker recognizes both the raw primitive and sealed typed entry
+point, with fixtures for an unclassified raw call and a missing publisher
+marker. Owner-local regressions cover build rejection, successful exact
+installation, crossed PG/epoch envelopes, exhausted shared budget, build-time
+log conflict with/without a visible slot, one-contender draining when a second
+command arrives, and exact failed-contender recovery handoff.
+
+This is an installation integration point, **not** the storage-primary builder
+or durable owner/window integration. Frontend serialization does not exclude
+another frontend's requests. The next builder must select/revalidate generation,
+placement and issuer at the actual primary, enforce the captured deadline beside
+allocation, and validate its returned descriptor before installation. It must
+not publish a pending command itself: ambiguous builder responses must not hide
+publication ownership. No RPC, schema, encoding, transaction or fsync is added
+here. All six ignored cleanup regressions remain unresolved.
+
+Validation: all 39 focused allocator/generation/Unix race tests passed. Full
+Nextest passed 9,121 tests (one slow, six skipped) in 256.099s. Strict
+all-target/all-feature Clippy, storage boundary checks, formatting and diff
+checks passed.
