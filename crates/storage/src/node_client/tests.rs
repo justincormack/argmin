@@ -2823,6 +2823,12 @@ fn unix_multipart_abort_mutation_metadata_route_rejects_foreign_epoch_before_rpc
 #[test]
 fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority() {
     let tmp = test_util::tempdir();
+    let mut placement_config = test_config(&tmp);
+    placement_config.pg_ids = vec![0, 1];
+    placement_config.pg_routes[0].acting_set = (7..13).map(NodeId::new).collect();
+    let mut second_route = placement_config.pg_routes[0].clone();
+    second_route.pg_id = 1;
+    placement_config.pg_routes.push(second_route);
     let storage_node = Arc::new(
         crate::node::SharedStorageNode::open_with_default_ec_shape(
             tmp.path(),
@@ -2873,6 +2879,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
     let command = route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&placement_config),
             request: &request,
             cleanup_after: Some(10_000),
             precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
@@ -2921,6 +2928,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     assert!(matches!(
         route
             .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                placement: PayloadPlacementInput::from_server_config(&placement_config),
                 request: &request,
                 cleanup_after: None,
                 precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
@@ -2977,6 +2985,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     };
     assert!(matches!(
         route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&placement_config),
             request: &unrelated_request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},
@@ -4396,6 +4405,8 @@ mod unix_metadata_rpc;
 
 #[path = "tests/publication_transport_model.rs"]
 mod publication_transport_model;
+#[path = "tests/stream_creation_placement.rs"]
+mod stream_creation_placement;
 #[path = "tests/stream_extent.rs"]
 mod stream_extent;
 #[path = "tests/unix_object_rpc.rs"]

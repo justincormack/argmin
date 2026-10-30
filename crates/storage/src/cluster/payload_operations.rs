@@ -6828,6 +6828,7 @@ impl StorageCluster {
             );
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    placement: PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &request,
                     cleanup_after,
                     precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {},

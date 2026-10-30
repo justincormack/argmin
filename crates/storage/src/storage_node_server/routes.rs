@@ -1717,6 +1717,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         )
         .and_then(|route| {
             route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                placement: crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(&self.route.handler.config),
                 request,
                 cleanup_after,
                 precondition,

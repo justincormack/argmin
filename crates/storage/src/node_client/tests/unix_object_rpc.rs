@@ -1781,6 +1781,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     ));
     let stream_command_error = wrong_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &stream_request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::PutObject {
@@ -2440,6 +2441,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let part_create_command = correct_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -2456,6 +2458,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let wrong_part_create_error = wrong_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -2473,6 +2476,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let crossed_part_create_error = correct_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -3594,7 +3598,8 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
 #[test]
 fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let tmp = test_util::tempdir();
-    let config = test_config(&tmp);
+    let mut config = test_config(&tmp);
+    config.pg_routes[0].acting_set = (7..13).map(NodeId::new).collect();
     let bucket = crate::tests::bucket_name("object-mutation-rpc-bucket");
     let key = crate::tests::object_key("object-mutation-rpc-key");
     let listed_stream_request = CreateStreamUploadReq {
@@ -3883,6 +3888,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         .unwrap());
     let stream_command = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &stream_request,
             cleanup_after: Some(12_345),
             precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3925,6 +3931,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
             ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
+                placement: PayloadPlacementInput::from_server_config(&config),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3956,6 +3963,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
             ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
+                placement: PayloadPlacementInput::from_server_config(&config),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3992,6 +4000,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     };
     let err = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &missing_upload_part_stream_request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -4134,7 +4143,8 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || server.accept_one().unwrap());
     let stale_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
-    let client = UnixStorageNodeClient::new(NodeId::new(7), stale_epoch, config.socket_path);
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), stale_epoch, config.socket_path.clone());
     let bucket = crate::tests::bucket_name("stale-upload-part-rpc-bucket");
     let key = crate::tests::object_key("stale-upload-part-rpc-key");
     let upload_id = crate::tests::multipart_upload_id("stale-upload-part-rpc-upload");
@@ -4169,6 +4179,7 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
         .unwrap();
     let err = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            placement: PayloadPlacementInput::from_server_config(&config),
             request: &request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {

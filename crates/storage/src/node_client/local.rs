@@ -5384,7 +5384,7 @@ impl LocalStorageNodeClient {
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        match (&request.request.target, request.precondition) {
+        match (&request.request.target, &request.precondition) {
             (
                 StreamUploadTarget::PutObject,
                 CreateStreamUploadPrecondition::PutObject { expected_current },
@@ -5394,7 +5394,7 @@ impl LocalStorageNodeClient {
                     &request.request.bucket,
                     &request.request.key,
                 )?;
-                if current.as_ref() != expected_current {
+                if current.as_ref() != *expected_current {
                     return Err(ObjectPgActionError::StaleObjectReadSubject);
                 }
             }
@@ -5412,7 +5412,7 @@ impl LocalStorageNodeClient {
                     &request.request.key,
                     upload_id,
                 )?;
-                if &current != expected_upload {
+                if &current != *expected_upload {
                     return Err(MetadataError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     }
@@ -5459,6 +5459,39 @@ impl LocalStorageNodeClient {
             &*pg,
             &request.request.bucket,
             &request.request.key,
+        )?;
+        // Derive the selected PG from the actual store topology and the state
+        // validated under this lock; the supplied catalogue only resolves it.
+        let topology = self.storage_node.pg_topology();
+        let data_pg_id = match &request.precondition {
+            CreateStreamUploadPrecondition::PutObject { .. }
+            | CreateStreamUploadPrecondition::PutObjectNoCurrentCheck { .. } => topology
+                .object_generation_segment_data_pg(
+                    &request.request.bucket,
+                    &request.request.key,
+                    payload_generation,
+                    0,
+                ),
+            CreateStreamUploadPrecondition::UploadPart { expected_upload } => {
+                let StreamUploadTarget::UploadPart { part_number, .. } = request.request.target
+                else {
+                    unreachable!("target and precondition validated above")
+                };
+                topology.object_generation_multipart_part_segment_data_pg(
+                    &request.request.bucket,
+                    &request.request.key,
+                    expected_upload.object_generation_id,
+                    part_number,
+                    0,
+                )
+            }
+        };
+        request.placement.require_segment_placement(
+            route_cluster_epoch,
+            data_pg_id.get(),
+            self.storage_node.default_ec_shape(),
+            &crate::stream_segment_key_hash(&request.request.session_id, 0),
+            GenerationId::MIN,
         )?;
         let command_id =
             self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;

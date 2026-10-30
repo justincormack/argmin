@@ -854,6 +854,16 @@ impl UnixStorageNodeClient {
                 "response command does not match request".to_string(),
             )));
         }
+        let (data_pg_id, ec) = request
+            .placement
+            .first_stream_data_pg(request, create.payload_generation)?;
+        request.placement.require_segment_placement(
+            cluster_epoch,
+            data_pg_id,
+            ec,
+            &crate::stream_segment_key_hash(&request.request.session_id, 0),
+            create.initial_next_segment_vid,
+        )?;
         Ok(())
     }
 

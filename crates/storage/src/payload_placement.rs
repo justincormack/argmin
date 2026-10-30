@@ -32,6 +32,37 @@ enum PlacementSource<'a> {
 }
 
 impl<'a> PayloadPlacementInput<'a> {
+    pub(in crate::node_runtime) fn first_stream_data_pg(
+        self,
+        build: &super::clients::BuildCreateStreamUploadCommandReq<'_>,
+        payload_generation: GenerationId,
+    ) -> Result<(u32, EcShape), StoreError> {
+        use super::clients::CreateStreamUploadPrecondition;
+        let (generation, part) = match (&build.request.target, &build.precondition) {
+            (
+                crate::StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObject { .. }
+                | CreateStreamUploadPrecondition::PutObjectNoCurrentCheck { .. },
+            ) => (payload_generation, None),
+            (
+                crate::StreamUploadTarget::UploadPart { part_number, .. },
+                CreateStreamUploadPrecondition::UploadPart { expected_upload },
+            ) => (expected_upload.object_generation_id, Some(*part_number)),
+            _ => {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "stream creation placement target",
+                })
+            }
+        };
+        self.stream_data_pg(
+            &build.request.bucket,
+            &build.request.key,
+            0,
+            generation,
+            part,
+        )
+    }
+
     pub(in crate::node_runtime) fn expected_stream_data_pg(
         self,
         bucket: &crate::BucketName,
@@ -39,18 +70,9 @@ impl<'a> PayloadPlacementInput<'a> {
         index: u32,
         expected: &crate::ExpectedStreamAppendState,
     ) -> Result<(u32, EcShape), StoreError> {
-        let server_topology;
-        let (topology, ec) = match self.source {
-            PlacementSource::Embedded(map) => (map.pg_topology(), map.default_ec_shape()),
-            PlacementSource::Server(config) => {
-                server_topology = crate::pg_topology::PgTopology::new(&config.pg_ids)
-                    .map_err(|source| StoreError::InvalidPgTopology { source })?;
-                (&server_topology, config.default_ec_shape)
-            }
-        };
-        let pg = match expected {
+        let (generation, part) = match expected {
             crate::ExpectedStreamAppendState::PutObject { generation_id, .. } => {
-                topology.object_generation_segment_data_pg(bucket, key, *generation_id, index)
+                (*generation_id, None)
             }
             crate::ExpectedStreamAppendState::UploadPart {
                 session, upload, ..
@@ -61,14 +83,38 @@ impl<'a> PayloadPlacementInput<'a> {
                         operation: "stream preparation placement target",
                     });
                 };
-                topology.object_generation_multipart_part_segment_data_pg(
-                    bucket,
-                    key,
-                    upload.object_generation_id,
-                    part_number,
-                    index,
-                )
+                (upload.object_generation_id, Some(part_number))
             }
+        };
+        self.stream_data_pg(bucket, key, index, generation, part)
+    }
+
+    fn stream_data_pg(
+        self,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        index: u32,
+        generation: GenerationId,
+        part: Option<u32>,
+    ) -> Result<(u32, EcShape), StoreError> {
+        let server_topology;
+        let (topology, ec) = match self.source {
+            PlacementSource::Embedded(map) => (map.pg_topology(), map.default_ec_shape()),
+            PlacementSource::Server(config) => {
+                server_topology = crate::pg_topology::PgTopology::new(&config.pg_ids)
+                    .map_err(|source| StoreError::InvalidPgTopology { source })?;
+                (&server_topology, config.default_ec_shape)
+            }
+        };
+        let pg = match part {
+            None => topology.object_generation_segment_data_pg(bucket, key, generation, index),
+            Some(part_number) => topology.object_generation_multipart_part_segment_data_pg(
+                bucket,
+                key,
+                generation,
+                part_number,
+                index,
+            ),
         };
         Ok((pg.get(), ec))
     }

@@ -49,6 +49,9 @@ placement input needed before adding durable first-window records.
 The [shared placement resolver](#shared-placement-resolver--2026-10-30) extracts
 the existing computation for reuse by installed builders; captured placement
 authority and durable descriptors are not implemented by that extraction.
+The [captured creation inputs](#captured-placement-inputs-for-stream-creation--2026-10-30)
+extend placement validation to generation-selecting stream creation builders.
+They remain computational inputs, not durable first-window authority.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3080,3 +3083,51 @@ RPC assertion expected an internal reason that the error layer intentionally
 redacts. Embedded tests pin the precise reasons; the installed test checks the
 wire error and unchanged durable state. Clippy prompted moving preparation onto
 the scoped route rather than passing its PG/bucket/key separately.
+
+## Captured Placement Inputs for Stream Creation — 2026-10-30
+
+The shared stream-creation builder now requires the captured placement catalogue
+used by preparation. All four cluster creation call sites pass their immutable
+map, including current-object-checked PUT creation, the lower
+record-under-reservation entry point, and both UploadPart workflows. Installed
+Unix/TLS handlers derive the catalogue from their admitted config; it is not
+serialized as client-selected participants.
+
+Under the existing object-PG lock, the builder validates the current object or
+upload, requires an unused session/reservation identity, and selects the payload
+generation read-only. It derives the first segment's data PG using the actual
+store topology and that validated state, then checks the captured route and
+canonical placement for index zero/VID one before allocating a command ID. PUT
+uses its newly selected generation; UploadPart uses the enclosing upload's
+generation and part number, retaining the existing payload placement contract.
+The independent part generation remains the encryption/ownership subject.
+
+Unix response validation resolves the first placement against the frontend's
+original catalogue after learning the returned payload generation. This catches
+a command whose selected route is unusable in that catalogue before installation.
+It does not certify equality of arbitrary frontend/server catalogues or persist
+participants: an immutable descriptor and its exact comparison still belong to
+the owner/window integration. Existing route and effect-fence checks remain
+required; the borrowed catalogue is not an admission capability.
+
+New embedded and installed-Unix canaries cover PUT and UploadPart with the
+selected data PG distinct from the object PG. A healthy frontend catalogue
+cannot bypass the server's unavailable selected route. Rejections preserve the
+session/segment/upload rows, generation-reservation absence, generation candidate,
+replica state and command index. Positive controls build and apply successfully
+with an unrelated PG in Peering, and reject the same returned command against a
+frontend catalogue whose selected PG is unavailable. The UploadPart case selects
+a key for which substituting the part generation for the upload generation would
+choose a different data PG.
+
+No wire/schema version, durable table, transaction or fsync is added. This
+completes captured placement inputs for stream creation and preparation, not
+durable owner/window integration. Direct PUT reservation placement, issuer
+binding, replicated intervals, terminal retention, confirmation and physical
+exclusion remain open, as do all six ignored cleanup regressions.
+
+Validation: all 84 focused creation, stream and Unix tests passed. Full Nextest
+passed 9,111 tests (two slow, six skipped) in 270.172s. Strict all-target/all-feature
+Clippy, the storage boundary checker, formatting and diff checks passed. Existing
+metadata-only builder fixtures now provide placeable catalogues consistent with
+their EC shapes; no payload fixtures or historical encoding specimens changed.

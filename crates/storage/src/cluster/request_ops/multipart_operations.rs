@@ -280,6 +280,7 @@ impl super::StorageCluster {
                 require_valid_route()?;
                 let command = match stream_creation_route.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
+                        placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                         request: &create,
                         cleanup_after,
                         precondition: CreateStreamUploadPrecondition::PutObject {
@@ -1490,6 +1491,7 @@ impl super::StorageCluster {
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &create,
                     cleanup_after,
                     precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -1760,6 +1762,7 @@ impl super::StorageCluster {
             }
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &create,
                     cleanup_after,
                     precondition: CreateStreamUploadPrecondition::UploadPart {

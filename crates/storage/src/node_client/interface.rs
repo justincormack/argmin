@@ -942,6 +942,7 @@ pub(crate) enum CreateStreamUploadPrecondition<'a> {
 }
 
 pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
+    pub(crate) placement: PayloadPlacementInput<'a>,
     pub(crate) request: &'a CreateStreamUploadReq,
     pub(crate) cleanup_after: Option<u64>,
     pub(crate) precondition: CreateStreamUploadPrecondition<'a>,
