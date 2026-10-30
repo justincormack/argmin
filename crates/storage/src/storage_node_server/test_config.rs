@@ -1,6 +1,9 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "allocation_lifetime_tests.rs"]
+mod allocation_lifetime_tests;
+
     use super::*;
     use crate::control_plane_auth::{
         ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,

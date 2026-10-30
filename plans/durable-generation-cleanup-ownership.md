@@ -33,6 +33,9 @@ The [local lifetime implementation](#pg-allocation-lifetime-hooks--2026-10-30)
 now tracks fresh PG-open and transfer-replacement lifetimes without persistent
 writes. Allocators do not consume that identity yet; durable issuer binding,
 primary-loss invalidation and physical write/cleanup exclusion remain open.
+The subsequent [storage-node route-publication hook](#storage-node-route-publication-lifetimes--2026-10-30)
+handles issuer replacement on installed storage-node route changes. Embedded
+cluster publication and durable window/allocator binding remain outstanding.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2479,3 +2482,68 @@ Validation: all nine focused lifetime tests passed. Full
 skipped) in 250.827 seconds. Strict workspace Clippy, storage boundary checks,
 formatting and `git diff --check` passed. The six skipped cleanup regressions
 remain unresolved; no write grant or window-enforcement completion is claimed.
+
+## Storage-Node Route-Publication Lifetimes — 2026-10-30
+
+The schema review exposed another lifetime boundary which must be implemented
+before a durable descriptor can rely on the local issuer nonce: a still-open
+storage-node process can lose and regain primary authority without a checkpoint
+import or restart. This slice implements that installed-server boundary; it does
+not yet add owner/window rows or make the nonce sufficient write authority.
+
+`StorageNodeServer::install_control_plane_runtime_config` now compares the complete
+old/new current-route descriptors by PG, after admission has drained and while
+holding route-state publication serialization. Changed descriptors replace the
+affected PG lifetimes. Global epoch or default-EC changes also invalidate them,
+including configurations using implicit routes. Same-node Active/Peering/Active
+and primary-away/primary-back cycles cannot restore an earlier identity.
+
+The storage-owned node helper acquires affected PG mutexes in sorted, deduplicated
+order. It retires their old lifetimes and holds both the PG locks and opaque
+replacement guards through **local** runtime-config publication. Successful
+publication completes the fresh candidates before the new in-memory route is
+exposed. Failure drops the guards and leaves the old identities retired. The
+callback performs no network IO and must not acquire PG locks itself. This adds
+no SQL operation, format field or ordinary-path durability barrier; it uses the
+existing config staging, rename and directory sync.
+
+Healthy validity-only renewal remains memory-only and does not acquire PG locks
+or drain admitted frames. Unchanged routes, history-only edits and exact repeat
+installs preserve their identities. There is one deliberate exceptional path:
+failed publication records the affected PG IDs in a bounded process-local pending
+set. The next successful install replaces those identities even if the control
+plane abandoned the candidate and merely renewed the old topology. Such a retry
+takes the full publication barrier instead of leaving those PGs retired forever
+through the renewal fast path. Success clears the pending set; restart opens
+fresh lifetimes, so this set needs no durable sidecar or recovery record.
+
+### Regression scope
+
+- Installed-server tests independently change state, acting set and primary
+  within one epoch, then move the primary away/back across epochs. An unaffected
+  PG is a positive preservation canary, and checkpoint equality pins that the
+  nonce changes do not mutate durable PG state.
+- Validity renewal, history-only changes and repeated installation preserve the
+  lifetime. Existing memory-only renewal coverage remains applicable.
+- A staged-file removal forces publication rename failure after staging. Both
+  retrying the candidate and renewing the old topology must establish fresh
+  identities without reviving the retired ones; a later healthy renewal must
+  preserve the recovered identity.
+- A held admitted frame and an observed `Draining` state prove that replacement
+  waits for admission drain, rather than invalidating a still-running frame.
+- An owner-local helper test checks that all affected PG mutexes remain held
+  through the publication callback, an unrelated PG stays unlocked, and callback
+  failure retires only the affected lifetimes before retry.
+
+**Still open:** the analogous process-local `StorageClusterRouteHandle` publication
+hook; durable owner/window fields and finite window/horizon policy; comparison of
+the captured issuer at allocation; settled-prefix confirmation; and independent
+file/ack exclusion with retained cleanup. An active local nonce is not an Active
+PG role, a settled-publication proof, or a physical write grant. None of the six
+ignored cleanup regressions is enabled or claimed fixed by these hooks.
+
+Validation: all 15 focused lifetime/publication tests passed. Full
+`cargo nextest run --offline --no-fail-fast` passed 9,082 tests (two slow, six
+skipped) in 273.371 seconds. Strict workspace Clippy, storage boundary checks,
+formatting and `git diff --check` passed. The six skipped cleanup regressions
+remain unresolved.

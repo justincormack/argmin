@@ -1608,6 +1608,35 @@ impl SharedStorageNode {
         Ok(BucketPgTestGuard { guard })
     }
 
+    /// Replace only the affected PG lifetimes while the caller holds its route
+    /// publication barrier. There are no SQL writes here. All locks are acquired
+    /// in ascending PG order and held through the local publication callback;
+    /// that callback must not acquire PG locks or perform network IO.
+    pub(super) fn with_replaced_pg_allocation_lifetimes<T, E>(
+        &self,
+        mut pg_ids: Vec<u32>,
+        publish: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        pg_ids.sort_unstable();
+        pg_ids.dedup();
+        let stores = pg_ids
+            .into_iter()
+            .map(|pg_id| self.get_pg(pg_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let replacements = stores
+            .iter()
+            .map(|store| store.begin_allocation_lifetime_replacement())
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = publish()?;
+        for replacement in replacements {
+            replacement.complete()?;
+        }
+        Ok(result)
+    }
+
     /// Lock and return a guard for the given PG.
     pub(crate) fn get_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
         observability::trace_scope!(TRACE_TARGET, "SharedStorageNode::get_pg", "pg_id={}", pg_id);
@@ -2706,6 +2735,39 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = LocalStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
+    }
+
+    #[test]
+    fn storage_node_allocation_lifetime_replacement_holds_pg_locks_through_publication() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1, 2, 3]).unwrap();
+        let identity = |pg_id| {
+            node.get_pg(pg_id)
+                .unwrap()
+                .test_allocation_lifetime_identity()
+        };
+        let before = [identity(0).unwrap(), identity(1).unwrap()];
+        let unaffected = identity(2).unwrap();
+        let result: Result<(), StoreError> =
+            node.with_replaced_pg_allocation_lifetimes(vec![1, 0, 1], || {
+                for pg_id in [0, 1] {
+                    assert!(matches!(
+                        node.stores[&pg_id].try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                }
+                assert!(node.stores[&2].try_lock().is_ok());
+                Err(StoreError::PgNotFound { pg_id: 999 })
+            });
+        assert!(matches!(result, Err(StoreError::PgNotFound { pg_id: 999 })));
+        assert_eq!([identity(0), identity(1)], [None, None]);
+        assert_eq!(identity(2), Some(unaffected));
+        node.with_replaced_pg_allocation_lifetimes(vec![0, 1], || Ok::<_, StoreError>(()))
+            .unwrap();
+        for pg_id in [0, 1] {
+            assert_ne!(identity(pg_id).unwrap(), before[pg_id as usize]);
+        }
+        assert_eq!(identity(2), Some(unaffected));
     }
 
     #[test]

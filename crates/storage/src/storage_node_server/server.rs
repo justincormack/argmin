@@ -141,6 +141,10 @@ impl StorageNodeRpcListener {
 pub struct StorageNodeServer {
     runtime_route_state: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     runtime_config_install_lock: Mutex<()>,
+    // A failed publication may have retired some local issuers. Even a later
+    // same-route/validity-only install must drain and establish fresh identities
+    // for these PGs; it must not leave them permanently retired via the fast path.
+    pending_allocation_lifetime_replacements: Mutex<BTreeSet<u32>>,
     route_admission: StorageNodeRouteAdmissionGate,
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
@@ -872,6 +876,7 @@ impl StorageNodeServer {
                 route_map_lease,
             })),
             runtime_config_install_lock: Mutex::new(()),
+            pending_allocation_lifetime_replacements: Mutex::new(BTreeSet::new()),
             route_admission: StorageNodeRouteAdmissionGate::default(),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
@@ -1287,10 +1292,16 @@ impl StorageNodeServer {
             bind_storage_node_route_map_lease(next_config.route_map_validity)?;
         let current_config = self.config_snapshot_arc();
         validate_runtime_config_install(&current_config, &next_config)?;
+        let mut pending_lifetimes = self
+            .pending_allocation_lifetime_replacements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Lease renewal is volatile serving authority. Keep the last complete
         // topology as the restart checkpoint; bootstrap refreshes it before bind.
-        if next_config.only_extends_route_map_validity_from(&current_config) {
+        if pending_lifetimes.is_empty()
+            && next_config.only_extends_route_map_validity_from(&current_config)
+        {
             #[cfg(test)]
             if let Some(hook) = self
                 .runtime_route_before_publish_lock_test_hook
@@ -1363,7 +1374,35 @@ impl StorageNodeServer {
             hook();
         }
         validate_runtime_config_install(&current_state.config, &next_config)?;
-        staged_config.publish()?;
+        // A live process can lose and regain primary authority without reopening
+        // its stores or importing a checkpoint. Do not let that ABA transition
+        // restore the issuer identity that belonged to the previous route.
+        // Healthy validity-only renewal returns above; history-only changes also
+        // preserve allocation identity unless an earlier reset failed. Compare
+        // complete current route descriptors, not only primary node IDs.
+        let current_routes: std::collections::BTreeMap<_, _> = current_state
+            .config
+            .pg_routes
+            .iter()
+            .map(|route| (route.pg_id, route))
+            .collect();
+        let next_routes: std::collections::BTreeMap<_, _> = next_config
+            .pg_routes
+            .iter()
+            .map(|route| (route.pg_id, route))
+            .collect();
+        pending_lifetimes.extend(
+            current_state.config.pg_ids.iter().copied().filter(|pg_id| {
+                current_state.config.cluster_epoch != next_config.cluster_epoch
+                    || current_state.config.default_ec_shape != next_config.default_ec_shape
+                    || current_routes.get(pg_id) != next_routes.get(pg_id)
+            }),
+        );
+        self._node.with_replaced_pg_allocation_lifetimes(
+            pending_lifetimes.iter().copied().collect(),
+            || staged_config.publish(),
+        )?;
+        pending_lifetimes.clear();
         *current_state = StorageNodeRuntimeRouteState {
             config: Arc::new(next_config),
             route_map_lease: next_route_map_lease,

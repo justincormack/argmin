@@ -155,6 +155,8 @@ mod sql_types;
 
 use schema::{init_pg_schema, require_current_pg_schema};
 
+pub(in crate::node_runtime) use allocation_lifetime::ReplacementLifetime as PgAllocationReplacement;
+
 #[cfg(test)]
 pub(crate) use crate::control_plane::METADATA_CANONICAL_STATE_ENCODING_VERSION;
 pub(crate) use command_log::{
@@ -1166,6 +1168,19 @@ fn open_and_validate_existing_pg_database_file(
 }
 
 impl PgStore {
+    /// The node holds PG serialization until route publication either succeeds
+    /// or fails. Replacement is volatile and cannot restore the old identity.
+    pub(in crate::node_runtime) fn begin_allocation_lifetime_replacement(
+        &self,
+    ) -> Result<PgAllocationReplacement<'_>, StoreError> {
+        self.allocation_lifetime.begin_replacement()
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_allocation_lifetime_identity(&self) -> Option<[u8; 16]> {
+        self.allocation_lifetime.active_identity()
+    }
+
     /// Open (or create) a PG store at the given directory.
     ///
     /// Creates `shards/` and `tmp/` subdirectories if they don't exist.

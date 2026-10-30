@@ -69,13 +69,13 @@ impl PgAllocationLifetime {
 
 /// Only the successful replacement path consumes this guard. Errors, unwind,
 /// and commit uncertainty leave allocation retired, independently of SQL rollback.
-pub(super) struct ReplacementLifetime<'a> {
+pub(in crate::node_runtime) struct ReplacementLifetime<'a> {
     lifetime: &'a PgAllocationLifetime,
     identity: [u8; 16],
 }
 
 impl ReplacementLifetime<'_> {
-    pub(super) fn complete(self) -> Result<(), StoreError> {
+    pub(in crate::node_runtime) fn complete(self) -> Result<(), StoreError> {
         if self.lifetime.state.get() != State::Replacing(self.identity) {
             return Err(StoreError::Io {
                 context: "complete PG allocation lifetime replacement",
