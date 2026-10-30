@@ -1814,11 +1814,17 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
+        let effect_fence = self.route.fence.intersect_effect_fence(effect_fence)
+            .map_err(ObjectPgActionError::Store)
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        let placement = crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(
+            &self.route.handler.config,
+        );
         let local_client = LocalStorageNodeClient::new(
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        let (target, mut segment) =
+        let (target, segment) =
             ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
                 &local_client,
                 self.route.fence.cluster_epoch,
@@ -1832,10 +1838,10 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                     request,
                     expected_append_state,
                     effect_fence,
+                    placement,
                 )
             })
             .map_err(StorageNodeObjectRouteError::Object)?;
-        segment.placement_cluster_epoch = self.route.fence.cluster_epoch;
         Ok((target, segment))
     }
 

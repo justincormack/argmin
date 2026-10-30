@@ -391,6 +391,7 @@ mod unix_rpc;
 #[path = "node_client/unix_sessions.rs"]
 mod unix_sessions;
 
+use super::payload_placement::PayloadPlacementInput;
 pub(crate) use interface::*;
 
 #[cfg(test)]

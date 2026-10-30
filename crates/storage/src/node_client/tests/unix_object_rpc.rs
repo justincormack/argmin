@@ -2173,6 +2173,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
+    config.default_ec_shape = EcShape { k: 1, m: 0 };
     config.pg_ids = vec![0, 1];
     config.pg_routes = vec![
         StorageNodePgRoute {
@@ -2660,6 +2661,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
                 generation_id: snapshot.generation_id,
             }),
             effect_fence,
+            PayloadPlacementInput::from_server_config(&config),
         )
         .unwrap();
     assert_eq!(target, StreamUploadTarget::PutObject);
@@ -2667,7 +2669,12 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     crossed_append.session_id = part_session_id.clone();
     assert!(matches!(
         correct_stream_session_route
-            .prepare_segment_append_with_expected_append_state(&crossed_append, None, effect_fence)
+            .prepare_segment_append_with_expected_append_state(
+                &crossed_append,
+                None,
+                effect_fence,
+                PayloadPlacementInput::from_server_config(&config)
+            )
             .unwrap_err(),
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation: "prepare stream segment append",

@@ -729,6 +729,7 @@ pub(crate) trait StreamUploadSessionMetadataRoute: Send {
         request: &PrepareStreamUploadSegmentAppendReq,
         expected: Option<&crate::ExpectedStreamAppendState>,
         effect_fence: AdmittedRouteEffectFence,
+        placement: PayloadPlacementInput<'_>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 
     fn update_put_bucket_write_reservation(

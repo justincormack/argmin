@@ -3030,3 +3030,53 @@ tests (one slow, six skipped) in 274.562s. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and diff checks passed. The initial
 focused run exposed the fixture's use of a convenience constructor requiring
 node 0; it now uses the explicit-primary constructor for its `[4, 2, 3]` nodes.
+
+## Captured Placement Inputs for Stream Preparation — 2026-10-30
+
+Stream append preparation now takes a borrowed immutable placement catalogue.
+Embedded callers supply their captured cluster map; Unix/TLS handlers derive
+the catalogue from the admitted handler's config, not a later runtime-map lookup
+or client-supplied participant list. This is computational input, **not a write
+capability** or a durable window. The session route, exact expected append state
+and immutable effect fence remain the authority checks.
+
+While holding the object-PG lock, preparation validates the loaded session and
+generation, computes the selected data PG and candidate VID, and resolves the
+canonical file placement before consuming the VID. Missing, inactive, stale,
+crossed-epoch or unplaceable selected routes cannot consume the single local
+preparation slot. The effect fence is rechecked after placement, immediately
+before allocation; installed handlers intersect the delegated deadline with
+their own captured route fence. Returned placement epochs are assigned by the
+builder rather than patched by its callers. No monotonic timestamps or new
+deadline representation cross the wire.
+
+The Unix sender checks its captured catalogue before transport and validates
+the returned data PG, epoch and EC shape against the expected durable generation,
+then resolves the exact returned hash/VID. PUT placement uses the reserved object
+generation; UploadPart placement continues to use the enclosing upload generation
+and part number, not its independently reserved part-payload generation.
+
+Coverage exercises PUT and UploadPart rejection with complete session,
+reservation, segment and command-state comparisons, independent invalid-catalogue
+cases, and positive allocator controls. An installed Unix request bypasses sender
+preflight to exercise the server's unplaceable catalogue. A malicious-response
+fixture supplies a valid response followed by crossed existing PG, epoch and EC
+responses and requires the placement-specific `PayloadDecode` diagnostic.
+
+This slice adds placement computation under the existing lock, but no durable
+rows, schema/encoding changes, new transactions or fsyncs. Creation builders still
+need captured placement inputs. Retained owner/first-window, next-window and
+terminal integration, issuer binding, settlement and physical exclusion remain
+unfinished; all six ignored cleanup regressions remain unresolved.
+
+Validation: all seven final focused preparation/deadline tests passed. Full
+Nextest passed 9,109 tests (one slow, six skipped) in 255.717s. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and diff
+checks passed. The initial full run exposed an existing deadline fixture with
+4+2 descriptors but only one placement participant; it now supplies six
+participants while retaining its deadline assertions. New-fixture failures were
+also corrected: a session label exceeded the encoded ID limit, and the installed
+RPC assertion expected an internal reason that the error layer intentionally
+redacts. Embedded tests pin the precise reasons; the installed test checks the
+wire error and unchanged durable state. Clippy prompted moving preparation onto
+the scoped route rather than passing its PG/bucket/key separately.

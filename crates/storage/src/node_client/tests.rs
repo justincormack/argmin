@@ -3404,6 +3404,9 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
 #[test]
 fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     let tmp = test_util::tempdir();
+    let mut placement_config = test_config(&tmp);
+    placement_config.default_ec_shape = EcShape { k: 1, m: 0 };
+    let placement = PayloadPlacementInput::from_server_config(&placement_config);
     let storage_node = Arc::new(
         crate::node::SharedStorageNode::open_with_default_ec_shape(
             tmp.path(),
@@ -3486,6 +3489,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
                 generation_id: first_generation,
             }),
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            placement,
         )
         .unwrap();
     assert_eq!(prepared.session_id, first_session);
@@ -3505,6 +3509,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
                     generation_id: crossed_generation,
                 }),
                 AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+                placement,
             )
             .unwrap_err(),
         ObjectPgActionError::InvalidRequest { .. }
@@ -3528,6 +3533,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
                 &crossed_append,
                 None,
                 AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+                placement,
             )
             .unwrap_err(),
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {

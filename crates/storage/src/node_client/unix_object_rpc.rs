@@ -4692,6 +4692,7 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
         request: &PrepareStreamUploadSegmentAppendReq,
         expected_append_state: Option<&crate::ExpectedStreamAppendState>,
         effect_fence: AdmittedRouteEffectFence,
+        placement: PayloadPlacementInput<'_>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         if request.session_id != self.session_id {
@@ -4701,6 +4702,28 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
             .into());
         }
         request.validate_extent()?;
+        let expected_placement = expected_append_state
+            .map(|expected| {
+                let (pg, ec) = placement.expected_stream_data_pg(
+                    &self.bucket,
+                    &self.key,
+                    request.segment_index,
+                    expected,
+                )?;
+                let session = match expected {
+                    crate::ExpectedStreamAppendState::PutObject { session, .. }
+                    | crate::ExpectedStreamAppendState::UploadPart { session, .. } => session,
+                };
+                placement.require_segment_placement(
+                    self.route_cluster_epoch,
+                    pg,
+                    ec,
+                    &crate::stream_segment_key_hash(&request.session_id, request.segment_index),
+                    session.next_segment_vid,
+                )?;
+                Ok::<_, StoreError>((pg, ec))
+            })
+            .transpose()?;
         let effect_deadline =
             effect_fence
                 .deadline()
@@ -4708,14 +4731,38 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
                     authority_valid_until_ms: deadline.authority_valid_until_ms(),
                     portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
                 });
-        self.client.prepare_stream_segment_append_rpc(
+        let (target, segment) = self.client.prepare_stream_segment_append_rpc(
             self.pg_id,
             &self.bucket,
             &self.key,
             request,
             expected_append_state,
             effect_deadline,
-        )
+        )?;
+        if segment.placement_cluster_epoch != self.route_cluster_epoch
+            || expected_placement.is_some_and(|(pg, ec)| {
+                segment.data_pg_id != pg || segment.ec_k != ec.k || segment.ec_m != ec.m
+            })
+        {
+            return Err(self
+                .client
+                .rpc_payload_error(
+                    "validate stream segment append prepare response",
+                    "placement does not match captured route and expected generation".into(),
+                )
+                .into());
+        }
+        placement.require_segment_placement(
+            self.route_cluster_epoch,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        )?;
+        Ok((target, segment))
     }
 
     fn update_put_bucket_write_reservation(

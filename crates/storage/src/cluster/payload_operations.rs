@@ -7012,13 +7012,13 @@ impl StorageCluster {
                 }
             }
         };
-        let (target, mut segment_record) = stream_route
+        let (target, segment_record) = stream_route
             .prepare_segment_append_with_expected_append_state(
                 request,
                 Some(&expected_append_state),
                 AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+                PayloadPlacementInput::from_local_map(&self.local_map),
             )?;
-        segment_record.placement_cluster_epoch = self.operation_epoch();
         Ok((target, segment_record))
     }
 
@@ -7186,6 +7186,7 @@ impl StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = route.object_pg_id.pg_id();
+        let placement = PayloadPlacementInput::from_local_map(&self.local_map);
         let mut work_budget = RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
             .for_operation("prepare_stream_segment_append")
             .for_pg(pg_id);
@@ -7239,7 +7240,7 @@ impl StorageCluster {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let mutation_client =
                 self.object_mutation_metadata_primary_client(route.bucket, route.key)?;
-            let (target, mut segment_record) = mutation_client
+            let (target, segment_record) = mutation_client
                 .open_stream_upload_session_metadata_route(
                     self.operation_epoch(),
                     route.object_pg_id,
@@ -7251,8 +7252,8 @@ impl StorageCluster {
                     request,
                     expected_append_state,
                     route.effect_fence,
+                    placement,
                 )?;
-            segment_record.placement_cluster_epoch = self.operation_epoch();
             return Ok((target, segment_record));
         }
     }

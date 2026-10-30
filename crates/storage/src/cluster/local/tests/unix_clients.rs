@@ -12,6 +12,7 @@ use crate::node_client::{
     ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, PlacedShardRoute, RetainedPlacedShardRoute,
     RetainedShardAckRoute, ShardAckRoute,
 };
+use crate::node_runtime::payload_placement::PayloadPlacementInput;
 use crate::storage_node_server::PreparedStorageNodeServer;
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::types::{
@@ -5231,6 +5232,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             &append,
             None,
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            PayloadPlacementInput::from_local_map(&map),
         )
         .unwrap_err();
     assert!(
@@ -5251,6 +5253,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
                 generation_id: GenerationId::new(1).unwrap(),
             }),
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            PayloadPlacementInput::from_local_map(&map),
         )
         .unwrap();
     assert_eq!(target, crate::StreamUploadTarget::PutObject);

@@ -5,6 +5,10 @@
     fn active_object_routes_keep_their_captured_deadline_after_validity_extension() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
+        // This metadata-only capability matrix uses 4+2 segment descriptors.
+        // Preparation must have six placeable participants even though this
+        // fixture does not dispatch physical shard writes to those peers.
+        config.pg_routes[0].acting_set = (7..13).map(NodeId::new).collect();
         config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = crate::clock::with_time_override(1_000, || {

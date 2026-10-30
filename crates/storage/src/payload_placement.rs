@@ -14,8 +14,170 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 use crate::cluster::ShardLocation;
 use crate::error::ClusterBuildError;
 use crate::{ClusterEpoch, DataPgId, EcShape, ShardIndex};
+use crate::{GenerationId, PgId, PgState, StoreError};
+
+/// A borrowed immutable catalogue, not a write grant. The map/config is the
+/// caller's already captured generation; resolving a selected PG never reloads
+/// the runtime handle or installed server config. Borrowing avoids copying every
+/// PG route for each segment. The separate effect fence still gates allocation.
+#[derive(Clone, Copy)]
+pub(crate) struct PayloadPlacementInput<'a> {
+    source: PlacementSource<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum PlacementSource<'a> {
+    Embedded(&'a crate::LocalClusterMap),
+    Server(&'a super::server::StorageNodeProcessConfig),
+}
+
+impl<'a> PayloadPlacementInput<'a> {
+    pub(in crate::node_runtime) fn expected_stream_data_pg(
+        self,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        index: u32,
+        expected: &crate::ExpectedStreamAppendState,
+    ) -> Result<(u32, EcShape), StoreError> {
+        let server_topology;
+        let (topology, ec) = match self.source {
+            PlacementSource::Embedded(map) => (map.pg_topology(), map.default_ec_shape()),
+            PlacementSource::Server(config) => {
+                server_topology = crate::pg_topology::PgTopology::new(&config.pg_ids)
+                    .map_err(|source| StoreError::InvalidPgTopology { source })?;
+                (&server_topology, config.default_ec_shape)
+            }
+        };
+        let pg = match expected {
+            crate::ExpectedStreamAppendState::PutObject { generation_id, .. } => {
+                topology.object_generation_segment_data_pg(bucket, key, *generation_id, index)
+            }
+            crate::ExpectedStreamAppendState::UploadPart {
+                session, upload, ..
+            } => {
+                let crate::StreamUploadTarget::UploadPart { part_number, .. } = session.target
+                else {
+                    return Err(StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "stream preparation placement target",
+                    });
+                };
+                topology.object_generation_multipart_part_segment_data_pg(
+                    bucket,
+                    key,
+                    upload.object_generation_id,
+                    part_number,
+                    index,
+                )
+            }
+        };
+        Ok((pg.get(), ec))
+    }
+
+    pub(crate) fn from_local_map(map: &'a crate::LocalClusterMap) -> Self {
+        Self {
+            source: PlacementSource::Embedded(map),
+        }
+    }
+
+    pub(in crate::node_runtime) fn from_server_config(
+        config: &'a super::server::StorageNodeProcessConfig,
+    ) -> Self {
+        Self {
+            source: PlacementSource::Server(config),
+        }
+    }
+
+    pub(crate) fn require_segment_placement(
+        self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<(), StoreError> {
+        let (epoch, configured_ec, route_epoch, state, primary, acting_set) = match self.source {
+            PlacementSource::Embedded(map) => {
+                let route =
+                    map.pg_route(PgId::new(data_pg_id))
+                        .ok_or(StoreError::ClusterPgNotFound {
+                            pg_id: data_pg_id,
+                            cluster_epoch: map.epoch(),
+                        })?;
+                (
+                    map.epoch(),
+                    map.default_ec_shape(),
+                    route.cluster_epoch(),
+                    route.state(),
+                    route.primary_node_id(),
+                    route.acting_set(),
+                )
+            }
+            PlacementSource::Server(config) => {
+                let route = config
+                    .pg_routes
+                    .iter()
+                    .find(|route| route.pg_id == data_pg_id)
+                    .ok_or(StoreError::ClusterPgNotFound {
+                        pg_id: data_pg_id,
+                        cluster_epoch: config.cluster_epoch,
+                    })?;
+                (
+                    config.cluster_epoch,
+                    config.default_ec_shape,
+                    route.cluster_epoch,
+                    route.state,
+                    route.primary_node_id,
+                    route.acting_set.as_slice(),
+                )
+            }
+        };
+        if epoch != operation_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: data_pg_id,
+                operation_epoch,
+                current_epoch: epoch,
+            });
+        }
+        if route_epoch != epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: data_pg_id,
+                route_epoch,
+                current_epoch: epoch,
+            });
+        }
+        if state != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: data_pg_id,
+                cluster_epoch: epoch,
+                state,
+            });
+        }
+        if ec != configured_ec || !acting_set.contains(&primary) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream preparation captured placement",
+            });
+        }
+        let data_pg_id = DataPgId::from_validated_placement(PgId::new(data_pg_id));
+        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
+        place_payload_shards_for_pg_route(epoch, data_pg_id, ec, &placement_key, acting_set)
+            .map(|_| ())
+            .map_err(|error| StoreError::PayloadShardSetMismatch {
+                reason: format!("stream preparation placement: {error}"),
+            })
+    }
+}
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
+
+pub(crate) fn segment_payload_placement_key(
+    segment_okh: &[u8; 16],
+    segment_vid: GenerationId,
+) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..16].copy_from_slice(segment_okh);
+    key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
+    key
+}
 
 pub(crate) fn place_payload_shards_for_pg_route(
     cluster_epoch: ClusterEpoch,

@@ -1,12 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-fn segment_payload_placement_key(segment_okh: &[u8; 16], segment_vid: GenerationId) -> [u8; 24] {
-    let mut key = [0u8; 24];
-    key[..16].copy_from_slice(segment_okh);
-    key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
-    key
-}
+use crate::node_runtime::payload_placement::{segment_payload_placement_key, PayloadPlacementInput};
 
 fn validate_placed_segment_repair_ec_shape(ec: EcShape) -> Result<EcConfig, StoreError> {
     EcConfig::new(ec.k, ec.m).map_err(|error| StoreError::ErasureCoding {
