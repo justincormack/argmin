@@ -23,6 +23,9 @@ removed; no retained ownership tables, worker, staging tickets or new RPC
 operations have landed. The six cleanup regressions remain unresolved.
 The [checkpoint evidence prerequisite](#checkpoint-evidence-before-ownerwindow-state--2026-10-30)
 preserves literal current-format bytes before changing state-table membership.
+The [confirmation and issuer-lifetime refinement](#window-confirmation-and-issuer-lifetime--2026-10-30)
+defines the remote authority handoff and adds bounded counterexample checks;
+these are design/model evidence, not implemented grants or schema integration.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2094,3 +2097,164 @@ skipped) in 278.501 seconds. Strict workspace Clippy, storage boundary checks,
 formatting and `git diff --check` passed. An initial sandboxed full run was
 stopped after read-only test-directory and socket-permission failures; the full
 replacement run used the required permissions without changing those tests.
+
+## Window Confirmation And Issuer Lifetime — 2026-10-30
+
+The next transaction slice needs a concrete answer to the remote-confirmation
+gate above. Persisting a window must not accidentally make its allocation
+authority reconstructible by every replica holding that row. This refinement
+separates three operations before freezing those fields into a schema:
+
+| Operation | Required authority | What it cannot do |
+| --- | --- | --- |
+| Consume a retry slot | Exact storage-owned allocation lifetime, matching owner/window and local consumed cursor, current request fence and immutable grant cutoff | A replica/restarted runtime cannot derive this authority from node ID, epoch, window row or consumed floor. |
+| Confirm an existing physical scope | Exact durable window plus authoritative evidence that its introducing creation/append is usable, through the authorized metadata route | Does not allocate a VID, extend a cutoff, renew a grant, reopen a sealed owner or perform recovery mutations. |
+| Admit file or acknowledgement mutation | Exact confirmed descriptor and request subject/geometry, checked at the effect owner under its exclusion guard | Confirmation is not a substitute for local deadline/route checks or for retaining the guard through persistence. |
+
+### Allocation lifetime is not route or node identity
+
+The current [`prepare_stream_segment_append_inner`](../crates/storage/src/node_client/local.rs)
+loads the complete session/generation under the object-PG lock and consumes the
+local allocator. Preserve that lock boundary when adding window checks. Neither
+its persisted cursor nor the replicated reserved end proves exclusive authority
+after importing a replica or reopening a runtime.
+
+The proposed issuer binding is the storage node identity plus an opaque,
+storage-minted allocation-lifetime nonce, attached to the specific opened PG
+incarnation. It is not supplied by the frontend, synthesized from a topology
+epoch, or restored from the window row. Minting the local identity is in-memory;
+the initial owner/window command records it in the existing apply transaction.
+No independently synced nonce file is proposed. Production must use a fresh
+128-bit random identity, not the model's small symbolic labels.
+
+Fresh runtime open, checkpoint replacement/import, and reactivation after losing
+allocation continuity cannot adopt the old lifetime. The row retains the old
+identity for cleanup and confirmation, but the new runtime lacks its local
+allocation capability. Ordinary validity-only renewal must not mint a new
+lifetime or extend an existing window's cutoff. A replacement which later
+returns to the same node ID still cannot resume using an imported floor.
+
+An old issuer may finish consuming an already delegated finite block while its
+old lifetime genuinely remains live, within the original cutoff. That permission
+does not authorize new blocks or fresh publication after losing its route.
+Stopping new frontend preparation on primary change and retaining all previously
+issued work is the first implementation policy. The lifecycle hook must retire
+new-allocation authority without pretending it has revoked transport requests
+already sent. Resumption needs the separately classified exceptional disjoint-
+window command; this slice does not implement that continuation.
+
+### Read-only confirmation protocol candidate
+
+Confirmation is a scoped storage-node operation on the owner object PG. Its
+request identifies the exact owner revision/window and concrete effect: segment
+index/hash/VID, participant/shard index, historical data placement, codec and
+bounded geometry, issuer binding and absolute cutoff. Derive the expected
+descriptor from the durable window and compare every field, including bucket
+incarnation and target. Neither authenticated node credentials nor a caller's
+descriptor alone grants physical authority. Response validation must bind the
+same complete descriptor to the request before constructing an opaque local
+confirmed-scope capability.
+
+The metadata owner must also establish that the window's introducing command is
+usable under the existing exact-command publication/recovery protocol. A pending
+slot, `publication_started`, or an applied witness row alone is insufficient.
+[`metadata_operations.rs`](../crates/storage/src/cluster/metadata_operations.rs)
+already distinguishes `Published`, `Witnessed`, `PublicationUnconfirmed` and
+`IrrevocableUnconfirmed`; do not collapse those outcomes for window confirmation.
+The conservative issuance boundary is completion of the existing successful
+creation/append workflow. Lost replies use exact-command matching/convergence,
+not another allocation.
+
+For remote reinspection, exact publication evidence (or certified transferred
+state covering that introduction) must establish the same usable fact. A
+replacement must resolve any ambiguous introducing command through the existing
+authorized recovery workflow before confirming it. The window revision/descriptor
+must remain stable across a validated same-payload reissue; a changed envelope
+log index/checksum is not permission to mint a different window. The concrete
+row/certificate relationship, including checkpoint/log-pruning and reissue
+evidence, remains part of the implementation review: the model's `Ready` state
+assumes this proof, it does not manufacture or validate it.
+
+This RPC is read-only. It cannot implicitly run an all-command drain, allocate,
+or add a durability barrier. If proof is unavailable or conflicting, fail closed
+within the caller's existing bounded work budget; explicit recovery handles the
+obstruction. No fallback to an unrelated current route or unchecked local row.
+After an authoritative transition, the successor may confirm a still-covered
+old window for delayed physical work; this is distinct from letting that
+successor allocate from the old window.
+
+### Confirmation-to-effect handoff
+
+1. Receive and bound the physical request; identify the exact historical effect
+   owner. Do not hold the data-PG mutation lock while making confirmation RPCs.
+2. Confirm/cache the immutable scope under the rules above. Cache keys include
+   the complete descriptor and participant; positive replies are not transferable
+   between owners, windows, placements, shards or effect kinds. Negative lookup
+   does not authorize mutation. A failed lookup never invents a new deadline.
+3. At the file owner, acquire local write/cleanup exclusion and recheck the
+   intersection of grant, request and receiving-route authority immediately before
+   file mutation. Keep exclusion through file publication and acknowledgement
+   production. At the separately admitted acknowledgement-storage owner, repeat
+   validation and hold its guard through the acknowledgement transaction.
+4. A positive reply delayed beyond its cutoff is rejected even if the sender or
+   current raw route has renewed. Transport only the existing absolute
+   conservative wall-clock upper bound, shorten for supported inter-host skew,
+   and bind once to receiver monotonic time. Neither reconnect nor cache hit may
+   restart a duration or rebind a later effective deadline.
+5. Sealing/cancellation does not revoke a cached or in-transit grant. Cleanup
+   still waits for the immutable cutoff and both independently admitted effect
+   classes to drain. An admitted effect may finish after the cutoff while its
+   guard blocks cleanup. A request which has not acquired that guard must fail
+   after the cutoff, even if cleanup has already removed the owner and payload.
+
+The local guard registry must survive frontend/session disconnection for as long
+as its IO task can persist. Its exact runtime/PG identity and shutdown/import
+draining are integration obligations. This proposal uses no per-write ticket,
+new signing key, sidecar or ordinary-path metadata commit. It does add confirmation
+RPCs/cache state and availability dependencies; measure those costs rather than
+claiming the protocol is free.
+
+### Bounded evidence and limits
+
+Two independent owner-local models supplement the prior allocation/fanout models:
+
+- [`confirmation.rs`](../crates/storage/src/cleanup_ownership_model/confirmation.rs)
+  separates publication readiness, request delivery, positive confirmation,
+  guarded local admission, physical persistence, sealing, cutoff and cleanup for
+  file and acknowledgement effects. It includes authenticated-but-premature
+  requests and a positive reply delayed until after owner removal. Six independent
+  unsafe variants omit publication readiness, the file cutoff, the ack cutoff,
+  the cleanup cutoff, the file guard or the ack guard; each must produce its own
+  counterexample. Explicit traces pin both delayed replies and both guards.
+- [`issuer.rs`](../crates/storage/src/cleanup_ownership_model/issuer.rs) separates
+  original issuer A, replacement B, A returning with replica state, and A reopening
+  with its own persisted floor. Prepared deliveries survive those transitions,
+  but allocation authority does not transfer. Independent node-ID-only and
+  replica-floor substitutions must fail; a trace also pins actual duplicate
+  allocation after A returns. The original live issuer can exhaust only its
+  two-slot model window before cutoff.
+
+These are exhaustive finite interleavings with required positive reachability,
+not production-connected failover/RPC tests, cryptographic proofs, liveness under
+unbounded failures, or a composition of all earlier models. The confirmation
+model assumes one exact descriptor, an authoritative usable-publication fact,
+a healthy shared cutoff and no selected/pending payload at sealing. The issuer
+model assumes a fresh local lifetime on reopen/import. Field substitution,
+clock-health/skew, exact route-history authorization, distributed publication,
+real filesystem failure and authenticated Unix/TLS response validation still
+require implementation tests.
+
+The next production slice remains retained owner/window integration. Before its
+schema is finalized, settle the usable-introduction/reissue/checkpoint evidence
+and runtime invalidation hooks described here; choose `B` and finite retry/horizon
+limits from existing request budgets rather than the two-slot model. No format
+version, production grant, cleanup worker or ignored regression changes here.
+
+Validation: all six focused tests passed. The safe confirmation model exhausted
+78 states / 144 transitions and the issuer model 80 states / 132 transitions,
+including every declared reachability witness; all eight independent unsafe
+variants produced their required counterexample. Full
+`cargo nextest run --offline --no-fail-fast` passed 9,066 tests (one slow, six
+skipped) in 235.323 seconds. Strict workspace Clippy, storage boundary checks,
+formatting and `git diff --check` passed. The six skipped cleanup regressions
+remain unresolved; these results do not certify the unimplemented protocol.

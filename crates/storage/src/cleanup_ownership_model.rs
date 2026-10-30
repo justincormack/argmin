@@ -11,10 +11,15 @@
 //! witness/primary/trailing publication. The independent lookahead child adds
 //! replica discovery of bounded allocation windows and symbolic placement epochs;
 //! production route migration remains unmodelled.
+//! Confirmation separately explores read-only grant lookup versus local physical
+//! admission, and issuer lifetime fencing. These are protocol candidates, not
+//! implemented RPCs or a composed production proof.
 
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
+mod confirmation;
 mod fanout;
+mod issuer;
 mod lookahead;
 mod publication;
 mod renewal;
