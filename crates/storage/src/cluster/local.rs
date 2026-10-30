@@ -3196,6 +3196,49 @@ pub struct LocalClusterMap {
 }
 
 impl LocalClusterMap {
+    /// Reset changed embedded issuers only at publication, never while building
+    /// a candidate. Remote endpoints own their lifetimes on the actual server;
+    /// a frontend's shadow runtime must not participate in this operation.
+    pub(super) fn with_replaced_allocation_lifetimes<T>(
+        &self,
+        candidate: &Self,
+        retry_failed_replacement: bool,
+        publish: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut targets = Vec::new();
+        for (map, other) in [(self, candidate), (candidate, self)] {
+            for (node_id, node) in &map.nodes {
+                if !matches!(
+                    node.route_execution_endpoint,
+                    LocalRouteExecutionEndpoint::Embedded(_)
+                ) {
+                    continue;
+                }
+                let same_runtime_binding = other.nodes.get(node_id).is_some_and(|other_node| {
+                    node.runtime.process_local_registry_key()
+                        == other_node.runtime.process_local_registry_key()
+                        && node.route_execution_endpoint == other_node.route_execution_endpoint
+                        && node.route_authority_advertised_endpoint
+                            == other_node.route_authority_advertised_endpoint
+                        && node.route_authority_node_incarnation
+                            == other_node.route_authority_node_incarnation
+                });
+                for pg_id in &map.pg_ids {
+                    if retry_failed_replacement
+                        || !same_runtime_binding
+                        || self.epoch != candidate.epoch
+                        || self.default_ec_shape != candidate.default_ec_shape
+                        || self.pg_routes.get(&PgId::new(*pg_id))
+                            != candidate.pg_routes.get(&PgId::new(*pg_id))
+                    {
+                        targets.push((&node.runtime, *pg_id));
+                    }
+                }
+            }
+        }
+        LocalNodeRuntime::with_replaced_allocation_lifetimes(targets, publish)
+    }
+
     pub fn open(
         data_dir: &Path,
         node_ids: &[NodeId],

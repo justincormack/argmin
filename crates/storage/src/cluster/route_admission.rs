@@ -17,6 +17,7 @@ pub struct StorageCluster {
 pub struct StorageClusterRouteHandle {
     cluster: Arc<RwLock<Arc<StorageCluster>>>,
     same_epoch_generations: Arc<Mutex<Vec<Weak<StorageCluster>>>>,
+    allocation_lifetime_replacement_pending: Arc<AtomicBool>,
     route_admission: StorageClusterRouteAdmissionGate,
 }
 

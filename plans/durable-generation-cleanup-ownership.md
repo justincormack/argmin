@@ -2547,3 +2547,65 @@ Validation: all 15 focused lifetime/publication tests passed. Full
 skipped) in 273.371 seconds. Strict workspace Clippy, storage boundary checks,
 formatting and `git diff --check` passed. The six skipped cleanup regressions
 remain unresolved.
+
+## Embedded Route-Publication Lifetimes — 2026-10-30
+
+The corresponding embedded runtime-map publication hook is now implemented in
+`StorageClusterRouteHandle`. Candidate construction alone does not alter live
+issuers. After frontend admission drains and the expected-current/epoch/validity
+checks succeed, publication compares the old and new maps' complete PG routes,
+global epoch and EC configuration, and embedded node runtime/endpoint/incarnation
+bindings. It replaces affected issuers on **both** sides, including removed nodes
+and genuinely different runtime instances with the same node IDs. Unchanged
+routes and healthy validity-only renewal preserve their identities.
+
+`LocalNodeRuntime` owns the batch operation. It sorts by PG ID and process-local
+node identity, deduplicates shared runtime clones, acquires all affected PG
+mutexes, and holds opaque replacement guards across the local publication
+callback. The callback rechecks candidate validity after lock acquisition, then
+updates pinned-generation leases and the current map. It performs no node access
+or network IO. The map write lock and publication barrier remain held until fresh
+lifetimes are completed. This adds no SQL transaction, persistent representation,
+or fsync, and never reopens stores.
+
+Failure after retirement leaves the affected issuers retired and records a
+shared process-local retry flag. Status-only renewal then requests a full map
+instead of extending the old lease. The next successful full publication resets
+the embedded issuers, even if the control plane abandoned the candidate and
+renewed the original topology. This exceptional retry conservatively resets all
+embedded PGs in the two maps; subsequent healthy renewals preserve the recovered
+identities. Restart needs no flag persistence because it opens fresh lifetimes.
+
+Unix/TCP endpoints and topology-only frontends are excluded from embedded
+replacement. Their actual storage-node server owns lifetime transitions; a
+frontend's shadow node stores must not be mistaken for those servers.
+
+### Regression scope
+
+- State-only, primary-only, and epoch changes replace the relevant lifetimes;
+  candidate construction, unchanged renewal, and an unrelated PG are preservation
+  canaries. Active/Peering/Active cannot resurrect the earlier identity.
+- Publication covers both replaced runtime instances and nodes removed from the
+  candidate. Unix and TCP shadow runtimes retain their identities.
+- Observed admission draining precedes replacement. A stale expected-current
+  candidate and a candidate already expired before replacement leave identities
+  unchanged.
+- A deterministic hook expires the candidate after replacement begins. The old
+  map remains installed with retired affected issuers; status-only renewal cannot
+  conceal that state, and full renewal of the original topology recovers fresh
+  identities.
+- The owner-local batch test checks actual mutex exclusion, duplicate shared
+  runtime targets, callback failure, retry, an untouched PG, and exact durable
+  checkpoint preservation.
+
+**Still open:** durable owner/window descriptors and finite window/horizon policy;
+captured-issuer comparison during allocation; settled-prefix confirmation; and
+independent file/ack exclusion with retained cleanup. These lifetime hooks still
+do not authorize allocation or physical writes. The six ignored cleanup
+regressions remain unresolved.
+
+Validation for this embedded publication slice: all five focused publication
+tests passed; the full suite, including the additional owner-local batch test,
+passed 9,088 tests (one slow, six skipped) in 269.495 seconds using
+`cargo nextest run --offline --no-fail-fast`. Strict workspace Clippy, storage
+boundary checks, formatting and `git diff --check` passed.

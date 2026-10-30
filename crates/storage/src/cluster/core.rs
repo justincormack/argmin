@@ -2615,6 +2615,8 @@ pub enum StorageClusterRuntimeMapRefreshError {
     UnboundedRouteMapValidity { candidate: ClusterEpoch },
     #[error("static route authority cannot publish or refresh a runtime map")]
     StaticRouteAuthorityRefresh,
+    #[error("replace embedded PG allocation lifetimes during route publication: {failure}")]
+    AllocationLifetimeReplacement { failure: crate::StoreFailure },
     #[error(
         "refreshed runtime map for epoch {candidate} expired before publication (valid until {valid_until_ms}, now {now_ms})"
     )]
@@ -2640,6 +2642,7 @@ impl StorageClusterRuntimeMapRefreshError {
             Self::EpochDowngrade { .. } => "epoch_downgrade",
             Self::UnboundedRouteMapValidity { .. } => "unbounded_route_map_validity",
             Self::StaticRouteAuthorityRefresh => "static_route_authority_refresh",
+            Self::AllocationLifetimeReplacement { .. } => "allocation_lifetime_replacement",
             Self::ExpiredRouteMapValidity { .. } => "expired_route_map_validity",
             Self::RefreshLoopZeroInterval => "refresh_loop_zero_interval",
             Self::RefreshLoopSpawn { .. } => "refresh_loop_spawn",

@@ -2020,6 +2020,7 @@ fn set_route_state(map: &mut LocalClusterMap, pg_id: u32, state: PgState) {
     map.pg_routes.get_mut(&PgId::new(pg_id)).unwrap().state = state;
 }
 
+mod allocation_lifetime;
 mod bucket_commands;
 mod bucket_delete;
 mod cleanup_discovery;

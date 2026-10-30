@@ -417,6 +417,7 @@ impl StorageClusterRouteHandle {
     pub(crate) fn from_authorized_cluster(initial: Arc<StorageCluster>) -> Self {
         Self {
             same_epoch_generations: Arc::new(Mutex::new(vec![Arc::downgrade(&initial)])),
+            allocation_lifetime_replacement_pending: Arc::new(AtomicBool::new(false)),
             cluster: Arc::new(RwLock::new(initial)),
             route_admission: StorageClusterRouteAdmissionGate::default(),
         }
@@ -576,6 +577,21 @@ impl StorageClusterRouteHandle {
         expected_current: Option<&Arc<StorageCluster>>,
         candidate: Arc<StorageCluster>,
     ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
+        self.install_during_publication_with_lifetime_hook(
+            publication,
+            expected_current,
+            candidate,
+            || {},
+        )
+    }
+
+    fn install_during_publication_with_lifetime_hook(
+        &self,
+        publication: &StorageClusterRoutePublicationGuard,
+        expected_current: Option<&Arc<StorageCluster>>,
+        candidate: Arc<StorageCluster>,
+        after_lifetime_replacement: impl FnOnce(),
+    ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
         debug_assert!(Arc::ptr_eq(
             &self.route_admission.inner,
             &publication.gate.inner
@@ -619,40 +635,75 @@ impl StorageClusterRouteHandle {
                 },
             );
         }
-        if candidate.cluster_epoch() == current.cluster_epoch() {
-            let candidate_digest = candidate_authority.content_digest;
-            let candidate_authority_incarnation =
-                candidate_authority.freshness_proof.authority_incarnation();
-            // Same-epoch authoritative refreshes update matching pinned
-            // dynamic generations only.
-            generations.retain(|generation| {
-                let Some(generation) = generation.upgrade() else {
-                    return false;
-                };
-                if generation.cluster_epoch() == candidate.cluster_epoch() {
-                    if !matches!(
-                        generation.route_authority,
-                        StorageClusterRouteAuthority::Dynamic(proof)
-                            if proof.content_digest == candidate_digest
-                                && proof.freshness_proof.authority_incarnation()
-                                    == candidate_authority_incarnation
-                    ) {
-                        return true;
-                    }
-                    generation
-                        .local_map
-                        .replace_route_map_lease_from(&candidate.local_map);
-                    true
+        let previous = Arc::clone(&current);
+        let retry_failed_replacement = self
+            .allocation_lifetime_replacement_pending
+            .swap(true, Ordering::SeqCst);
+        let result = previous.local_map.with_replaced_allocation_lifetimes(
+            &candidate.local_map,
+            retry_failed_replacement,
+            || {
+                after_lifetime_replacement();
+                // PG lock acquisition may have waited beyond the captured candidate
+                // lease. Never publish it based solely on the pre-lock validity check.
+                candidate.require_route_map_valid_now()?;
+                if candidate.cluster_epoch() == current.cluster_epoch() {
+                    let candidate_digest = candidate_authority.content_digest;
+                    let candidate_authority_incarnation =
+                        candidate_authority.freshness_proof.authority_incarnation();
+                    // Same-epoch authoritative refreshes update matching pinned
+                    // dynamic generations only.
+                    generations.retain(|generation| {
+                        let Some(generation) = generation.upgrade() else {
+                            return false;
+                        };
+                        if generation.cluster_epoch() == candidate.cluster_epoch() {
+                            if !matches!(
+                                generation.route_authority,
+                                StorageClusterRouteAuthority::Dynamic(proof)
+                                    if proof.content_digest == candidate_digest
+                                        && proof.freshness_proof.authority_incarnation()
+                                            == candidate_authority_incarnation
+                            ) {
+                                return true;
+                            }
+                            generation
+                                .local_map
+                                .replace_route_map_lease_from(&candidate.local_map);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    generations.push(Arc::downgrade(&candidate));
                 } else {
-                    false
+                    generations.clear();
+                    generations.push(Arc::downgrade(&candidate));
                 }
+                *current = Arc::clone(&candidate);
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            return Err(match error {
+                StoreError::RouteMapExpired {
+                    valid_until_ms,
+                    now_ms,
+                    ..
+                } => {
+                    StorageClusterRuntimeMapRefreshError::ExpiredRouteMapValidity {
+                        candidate: candidate.cluster_epoch(),
+                        valid_until_ms,
+                        now_ms,
+                    }
+                }
+                error => StorageClusterRuntimeMapRefreshError::AllocationLifetimeReplacement {
+                    failure: error.into(),
+                },
             });
-            generations.push(Arc::downgrade(&candidate));
-        } else {
-            generations.clear();
-            generations.push(Arc::downgrade(&candidate));
         }
-        *current = candidate;
+        self.allocation_lifetime_replacement_pending
+            .store(false, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -667,6 +718,15 @@ impl StorageClusterRouteHandle {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current_authority = current.route_authority.dynamic_proof()?;
+        // A failed replacement may have retired the current map's issuers.
+        // Fetch/install a full map under the publication barrier to recover;
+        // merely extending its lease must not leave those issuers retired.
+        if self
+            .allocation_lifetime_replacement_pending
+            .load(Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         let Some(renewal) = status.lease_renewal() else {
             return Ok(None);
         };

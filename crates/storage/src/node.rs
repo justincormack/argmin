@@ -551,6 +551,42 @@ fn allocate_process_local_registry_key() -> Result<ProcessLocalRegistryKey, Stor
 }
 
 impl LocalNodeRuntime {
+    /// Replace issuer lifetimes in one local publication critical section. The
+    /// caller must have drained route admission. Never call back into a node or
+    /// perform network IO from `publish`.
+    pub(crate) fn with_replaced_allocation_lifetimes<T>(
+        targets: Vec<(&Self, u32)>,
+        publish: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        // Include both removed and added runtimes, deduplicating shared clones.
+        // PG-first ordering agrees with ordinary multi-PG node operations;
+        // runtime address breaks ties without exposing that identity externally.
+        let mut targets = targets;
+        targets.sort_unstable_by_key(|(runtime, pg)| (*pg, Arc::as_ptr(&runtime.node)));
+        targets.dedup_by_key(|(runtime, pg)| (*pg, Arc::as_ptr(&runtime.node)));
+        let stores = targets
+            .iter()
+            .map(|(runtime, pg)| runtime.node.get_pg(*pg))
+            .collect::<Result<Vec<_>, _>>()?;
+        let replacements = stores
+            .iter()
+            .map(|store| store.begin_allocation_lifetime_replacement())
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = publish()?;
+        for replacement in replacements {
+            replacement.complete()?;
+        }
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pg_allocation_lifetime(&self, pg: u32) -> Option<[u8; 16]> {
+        self.node
+            .get_pg(pg)
+            .expect("test PG exists")
+            .test_allocation_lifetime_identity()
+    }
+
     pub(crate) fn open(
         node_id: NodeId,
         data_dir: &Path,
@@ -2768,6 +2804,71 @@ mod tests {
             assert_ne!(identity(pg_id).unwrap(), before[pg_id as usize]);
         }
         assert_eq!(identity(2), Some(unaffected));
+    }
+
+    #[test]
+    fn embedded_allocation_lifetime_batch_holds_all_locks_and_retires_on_failure() {
+        let first_root = test_util::tempdir();
+        let second_root = test_util::tempdir();
+        let open = |path: &Path| {
+            LocalNodeRuntime::open(
+                NodeId::new(0),
+                path,
+                &[0, 1],
+                EcShape { k: 1, m: 0 },
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap()
+        };
+        let first = open(first_root.path());
+        let second = open(second_root.path());
+        let first_clone = first.clone();
+        let untouched = first.test_pg_allocation_lifetime(1);
+        let before = [
+            first.test_pg_allocation_lifetime(0),
+            second.test_pg_allocation_lifetime(0),
+        ];
+        let checkpoint = first
+            .node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let targets = vec![(&second, 0), (&first, 0), (&first_clone, 0)];
+        let result = LocalNodeRuntime::with_replaced_allocation_lifetimes(targets.clone(), || {
+            for runtime in [&first, &second] {
+                assert!(matches!(
+                    runtime.node.stores[&0].try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                assert!(runtime.node.stores[&1].try_lock().is_ok());
+            }
+            Err::<(), _>(StoreError::PgNotFound { pg_id: 999 })
+        });
+        assert!(matches!(result, Err(StoreError::PgNotFound { pg_id: 999 })));
+        assert_eq!(
+            [
+                first.test_pg_allocation_lifetime(0),
+                second.test_pg_allocation_lifetime(0)
+            ],
+            [None, None]
+        );
+        LocalNodeRuntime::with_replaced_allocation_lifetimes(targets, || Ok(())).unwrap();
+        for (runtime, old) in [&first, &second].into_iter().zip(before) {
+            let fresh = runtime.test_pg_allocation_lifetime(0);
+            assert!(fresh.is_some());
+            assert_ne!(fresh, old);
+        }
+        assert_eq!(first.test_pg_allocation_lifetime(1), untouched);
+        assert_eq!(
+            first
+                .node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                .unwrap(),
+            checkpoint
+        );
     }
 
     #[test]
