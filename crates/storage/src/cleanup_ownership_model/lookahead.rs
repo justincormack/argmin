@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Independent bounded-window candidate, NOT production failover validation.
-//! Two retry identities for segment zero, one representative identity in the next
+//! One or two identities for segment zero, one representative identity in the next
 //! window, two object-metadata replicas and one abstract file/ack participant per
 //! identity. Creation has already replicated window zero. Append has separate
 //! install, irrevocable marker, witness apply, primary apply and slot-clear steps.
@@ -74,6 +74,7 @@ impl Command {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
+    first_window_slots: u8,
     // Replicated scopes are durable; counters represent each node's local floor.
     windows: [u8; 2],
     counters: [u8; 2],
@@ -100,8 +101,16 @@ struct State {
 
 impl Default for State {
     fn default() -> Self {
+        Self::with_window_slots(2)
+    }
+}
+
+impl State {
+    fn with_window_slots(first_window_slots: u8) -> Self {
+        assert!((1..=2).contains(&first_window_slots));
         Self {
-            windows: [FIRST_WINDOW; 2],
+            first_window_slots,
+            windows: [(1 << first_window_slots) - 1; 2],
             counters: [0; 2],
             references: [None; 2],
             next_window_epoch: 0,
@@ -199,7 +208,10 @@ impl State {
         if !self.expired && !self.sealed {
             if self.primary == 0 && self.command == Command::None {
                 let key = usize::from(self.counters[0]);
-                if key < 2 || (key == 2 && fault == Fault::AllocatePastWindow) {
+                if key < usize::from(self.first_window_slots)
+                    || (key == usize::from(self.first_window_slots)
+                        && fault == Fault::AllocatePastWindow)
+                {
                     add(Action::Prepare(key), &|s| {
                         s.allocate(key);
                         s.counters[0] += 1;
@@ -208,7 +220,7 @@ impl State {
             }
             if self.primary == 1 && fault == Fault::ReuseReplicaCounter {
                 let key = usize::from(self.counters[1]);
-                if key < 2 {
+                if key < usize::from(self.first_window_slots) {
                     add(Action::Prepare(key), &|s| {
                         s.allocate(key);
                         s.counters[1] += 1;
@@ -226,7 +238,7 @@ impl State {
         // A stopped/replaced primary need not retract already delegated scope.
         // Model a stale issuer still consuming that bounded scope, even after
         // the successor has sealed the owner. It cannot renew the cutoff.
-        if self.primary == 1 && !self.expired && self.counters[0] < 2 {
+        if self.primary == 1 && !self.expired && self.counters[0] < self.first_window_slots {
             let key = usize::from(self.counters[0]);
             add(Action::LatePrepareAtOldPrimary(key), &|s| {
                 s.allocate(key);
@@ -262,7 +274,7 @@ impl State {
             }
         }
         if self.primary == 0 && !self.sealed && !self.expired && self.command == Command::None {
-            for key in 0..2 {
+            for key in 0..usize::from(self.first_window_slots) {
                 if self.writes[key] == Write::Done {
                     add(Action::DispatchAppend(key), &|s| {
                         s.command = Command::Sent;
@@ -369,6 +381,7 @@ impl State {
     }
 
     fn check(&self, fault: Fault) -> Checks {
+        let first_window = (1 << self.first_window_slots) - 1;
         let failure = if self.duplicate_allocation {
             Some("failover must not recycle an uncertain identity")
         } else if self.issued & !self.discoverable(fault) != 0 {
@@ -391,15 +404,18 @@ impl State {
         };
         let mut witnesses = Vec::new();
         if self.primary == 1
-            && self.issued & FIRST_WINDOW == FIRST_WINDOW
+            && self.issued & first_window == first_window
             && self.counters[1] == 0
             && self.cleaned
         {
-            witnesses.push(
-                "replacement cleans both locally prepared identities from the durable window",
-            );
+            witnesses
+                .push("replacement cleans every locally prepared identity from the durable window");
         }
-        if self.counters[0] == 2 && self.command == Command::None && !self.expired && !self.sealed {
+        if self.counters[0] == self.first_window_slots
+            && self.command == Command::None
+            && !self.expired
+            && !self.sealed
+        {
             witnesses.push("initial retry window is exhausted without expanding authority");
         }
         if self.reply_lost && self.writes[2] == Write::Done && self.command == Command::Settled {
@@ -408,7 +424,7 @@ impl State {
         if self.primary == 1 && self.command == Command::WitnessApplied && self.expired {
             witnesses.push("partial publication remains protected after failover and expiry");
         }
-        if self.replaced && self.cleaned && self.issued == FIRST_WINDOW | NEXT_WINDOW {
+        if self.replaced && self.cleaned && self.issued == first_window | NEXT_WINDOW {
             witnesses.push("replacement cleans old retries and the speculative next window");
         }
         if self.cleaned && self.writes.contains(&Write::Rejected) {
@@ -425,10 +441,14 @@ impl State {
 }
 
 fn run(fault: Fault) -> Exploration<State, Action> {
+    run_with_window_slots(fault, 2)
+}
+
+fn run_with_window_slots(fault: Fault, slots: u8) -> Exploration<State, Action> {
     explore(
-        [State::default()],
+        [State::with_window_slots(slots)],
         &[
-            "replacement cleans both locally prepared identities from the durable window",
+            "replacement cleans every locally prepared identity from the durable window",
             "initial retry window is exhausted without expanding authority",
             "lost append reply retains the next window",
             "partial publication remains protected after failover and expiry",
@@ -476,6 +496,45 @@ fn cleanup_lookahead_model_exhausts_replica_discovery_and_write_interleavings() 
 }
 
 #[test]
+fn cleanup_single_slot_lookahead_model_exhausts_and_pins_allocation_limit() {
+    let result = run_with_window_slots(Fault::None, 1);
+    result.assert_complete();
+    println!(
+        "{} states, {} transitions",
+        result.state_count(),
+        result.transitions
+    );
+    let mut state = step(State::with_window_slots(1), Action::Prepare(0));
+    assert!(!enabled(&state, Action::Prepare(1)));
+    assert!(!enabled(&state, Action::Prepare(2)));
+    for action in [
+        Action::FileSend(0),
+        Action::FileAdmit(0),
+        Action::FilePersist(0),
+        Action::AckSend(0),
+        Action::AckAdmit(0),
+        Action::AckPersist(0),
+        Action::DispatchAppend(0),
+        Action::Install,
+        Action::MarkStarted,
+        Action::ApplyWitness,
+        Action::ApplyPrimary,
+        Action::LoseReply,
+    ] {
+        state = step(state, action);
+    }
+    assert!(
+        !enabled(&state, Action::Prepare(2)),
+        "application alone is not settled confirmation"
+    );
+    state = step(state, Action::Settle);
+    state = step(state, Action::Prepare(2));
+    assert_eq!(state.issued, 0b101);
+    assert_eq!(state.discoverable(Fault::None), 0b101);
+    assert!(state.reply_lost);
+}
+
+#[test]
 fn cleanup_lookahead_model_detects_independent_boundary_omissions() {
     for (fault, property) in [
         (
@@ -515,14 +574,19 @@ fn cleanup_lookahead_model_detects_independent_boundary_omissions() {
             "completed cleanup cannot leave or recreate payload",
         ),
     ] {
-        let result = run(fault);
-        assert!(
-            matches!(result.termination, Termination::Violation { property: actual, .. } if actual == property),
-            "{fault:?}: {:?}; trace={:?}",
-            result.termination,
-            result.counterexample()
-        );
-        println!("{fault:?}: {:?}", result.counterexample().unwrap());
+        for slots in [1, 2] {
+            let result = run_with_window_slots(fault, slots);
+            assert!(
+                matches!(result.termination, Termination::Violation { property: actual, .. } if actual == property),
+                "{slots} slots, {fault:?}: {:?}; trace={:?}",
+                result.termination,
+                result.counterexample()
+            );
+            println!(
+                "{slots} slots, {fault:?}: {:?}",
+                result.counterexample().unwrap()
+            );
+        }
     }
 }
 

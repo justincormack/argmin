@@ -377,3 +377,156 @@ fn upload_part_replica_discovery_evidence_at_each_durable_boundary() {
         inspect_surviving_replica(Target::UploadPart, stop);
     }
 }
+
+// Production workflow evidence for the proposed one-slot policy. These tests
+// do not claim that today's allocator enforces a replicated window. They force
+// a real command-ID collision after preparation and check that the append owner
+// retries publication with the same physical identity instead of preparing again.
+fn append_publication_retry_consumes_one_vid(target: Target) {
+    let tmp = test_util::tempdir();
+    let nodes = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &nodes, &[0, 1], ec).unwrap());
+    let cluster = StorageCluster::from_static_local_map(map.clone()).unwrap();
+    let bucket = crate::BucketName::try_from("one-slot-bucket").unwrap();
+    let key = crate::ObjectKey::try_from("one-slot-key").unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("cd".repeat(16)).unwrap();
+    let plaintext = b"append retries retain the prepared encrypted payload";
+    let encrypted = match target {
+        Target::PutObject => {
+            let encrypted = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    encrypted.encryption.clone(),
+                )
+                .unwrap();
+            encrypted
+        }
+        Target::UploadPart => {
+            let (completion, _) =
+                seed_streamed_multipart_completion(&cluster, &bucket, &key, "oneslot");
+            let upload = cluster
+                .load_in_progress_multipart_upload(&bucket, &key, &completion.upload_id)
+                .unwrap();
+            let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(plaintext, 2, 0);
+            assert_eq!(upload.encryption, encrypted.encryption);
+            cluster
+                .create_upload_part_stream_session(
+                    &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                    2,
+                    &session_id,
+                )
+                .unwrap();
+            encrypted
+        }
+    };
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let initial_cursor = map
+        .node(nodes[0])
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .get_stream_upload(&session_id)
+        .unwrap()
+        .next_segment_vid;
+    let command_builds = Arc::new(AtomicUsize::new(0));
+    let hook_builds = command_builds.clone();
+    let hook_map = map.clone();
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let _hook =
+        cluster.test_install_after_stream_append_command_id_allocated_hook(Arc::new(move |id| {
+            if hook_builds.fetch_add(1, Ordering::SeqCst) != 0 {
+                return;
+            }
+            let collision = MetadataCommandEnvelope::new(
+                id,
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_key.clone(),
+                        crate::SessionId::try_from("ef".repeat(16)).unwrap(),
+                    ),
+                ),
+            );
+            for node in hook_map
+                .metadata_pg_acting_nodes(id.cluster_epoch(), id.pg_id())
+                .unwrap()
+            {
+                node.metadata_command_client()
+                    .apply_metadata_command_and_record(id.pg_id(), &collision)
+                    .unwrap();
+            }
+        }));
+    let preparations = AtomicUsize::new(0);
+    cluster
+        .test_append_stream_segment_with_after_prepare(
+            &bucket,
+            &key,
+            crate::StreamSegmentAppendInput {
+                session_id: &session_id,
+                segment_index: 0,
+                payload_crc64: encrypted.payload_crc64,
+                storage_bytes: &encrypted.storage_bytes,
+            },
+            || {
+                preparations.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("publication must retry the collision and finish the append");
+    assert!(
+        command_builds.load(Ordering::SeqCst) >= 2,
+        "fixture must force a publication retry"
+    );
+    assert_eq!(preparations.load(Ordering::SeqCst), 1);
+    let mut committed = None;
+    for node_id in nodes {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        let session = pg.get_stream_upload(&session_id).unwrap();
+        assert_eq!(session.next_segment_vid.get(), initial_cursor.get() + 1);
+        let segments = pg.list_stream_segments(&session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_vid, initial_cursor);
+        if let Some(expected) = &committed {
+            assert_eq!(&segments[0], expected);
+        } else {
+            committed = Some(segments[0].clone());
+        }
+    }
+    let segment = committed.unwrap();
+    let mut bytes = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: encrypted.storage_bytes.len(),
+                segment_crc64: encrypted.storage_crc64,
+                ec,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes, encrypted.storage_bytes);
+}
+
+#[test]
+fn put_stream_publication_retry_consumes_one_vid() {
+    append_publication_retry_consumes_one_vid(Target::PutObject);
+}
+
+#[test]
+fn upload_part_publication_retry_consumes_one_vid() {
+    append_publication_retry_consumes_one_vid(Target::UploadPart);
+}

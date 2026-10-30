@@ -1614,6 +1614,9 @@ Start with explicit window rows. Compact only adjacent intervals whose complete
 subject, index/hash, placement, issuer and cutoff agree; merging different
 indices requires an equally exact, versioned derivation, not a wider unchecked
 range. Do not pick a production block size `B` from the model's two retry slots.
+The [initial policy decision](#initial-window-policy-and-retry-evidence--2026-10-30)
+below selects one slot using the production retry-path evidence and a separate
+one-slot exploration; enforcement remains part of owner/window integration.
 Bounded lookup costs `B * (k+m)` final keys per window; count empty probes, not
 just discovered files. Existing object/part limits and explicit exceptional-window
 limits must bound retained rows and scan work as well as each individual block.
@@ -2609,3 +2612,129 @@ tests passed; the full suite, including the additional owner-local batch test,
 passed 9,088 tests (one slow, six skipped) in 269.495 seconds using
 `cargo nextest run --offline --no-fail-fast`. Strict workspace Clippy, storage
 boundary checks, formatting and `git diff --check` passed.
+
+## Initial Window Policy And Retry Evidence — 2026-10-30
+
+With local lifetime invalidation implemented, select the initial policy before
+encoding owner/window records. The goal remains no additional ordinary-path
+metadata command or fsync. This slice supplies policy and executable evidence;
+it does **not** change the production allocator, timeouts, or persisted formats.
+
+### One physical allocation per segment window
+
+Use **`B = 1` initially**, for both the first stream window and each append's
+lookahead window. Direct PUT already needs one exact key per shard. Do not reserve
+four/eight speculative VIDs merely because publication has a retry loop:
+
+- `prepare_stream_segment_append_with_route_validation` retries unrelated pending
+  commands **before** invoking the preparation RPC. It returns or propagates that
+  RPC's result; it does not repeat successful or uncertain allocation.
+- `append_stream_segment_with_route_validation` prepares once, writes the selected
+  shard identities, and gives the same record to the append publisher. Command-ID
+  contention/reissue retries publication, not physical allocation.
+- PUT, POST, UploadPart and copy ingestion feed segments sequentially. A failed
+  append is handled as failed/uncertain work, not permission to encrypt or allocate
+  another physical candidate under the same segment index.
+
+The new production-workflow tests in
+[`cleanup_discovery.rs`](../crates/storage/src/cluster/local/tests/cleanup_discovery.rs)
+force a command-ID collision after shard preparation for both streamed PUT and
+UploadPart. Each requires at least two command builds but exactly one preparation,
+one consumed VID on the primary and replicas, one identical committed segment,
+and exact ciphertext reconstruction. These are evidence for publication retry
+behavior, not proof that today's allocator enforces `B = 1`.
+
+An ambiguous/lost **preparation** response is different from a lost append reply.
+Without exact response evidence the caller must fail the attempt and hand off
+cleanup, not obtain a second slot or reuse the first identity. A committed append
+with a lost reply still converges through exact-command inspection; its already
+reserved next window is not allocated again. Exceptional disjoint windows and
+replacement-issuer continuation remain deferred. The existing adversarial tests
+which prepare multiple candidates describe today's behavior; window enforcement
+must migrate them to explicit rejection or an owner-local malformed-state fixture,
+not silently widen the production policy to keep those fixtures working.
+
+Cleanup enumeration is then one candidate per shard per window, rather than
+`B * (k+m)` candidates. With 2+1, increasing B from one to eight would increase
+potential file probes from three to twenty-four for each window, even if only
+one candidate was ever written; acknowledgement checks are additional. This is
+a bound on enumeration work, not a measured RPC count or latency improvement.
+
+The finite lookahead model now explores **both** one-slot and two-slot initial
+windows. Each checks the same safety properties and positive reachability, and
+each independent unsafe mutation must still produce its own counterexample.
+An ordered one-slot trace pins exhaustion before append, withholding the next
+window until settlement, and preserving the next window across a lost reply.
+Its keys are symbolic (the next window's representative is still key 2), not a
+production VID layout. It retains the prior model's abstract publication, clock,
+fanout and issuer assumptions; this is not an end-to-end failover proof.
+
+### Finite physical-authority horizon
+
+Use the following initial implementation policy, subject to the acceptance tests
+below rather than treating current idle/heartbeat limits as equivalent authority:
+
+- **Direct PUT:** at most ten seconds of new physical admission from descriptor
+  creation, additionally bounded by the captured request and receiving-route
+  fences. This matches the existing order of magnitude of write/publication work
+  budgets, but is a new explicit physical-scope cap, not a claim that the current
+  budgets already cover all effects.
+- **Streams:** at most five minutes per immutable window, starting when its
+  introducing create/append command is built. Each successful append may reserve
+  the next window in its existing transaction with a new cutoff; it cannot extend
+  an earlier window. The owner tracks the maximum cutoff of every retained window.
+  No standalone idle-renewal command is introduced.
+- The five-minute bound is a **per-segment progress limit**, not a total upload
+  duration. At the current 8 MiB segment size it permits roughly 27 KiB/s between
+  appends before other limits; it intentionally rejects an indefinitely trickling
+  body even if frames arrive within the current 30-second HTTP idle timeout.
+  Faster overall uploads can continue through successive windows. Existing
+  stricter admission and body deadlines still win.
+- The ten-second reservation heartbeat and fifteen-second bucket-proof lease
+  remain separate resource-liveness mechanisms. Neither renews physical write
+  authority. Conversely, retaining cleanup evidence after cancellation must not
+  keep a live bucket reservation until the physical cutoff.
+- Construct each cutoff once with checked arithmetic; reject overflow. Preserve
+  it through exact retries and same-payload reissue. If command construction or
+  contention consumes the usable interval, fail rather than resetting its clock.
+  Static/unbounded route authority must still receive a finite physical cutoff.
+- Transport the existing absolute conservative wall-clock upper bound, with the
+  supported skew shortening and receiver-local monotonic binding. Never transmit
+  a duration or monotonic timestamp. Replica apply compares immutable values;
+  only primary/physical admission evaluates time. Already-admitted IO retains its
+  exclusion guard through persistence even if it finishes after cutoff.
+
+This trades delayed cleanup (up to the remaining window horizon, plus guarded
+in-flight work and unavailable participants) for avoiding an extra revocation
+commit. It does not promise physical completion at exactly ten seconds/five
+minutes. Bound per-owner rows as well: the current 5 GiB request limit and 8 MiB
+segments imply at most 640 selected segments plus one unused lookahead window per
+stream attempt. Enforce this at the storage owner before introducing windows,
+not merely through HTTP checks. It is a per-attempt limit, not a whole-MPU object
+limit or a bound on aggregate retained state. Limits must have a shared owner so
+future request-size/segment-size changes cannot silently diverge.
+
+### Next implementation and acceptance gate
+
+Implement owner/window state together with its existing creation, append and
+terminal transactions, route-reference/digest/export membership and versioned
+evidence. Carry the primary's opaque local issuer into the descriptor; replicas
+must persist that issuer rather than substituting their own. Enforce one-slot
+consumption under the allocator lock and preserve exact descriptors on retries.
+Neither imported rows nor a new runtime nonce may resume an old window.
+
+Before enabling the policy, add deterministic tests for first-slot success and
+second-slot rejection without mutation; lost preparation reply; repeated append
+publication without another allocation; next-window expiry while buffering body;
+static-route finite cutoff; same-epoch renewal; arithmetic limits; and independent
+file/ack delayed delivery. Cover existing AWS-facing failure/transport handling
+for PUT, POST and UploadPart instead of introducing an ad-hoc S3 error. Actual
+capacity/progress checks and remote confirmation remain implementation work.
+
+Validation: eight focused model/workflow tests passed. Full
+`cargo nextest run --offline --no-fail-fast` passed 9,091 tests (one slow, six
+skipped) in 235.990 seconds. Strict workspace Clippy, storage boundary checks,
+formatting and `git diff --check` passed. The first focused run exposed an invalid
+hyphenated upload-ID label in the new UploadPart fixture; correcting that label
+allowed the test to reach its intended publication collision. The six ignored
+cleanup regressions remain unresolved.
