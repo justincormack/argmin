@@ -774,6 +774,32 @@ previous carrier budget; build-request preconditions shrink by one byte and keep
 their existing cap. Exact-at-cap/one-byte-over framed admission tests pin both.
 Build responses retain the existing bounded, self-describing command carrier.
 
+### Checkpoint Evidence Before Cleanup Ownership Changes
+
+[`checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5.hex`](../crates/storage/src/pg_store/testdata/checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5.hex)
+preserves the complete current checkpoint specimen from the unchanged writer at
+`144ba8ac4e683642bdf3f0d64754f5b1219454ca`, before retained owner/window tables are
+introduced. Its version vector is checkpoint **6**, canonical state **8**, PG
+schema **9**, nested SSE-S3 **5**. The original evidence remains unchanged:
+
+- decoded length: **7,760 bytes**;
+- decoded SHA-256: `ecd3abb5de9f324640ced63f47dbebfca63641e5b72e74a375c79e29512f7eda`;
+- canonical state digest: `4699376559631902336`;
+- checkpoint CRC64: `2653891692263939273`.
+
+The current writer compares exact bytes. Independent tests decode and verify the
+literal fixture, compare its table membership with the production registry, then
+install and reopen it through the storage checkpoint path with exact materialized
+table blocks and encoding. This metadata-only representative includes a populated
+multipart-upload row and the complete table catalogue; it does not claim populated
+coverage of every table or branch, or decryptable payload evidence.
+
+On the upcoming state-membership/version advance, retain this literal specimen
+unchanged and assert its exact unsupported-version rejection. Append new
+version-vector evidence instead of reconstructing this predecessor using changed
+Rust structs. Existing historical hash tuples and the schema-9 catalogue remain
+unchanged; this evidence-only slice advances no production format.
+
 ## Baseline Closeout Audit (2026-08-22)
 
 The completed matrix was re-audited against every production format/version constant and its

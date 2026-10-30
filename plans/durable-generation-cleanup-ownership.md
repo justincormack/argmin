@@ -21,6 +21,8 @@ retained owner/window records. It advances command/RPC encodings but reuses the
 existing tables and apply transaction. The unfinished cleanup prototype was
 removed; no retained ownership tables, worker, staging tickets or new RPC
 operations have landed. The six cleanup regressions remain unresolved.
+The [checkpoint evidence prerequisite](#checkpoint-evidence-before-ownerwindow-state--2026-10-30)
+preserves literal current-format bytes before changing state-table membership.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -1737,8 +1739,9 @@ existing reserve/create/append/apply boundaries, before granting any new remote
 write authority. Its review must include schema, command and export/digest
 membership together, not just new structs. First canaries:
 
-1. Reserve then crash before session creation: empty physical scope, exact retained
-   release obligation on another replica.
+1. Direct PUT reserve then crash before staging: empty physical scope, exact
+   retained release obligation on another replica. Stream creation is now atomic:
+   failed creation must leave neither a new session nor its generation reservation.
 2. Two preparations and a lost reply: replica keeps the reserved end while its
    consumed floor is stale; no replacement or same-node/new-authority reuse.
 3. Append a non-final slot: next interval starts beyond the **entire** old block;
@@ -2058,3 +2061,36 @@ and verifies that ownership before continuing its heartbeat assertions. The thre
 focused atomic-creation tests and the corrected full suite pass. No failure was
 ignored or retried without a corresponding correction.
 The six skipped cleanup regressions are unchanged and remain unresolved.
+
+## Checkpoint Evidence Before Owner/Window State — 2026-10-30
+
+Before introducing retained owner/window tables, preserve the existing checkpoint
+specimen as literal bytes at a separate commit boundary, as required by the
+[versioning guide](../guides/versioning.md). The current schema-9 catalogue already
+has literal evidence; the checkpoint specimen previously retained only its
+state-digest/CRC/length/SHA-256 tuple.
+
+The new checkpoint-v6 / canonical-state-v8 / PG-schema-v9 / SSE-S3-v5 fixture
+captures the unchanged writer at `144ba8ac4e683642bdf3f0d64754f5b1219454ca`.
+Its 7,760 decoded bytes match the original SHA-256
+`ecd3abb5de9f324640ced63f47dbebfca63641e5b72e74a375c79e29512f7eda`.
+The existing writer test now compares exact bytes, while independent literal-reader
+tests verify the complete table catalogue, install the checkpoint through the
+storage import path, and reopen it with identical materialized state and encoding.
+This is a metadata-only representative with a populated multipart-upload row,
+not an exhaustive populated-row or payload-read corpus. All previous evidence is
+unchanged. The [format ledger](../guides/storage-format-ledger.md#checkpoint-evidence-before-cleanup-ownership-changes)
+records the complete version vector and retention requirements.
+
+Production behavior and format versions are unchanged. The next implementation
+slice remains retained owner/window integration into existing transactions, with
+coordinated schema, command and export/digest membership and replica/restart tests.
+No new ordinary-path commit, remote grant, cleanup worker or skipped-test change
+is introduced here. All six cleanup regressions remain unresolved.
+
+Validation: all three focused checkpoint tests passed. The full permitted
+`cargo nextest run --offline --no-fail-fast` passed 9,060 tests (one slow, six
+skipped) in 278.501 seconds. Strict workspace Clippy, storage boundary checks,
+formatting and `git diff --check` passed. An initial sandboxed full run was
+stopped after read-only test-directory and socket-permission failures; the full
+replacement run used the required permissions without changing those tests.

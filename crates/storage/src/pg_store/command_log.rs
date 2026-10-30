@@ -7658,6 +7658,87 @@ impl PgStore {
 mod canonical_format_baseline_tests {
     use super::*;
 
+    fn frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5() -> Vec<u8> {
+        let hex = include_str!("testdata/checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5.hex")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<String>();
+        assert_eq!(hex.len(), 2 * 7_760);
+        let bytes = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checksum::compute_checksum(ChecksumAlgorithm::Sha256, &bytes).bytes(),
+            &[
+                236, 211, 171, 181, 222, 159, 50, 70, 64, 206, 214, 63, 71, 219, 235, 252, 166, 54,
+                65, 229, 183, 46, 116, 163, 117, 199, 158, 41, 81, 47, 126, 218,
+            ],
+            "immutable checkpoint evidence changed"
+        );
+        bytes
+    }
+
+    #[test]
+    fn frozen_checkpoint_v6_decodes_and_verifies_independently_of_current_builders() {
+        // Start from the literal predecessor candidate, not a checkpoint built
+        // with today's table registry. On a format advance keep these bytes and
+        // convert this acceptance test to exact version-rejection evidence.
+        let bytes = frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5();
+        let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
+        checkpoint.verify().unwrap();
+        assert_eq!(checkpoint.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(checkpoint.pg_id, PgId::new(1));
+        assert_eq!(checkpoint.applied_log_index, 0);
+        assert_eq!(checkpoint.state_digest.value(), 4_699_376_559_631_902_336);
+        assert_eq!(checkpoint.checkpoint_crc64, 2_653_891_692_263_939_273);
+        assert_eq!(
+            checkpoint
+                .table_blocks
+                .iter()
+                .map(|block| block.table_name.as_str())
+                .collect::<Vec<_>>(),
+            METADATA_DIGEST_TABLES
+                .iter()
+                .map(|table| table.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            encode_metadata_command_checkpoint_payload(&checkpoint).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn frozen_checkpoint_v6_installs_and_reopens_with_exact_materialized_state() {
+        let bytes = frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5();
+        let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        store
+            .install_metadata_transfer_checkpoint_base(0, ClusterEpoch::INITIAL, &checkpoint)
+            .unwrap();
+        let assert_exact = |store: &PgStore| {
+            let restored = store
+                .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                .unwrap();
+            restored.verify().unwrap();
+            assert_eq!(restored.table_digests, checkpoint.table_digests);
+            assert_eq!(restored.table_blocks, checkpoint.table_blocks);
+            assert_eq!(
+                encode_metadata_command_checkpoint_payload(&restored).unwrap(),
+                bytes
+            );
+        };
+        assert_exact(&store);
+        drop(store);
+        let reopened = PgStore::open(tmp.path(), 1).unwrap();
+        assert_exact(&reopened);
+    }
+
     fn insert_test_checkpoint_row(store: &PgStore, applied_log_index: usize) {
         store
             .conn
@@ -7964,6 +8045,11 @@ mod canonical_format_baseline_tests {
         );
 
         let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
+        assert_eq!(
+            encoded,
+            frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5(),
+            "append a new version-vector specimen; never rewrite the old checkpoint"
+        );
         let encoded_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded);
         let current_evidence = (
             checkpoint.state_digest.value(),
