@@ -4352,13 +4352,6 @@ impl super::StorageCluster {
                             ));
                         }
                     }
-                    self.release_object_generation_reservation(
-                        &upload.bucket,
-                        &upload.key,
-                        &upload.session_id,
-                    )
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                     aborted_any = true;
                     any_aborted = true;
                     aborted_count += 1;

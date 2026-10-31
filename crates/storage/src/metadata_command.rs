@@ -1065,15 +1065,9 @@ impl MetadataCommandPayload {
                 commit.object.key.clone(),
                 commit.generation_reservation_id.clone(),
             ),
-            Self::CreateStreamUpload(create)
-                if create.session.target == StreamUploadTarget::PutObject =>
-            {
-                ReleaseObjectGenerationCommand::new(
-                    create.session.bucket.clone(),
-                    create.session.key.clone(),
-                    create.session.session_id.clone(),
-                )
-            }
+            // Stream creation reserves its generation in the same transaction
+            // as the session. Safe abandonment applied neither; it must not
+            // release an independently owned reservation with the same ID.
             _ => return None,
         };
         Some(Self::ReleaseObjectGeneration(release))

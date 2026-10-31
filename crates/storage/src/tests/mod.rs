@@ -69,6 +69,87 @@ pub(super) fn committed_metadata_only_test_encryption(
         .expect("metadata-only live fixture must admit its exact terminal subject")
 }
 
+/// Self-contained command evidence for protocol-only abandonment/certificate
+/// tests. No files are written and the source command must not be applied.
+/// Its one-segment 1+0 geometry, witness and committed encryption describe real
+/// Cobblestone ciphertext; cluster cleanup tests instead stage actual shards.
+pub(super) fn direct_put_recovery_source_payload(
+    pg_id: crate::PgId,
+    reservation_id: SessionId,
+    proof: crate::BucketWriteReservationProof,
+    key: ObjectKey,
+    created_at: u64,
+) -> crate::metadata_command::MetadataCommandPayload {
+    use crate::metadata_command::{CommitDirectPutObjectCommand, MetadataCommandPayload};
+    let bucket = proof.bucket.clone();
+    let generation_id = GenerationId::MIN;
+    let encrypted = sse_s3_segment_test_fixture(b"", 0);
+    let subject = ObjectEncryptionSubject::standard_object(
+        proof.bucket_incarnation_generation,
+        &bucket,
+        &key,
+        generation_id,
+        &encrypted.encryption,
+    );
+    let ec = crate::EcShape { k: 1, m: 0 };
+    let segment_okh = crate::direct_put_segment_key_hash(&reservation_id, 0);
+    let shard_key = crate::ShardKey::new(&segment_okh, generation_id.get(), 0);
+    let ack = crate::WriteAck {
+        stored_size: encrypted.storage_bytes.len() as u64,
+        crc64: encrypted.storage_crc64,
+    };
+    let witness = crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+        pg_id.get(),
+        ec,
+        &segment_okh,
+        generation_id,
+        ack.stored_size,
+        ack.crc64,
+        &[(&shard_key, ack)],
+    )
+    .unwrap();
+    MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+        object: crate::PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: crate::VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: 0,
+            etag: crate::ObjectEtag::single_part(encrypted.payload_crc64),
+            ec,
+            layout: crate::ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+            system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: encrypted.committed_encryption(&subject),
+        },
+        segments: vec![crate::ObjectSegmentRecord {
+            bucket,
+            key,
+            version_id: crate::VersionId::Null,
+            segment_index: 0,
+            size: 0,
+            segment_crc64: encrypted.storage_crc64,
+            segment_okh,
+            segment_vid: generation_id,
+            data_pg_id: pg_id.get(),
+            placement_cluster_epoch: proof.cluster_epoch,
+            ec_k: ec.k,
+            ec_m: ec.m,
+            shard_integrity: Some(witness.durable_record()),
+        }],
+        generation_reservation_id: reservation_id,
+        write_sequence: 1,
+        last_modified_millis: created_at,
+        stale_payload: None,
+        bucket_write_reservation: proof,
+    }))
+}
+
 pub(super) struct SseS3SegmentTestFixture {
     pub encryption: ObjectEncryption,
     pub storage_bytes: Vec<u8>,

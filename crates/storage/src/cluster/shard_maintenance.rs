@@ -1185,25 +1185,11 @@ impl StorageCluster {
                 &session.session_id,
             ) {
                 Ok(()) => {
-                    if session.target == StreamUploadTarget::PutObject {
-                        let _ = self.release_object_generation_reservation(
-                            &session.bucket,
-                            &session.key,
-                            &session.session_id,
-                        );
-                    }
                     summary.cleaned += 1;
                 }
                 Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                     ..
                 })) => {
-                    if session.target == StreamUploadTarget::PutObject {
-                        let _ = self.release_object_generation_reservation(
-                            &session.bucket,
-                            &session.key,
-                            &session.session_id,
-                        );
-                    }
                     summary.cleaned += 1;
                 }
                 Err(_) => summary.abort_failed += 1,

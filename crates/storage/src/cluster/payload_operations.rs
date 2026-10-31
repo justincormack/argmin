@@ -3613,16 +3613,6 @@ impl StorageCluster {
             MetadataCommandPayload::AppendStreamSegment(_) => {
                 self.after_object_metadata_command_abandoned_payload_cleanup(command);
             }
-            MetadataCommandPayload::CreateStreamUpload(create)
-                if create.session.target == StreamUploadTarget::PutObject =>
-            {
-                reservation_authority.release_object_generation_reservation_command_required(
-                    command.id().pg_id(),
-                    &create.session.bucket,
-                    &create.session.key,
-                    &create.session.session_id,
-                )?;
-            }
             _ => {}
         }
         Ok(())
@@ -6762,17 +6752,11 @@ impl StorageCluster {
                         pg_id, bucket, &proof,
                     ) {
                         Ok(true) => Ok(()),
-                        Ok(false) => {
-                            let generation_cleanup = self
-                                .release_object_generation_reservation(bucket, key, session_id);
-                            let bucket_cleanup = self
-                                .release_durable_bucket_write_reservation(reservation)
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error);
-                            match (generation_cleanup, bucket_cleanup) {
-                                (Ok(()), Ok(())) => Ok(()),
-                                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-                            }
-                        }
+                        // Creation owns generation and session atomically. A
+                        // failed attempt has no standalone generation to release.
+                        Ok(false) => self
+                            .release_durable_bucket_write_reservation(reservation)
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error),
                         Err(error) => Err(error),
                     }
                 }

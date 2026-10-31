@@ -1000,7 +1000,13 @@ reservation/high-water, session, and applied log together on each replica. PUT
 and UploadPart no longer publish an earlier `ReserveObjectGeneration`; Direct PUT
 still does. A rejected creation cannot leave a generation-only reservation, and
 request failure must not release a generation owned by an ambiguously applied
-creation. Builders reject a pre-existing reservation under the requested session
+creation. Safe abandonment of `CreateStreamUpload` therefore has no generation-
+release derivative, on either ordinary or historical recovery routes. An
+independent reservation with the same ID must survive failed creation cleanup.
+Stream abort removes the generation with the session in its apply transaction;
+scavenging and bucket deletion must not publish an additional generation release.
+Direct PUT terminal abandonment still has its separate generation-release
+obligation. Builders reject a pre-existing reservation under the requested session
 ID. Apply independently requires reservation absence inside the creation
 transaction whenever the session is absent, including for decoded recovery
 commands. Only an existing exact session may use the idempotent branch, which

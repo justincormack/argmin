@@ -4420,32 +4420,11 @@ fn assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(object_pg);
     let session_id = crate::SessionId::try_from(session_octet.repeat(16)).unwrap();
-    let proof = acquire_test_bucket_write_proof(
-        &cluster,
-        &bucket,
-        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-        Some(key.as_str()),
-    );
-    let source = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            cluster.operation_epoch(),
-            pg_id,
-            map.test_next_metadata_command_log_index(pg_id),
-        ),
-        MetadataCommandPayload::CreateStreamUpload(Box::new(
-            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                crate::CreateStreamUploadReq {
-                    session_id: session_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::tests::metadata_only_test_encryption(),
-                },
-                123,
-                proof.clone(),
-            ),
-        )),
-    );
+    let source = staged_direct_put_recovery_command(&cluster, &bucket, &key, &session_id);
+    let MetadataCommandPayload::CommitDirectPutObject(commit) = source.payload() else {
+        panic!("fixture must stage Direct PUT");
+    };
+    let proof = commit.bucket_write_reservation.clone();
     let derivative = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             source.id().cluster_epoch(),
@@ -4455,7 +4434,7 @@ fn assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
         source
             .payload()
             .abandoned_recovery_follow_up()
-            .expect("abandoned stream creation must require generation cleanup"),
+            .expect("abandoned Direct PUT requires generation cleanup"),
     );
     let MetadataCommandRecoveryAdmission::Leader(owner) = map
         .runtime_state()

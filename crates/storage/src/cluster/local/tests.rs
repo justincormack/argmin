@@ -1061,6 +1061,59 @@ fn direct_put_commit_req(
     direct_put_commit_req_with_bucket_write_proof(fixture, bucket_write_reservation)
 }
 
+/// A real staged Direct PUT for tests of its generation-release derivative.
+/// Stream creation no longer has a separately acquired generation to clean up.
+fn staged_direct_put_recovery_command(
+    cluster: &StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    reservation_id: &crate::SessionId,
+) -> MetadataCommandEnvelope {
+    let generation_id = cluster
+        .reserve_put_object_generation(bucket, key, reservation_id)
+        .unwrap();
+    let payload = b"Direct PUT recovery cleanup";
+    let segment_okh = crate::direct_put_segment_key_hash(reservation_id, 0);
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        cluster,
+        bucket,
+        key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
+    let request = direct_put_commit_req(
+        cluster,
+        DirectPutCommitReqFixture {
+            bucket,
+            key,
+            reservation_id: reservation_id.clone(),
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let pg_id = cluster.object_metadata_pg(bucket, key).pg_id();
+    let primary = cluster
+        .local_map
+        .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &pg,
+            &request,
+            &written.written_shards,
+            crate::VersionId::Null,
+            request.bucket_write_reservation.clone(),
+        )
+        .unwrap()
+}
+
 fn direct_put_commit_req_with_bucket_write_proof(
     fixture: DirectPutCommitReqFixture<'_>,
     bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,

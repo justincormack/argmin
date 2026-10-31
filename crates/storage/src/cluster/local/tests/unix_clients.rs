@@ -2304,7 +2304,7 @@ fn unix_current_route_fans_out_primary_abandonment_to_replica() {
 }
 
 #[test]
-fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
+fn unix_historical_recovery_reissues_then_cleans_stale_direct_put_generation() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(0);
     let node_ids = [node_id];
@@ -2339,30 +2339,26 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
             pg_id,
             MetadataCommandLogIndex::new(1).unwrap(),
         ),
-        MetadataCommandPayload::CreateStreamUpload(Box::new(
-            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                crate::CreateStreamUploadReq {
-                    session_id: session_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::tests::metadata_only_test_encryption(),
-                },
-                now_ms,
-                crate::BucketWriteReservationProof {
-                    bucket: bucket.clone(),
-                    reservation_id: "missing-recovery-reservation".to_string(),
-                    owner_token: "recovery-owner".to_string(),
-                    cluster_epoch: command_epoch,
-                    bucket_execution_generation: 1,
-                    bucket_incarnation_generation: 1,
-                    operation_kind: "historical-recovery".to_string(),
-                    created_at: now_ms,
-                    lease_deadline: now_ms.saturating_add(60_000),
-                    target_context: Some(key.as_str().to_string()),
-                },
-            ),
-        )),
+        crate::tests::direct_put_recovery_source_payload(
+            pg_id,
+            session_id.clone(),
+            crate::BucketWriteReservationProof {
+                bucket: bucket.clone(),
+                reservation_id: "missing-recovery-reservation".to_string(),
+                owner_token: "recovery-owner".to_string(),
+                cluster_epoch: command_epoch,
+                bucket_execution_generation: 1,
+                bucket_incarnation_generation: 1,
+                operation_kind:
+                    crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                        .to_string(),
+                created_at: now_ms,
+                lease_deadline: now_ms.saturating_add(60_000),
+                target_context: Some(key.as_str().to_string()),
+            },
+            key.clone(),
+            now_ms,
+        ),
     );
     let reissued = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
@@ -2381,7 +2377,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
         source
             .payload()
             .abandoned_recovery_follow_up()
-            .expect("PutObject stream creation requires generation cleanup"),
+            .expect("Direct PUT requires generation cleanup"),
     );
     let pending = crate::control_plane::PendingMetadataCommandObservation::new(
         command_epoch,

@@ -589,3 +589,28 @@ fn decoded_direct_put_reservation_cannot_adopt_a_stream_generation() {
         assert_rejected(&reopened);
     }
 }
+
+#[test]
+fn atomic_stream_creation_does_not_authorize_a_generation_release_derivative() {
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        let source = envelope(&create, 1);
+        let release = MetadataCommandPayload::ReleaseObjectGeneration(
+            crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                create.session.bucket.clone(),
+                create.session.key.clone(),
+                create.session.session_id.clone(),
+            ),
+        );
+        assert!(source.payload().abandoned_recovery_follow_up().is_none());
+        assert!(!release.is_authorized_recovery_derivative_of(source.payload()));
+        assert!(
+            source
+                .payload()
+                .is_authorized_recovery_derivative_of(source.payload()),
+            "equivalent source reissue must remain authorized"
+        );
+    }
+}

@@ -4357,26 +4357,21 @@ fn test_metadata_command_recovery_chain(
     let key = crate::tests::object_key("metadata-recovery-certificate-object");
     let session_id = crate::tests::stream_session_id("recovery-cert");
     let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
-    proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+    proof.operation_kind =
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.to_string();
     let source = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             epoch,
             PgId::new(pg_id),
             MetadataCommandLogIndex::new(1).unwrap(),
         ),
-        MetadataCommandPayload::CreateStreamUpload(Box::new(
-            CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                CreateStreamUploadReq {
-                    session_id,
-                    bucket,
-                    key,
-                    target: StreamUploadTarget::PutObject,
-                    encryption: metadata_only_test_encryption(),
-                },
-                123,
-                proof,
-            ),
-        )),
+        crate::tests::direct_put_recovery_source_payload(
+            PgId::new(pg_id),
+            session_id,
+            proof,
+            key,
+            123,
+        ),
     );
     let reissued = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
@@ -4395,7 +4390,7 @@ fn test_metadata_command_recovery_chain(
         source
             .payload()
             .abandoned_recovery_follow_up()
-            .expect("PutObject stream creation requires generation cleanup"),
+            .expect("Direct PUT requires generation cleanup"),
     );
     let unrelated = test_metadata_command(pg_id, 4);
     (source, reissued, cleanup, unrelated)

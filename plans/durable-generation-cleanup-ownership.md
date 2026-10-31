@@ -101,6 +101,10 @@ The [reservation-kind apply guard](#direct-put-reservation-kind-at-apply--2026-1
 now rejects a standalone Direct PUT reservation command naming a live stream's
 generation. Exact Direct PUT replay/reissue remains supported; this does not yet
 persist the retained owner or change the frontend proof handoff.
+The [atomic stream cleanup correction](#atomic-stream-creation-and-abort-cleanup--2026-10-31)
+removes obsolete standalone generation-release commands from creation failure,
+abandonment and post-abort maintenance. Failed creation now preserves independent
+reservations; real Direct PUT cleanup derivatives retain their recovery coverage.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -4350,3 +4354,64 @@ Validation: both focused regressions passed. Full `cargo nextest run --offline`
 passed all 9,168 tests (one slow, six skipped) in 263.745s. Strict
 all-target/all-feature Clippy, the storage boundary checker, formatting and
 `git diff --check` passed. No format fixtures or ignored tests changed.
+
+## Atomic Stream Creation And Abort Cleanup — 2026-10-31
+
+The follow-up audit found cleanup paths that still assumed the old two-command
+stream creation protocol, despite atomic creation and the new apply ownership
+checks:
+
+- The low-level PUT stream-creation wrapper issued `ReleaseObjectGeneration` on
+  failure when no pending command retained its bucket proof. If creation rejected
+  a pre-existing generation or session, this cleanup could delete the generation
+  it had correctly refused to adopt.
+- Ordinary abandonment and the shared historical-recovery derivative classifier
+  still authorized a generation-release follow-up for `CreateStreamUpload`.
+  Authoritatively abandoned atomic creation applied neither the session nor its
+  generation. There is no independent resource from that creation to release.
+- Stream scavenging and bucket deletion issued another generation-release command
+  after successful abort, although abort already deletes session and generation
+  together in its apply transaction.
+
+Removed those calls and the obsolete stream-create recovery derivative. Failed
+creation retains its existing exact bucket-proof disposition and error mapping;
+it no longer guesses ownership of a generation from the requested session ID.
+Ambiguous or started publication still belongs to convergence, not abandonment.
+No new transaction, fsync, schema, command/RPC encoding or optional state is added.
+Existing frozen format specimens are unchanged. This is a correction of resource
+ownership/authorization, not a new representation or compatibility path.
+
+Direct PUT terminal abandonment still requires its generation-release derivative.
+Its generation exists before the terminal command, unlike atomic stream creation.
+The failed-release, omitted-predecessor, ambiguous replacement, recovery-flight
+handoff, same-payload reissue and foreground-outcome tests now use staged Direct
+PUT commands with real encrypted shards. Protocol-only certificate tests use
+self-contained Direct PUT command evidence with coherent encrypted geometry and
+witnesses; they do not apply that source or claim physical cleanup coverage.
+Installed Unix reissue/cleanup coverage remains in place under the real derivative.
+
+Regression changes also pin:
+
+- rejected frontend creation with an existing Direct PUT reservation and with an
+  existing live stream: complete object-PG checkpoints/logs remain unchanged on
+  all replicas, and the existing bucket proofs survive the failed attempt's
+  exact proof release;
+- ordinary and control-plane-authorized historical stream-creation abandonment:
+  a same-ID independent generation survives, and no release command advances
+  the object-PG log;
+- both PUT and UploadPart creation explicitly refuse a generation-release
+  derivative while equivalent source reissue remains valid; and
+- scavenging and bucket-delete cleanup each use exactly one object-PG abort
+  command, remove both session and generation on all replicas, and preserve a
+  live-session canary in the scavenger case. The bucket-delete fixture now creates
+  its expired stream through atomic production creation, not separate raw rows.
+
+These command-count assertions establish removal of redundant publication work,
+not measured filesystem sync savings. The retained owner/window, pre-install
+orphan retirement and physical-exclusion integration is still outstanding; all
+six original cleanup regressions remain open.
+
+Validation: the expanded focused selection passed all 57 tests. Full `cargo
+nextest run --offline` passed all 9,170 tests (one slow, six skipped) in 260.992s.
+Strict all-target/all-feature Clippy, the storage boundary checker, formatting
+and `git diff --check` passed.

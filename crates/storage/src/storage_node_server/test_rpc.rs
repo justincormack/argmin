@@ -2257,25 +2257,17 @@
         let bucket = crate::tests::bucket_name("metadata-recovery-cleanup");
         let key = crate::tests::object_key("object");
         let session_id = crate::tests::stream_session_id("recovery");
+        let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        proof.operation_kind = crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.into();
         let source = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 source_route_epoch,
                 PgId::new(0),
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
-            MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                    crate::CreateStreamUploadReq {
-                        session_id: session_id.clone(),
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::tests::metadata_only_test_encryption(),
-                    },
-                    123,
-                    test_bucket_write_reservation_proof(bucket.clone(), &key),
-                ),
-            )),
+            crate::tests::direct_put_recovery_source_payload(
+                PgId::new(0), session_id.clone(), proof, key.clone(), 123,
+            ),
         );
         let reissued = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -2294,7 +2286,7 @@
             source
                 .payload()
                 .abandoned_recovery_follow_up()
-                .expect("PutObject stream creation requires generation cleanup"),
+                .expect("Direct PUT requires generation cleanup"),
         );
         private_socket_dir(config.socket_path.parent().unwrap());
         let source_route = config.pg_routes[0].clone();

@@ -1928,7 +1928,7 @@ fn refresh_recovery_abandons_stale_reservation_from_historical_active_route() {
 }
 
 #[test]
-fn refresh_recovery_abandons_stream_create_with_certified_generation_cleanup() {
+fn refresh_recovery_abandons_stream_create_without_releasing_an_independent_generation() {
     let tmp = test_util::tempdir();
     let mut fixture = HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-stream-abandon");
     let bucket = BucketName::new("historical-stream-abandon").unwrap();
@@ -2001,15 +2001,16 @@ fn refresh_recovery_abandons_stream_create_with_certified_generation_cleanup() {
             .storage_node()
             .get_pg(fixture.pg_id.get())
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             crate::PgMetadataStore::get_object_generation_reservation(
                 &*pg,
                 &bucket,
                 &key,
                 &session_id,
-            ),
-            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
-        ));
+            )
+            .unwrap(),
+            generation_id
+        );
         assert!(matches!(
             crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
             Err(crate::MetadataError::StreamSessionNotFound { .. })
@@ -2018,7 +2019,7 @@ fn refresh_recovery_abandons_stream_create_with_certified_generation_cleanup() {
             pg.metadata_command_replica_state()
                 .unwrap()
                 .applied_log_index,
-            command.id().log_index().get() + 1
+            command.id().log_index().get()
         );
     }
     assert_eq!(generation_id, crate::GenerationId::MIN);
@@ -10515,7 +10516,7 @@ fn partial_abandoned_reservation_retry_does_not_report_skipped_command_success()
 }
 
 #[test]
-fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
+fn abandoned_put_object_stream_create_preserves_independent_generation_on_drain() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -10536,7 +10537,7 @@ fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(object_pg);
     let session_id = crate::SessionId::try_from("59".repeat(16)).unwrap();
-    cluster
+    let generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &session_id)
         .unwrap();
     let proof = acquire_test_bucket_write_proof(
@@ -10589,15 +10590,23 @@ fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
             .storage_node()
             .get_pg(object_pg)
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             crate::PgMetadataStore::get_object_generation_reservation(
                 &*pg,
                 &bucket,
                 &key,
                 &session_id
-            ),
-            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
-        ));
+            )
+            .unwrap(),
+            generation_id
+        );
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get(),
+            "abandonment must not publish a generation-release command"
+        );
     }
 }
 
@@ -10719,7 +10728,7 @@ fn stream_create_recovery_rejects_crossed_reservation_authority_without_mutation
 }
 
 #[test]
-fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanup() {
+fn abandoned_direct_put_release_failure_retries_to_terminal_cleanup() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -10740,35 +10749,7 @@ fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanu
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(object_pg);
     let session_id = crate::SessionId::try_from("5a".repeat(16)).unwrap();
-    let _generation_id = cluster
-        .reserve_put_object_generation(&bucket, &key, &session_id)
-        .unwrap();
-    let proof = acquire_test_bucket_write_proof(
-        &cluster,
-        &bucket,
-        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-        Some(key.as_str()),
-    );
-    let command = MetadataCommandEnvelope::new(
-            crate::metadata_command::MetadataCommandId::new(
-                cluster.operation_epoch(),
-                pg_id,
-                map.test_next_metadata_command_log_index(pg_id),
-            ),
-            MetadataCommandPayload::CreateStreamUpload(Box::new(
-                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                    crate::CreateStreamUploadReq {
-                        session_id: session_id.clone(),
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::tests::metadata_only_test_encryption(),
-                    },
-                    123,
-                    proof,
-                ),
-            )),
-        );
+    let command = staged_direct_put_recovery_command(&cluster, &bucket, &key, &session_id);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
     {
         let node_zero_pg = map
@@ -10797,9 +10778,9 @@ fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanu
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {
-                        context: "injected abandoned stream create release failure",
+                        context: "injected abandoned Direct PUT release failure",
                         source: std::io::Error::other(
-                            "injected abandoned stream create release failure",
+                            "injected abandoned Direct PUT release failure",
                         ),
                     });
                 }
@@ -10854,35 +10835,7 @@ fn abandoned_cleanup_derivative_handoff_retains_predecessor_and_root_outcome() {
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(object_pg);
     let session_id = crate::SessionId::try_from("5c".repeat(16)).unwrap();
-    cluster
-        .reserve_put_object_generation(&bucket, &key, &session_id)
-        .unwrap();
-    let proof = acquire_test_bucket_write_proof(
-        &cluster,
-        &bucket,
-        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-        Some(key.as_str()),
-    );
-    let source = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            cluster.operation_epoch(),
-            pg_id,
-            map.test_next_metadata_command_log_index(pg_id),
-        ),
-        MetadataCommandPayload::CreateStreamUpload(Box::new(
-            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                crate::CreateStreamUploadReq {
-                    session_id: session_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::tests::metadata_only_test_encryption(),
-                },
-                123,
-                proof,
-            )),
-        ),
-    );
+    let source = staged_direct_put_recovery_command(&cluster, &bucket, &key, &session_id);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &source);
     map.node(NodeId::new(0))
         .unwrap()
@@ -10900,7 +10853,7 @@ fn abandoned_cleanup_derivative_handoff_retains_predecessor_and_root_outcome() {
         source
             .payload()
             .abandoned_recovery_follow_up()
-            .expect("abandoned stream creation must require generation cleanup"),
+            .expect("abandoned Direct PUT requires generation cleanup"),
     );
     map.node(NodeId::new(1))
         .unwrap()
@@ -11021,7 +10974,7 @@ fn abandoned_cleanup_derivative_handoff_retains_predecessor_and_root_outcome() {
 }
 
 #[test]
-fn abandoned_stream_create_cleanup_derivative_reissues_and_converges() {
+fn abandoned_direct_put_cleanup_derivative_reissues_and_converges() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -11042,35 +10995,7 @@ fn abandoned_stream_create_cleanup_derivative_reissues_and_converges() {
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(object_pg);
     let session_id = crate::SessionId::try_from("5b".repeat(16)).unwrap();
-    let _generation_id = cluster
-        .reserve_put_object_generation(&bucket, &key, &session_id)
-        .unwrap();
-    let proof = acquire_test_bucket_write_proof(
-        &cluster,
-        &bucket,
-        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-        Some(key.as_str()),
-    );
-    let command = MetadataCommandEnvelope::new(
-        crate::metadata_command::MetadataCommandId::new(
-            cluster.operation_epoch(),
-            pg_id,
-            map.test_next_metadata_command_log_index(pg_id),
-        ),
-        MetadataCommandPayload::CreateStreamUpload(Box::new(
-            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
-                crate::CreateStreamUploadReq {
-                    session_id: session_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::tests::metadata_only_test_encryption(),
-                },
-                123,
-                proof,
-            ),
-        )),
-    );
+    let command = staged_direct_put_recovery_command(&cluster, &bucket, &key, &session_id);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
     map.node(NodeId::new(0))
         .unwrap()
@@ -11089,7 +11014,7 @@ fn abandoned_stream_create_cleanup_derivative_reissues_and_converges() {
         command
             .payload()
             .abandoned_recovery_follow_up()
-            .expect("PUT stream creation has a certified reservation-release derivative"),
+            .expect("Direct PUT has a certified reservation-release derivative"),
     );
     let omitted_predecessor_error = cluster
         .test_apply_recovery_derivative_without_predecessor(

@@ -2487,31 +2487,31 @@ fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
 
     let session_id =
         crate::SessionId::try_from("a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3".to_string()).unwrap();
-    let create = crate::CreateStreamUploadReq {
-        session_id: session_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::tests::metadata_only_test_encryption(),
-    };
-    let generation_id = cluster
-        .reserve_put_object_generation(&bucket, &key, &session_id)
-        .unwrap();
-    for node_id in node_ids {
-        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
-        crate::PgMetadataStore::create_stream_upload(&*pg, &create).unwrap();
-        assert_eq!(
-            crate::PgMetadataStore::get_object_generation_reservation(
-                &*pg,
+    crate::clock::with_time_override(1_000, || {
+        cluster
+            .create_put_object_stream_session_record_with_cleanup_deadline(
                 &bucket,
                 &key,
-                &session_id
+                &session_id,
+                crate::tests::metadata_only_test_encryption(),
+                Some(1_001),
             )
-            .unwrap(),
-            generation_id
-        );
-        pg.refresh_metadata_command_state_digest().unwrap();
-    }
+            .unwrap();
+    });
+    let before = {
+        let pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+        crate::PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &session_id)
+            .unwrap();
+        pg.metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index
+    };
 
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -2519,6 +2519,13 @@ fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
 
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            before + 1,
+            "bucket cleanup must remove session and generation with one abort command"
+        );
         assert!(
             matches!(
                 crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
@@ -3119,11 +3126,41 @@ fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
                 crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
+        let before = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index;
         assert_eq!(
             cluster.scavenge_abandoned_stream_sessions(0).cleaned,
             1,
             "scavenger should abort only the expired proof"
         );
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert_eq!(pg.metadata_command_replica_state().unwrap().applied_log_index, before + 1,
+                "abort must remove the session and generation in one command, without a follow-up release");
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &expired_bucket,
+                    &expired_key,
+                    &expired_session,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &live_bucket,
+                &live_key,
+                &live_session,
+            )
+            .expect("live session's generation must survive scavenging");
+        }
     });
 
     let object_pg = map
@@ -3138,6 +3175,103 @@ fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
         crate::PgMetadataStore::get_stream_upload(&*object_pg, &expired_session),
         Err(crate::MetadataError::StreamSessionNotFound { .. })
     ));
+}
+
+#[test]
+fn rejected_stream_creation_preserves_preexisting_generation_and_session_owners() {
+    for live_session in [false, true] {
+        let tmp = test_util::tempdir();
+        let nodes = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let map = Arc::new(
+            LocalClusterMap::open(tmp.path(), &nodes, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+                .unwrap(),
+        );
+        let topology = map.node(nodes[0]).unwrap().storage_node().pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "create-owner-preservation-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        let session_id = crate::tests::stream_session_id("existing-owner");
+        if live_session {
+            cluster
+                .create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    crate::tests::metadata_only_test_encryption(),
+                )
+                .unwrap();
+        } else {
+            cluster
+                .reserve_put_object_generation(&bucket, &key, &session_id)
+                .unwrap();
+        }
+        let before: Vec<_> = nodes
+            .iter()
+            .map(|node| {
+                map.node(*node)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(2)
+                    .unwrap()
+                    .metadata_command_checkpoint(node.as_u32(), cluster.operation_epoch())
+                    .unwrap()
+            })
+            .collect();
+        let before_proofs = {
+            let pg = map
+                .node(nodes[0])
+                .unwrap()
+                .storage_node()
+                .get_pg(1)
+                .unwrap();
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap()
+        };
+        let error = cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::tests::metadata_only_test_encryption(),
+            )
+            .expect_err("creation must not adopt an existing identity");
+        let expected_context = if live_session {
+            "create stream upload existing session mismatch"
+        } else {
+            "create stream upload pre-existing generation reservation"
+        };
+        assert!(
+            matches!(error,
+                crate::ObjectPgActionError::Metadata(crate::MetadataError::InvariantViolation { context, .. })
+                    if context == expected_context
+            ),
+            "{error:?}"
+        );
+        for (node, checkpoint) in nodes.iter().zip(&before) {
+            let pg = map.node(*node).unwrap().storage_node().get_pg(2).unwrap();
+            assert_eq!(
+                &pg.metadata_command_checkpoint(node.as_u32(), cluster.operation_epoch())
+                    .unwrap(),
+                checkpoint,
+                "creation error cleanup changed another owner's object-PG state"
+            );
+            assert!(pg
+                .pending_metadata_command_slot(node.as_u32(), cluster.operation_epoch())
+                .unwrap()
+                .is_none());
+        }
+        let pg = map
+            .node(nodes[0])
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap(),
+            before_proofs,
+            "only the failed creation's newly acquired bucket proof should be released"
+        );
+    }
 }
 
 #[test]
