@@ -93,6 +93,11 @@ The [Direct PUT successor-evidence tests](#direct-put-successor-evidence--2026-1
 now exercise real pending slots, witness-first application, peering decisions and
 compacted generation-reservation transfer. They do not supply a replacement
 primary's route certificate or the still-missing retained owner/proof obligation.
+The [successor orphan-inspection model](#successor-orphan-inspection-model--2026-10-31)
+now explores replacement overlapping an insertion that finishes after the cutoff,
+unavailable inspection, and retained custody after compaction/restart. Its
+settled-prefix reconciliation is an abstract obligation, not an implemented
+replacement protocol.
 The [participant-capture extraction](#captured-file-and-acknowledgement-participants--2026-10-31)
 now returns the shared resolver's actual shard locations and independent
 acknowledgement primary. Existing builders still use it only for preflight;
@@ -4415,3 +4420,50 @@ Validation: the expanded focused selection passed all 57 tests. Full `cargo
 nextest run --offline` passed all 9,170 tests (one slow, six skipped) in 260.992s.
 Strict all-target/all-feature Clippy, the storage boundary checker, formatting
 and `git diff --check` passed.
+
+## Successor Orphan Inspection Model — 2026-10-31
+
+The pre-install model assumed an already settled authoritative primary. Added a
+separate bounded model for the replacement boundary in
+`cleanup_ownership_model/replacement.rs`: one introduction, an old primary,
+witness and successor, one immutable cutoff, one successor restart and one
+unavailable inspection. This composes the insertion/inspection timing obligations
+without claiming that the production route-transfer protocol is implemented.
+
+The old primary holds insertion serialization from its final deadline check
+through commit. Replacement may begin and the cutoff may expire during that
+interval. Fencing must drain the in-flight insertion before the successor can
+certify absence; expiry alone cannot roll back an already-admitted transaction.
+Inspection then considers the settled prefix's pending and materialized custody,
+not merely the successor's initially empty local state. Witness-first application
+does not authorize orphan release. Compaction removes log evidence, not the
+materialized owner's release obligation. Restart discards the volatile inspection
+result and requires reinspection. An unavailable inspection remains unsettled;
+it is never evidence of absence. Exact orphan release is a separate bucket-PG
+action after object-PG inspection, not a cross-PG transaction.
+
+Required reachability canaries cover overlap of expiry/replacement/insertion,
+remote pending custody with an empty successor, witness-ahead custody, compacted
+owner preservation across successor restart, and successful orphan release after
+an unavailable inspection and restart. Independent faulty variants must produce
+counterexamples for fencing without draining, trusting successor-local absence,
+dropping compacted owner state, and treating unavailable inspection as absence.
+A scripted trace also pins the old insertion completing after expiry, witness
+application, fencing, reinspection, convergence, compaction and restart.
+An independent empty-prefix trace pins failure-before-restart, mandatory
+reinspection, orphan release and rejection of the still-queued old request.
+
+`Reconcile` is explicitly an abstract authenticated settled-prefix operation.
+This model does not prove how route certificates fence an unreachable old node,
+how a distributed implementation obtains that prefix, clock health, or physical
+write exclusion. Those remain production integration obligations. No format,
+runtime behavior, transaction or fsync changes are introduced. The coordinated
+owner/window state integration remains next, and all six cleanup regressions
+remain unresolved.
+
+Validation: exhaustive exploration completed 149 states and 369 transitions;
+all four faulty variants produced the expected independent counterexamples.
+Full Nextest passed 9,173 tests (one slow, six skipped) in 237.053s. The explicit
+empty-prefix trace was added after that build began; the subsequent focused run
+passed all four replacement-model tests. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed.
