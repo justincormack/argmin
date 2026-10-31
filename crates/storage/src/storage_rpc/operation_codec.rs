@@ -1999,6 +1999,31 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     })
 }
 
+pub(crate) fn encode_stream_append_command_build_request(
+    request: &StorageRpcStreamAppendCommandBuildRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_stream_upload_target(&mut out, &request.target);
+    put_stream_upload_segment_record(&mut out, &request.segment);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
+    out
+}
+
+pub(crate) fn decode_stream_append_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamAppendCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let request = StorageRpcStreamAppendCommandBuildRequest {
+        object: decoder.read_rpc_object_request()?,
+        target: decoder.read_stream_upload_target()?,
+        segment: decoder.read_stream_upload_segment_record()?,
+        effect_deadline: decoder
+            .read_admitted_route_effect_deadline("stream append command build")?,
+    };
+    decoder.finish()?;
+    Ok(request)
+}
+
 pub(crate) fn encode_stream_segment_append_prepare_response(
     response: &StorageRpcStreamSegmentAppendPrepareResponse,
 ) -> Vec<u8> {

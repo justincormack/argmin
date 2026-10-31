@@ -1750,6 +1750,34 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn build_stream_append_command(
+        &self,
+        target: &StreamUploadTarget,
+        segment: &StreamUploadSegmentRecord,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        let effect_fence = self
+            .route
+            .fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(ObjectPgActionError::Store)
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
+            &local_client,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            &segment.session_id,
+        )
+        .and_then(|route| route.build_append_command(target, segment, effect_fence))
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn update_stream_upload_bucket_write_reservation(
         &self,
         session_id: &SessionId,

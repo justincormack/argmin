@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 30;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 31;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -54,9 +54,9 @@ const STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_KEY_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_SCAVENGER_PAYLOAD_REFERENCE_MIN_LEN: usize = 1 + 4 + 16 + 8 + 2;
 const STORAGE_RPC_SCAVENGER_OBSERVATION_MIN_LEN: usize =
     STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
-const STORAGE_RPC_SEGMENT_SHARD_INTEGRITY_MAX_ENCODED_LEN: usize = 1 + 8 + 2 + 255 * 8;
-const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN: usize =
-    4 + 16 + 8 + 8 + 8 + 2 + 1 + 1;
+// The durable witness permits every u8 shard index, including index 255.
+const STORAGE_RPC_SEGMENT_SHARD_INTEGRITY_MAX_ENCODED_LEN: usize = 1 + 8 + 2 + 256 * 8;
+const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN: usize = 4 + 16 + 8 + 8 + 8 + 2 + 1 + 1;
 const STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MAX_LEN: usize =
     STORAGE_RPC_PLACED_SEGMENT_REPAIR_WORK_ITEM_MIN_LEN
         + 4
@@ -310,6 +310,33 @@ const STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN: usize =
     4 + 8 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN;
 const STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
+// Object route, largest target, one complete segment (including its bounded
+// integrity witness), and the portable absolute deadline. No payload bytes.
+const STORAGE_RPC_MAX_STREAM_APPEND_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
+        + 1
+        + 4
+        + UPLOAD_ID_LEN
+        + 4
+        + 4
+        + SESSION_ID_LEN
+        + 4
+        + 8
+        + 8
+        + 8
+        + 4
+        + 16
+        + 8
+        + 4
+        + 8
+        + 1
+        + 1
+        + 1
+        + 4
+        + STORAGE_RPC_SEGMENT_SHARD_INTEGRITY_MAX_ENCODED_LEN
+        + 1
+        + 8
+        + 8;
 const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN: usize =

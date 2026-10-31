@@ -1339,6 +1339,16 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ObjectStreamAppendCommandBuild => {
+                match crate::storage_rpc::decode_stream_append_command_build_request(&frame.payload)
+                {
+                    Ok(request) => self.stream_append_command_build_response(route_permit, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ObjectGenerationReserveCommandBuild => {
                 match crate::storage_rpc::decode_object_generation_reserve_command_build_request(
                     &frame.payload,
@@ -2979,6 +2989,46 @@ impl StorageNodeConnectionHandler {
                 encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
             }
         }
+    }
+
+    fn stream_append_command_build_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: crate::storage_rpc::StorageRpcStreamAppendCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
+            "stream append command build",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
+        let outcome =
+            match route.build_stream_append_command(&request.target, &request.segment, fence) {
+                Ok(command) => {
+                    StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
+                }
+                Err(StorageNodeObjectRouteError::Route(error)) => {
+                    return encode_storage_rpc_error_response(&error)
+                }
+                Err(StorageNodeObjectRouteError::Object(error)) => {
+                    match object_metadata_command_build_error_outcome(
+                        error,
+                        Some("AppendStreamSegment"),
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => return encode_storage_rpc_error_response(&error),
+                    }
+                }
+            };
+        Ok(encode_storage_rpc_success_response(
+            &encode_object_metadata_command_build_response(
+                &StorageRpcObjectMetadataCommandBuildResponse { outcome },
+            ),
+        ))
     }
 
     fn object_generation_reserve_command_build_response(

@@ -18,7 +18,9 @@ const RETIRED_V28: &str =
     include_str!("testdata/stream_creation_rpc_v28_command_v12_sse_s3_v5.hex");
 const RETIRED_V29: &str =
     include_str!("testdata/stream_creation_rpc_v29_command_v12_sse_s3_v5.hex");
-const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v30_command_v12_sse_s3_v5.hex");
+const RETIRED_V30: &str =
+    include_str!("testdata/stream_creation_rpc_v30_command_v12_sse_s3_v5.hex");
+const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v31_command_v12_sse_s3_v5.hex");
 
 enum Specimen {
     Match(Box<StorageRpcStreamUploadMatchRequest>),
@@ -392,8 +394,8 @@ fn frozen_specimens(input: &str) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn stream_creation_rpc_v30_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 30);
+fn stream_creation_rpc_v31_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 31);
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(current.len(), 37);
@@ -411,7 +413,7 @@ fn stream_creation_rpc_v30_writers_match_frozen_command_v12_sse_s3_v5_evidence()
 }
 
 #[test]
-fn stream_creation_rpc_v30_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
+fn stream_creation_rpc_v31_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(
@@ -503,6 +505,19 @@ fn retired_stream_creation_rpc_v29_frames_are_rejected() {
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
             Err(StorageRpcFrameError::UnsupportedVersion(29)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn retired_stream_creation_rpc_v30_frames_are_rejected() {
+    let frozen = frozen_specimens(RETIRED_V30);
+    assert_eq!(frozen.len(), 37);
+    for (name, bytes) in frozen {
+        assert_eq!(
+            decode_storage_rpc_frame(&bytes),
+            Err(StorageRpcFrameError::UnsupportedVersion(30)),
             "{name}"
         );
     }

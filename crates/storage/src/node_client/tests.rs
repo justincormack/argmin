@@ -4415,6 +4415,8 @@ mod stream_creation_placement;
 mod allocation_lifetime;
 #[path = "tests/generation_reservation_builder.rs"]
 mod generation_reservation_builder;
+#[path = "tests/stream_append_builder.rs"]
+mod stream_append_builder;
 #[path = "tests/stream_extent.rs"]
 mod stream_extent;
 #[path = "tests/unix_object_rpc.rs"]

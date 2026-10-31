@@ -4580,23 +4580,6 @@ impl StorageCluster {
         }
     }
 
-    fn try_install_object_pg_pending_command_with_fresh_id(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        completion_admission: bool,
-        effect_fence: Option<AdmittedRouteEffectFence>,
-        build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
-    ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
-        self.try_install_object_pg_built_pending_command(pg_id, bucket, effect_fence, || {
-            let command_id = self.next_object_metadata_command_id_with_completion_admission(
-                pg_id,
-                completion_admission,
-            )?;
-            Ok(build_command(command_id))
-        })
-    }
-
     // Construction can be a storage-primary RPC, not just a frontend closure
     // over a separately allocated command ID. Keep the pending observation and
     // installation serialized, and classify build-time log conflicts exactly
@@ -5066,24 +5049,24 @@ impl StorageCluster {
         }
     }
 
-    fn install_apply_validated_metadata_command_with_fresh_id(
+    fn install_apply_validated_built_metadata_command(
         &self,
         publisher: impl crate::metadata_command::ApplyValidatedMetadataCommandPublisher,
         pg_id: PgId,
         bucket: &BucketName,
-        completion_admission: bool,
         effect_fence: Option<AdmittedRouteEffectFence>,
-        build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
+        build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
     ) -> Result<ApplyValidatedFreshInstallOutcome, ObjectPgActionError> {
-        let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+        let command = match self.try_install_object_pg_built_pending_command(
             pg_id,
             bucket,
-            completion_admission,
             effect_fence,
             build_command,
         )? {
             ObjectPgPendingCommandInstall::Installed(command) => {
-                return Ok(ApplyValidatedFreshInstallOutcome::Installed(Box::new(command)));
+                return Ok(ApplyValidatedFreshInstallOutcome::Installed(Box::new(
+                    command,
+                )));
             }
             ObjectPgPendingCommandInstall::Pending(command) => command,
             ObjectPgPendingCommandInstall::LogConflict { pending } => {

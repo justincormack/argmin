@@ -314,10 +314,12 @@ impl PgStore {
         }
     }
 
-    fn apply_append_stream_segment_command(
+    /// Read-only preflight shared by primary construction and replica apply.
+    /// Callers hold the PG lock; apply also holds its existing transaction.
+    pub(in crate::node_runtime) fn validate_append_stream_segment_command(
         &self,
         command: &AppendStreamSegmentCommand,
-    ) -> Result<(), MetadataError> {
+    ) -> Result<Option<StreamUploadSegmentRecord>, MetadataError> {
         if !crate::payload_limits::stream_segment_extent_is_valid(
             command.segment.segment_index,
             command.segment.size,
@@ -327,6 +329,80 @@ impl PgStore {
                 reason: "segment exceeds the single-write index or logical-size limit".into(),
             });
         }
+        segment_vid_window::checked_segment_vid_window(
+            command.segment.segment_vid,
+            std::num::NonZeroU32::MIN,
+        )?;
+        let session = self.get_stream_upload(&command.segment.session_id)?;
+        if session.bucket != command.bucket || session.key != command.key {
+            return Err(MetadataError::InvariantViolation {
+                context: "append stream segment command session binding mismatch",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
+        if session.target != command.target {
+            return Err(MetadataError::InvariantViolation {
+                context: "append stream segment command target binding mismatch",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
+        if session.state != StreamUploadState::InProgress {
+            return Err(MetadataError::StreamSessionNotInProgress {
+                state: session.state as u8,
+            });
+        }
+        let stored_size = session
+            .encryption
+            .segment_stored_size(command.segment.size)
+            .ok_or(MetadataError::InvariantViolation {
+                context: "append stream segment command payload-codec geometry",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            })?;
+        validate_segment_shard_integrity_for_profile(
+            session.encryption.payload_profile(),
+            command.segment.shard_integrity.as_ref(),
+            EcShape {
+                k: command.segment.ec_k,
+                m: command.segment.ec_m,
+            },
+            stored_size,
+            command.segment.segment_crc64,
+        )
+        .map_err(|_| MetadataError::InvariantViolation {
+            context: "append stream segment command shard integrity witness",
+            reason: "metadata state does not satisfy the operation invariant".into(),
+        })?;
+        if let StreamUploadTarget::UploadPart { upload_id, .. } = &session.target {
+            let upload = self.get_multipart_upload(upload_id)?;
+            if upload.bucket != command.bucket
+                || upload.key != command.key
+                || upload.state != UploadState::InProgress
+            {
+                return Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+        }
+
+        let existing = self
+            .list_stream_segments(&command.segment.session_id)?
+            .into_iter()
+            .find(|segment| segment.segment_index == command.segment.segment_index);
+        if existing
+            .as_ref()
+            .is_some_and(|segment| segment != &command.segment)
+        {
+            return Err(MetadataError::StreamSegmentConflict {
+                segment_index: command.segment.segment_index,
+            });
+        }
+        Ok(existing)
+    }
+
+    fn apply_append_stream_segment_command(
+        &self,
+        command: &AppendStreamSegmentCommand,
+    ) -> Result<(), MetadataError> {
         // Validate decoded/recovered commands before inserting any segment row.
         // A VID may fit SQLite while its required next cursor does not. Carry
         // the checked interval through both fresh and idempotent application.
@@ -338,76 +414,17 @@ impl PgStore {
             "append stream segment command (begin txn)",
             "append stream segment command (commit txn)",
             |store| {
-                let session = store.get_stream_upload(&command.segment.session_id)?;
-                if session.bucket != command.bucket || session.key != command.key {
-                    return Err(MetadataError::InvariantViolation {
-                        context: "append stream segment command session binding mismatch",
-                        reason: "metadata state does not satisfy the operation invariant".into(),
-                    });
-                }
-                if session.target != command.target {
-                    return Err(MetadataError::InvariantViolation {
-                        context: "append stream segment command target binding mismatch",
-                        reason: "metadata state does not satisfy the operation invariant".into(),
-                    });
-                }
-                if session.state != StreamUploadState::InProgress {
-                    return Err(MetadataError::StreamSessionNotInProgress {
-                        state: session.state as u8,
-                    });
-                }
-                let stored_size = session
-                    .encryption
-                    .segment_stored_size(command.segment.size)
-                    .ok_or(MetadataError::InvariantViolation {
-                        context: "append stream segment command payload-codec geometry",
-                        reason: "metadata state does not satisfy the operation invariant".into(),
-                    })?;
-                validate_segment_shard_integrity_for_profile(
-                    session.encryption.payload_profile(),
-                    command.segment.shard_integrity.as_ref(),
-                    EcShape {
-                        k: command.segment.ec_k,
-                        m: command.segment.ec_m,
-                    },
-                    stored_size,
-                    command.segment.segment_crc64,
-                )
-                .map_err(|_| MetadataError::InvariantViolation {
-                    context: "append stream segment command shard integrity witness",
-                    reason: "metadata state does not satisfy the operation invariant".into(),
-                })?;
-                if let StreamUploadTarget::UploadPart { upload_id, .. } = &session.target {
-                    let upload = store.get_multipart_upload(upload_id)?;
-                    if upload.bucket != command.bucket
-                        || upload.key != command.key
-                        || upload.state != UploadState::InProgress
-                    {
-                        return Err(MetadataError::NoSuchUpload {
-                            upload_id: upload_id.to_string(),
-                        });
-                    }
-                }
-
-                let existing = store
-                    .list_stream_segments(&command.segment.session_id)?
-                    .into_iter()
-                    .find(|segment| segment.segment_index == command.segment.segment_index);
+                let existing = store.validate_append_stream_segment_command(command)?;
                 match existing {
-                    Some(existing) if existing == command.segment => store
-                        .advance_stream_segment_vid_floor(
-                            &command.segment.session_id,
-                            &window,
-                        ),
+                    Some(existing) if existing == command.segment => {
+                        store.advance_stream_segment_vid_floor(&command.segment.session_id, &window)
+                    }
                     Some(_) => Err(MetadataError::StreamSegmentConflict {
                         segment_index: command.segment.segment_index,
                     }),
                     None => {
                         store.append_stream_segment_direct(&command.segment)?;
-                        store.advance_stream_segment_vid_floor(
-                            &command.segment.session_id,
-                            &window,
-                        )
+                        store.advance_stream_segment_vid_floor(&command.segment.session_id, &window)
                     }
                 }
             },

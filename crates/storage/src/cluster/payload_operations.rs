@@ -7686,32 +7686,23 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
             }
-            let command = match self.install_apply_validated_metadata_command_with_fresh_id(
+            let command = match self.install_apply_validated_built_metadata_command(
                 publisher,
                 pg_id,
                 bucket,
-                false,
                 Some(route.effect_fence),
-                |command_id| {
-                    self.maybe_run_after_stream_append_command_id_allocated_hook(command_id);
-                    MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::AppendStreamSegment(Box::new(
-                            AppendStreamSegmentCommand {
-                                bucket: bucket.clone(),
-                                key: key.clone(),
-                                target: target.clone(),
-                                segment: segment_record.clone(),
-                            },
-                        )),
-                    )
+                || {
+                    let command = stream_route.build_append_command(
+                        target,
+                        segment_record,
+                        route.effect_fence,
+                    )?;
+                    self.maybe_run_after_stream_append_command_id_allocated_hook(command.id());
+                    Ok(command)
                 },
             ) {
                 Ok(ApplyValidatedFreshInstallOutcome::Installed(command)) => *command,
-                Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained {
-                    command,
-                    outcome,
-                }) => {
+                Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained { command, outcome }) => {
                     if Self::stream_append_command_matches_request(
                         &command,
                         bucket,

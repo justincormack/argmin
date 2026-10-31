@@ -94,6 +94,16 @@ and checks it at command construction under the PG lock. Command v12 and durable
 formats remain unchanged. The complete v29 corpus and authentication composites
 remain immutable rejection evidence; v30 appends both deadline alternatives.
 
+Primary-owned stream-append construction subsequently advances storage-node RPC
+framing to v31 (kind 177). The request binds the object/session/target, exact
+segment integrity evidence and portable effect deadline; the response uses the
+existing command-v12 envelope. SQLite and other durable formats are unchanged.
+The v30 creation corpus, exact frames and authentication composites remain
+immutable rejection evidence beside v31. Eight independent append request
+specimens cover PUT/UploadPart, witness presence and bounded/unbounded deadline
+encoding; exact-at-cap admission covers the full encoded witness index space.
+This is a current-version boundary, not mixed-version support.
+
 ## Non-Goals
 
 This plan does not version the public S3 protocol, promise Rust API stability, select a new

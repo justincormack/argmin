@@ -84,7 +84,7 @@ publisher_fixture_required_patterns=(
     $'^PUBLISHER\t.*:raw_built_allocator_without_marker_is_inventoried:<missing>:try_install_object_pg_built_pending_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_terminal_session_publisher_without_marker_is_rejected:install_terminal_session_retry_metadata_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_matching_outcome_publisher_without_marker_is_rejected:install_matching_outcome_retry_metadata_command$'
-    $'^TYPED_MISSING_MARKER\t.*:typed_apply_validated_publisher_without_marker_is_rejected:install_apply_validated_metadata_command_with_fresh_id$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_apply_validated_publisher_without_marker_is_rejected:install_apply_validated_built_metadata_command$'
     $'^TYPED_MISSING_MARKER\t.*:typed_generic_drain_without_marker_is_rejected:drain_pending_object_metadata_commands_for_publisher$'
     $'^MARKER\tRawGenericDrainPublisher:raw_generic_drain_from_publisher_is_rejected$'
     $'^PUBLISHER\t.*:raw_generic_drain_from_publisher_is_rejected:RawGenericDrainPublisher:raw_pending_object_metadata_command_drain$'

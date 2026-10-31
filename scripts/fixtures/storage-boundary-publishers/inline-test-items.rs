@@ -113,11 +113,11 @@ impl Fixture {
 
     fn typed_apply_validated_publisher_is_not_shell_inventoried() {
         crate::metadata_command::metadata_command_publisher!(TypedApplyValidatedPublisher);
-        install_apply_validated_metadata_command_with_fresh_id();
+        install_apply_validated_built_metadata_command();
     }
 
     fn typed_apply_validated_publisher_without_marker_is_rejected() {
-        install_apply_validated_metadata_command_with_fresh_id();
+        install_apply_validated_built_metadata_command();
     }
 
     fn typed_generic_drain_is_not_shell_inventoried() {

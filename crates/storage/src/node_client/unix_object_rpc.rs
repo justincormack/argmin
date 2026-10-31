@@ -4736,6 +4736,63 @@ impl UnixStreamUploadSessionMetadataRoute<'_> {
 }
 
 impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'_> {
+    fn build_append_command(
+        &self,
+        target: &StreamUploadTarget,
+        segment: &StreamUploadSegmentRecord,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        use crate::storage_rpc::{
+            encode_stream_append_command_build_request, StorageRpcStreamAppendCommandBuildRequest,
+        };
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if segment.session_id != self.session_id
+            || segment.segment_okh
+                != crate::stream_segment_key_hash(&self.session_id, segment.segment_index)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream append command",
+            }
+            .into());
+        }
+        let request = StorageRpcStreamAppendCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            target: target.clone(),
+            segment: segment.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectStreamAppendCommandBuild,
+            self.pg_id.pg_id(), encode_stream_append_command_build_request(&request),
+            "decode stream append command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                if command.id().pg_id() != self.pg_id.pg_id()
+                    || command.id().cluster_epoch() != self.route_cluster_epoch
+                    || !matches!(command.payload(), MetadataCommandPayload::AppendStreamSegment(append)
+                        if append.bucket == self.bucket && append.key == self.key
+                            && append.target == *target && append.segment == *segment)
+                {
+                    return Err(self.client.rpc_payload_error(
+                        "validate stream append command build response",
+                        "command does not match the exact stream append request".into(),
+                    ).into());
+                }
+                Ok(())
+            },
+        )?.ok_or_else(|| self.client.rpc_payload_error(
+            "decode stream append command build response",
+            "stream append command build cannot return missing".into(),
+        ).into())
+    }
+
     fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError> {
         self.client.load_stream_upload_session_rpc(
             self.pg_id,

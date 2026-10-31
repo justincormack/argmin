@@ -539,6 +539,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectGenerationReserveCommandBuild => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8 + 1 + 16
         }
+        StorageRpcMessageKind::ObjectStreamAppendCommandBuild => {
+            STORAGE_RPC_MAX_STREAM_APPEND_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::DirectPutCommitSnapshotLoad => {
             STORAGE_RPC_MAX_DIRECT_PUT_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }

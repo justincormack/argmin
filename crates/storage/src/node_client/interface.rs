@@ -728,6 +728,13 @@ pub(crate) trait StreamUploadCreationMetadataRoute: Send {
 }
 
 pub(crate) trait StreamUploadSessionMetadataRoute: Send {
+    fn build_append_command(
+        &self,
+        target: &StreamUploadTarget,
+        segment: &StreamUploadSegmentRecord,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
     fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError>;
 
     fn load_segments(&self) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;

@@ -13,6 +13,75 @@ struct CreationFixture {
 }
 
 impl CreationFixture {
+    fn build_command(
+        &self,
+        client: &dyn ObjectMutationMetadataNodeClient,
+        config: &StorageNodeProcessConfig,
+        fence: AdmittedRouteEffectFence,
+        append: Option<&StreamUploadSegmentRecord>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+        if let Some(segment) = append {
+            client
+                .open_stream_upload_session_metadata_route(
+                    config.cluster_epoch,
+                    pg_id,
+                    &self.request.bucket,
+                    &self.request.key,
+                    &self.request.session_id,
+                )?
+                .build_append_command(&self.request.target, segment, fence)
+        } else {
+            client
+                .open_stream_upload_creation_metadata_route(
+                    config.cluster_epoch,
+                    pg_id,
+                    &self.request.bucket,
+                    &self.request.key,
+                )?
+                .build_create_stream_upload_command(self.build(config, fence))
+        }
+    }
+
+    fn seed_append(
+        &self,
+        node: &Arc<SharedStorageNode>,
+        config: &StorageNodeProcessConfig,
+    ) -> StreamUploadSegmentRecord {
+        let client = LocalStorageNodeClient::new(config.node_id, Arc::clone(node));
+        let command = self
+            .build_command(
+                &client,
+                config,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                None,
+            )
+            .unwrap();
+        node.get_pg(0)
+            .unwrap()
+            .apply_metadata_command_and_record(config.node_id.as_u32(), &command)
+            .unwrap();
+        // Metadata-only preflight fixture: no ciphertext is exposed or written.
+        let (crc, witness) = crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+            EcShape { k: 1, m: 0 },
+            self.request.encryption.segment_stored_size(1).unwrap(),
+        );
+        StreamUploadSegmentRecord {
+            session_id: self.request.session_id.clone(),
+            segment_index: 0,
+            size: 1,
+            segment_crc64: crc,
+            payload_crc64: 0,
+            segment_okh: crate::stream_segment_key_hash(&self.request.session_id, 0),
+            segment_vid: GenerationId::MIN,
+            data_pg_id: 0,
+            placement_cluster_epoch: config.cluster_epoch,
+            ec_k: 1,
+            ec_m: 0,
+            shard_integrity: Some(witness),
+        }
+    }
+
     fn new(node: &SharedStorageNode, part: bool) -> Self {
         let bucket = crate::tests::bucket_name("creation-deadline");
         let key = crate::tests::object_key("key");
@@ -95,6 +164,15 @@ impl CreationFixture {
 
 #[test]
 fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
+    stream_command_deadline_matrix(false);
+}
+
+#[test]
+fn stream_append_builder_rechecks_captured_deadline_after_pg_lock_gap() {
+    stream_command_deadline_matrix(true);
+}
+
+fn stream_command_deadline_matrix(append: bool) {
     for (remote, server_first, absent_client) in [
         (false, false, false),
         (true, false, false),
@@ -112,6 +190,7 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
             let server = StorageNodeServer::bind(config.clone()).unwrap();
             let node = server.test_storage_node();
             let fixture = CreationFixture::new(&node, part);
+            let segment = append.then(|| fixture.seed_append(&node, &config));
             let observe = || {
                 let pg = node.get_pg(0).unwrap();
                 (
@@ -131,6 +210,8 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
                     )
                     .unwrap(),
                     pg.list_all_stream_uploads().unwrap(),
+                    pg.list_stream_segments(&fixture.request.session_id)
+                        .unwrap(),
                 )
             };
             let before = observe();
@@ -150,7 +231,7 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
                     let time = crate::clock::test_time_override_guard(1_000);
                     server.accept_one().unwrap();
                     let control = time.control();
-                    LocalStorageNodeClient::test_with_before_stream_creation_lock_hook(
+                    LocalStorageNodeClient::test_with_before_stream_command_lock_hook(
                         move || {
                             ran.store(true, Ordering::SeqCst);
                             control.set(4_500);
@@ -168,15 +249,7 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
             );
             let local = LocalStorageNodeClient::new(config.node_id, Arc::clone(&node));
             let client: &dyn ObjectMutationMetadataNodeClient = if remote { &unix } else { &local };
-            let route = client
-                .open_stream_upload_creation_metadata_route(
-                    config.cluster_epoch,
-                    ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                    &fixture.request.bucket,
-                    &fixture.request.key,
-                )
-                .unwrap();
-            let build = || route.build_create_stream_upload_command(fixture.build(&config, fence));
+            let build = || fixture.build_command(client, &config, fence, segment.as_ref());
             let positive = build().unwrap();
             assert_eq!(positive.id().log_index().get(), before.2 + 1);
             let error = if remote {
@@ -184,7 +257,7 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
             } else {
                 let control = time.control();
                 let ran = Arc::clone(&hook_ran);
-                LocalStorageNodeClient::test_with_before_stream_creation_lock_hook(
+                LocalStorageNodeClient::test_with_before_stream_command_lock_hook(
                     move || {
                         ran.store(true, Ordering::SeqCst);
                         control.set(4_500);
@@ -222,20 +295,31 @@ fn stream_creation_rechecks_captured_deadline_after_pg_lock_gap() {
                 serving.join().unwrap();
             }
             assert_eq!(observe(), before, "expired creation changed durable state");
-            assert!(matches!(
-                node.get_pg(0).unwrap().get_object_generation_reservation(
-                    &fixture.request.bucket,
-                    &fixture.request.key,
-                    &fixture.request.session_id
-                ),
-                Err(MetadataError::ObjectGenerationReservationNotFound { .. })
-            ));
+            if !append {
+                assert!(matches!(
+                    node.get_pg(0).unwrap().get_object_generation_reservation(
+                        &fixture.request.bucket,
+                        &fixture.request.key,
+                        &fixture.request.session_id
+                    ),
+                    Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+                ));
+            }
         }
     }
 }
 
 #[test]
 fn tls_stream_creation_rebinds_sender_deadline_across_monotonic_origins() {
+    tls_stream_command_deadline_matrix(false);
+}
+
+#[test]
+fn tls_stream_append_builder_rebinds_sender_deadline_across_monotonic_origins() {
+    tls_stream_command_deadline_matrix(true);
+}
+
+fn tls_stream_command_deadline_matrix(append: bool) {
     for part in [false, true] {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -256,6 +340,7 @@ fn tls_stream_creation_rebinds_sender_deadline_across_monotonic_origins() {
         });
         let node = server.test_storage_node();
         let fixture = CreationFixture::new(&node, part);
+        let segment = append.then(|| fixture.seed_append(&node, &config));
         let before = node
             .get_pg(0)
             .unwrap()
@@ -288,28 +373,25 @@ fn tls_stream_creation_rebinds_sender_deadline_across_monotonic_origins() {
                 LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
                 Some(storage_rpc_client_auth(credential.clone(), 9)),
             );
-            let route = client
-                .open_stream_upload_creation_metadata_route(
-                    config.cluster_epoch,
-                    ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                    &fixture.request.bucket,
-                    &fixture.request.key,
-                )
-                .unwrap();
             // Keep the authenticated response within the allowed 1,000 ms
             // future skew while both sender samples still project cutoff 4,000.
             crate::clock::with_time_and_monotonic_override(
                 if late { 3_500 } else { 2_500 },
                 if late { 11_000 } else { 10_000 },
                 || {
-                    route.build_create_stream_upload_command(fixture.build(
+                    fixture.build_command(
+                        &client,
                         &config,
                         AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500),
-                    ))
+                        segment.as_ref(),
+                    )
                 },
             )
         };
-        assert_eq!(build(false).unwrap().id().log_index().get(), 1);
+        assert_eq!(
+            build(false).unwrap().id().log_index().get(),
+            if append { 2 } else { 1 }
+        );
         let error = build(true).unwrap_err();
         assert!(
             matches!(
@@ -339,7 +421,7 @@ fn tls_stream_creation_rebinds_sender_deadline_across_monotonic_origins() {
                 .unwrap()
                 .max_metadata_command_log_index(config.cluster_epoch)
                 .unwrap(),
-            0
+            if append { 1 } else { 0 }
         );
     }
 }

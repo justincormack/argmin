@@ -537,7 +537,7 @@ Current production pending-command publishers:
 | `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot before and during command-id allocation and retry. |
 | `commit_direct_put_object_from_payload_shards_with_route_validation` | `CommitDirectPutObject` | `SnapshotSensitive` | Revalidate the admitted PutObject route while rebuilding the commit from fresh object preconditions and stale-payload snapshots after pending-install contention or pre-publish command-id contention. Carry the immutable effect fence to version reservation and final pending-slot insertion. The commit command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
-| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Command-id and pending-install contention are drained and retried from a fresh stream-session snapshot without deleting the staged payload; apply validates session binding/state and existing staged segment before inserting. |
+| `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | The actual object-PG primary builds the command under its PG lock, validating the session/target, segment witness, live allocation lifetime and captured effect fence. Build-time and pending-install contention return through the existing one-contender retry loop without deleting referenced staged payload; replica apply independently validates the same durable session/segment invariants. |
 | `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated pending-slot or command-id contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
 | `put_object_metadata_if_with_route_validation` | `PutObjectMetadata` | `SnapshotSensitive` | Revalidate request-scoped route authority and rerun request action/preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `delete_specific_object_version_if_with_route_validation` | `DeleteObjectVersion` | `SnapshotSensitive` | Revalidate request-scoped route authority and rerun delete preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
@@ -562,7 +562,6 @@ command requires adding it to the authoritative Rust registry and updating
 this table. Production publisher entry points cannot directly use
 `try_set_pending_metadata_command_for_bucket`,
 `try_install_pending_metadata_command_for_bucket`,
-`try_install_object_pg_pending_command_with_fresh_id`,
 `try_install_object_pg_built_pending_command`, and
 `set_pending_metadata_command_for_bucket`; the boundary checker rejects any
 such call outside the compiler-classified typed installer implementations.
@@ -592,6 +591,15 @@ delegated deadline with the server's captured route fence and validates the
 returned PG, epoch, bucket, key, reservation ID and generation. Version/release
 builders retain the fresh-ID adapter. Neither builder path publishes a pending
 slot; that ownership transfer remains the installer's responsibility.
+Stream append uses `install_apply_validated_built_metadata_command` with the
+same fallible built-command primitive. The frontend no longer constructs
+`AppendStreamSegment` from a separately selected ID. The actual primary performs
+read-only preflight and ID selection under its PG lock; Unix/TLS carries the
+absolute portable deadline, intersects the server's captured fence, and validates
+the returned subject, target, entire segment, PG and epoch. Construction adds no
+durable write or fsync. It does require a remote builder RPC; no latency saving
+is claimed. The pending-slot insertion still rechecks the immutable effect fence,
+and replicas retain apply-time validation rather than trusting preflight.
 Terminal-session publishers use
 `install_terminal_session_retry_metadata_command`, whose exhaustive result
 distinguishes installation, a matching visible contender, an unrelated visible

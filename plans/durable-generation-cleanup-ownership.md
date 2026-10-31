@@ -57,6 +57,9 @@ The [integration boundary audit](#ownerwindow-integration-boundary-audit--2026-1
 pins the remaining primary-builder inputs and resource-release responsibilities
 for the next coordinated durable state slice; route-local lifetime capture is
 not a substitute for persisted window/issuer binding.
+The [primary-owned append builder](#primary-owned-stream-append-construction--2026-10-31)
+now supplies the actual-primary construction boundary needed by future window
+issuance, without adding owner records or changing durable command semantics.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2627,6 +2630,56 @@ captured-issuer comparison during allocation; settled-prefix confirmation; and
 independent file/ack exclusion with retained cleanup. These lifetime hooks still
 do not authorize allocation or physical writes. The six ignored cleanup
 regressions remain unresolved.
+
+## Primary-owned stream append construction — 2026-10-31
+
+Implemented the append-builder prerequisite identified by the integration audit.
+The production frontend no longer constructs `AppendStreamSegment` from an ID
+selected separately. The scoped stream-session route builds it on the actual
+object-PG primary under its PG lock. Shared read-only preflight checks the exact
+bucket/key/session/target, InProgress session and MPU, segment extent, checked
+VID successor, encrypted geometry/integrity witness and existing segment. The
+builder then requires a live allocation lifetime and revalidates the captured
+effect fence before selecting the command ID. Replica apply independently uses
+the same durable validation in its existing transaction; it does not require a
+live issuer lifetime to converge already-built commands.
+
+Unix/TLS kind 177 carries the exact target/segment and absolute portable deadline.
+The server intersects delegated authority with its own captured route fence; the
+client rejects substituted PG, epoch, bucket, key, target or segment responses.
+The typed ApplyValidated installer accepts a fallible primary-built envelope and
+retains the existing pending-slot fence, one-observed-contender retry, work-budget,
+recovery handoff and reference-aware payload cleanup behavior. Construction is
+read-only: no additional durable command, transaction or fsync. Remote operation
+does introduce a builder RPC; this slice makes no performance improvement claim.
+
+Storage RPC advances from v30 to v31; command v12 and durable formats do not
+change. All v30 frames, 37 creation specimens and authentication composites remain
+unchanged rejection evidence. New v31 composites and eight append-request
+specimens are appended. The request cap includes the complete 256-entry encoded
+witness index space (the codec's bound, not a new supported EC runtime shape).
+
+Coverage includes embedded and installed Unix PUT/UploadPart construction with
+exact checkpoint, pending-slot, log, session and segment non-mutation canaries;
+crossed request and malicious response subjects; retired-lifetime rejection while
+already-built commands still apply/replay; and deterministic expiry after the
+initial check but before the PG lock. Unix cases cover both sender-first and
+server-first deadlines, including an absent delegated deadline. TLS cases use the
+real client conversion with different frontend/storage monotonic origins. Codec
+tests pin optional branches, truncation/trailing rejection and exact maximum
+framed admission. Existing append contention/recovery tests remain in scope.
+
+This is **not** persisted issuer/window binding, settled-prefix confirmation or
+physical write/cleanup exclusion. Owner/resource-obligation schema integration
+and all six original cleanup regressions remain open. Future append-window
+issuance must derive its persisted issuer from this primary boundary; merely
+checking the currently live lifetime is not replacement-primary authorization.
+
+Validation: 270 focused tests passed. Full Nextest passed 9,142 tests (one slow,
+six skipped) in 265.901s; strict all-target/all-feature Clippy, storage boundary
+checks, formatting, shell syntax and diff checks passed. All pre-existing long
+hex specimens in the changed RPC/authentication tests remain present. The six
+skipped cleanup regressions are unchanged and remain unresolved.
 
 Validation for this embedded publication slice: all five focused publication
 tests passed; the full suite, including the additional owner-local batch test,

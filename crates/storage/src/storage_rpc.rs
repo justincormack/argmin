@@ -103,3 +103,7 @@ include!("storage_rpc/tests.rs");
 #[cfg(test)]
 #[path = "storage_rpc/stream_creation_format_tests.rs"]
 mod stream_creation_format_tests;
+
+#[cfg(test)]
+#[path = "storage_rpc/stream_append_format_tests.rs"]
+mod stream_append_format_tests;

@@ -179,6 +179,7 @@ pub(crate) enum StorageRpcMessageKind {
     ShardAckHistoricalLoad = 144,
     ShardHistoricalReadRange = 175,
     ObjectGenerationReserveCommandBuild = 176,
+    ObjectStreamAppendCommandBuild = 177,
 }
 
 /// Opaque diagnostic identifying a failure reported by a storage node.
@@ -452,6 +453,7 @@ impl StorageRpcMessageKind {
             Self::ObjectMultipartUploadMatch => "object multipart upload match",
             Self::ObjectStreamUploadCommandBuild => "object stream upload command build",
             Self::ObjectGenerationReserveCommandBuild => "object generation reserve command build",
+            Self::ObjectStreamAppendCommandBuild => "object stream append command build",
             Self::ObjectMultipartUploadCommandBuild => "object multipart upload command build",
             Self::ObjectStreamPutFinalizeSnapshotLoad => "object stream PUT finalize snapshot load",
             Self::ObjectStreamPutCommitCommandBuild => "object stream PUT commit command build",
@@ -736,6 +738,7 @@ impl StorageRpcMessageKind {
             144 => Ok(Self::ShardAckHistoricalLoad),
             175 => Ok(Self::ShardHistoricalReadRange),
             176 => Ok(Self::ObjectGenerationReserveCommandBuild),
+            177 => Ok(Self::ObjectStreamAppendCommandBuild),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }
@@ -1069,6 +1072,14 @@ pub(crate) struct StorageRpcObjectGenerationReserveCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) reservation_id: SessionId,
     pub(crate) expected_generation: GenerationId,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamAppendCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) target: StreamUploadTarget,
+    pub(crate) segment: StreamUploadSegmentRecord,
     pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 

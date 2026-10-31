@@ -17,24 +17,24 @@ use crate::BucketAclSummary;
 
 #[cfg(test)]
 thread_local! {
-    static BEFORE_STREAM_CREATION_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static BEFORE_STREAM_COMMAND_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 impl LocalStorageNodeClient {
-    pub(crate) fn test_with_before_stream_creation_lock_hook<T>(
+    pub(crate) fn test_with_before_stream_command_lock_hook<T>(
         hook: impl FnOnce() + 'static,
         action: impl FnOnce() -> T,
     ) -> T {
         struct Reset(Option<Box<dyn FnOnce()>>);
         impl Drop for Reset {
             fn drop(&mut self) {
-                BEFORE_STREAM_CREATION_LOCK.with(|slot| *slot.borrow_mut() = self.0.take());
+                BEFORE_STREAM_COMMAND_LOCK.with(|slot| *slot.borrow_mut() = self.0.take());
             }
         }
         let _reset =
-            Reset(BEFORE_STREAM_CREATION_LOCK.with(|slot| slot.replace(Some(Box::new(hook)))));
+            Reset(BEFORE_STREAM_COMMAND_LOCK.with(|slot| slot.replace(Some(Box::new(hook)))));
         action()
     }
 }
@@ -4025,6 +4025,47 @@ impl StreamUploadCreationMetadataRoute for LocalStreamUploadCreationMetadataRout
 }
 
 impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<'_> {
+    fn build_append_command(
+        &self,
+        target: &StreamUploadTarget,
+        segment: &StreamUploadSegmentRecord,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if segment.session_id != self.session_id
+            || segment.segment_okh
+                != crate::stream_segment_key_hash(&self.session_id, segment.segment_index)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream append command",
+            }
+            .into());
+        }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_STREAM_COMMAND_LOCK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let command = crate::metadata_command::AppendStreamSegmentCommand {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            target: target.clone(),
+            segment: segment.clone(),
+        };
+        pg.validate_append_stream_segment_command(&command)?;
+        pg.require_live_allocation_lifetime()?;
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            id,
+            MetadataCommandPayload::AppendStreamSegment(Box::new(command)),
+        ))
+    }
+
     fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError> {
         self.client.load_stream_upload_session(
             self.pg_id,
@@ -5472,7 +5513,7 @@ impl LocalStorageNodeClient {
             .effect_fence
             .require_valid_for(route_cluster_epoch)?;
         #[cfg(test)]
-        if let Some(hook) = BEFORE_STREAM_CREATION_LOCK.with(|slot| slot.borrow_mut().take()) {
+        if let Some(hook) = BEFORE_STREAM_COMMAND_LOCK.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -5542,7 +5583,7 @@ impl LocalStorageNodeClient {
                     context: "create stream upload pre-existing generation reservation",
                     reason: "stream creation requires an unreserved session identity".into(),
                 }
-                .into())
+                .into());
             }
             Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
