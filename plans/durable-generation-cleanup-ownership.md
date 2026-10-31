@@ -68,6 +68,9 @@ and the owner/window state remain part of the coordinated integration.
 The [append placement input](#captured-placement-input-for-append-construction--2026-10-31)
 checks fresh append placement against durable PUT/MPU generation under the primary
 lock. This remains preflight, not persisted window authority.
+The [primary preparation check](#primary-append-preparation-binding--2026-10-31)
+also rejects unallocated or crossed local slots before fresh command construction;
+it does not bind a persisted window to its issuing lifetime.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3697,3 +3700,52 @@ were assertion mistakes in the new regression: public error formatting redacts
 diagnostics. The corrected tests match the typed error and use storage's
 test-only remote-detail accessor, retaining exact `PayloadDecode` and placement
 diagnostic assertions. The six skipped cleanup regressions remain unresolved.
+
+## Primary Append Preparation Binding — 2026-10-31
+
+The integration review found a fresh-command bypass of the implemented local
+single-outstanding-slot rule: the new primary builder accepted an append without
+any preparation. The regression reproduced an index-zero/VID-one command at log
+index two immediately after creation, while the local cursor was still one.
+Application would advance that cursor without the primary ever consuming a slot.
+
+Fresh construction now requires either an exact already-appended record or the
+single locally prepared next segment: its index follows the appended prefix, its
+VID follows the prefix's maximum VID, and the local cursor equals that VID's
+checked exclusive end. The preflight result comes from the session/segment reads
+already made under the same primary PG lock, before command-ID selection. It adds
+no SQL query, transaction, fsync or format change. Unix/TLS dispatch uses the same
+local builder and rejects preparation mismatch as `PayloadDecode`.
+
+Replica apply deliberately does **not** impose primary-local consumption. It
+continues validating the immutable command and advancing its floor, including on
+replicas which never prepared the segment. The preflight type keeps that result
+separate from fresh primary issuance. Exact earlier append matching remains valid
+after later preparations/appends advance the cursor; already-built replay and
+recovery remain unchanged.
+
+Embedded and installed-Unix PUT/UploadPart tests reject unprepared, skipped-VID
+and crossed-index requests before log/slot/session/segment changes, then build
+successfully after real scoped preparation. Existing deadline/TLS fixtures now
+prepare through the scoped API rather than manufacturing an unallocated positive
+append. An owner-local canary independently crosses the consumed cursor, the
+prefix's next VID and next index, preserves state after rejection, and proves
+replica application/replay converges without local preparation. Its malformed
+extra-consumption case is explicitly owner-local, not a production writer path.
+
+This closes a fresh-construction bypass, **not** replacement-primary issuance or
+durable cleanup ownership. A local cursor can survive reopen and replicas receive
+only its applied floor; neither proves the future persisted issuer/window binding.
+Decoded recovery commands still rely on their existing command authorization and
+apply validation, not this local preflight. The coordinated owner/window records,
+retained obligations, confirmation, physical exclusion and all six cleanup
+regressions remain outstanding.
+
+Validation: the new no-preparation regression first failed against the previous
+builder, returning an append envelope as expected. All 73 focused tests then
+passed with the check installed. Full Nextest passed 9,148 tests (one slow, six
+skipped) in 261.494s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and diff checks passed. An initial focused fixture failure
+was corrected by supplying the exact loaded session/generation to preparation,
+rather than bypassing its required authority with `None`. No production check
+was relaxed. The six skipped cleanup regressions remain unresolved.

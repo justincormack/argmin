@@ -4065,7 +4065,8 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             target: target.clone(),
             segment: segment.clone(),
         };
-        pg.validate_append_stream_segment_command(&command)?;
+        pg.validate_append_stream_segment_command(&command)?
+            .require_primary_preparation()?;
         let placement_generation = match target {
             StreamUploadTarget::PutObject => {
                 pg.get_object_generation_reservation(&self.bucket, &self.key, &self.session_id)?

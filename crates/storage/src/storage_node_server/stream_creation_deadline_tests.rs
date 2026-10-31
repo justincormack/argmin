@@ -67,20 +67,52 @@ impl CreationFixture {
             EcShape { k: 1, m: 0 },
             self.request.encryption.segment_stored_size(1).unwrap(),
         );
-        StreamUploadSegmentRecord {
-            session_id: self.request.session_id.clone(),
-            segment_index: 0,
-            size: 1,
-            segment_crc64: crc,
-            payload_crc64: 0,
-            segment_okh: crate::stream_segment_key_hash(&self.request.session_id, 0),
-            segment_vid: GenerationId::MIN,
-            data_pg_id: 0,
-            placement_cluster_epoch: config.cluster_epoch,
-            ec_k: 1,
-            ec_m: 0,
-            shard_integrity: Some(witness),
-        }
+        let expected = {
+            let pg = node.get_pg(0).unwrap();
+            let session = pg.get_stream_upload(&self.request.session_id).unwrap();
+            let generation = pg
+                .get_object_generation_reservation(
+                    &self.request.bucket,
+                    &self.request.key,
+                    &self.request.session_id,
+                )
+                .unwrap();
+            match &self.request.target {
+                StreamUploadTarget::PutObject => crate::ExpectedStreamAppendState::PutObject {
+                    session,
+                    generation_id: generation,
+                },
+                StreamUploadTarget::UploadPart { .. } => crate::ExpectedStreamAppendState::UploadPart {
+                    session,
+                    upload: Box::new(self.upload.clone()),
+                    part_generation_id: generation,
+                },
+            }
+        };
+        let (_, mut segment) = client
+            .open_stream_upload_session_metadata_route(
+                config.cluster_epoch,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &self.request.bucket,
+                &self.request.key,
+                &self.request.session_id,
+            )
+            .unwrap()
+            .prepare_segment_append_with_expected_append_state(
+                &PrepareStreamUploadSegmentAppendReq {
+                    session_id: self.request.session_id.clone(),
+                    segment_index: 0,
+                    size: 1,
+                    segment_crc64: crc,
+                    payload_crc64: 0,
+                },
+                Some(&expected),
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                PayloadPlacementInput::from_server_config(config),
+            )
+            .unwrap();
+        segment.shard_integrity = Some(witness);
+        segment
     }
 
     fn new(node: &SharedStorageNode, part: bool) -> Self {

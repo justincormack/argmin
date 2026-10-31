@@ -215,6 +215,123 @@ mod tests {
     }
 
     #[test]
+    fn primary_append_preparation_binds_cursor_vid_and_index_without_gating_replica_apply() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let first = session(&store, "11");
+        store.refresh_metadata_command_state_digest().unwrap();
+        let command = append_command(&store, &first, 1, 1);
+        let preflight = |store: &PgStore, command: &MetadataCommandEnvelope| {
+            let MetadataCommandPayload::AppendStreamSegment(append) = command.payload() else {
+                unreachable!();
+            };
+            store
+                .validate_append_stream_segment_command(append)
+                .unwrap()
+                .require_primary_preparation()
+        };
+        let observe = || {
+            (
+                store.get_stream_upload(&first).unwrap(),
+                store.list_stream_segments(&first).unwrap(),
+                store.metadata_command_replica_state().unwrap(),
+                store
+                    .max_metadata_command_log_index(crate::ClusterEpoch::INITIAL)
+                    .unwrap(),
+            )
+        };
+        let reject = |command: &MetadataCommandEnvelope| {
+            let before = observe();
+            assert!(matches!(
+                preflight(&store, command),
+                Err(crate::error::StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "stream append primary preparation",
+                })
+            ));
+            assert_eq!(observe(), before);
+        };
+        // Correct VID/index without a consumed local cursor is not preparation.
+        reject(&command);
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 0)
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+        preflight(&store, &command).unwrap();
+
+        // Owner-local malformed allocator state: a matching cursor is not enough
+        // if a second local slot was consumed without committing the first.
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .allocate_stream_segment_vid_window(&first, NonZeroU32::MIN)
+            .unwrap();
+        let skipped = append_command(&store, &first, 2, 1);
+        reject(&skipped);
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        preflight(&store, &command).unwrap();
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_append(&first, 1)
+                .unwrap(),
+            GenerationId::new(2)
+        );
+
+        let MetadataCommandPayload::AppendStreamSegment(mut second) = skipped.payload().clone()
+        else {
+            unreachable!();
+        };
+        second.segment.segment_index = 2;
+        let crossed_index = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                crate::ClusterEpoch::INITIAL,
+                crate::PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::AppendStreamSegment(second.clone()),
+        );
+        // Cursor and VID match; only the next segment index is crossed.
+        reject(&crossed_index);
+        second.segment.segment_index = 1;
+        let second = MetadataCommandEnvelope::new(
+            crossed_index.id(),
+            MetadataCommandPayload::AppendStreamSegment(second),
+        );
+        preflight(&store, &second).unwrap();
+        preflight(&store, &command).unwrap(); // Exact earlier append, cursor advanced.
+        store.apply_metadata_command_and_record(0, &second).unwrap();
+        preflight(&store, &command).unwrap();
+
+        let replica_dir = test_util::tempdir();
+        let replica = PgStore::open(replica_dir.path(), 0).unwrap();
+        assert_eq!(session(&replica, "11"), first);
+        replica.refresh_metadata_command_state_digest().unwrap();
+        for command in [&command, &second] {
+            assert!(
+                preflight(&replica, command).is_err(),
+                "replica has never prepared this append"
+            );
+            replica
+                .apply_metadata_command_and_record(0, command)
+                .unwrap();
+            replica
+                .apply_metadata_command_and_record(0, command)
+                .unwrap();
+        }
+        assert_eq!(
+            replica.list_stream_segments(&first).unwrap(),
+            store.list_stream_segments(&first).unwrap()
+        );
+        assert_eq!(
+            replica.get_stream_upload(&first).unwrap().next_segment_vid,
+            store.get_stream_upload(&first).unwrap().next_segment_vid
+        );
+    }
+
+    #[test]
     fn single_slot_preparation_lost_reply_reopen_and_append_replay() {
         let dir = test_util::tempdir();
         let store = PgStore::open(dir.path(), 0).unwrap();

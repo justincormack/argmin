@@ -205,6 +205,68 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     .object_generation_segment_data_pg(&bucket, &key, reserved, 0)
                     .get()
             };
+            let error = route
+                .build_append_command(
+                    &target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config),
+                )
+                .unwrap_err();
+            assert_unprepared_append_error(&error, remote);
+            assert_eq!(
+                observe(),
+                before,
+                "an unprepared append must not allocate a command"
+            );
+            let expected = if part {
+                crate::ExpectedStreamAppendState::UploadPart {
+                    session: route.load_session().unwrap(),
+                    upload: Box::new(upload.clone()),
+                    part_generation_id: reserved,
+                }
+            } else {
+                crate::ExpectedStreamAppendState::PutObject {
+                    session: route.load_session().unwrap(),
+                    generation_id: reserved,
+                }
+            };
+            let (_, mut prepared) = route
+                .prepare_segment_append_with_expected_append_state(
+                    &PrepareStreamUploadSegmentAppendReq {
+                        session_id: session_id.clone(),
+                        segment_index: segment.segment_index,
+                        size: segment.size,
+                        segment_crc64: segment.segment_crc64,
+                        payload_crc64: segment.payload_crc64,
+                    },
+                    Some(&expected),
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config),
+                )
+                .unwrap();
+            prepared.shard_integrity = segment.shard_integrity.clone();
+            assert_eq!(prepared, segment);
+            let before = observe();
+            for case in 0..2 {
+                let mut crossed = segment.clone();
+                if case == 0 {
+                    crossed.segment_vid = GenerationId::new(2).unwrap();
+                } else {
+                    crossed.segment_index = 1;
+                    crossed.segment_okh = crate::stream_segment_key_hash(&session_id, 1);
+                }
+                let error = route
+                    .build_append_command(
+                        &target,
+                        &crossed,
+                        fence,
+                        PayloadPlacementInput::from_server_config(&config),
+                    )
+                    .unwrap_err();
+                assert_unprepared_append_error(&error, remote);
+                assert_eq!(observe(), before, "crossed preparation changed state");
+            }
             let built = route
                 .build_append_command(
                     &target,
@@ -426,6 +488,30 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 .unwrap();
             assert_eq!(route.load_segments().unwrap(), vec![segment]);
         }
+    }
+}
+
+fn assert_unprepared_append_error(error: &ObjectPgActionError, remote: bool) {
+    match error {
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch { operation })
+            if !remote =>
+        {
+            assert_eq!(*operation, "stream append primary preparation");
+        }
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail,
+            ..
+        }) if remote => {
+            assert!(
+                detail
+                    .as_str()
+                    .contains("stream append primary preparation"),
+                "{}",
+                detail.as_str()
+            );
+        }
+        _ => panic!("unexpected unprepared-append error: {error:?}"),
     }
 }
 

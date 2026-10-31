@@ -1,6 +1,26 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+/// Read-only append validation under the caller's PG lock. Replica application
+/// does not require the primary's unreplicated preparation cursor; fresh primary
+/// construction does. Keep those two guarantees distinct.
+pub(in crate::node_runtime) struct StreamAppendCommandPreflight {
+    existing: Option<StreamUploadSegmentRecord>,
+    matches_local_preparation: bool,
+}
+
+impl StreamAppendCommandPreflight {
+    pub(in crate::node_runtime) fn require_primary_preparation(self) -> Result<(), StoreError> {
+        if self.existing.is_some() || self.matches_local_preparation {
+            Ok(())
+        } else {
+            Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream append primary preparation",
+            })
+        }
+    }
+}
+
 impl PgStore {
     fn apply_put_object_metadata_command(
         &self,
@@ -319,7 +339,7 @@ impl PgStore {
     pub(in crate::node_runtime) fn validate_append_stream_segment_command(
         &self,
         command: &AppendStreamSegmentCommand,
-    ) -> Result<Option<StreamUploadSegmentRecord>, MetadataError> {
+    ) -> Result<StreamAppendCommandPreflight, MetadataError> {
         if !crate::payload_limits::stream_segment_extent_is_valid(
             command.segment.segment_index,
             command.segment.size,
@@ -329,7 +349,7 @@ impl PgStore {
                 reason: "segment exceeds the single-write index or logical-size limit".into(),
             });
         }
-        segment_vid_window::checked_segment_vid_window(
+        let window = segment_vid_window::checked_segment_vid_window(
             command.segment.segment_vid,
             std::num::NonZeroU32::MIN,
         )?;
@@ -384,8 +404,22 @@ impl PgStore {
             }
         }
 
-        let existing = self
-            .list_stream_segments(&command.segment.session_id)?
+        let segments = self.list_stream_segments(&command.segment.session_id)?;
+        let next_index = segments
+            .iter()
+            .map(|segment| segment.segment_index)
+            .max()
+            .map_or(Some(0), |index| index.checked_add(1));
+        let next_vid = segments
+            .iter()
+            .map(|segment| segment.segment_vid.get())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1);
+        let matches_local_preparation = next_index == Some(command.segment.segment_index)
+            && next_vid == Some(command.segment.segment_vid.get())
+            && session.next_segment_vid == window.end();
+        let existing = segments
             .into_iter()
             .find(|segment| segment.segment_index == command.segment.segment_index);
         if existing
@@ -396,7 +430,10 @@ impl PgStore {
                 segment_index: command.segment.segment_index,
             });
         }
-        Ok(existing)
+        Ok(StreamAppendCommandPreflight {
+            existing,
+            matches_local_preparation,
+        })
     }
 
     fn apply_append_stream_segment_command(
@@ -414,8 +451,8 @@ impl PgStore {
             "append stream segment command (begin txn)",
             "append stream segment command (commit txn)",
             |store| {
-                let existing = store.validate_append_stream_segment_command(command)?;
-                match existing {
+                let preflight = store.validate_append_stream_segment_command(command)?;
+                match preflight.existing {
                     Some(existing) if existing == command.segment => {
                         store.advance_stream_segment_vid_floor(&command.segment.session_id, &window)
                     }
