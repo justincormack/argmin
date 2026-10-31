@@ -4745,6 +4745,7 @@ impl StorageCluster {
             DurableCommand,
         }
         let mut payload_ownership = DirectPutPayloadOwnership::Caller;
+        let mut generation_reservation_released = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
             () => {{
                 if !bucket_write_proof_command_owned {
@@ -4760,11 +4761,13 @@ impl StorageCluster {
                 let release_result = release_caller_bucket_write_proof_if_unowned!();
                 match payload_ownership {
                     DirectPutPayloadOwnership::Caller => {
-                        self.release_object_generation_reservation_best_effort(
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
+                        if !generation_reservation_released {
+                            self.release_object_generation_reservation_best_effort(
+                                &req.bucket,
+                                &req.key,
+                                &req.generation_reservation_id,
+                            );
+                        }
                         self.delete_direct_put_segment_payload_shards_at_epoch(
                             effective_bucket_write_reservation.cluster_epoch,
                             req.data_pg_id,
@@ -5141,6 +5144,10 @@ impl StorageCluster {
                                     cleanup_direct_put_attempt_before_command_ownership!();
                                     return Err(cleanup_error);
                                 }
+                                // The budgeted release already published cleanup for this
+                                // exact attempt. Common cleanup still owns its bucket proof
+                                // and shards, but must not publish another release command.
+                                generation_reservation_released = true;
                             }
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));

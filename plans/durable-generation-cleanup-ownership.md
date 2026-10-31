@@ -98,6 +98,9 @@ now explores replacement overlapping an insertion that finishes after the cutoff
 unavailable inspection, and retained custody after compaction/restart. Its
 settled-prefix reconciliation is an abstract obligation, not an implemented
 replacement protocol.
+The [single-release correction](#single-release-for-a-rejected-direct-put-contender--2026-10-31)
+removes a redundant generation-release publication after successful budgeted
+loser cleanup. It does not change the planned durable custody handoff.
 The [participant-capture extraction](#captured-file-and-acknowledgement-participants--2026-10-31)
 now returns the shared resolver's actual shard locations and independent
 acknowledgement primary. Existing builders still use it only for preflight;
@@ -4467,3 +4470,40 @@ Full Nextest passed 9,173 tests (one slow, six skipped) in 237.053s. The explici
 empty-prefix trace was added after that build began; the subsequent focused run
 passed all four replacement-model tests. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and `git diff --check` passed.
+
+## Single Release For A Rejected Direct PUT Contender — 2026-10-31
+
+The integration audit found another redundant existing cleanup publication. When
+a Direct PUT observes a same-object winner and its re-evaluated precondition
+rejects, it first waits for its own generation release through the budgeted
+cleanup helper. The common caller-owned cleanup block then published that same
+release again, even when the first command had fully converged and cleared its
+pending slot. The release helper does not treat an absent reservation as a
+read-only success; the second call introduces another durable command.
+
+The foreground workflow now records successful generation release and skips
+only that step in common cleanup. Its bucket-proof release and staged-shard
+deletion still run. An error from the budgeted release does not mark it complete,
+so the existing best-effort failure path remains intact. Ordinary precondition
+rejection without a preceding release still performs generation cleanup. The
+existing successful release outcomes and pending-recovery semantics are unchanged.
+
+The strengthened three-replica terminal-cleanup handoff regression failed against
+the prior implementation with two applied release commands instead of one. It now
+requires exactly one applied command for the losing attempt on every replica,
+preserves the winner's object and shards and both unrelated reservation canaries,
+and retains assertions that the loser staging and bucket proofs are cleaned. A
+separate ordinary precondition-rejection control uses real encrypted payload and
+requires the same one-release count, complete cleanup and no object publication.
+
+This removes redundant command publication, not a measured number of filesystem
+syncs. No schema, command/RPC encoding, recovery authority or production interface
+changes. The coordinated retained owner/window integration remains outstanding;
+all six original cleanup regressions remain open.
+
+Validation: the strengthened regression reproduced two releases before the fix;
+both focused tests passed afterward. Full Nextest passed all 9,175 tests (one
+slow, six skipped) in 273.313s. Strict all-target/all-feature Clippy, the storage
+boundary checker, formatting and `git diff --check` passed. The new control
+fixture initially used inaccessible helper names; those were corrected before
+the successful focused and full runs.

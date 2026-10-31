@@ -118,6 +118,117 @@ fn assert_direct_payload_staging_cleaned(
     }
 }
 
+fn assert_single_generation_release(
+    map: &LocalClusterMap,
+    pg_id: u32,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    reservation_id: &crate::SessionId,
+) {
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(pg_id).unwrap();
+        let last = pg
+            .metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index;
+        let releases = pg
+            .retained_metadata_command_log_entries(
+                node.node_id().as_u32(),
+                ClusterEpoch::INITIAL,
+                MetadataCommandLogIndex::new(1).unwrap(),
+                MetadataCommandLogIndex::new(last).unwrap(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.kind,
+                    crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command)
+                        if matches!(command.payload(),
+                            MetadataCommandPayload::ReleaseObjectGeneration(release)
+                                if release.matches_request(bucket, key, reservation_id))
+                )
+            })
+            .count();
+        assert_eq!(
+            releases,
+            1,
+            "cleanup must publish one release on {:?}",
+            node.node_id()
+        );
+    }
+}
+
+#[test]
+fn direct_put_rejected_precondition_releases_generation_once() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("single-release");
+    let key = crate::tests::object_key("object");
+    create_test_bucket(&cluster, &bucket);
+    let reservation_id = crate::tests::stream_session_id("rejected-put");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"rejected Direct PUT staging";
+    let segment_okh = [0x71; 16];
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
+    let identity = DirectPayloadTestIdentity {
+        data_pg_id: written.data_pg_id,
+        ec: written.ec,
+        segment_okh,
+        segment_vid: generation_id,
+    };
+    assert_direct_payload_shards_exist(&cluster, identity);
+    let request = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: reservation_id.clone(),
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(&request, &written.written_shards, |_| {
+            Err::<(), _>("precondition rejected")
+        })
+        .unwrap();
+    assert!(matches!(outcome, Err("precondition rejected")));
+    assert_single_generation_release(&map, 0, &bucket, &key, &reservation_id);
+    assert_direct_payload_staging_cleaned(&map, &cluster, &bucket, &key, &reservation_id, identity);
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(0).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
 #[test]
 fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     let tmp = test_util::tempdir();
@@ -5925,6 +6036,43 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_waits_for_unrela
     assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
 
     let pg_id = PgId::new(object_pg);
+    assert_single_generation_release(&map, object_pg, &bucket, &key, &contender_reservation_id);
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap();
+        let pg = node.storage_node().get_pg(object_pg).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &same_object_reservation_id,
+            )
+            .unwrap(),
+            same_object_generation_id,
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &other_key,
+                &other_reservation_id,
+            )
+            .unwrap(),
+            other_generation_id,
+        );
+        let winner = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        assert_eq!(winner.as_live().unwrap().generation_id, generation_id);
+    }
+    assert_direct_payload_shards_exist(
+        &cluster,
+        DirectPayloadTestIdentity {
+            data_pg_id: written.data_pg_id,
+            ec: written.ec,
+            segment_okh,
+            segment_vid: generation_id,
+        },
+    );
+    assert_bucket_write_reservations_released(&map, &bucket);
     assert!(matches!(
         command.payload(),
         MetadataCommandPayload::CommitDirectPutObject(commit)
