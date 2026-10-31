@@ -507,9 +507,11 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild
         | StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild
         | StorageRpcMessageKind::ObjectMultipartUploadMatch
-        | StorageRpcMessageKind::ObjectStreamUploadCommandBuild
         | StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
             STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamUploadCommandBuild => {
+            STORAGE_RPC_MAX_STREAM_UPLOAD_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamUploadMatch => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_MATCH_REQUEST_PAYLOAD_LEN

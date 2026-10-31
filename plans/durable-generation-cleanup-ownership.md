@@ -19,8 +19,8 @@ The [atomic stream-creation implementation](#atomic-stream-generation-and-sessio
 combines stream generation reservation with session creation, before adding the
 retained owner/window records. It advances command/RPC encodings but reuses the
 existing tables and apply transaction. The unfinished cleanup prototype was
-removed; no retained ownership tables, worker, staging tickets or new RPC
-operations have landed. The six cleanup regressions remain unresolved.
+removed; no retained ownership tables, worker, staging tickets or physical-grant
+RPC operations have landed. The six cleanup regressions remain unresolved.
 The [checkpoint evidence prerequisite](#checkpoint-evidence-before-ownerwindow-state--2026-10-30)
 preserves literal current-format bytes before changing state-table membership.
 The [confirmation and issuer-lifetime refinement](#window-confirmation-and-issuer-lifetime--2026-10-30)
@@ -31,8 +31,9 @@ selects materialized-window confirmation rather than indefinitely retaining an
 introducing-command receipt, and pins the existing compaction/import behavior.
 The [local lifetime implementation](#pg-allocation-lifetime-hooks--2026-10-30)
 now tracks fresh PG-open and transfer-replacement lifetimes without persistent
-writes. Allocators do not consume that identity yet; durable issuer binding,
-primary-loss invalidation and physical write/cleanup exclusion remain open.
+writes. Fresh Direct PUT/stream builders and append preparation now reject retired
+lifetimes; matching a persisted issuer to that identity and physical write/cleanup
+exclusion remain open.
 The subsequent [storage-node route-publication hook](#storage-node-route-publication-lifetimes--2026-10-30)
 handles issuer replacement on installed storage-node route changes. Embedded
 cluster publication is covered by the subsequent embedded-lifetime slice;
@@ -3316,3 +3317,58 @@ Validation: all 22 focused lifetime tests passed. Full Nextest passed 9,131 test
 boundary checks, formatting and diff checks passed. The reported slow Raft
 heartbeat write-amplification test completed successfully in 94.690s; no rerun or
 test change was needed.
+
+## Captured Stream-Creation Fence At The Primary — 2026-10-31
+
+The input audit for first-window issuance found that stream creation still
+carried only placement and `cleanup_after` to its primary builder, unlike the
+Direct PUT builder. A cleanup horizon is not the request's immutable authority.
+Thread that missing input before deriving a physical window cutoff from it.
+
+All four creation workflows now supply an explicit `AdmittedRouteEffectFence`
+to the shared node builder. The test-only raw UploadPart adapter supplies an
+explicit unbounded fence; production paths carry their original admitted fence.
+The builder validates it before waiting for its PG lock and again after loading
+the session/reservation candidate and selected placement, immediately before
+command-ID selection. It retains the live-allocation-lifetime check. Existing
+pending installation still receives its own original fence; building neither
+inserts a session/reservation nor installs a pending slot.
+
+The Unix/TLS client validates the fence and projects its conservative absolute
+wall-clock cutoff into the RPC request. The server rebinds that cutoff to its
+own monotonic clock and intersects it with the storage node's captured route
+fence, including when the sender supplies no deadline. No monotonic timestamp or
+remaining duration is transported. A renewed/longer raw route cannot extend
+the request's shorter captured authority.
+
+RPC advances v29 → v30; creation-build admission preserves its existing payload
+budget plus the maximum 17-byte optional-deadline field. Command v12, schema,
+digest/checkpoint and encryption encodings do not change. The original 27-case
+v29 corpus, generic/encrypted frames and authentication bindings remain literal
+rejection evidence. The appended 37-case v30 corpus covers both deadline arms
+for all existing creation-precondition/cleanup alternatives. Malformed deadline,
+truncation/trailing-byte and exact-cap frame tests supplement it.
+
+Owner-local embedded/installed-Unix tests advance time after initial validation
+but before acquiring the PG lock, across the effective deadline and before the
+raw authority timestamp. They cover PUT and UploadPart, either deadline expiring
+first, and an absent delegated deadline, with successful controls and exact
+checkpoint/pending/log/candidate/session non-mutation assertions. Authenticated
+TLS tests invoke the production fenced client with different frontend/storage
+monotonic origins, demonstrating success before the portable cutoff and rejection
+after network transit crosses it while the server route remains valid.
+
+This adds no normal-path transaction or fsync. It supplies the missing cutoff
+input, not a durable window or write grant. Retained owner/window integration,
+issuer matching, confirmation, physical exclusion and all six cleanup regressions
+remain open.
+
+Validation: all 58 focused deadline/creation/format tests passed. The full-suite
+run exposed a stale-epoch fixture incorrectly given an initial-epoch fence;
+binding that fence to its request epoch restores the intended installed-server
+rejection (also verified independently). The full rerun passed all 9,135 tests
+(one slow, six skipped) in 235.419s. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and diff checks passed. TLS test setup was corrected
+to use a separate connection per receiver-clock scope and keep authenticated
+response timestamps within the supported skew; it still exercises production
+sender conversion and receiver rebinding with distinct monotonic origins.

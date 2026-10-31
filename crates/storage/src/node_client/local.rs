@@ -15,6 +15,30 @@ use crate::metadata_command::{
 };
 use crate::BucketAclSummary;
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_STREAM_CREATION_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl LocalStorageNodeClient {
+    pub(crate) fn test_with_before_stream_creation_lock_hook<T>(
+        hook: impl FnOnce() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Box<dyn FnOnce()>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_STREAM_CREATION_LOCK.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset =
+            Reset(BEFORE_STREAM_CREATION_LOCK.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
+    }
+}
+
 struct LocalObjectPayloadLease {
     storage_node: Arc<SharedStorageNode>,
     node_id: NodeId,
@@ -5444,6 +5468,13 @@ impl LocalStorageNodeClient {
         route_cluster_epoch: ClusterEpoch,
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        request
+            .effect_fence
+            .require_valid_for(route_cluster_epoch)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_STREAM_CREATION_LOCK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let pg = self.storage_node.get_pg(pg_id.get())?;
         match (&request.request.target, &request.precondition) {
             (
@@ -5555,6 +5586,9 @@ impl LocalStorageNodeClient {
             GenerationId::MIN,
         )?;
         pg.require_live_allocation_lifetime()?;
+        request
+            .effect_fence
+            .require_valid_for(route_cluster_epoch)?;
         let command_id =
             self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;
         Ok(MetadataCommandEnvelope::new(

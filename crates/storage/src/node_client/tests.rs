@@ -2879,6 +2879,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
     let command = route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&placement_config),
             request: &request,
             cleanup_after: Some(10_000),
@@ -2928,6 +2929,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     assert!(matches!(
         route
             .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 placement: PayloadPlacementInput::from_server_config(&placement_config),
                 request: &request,
                 cleanup_after: None,
@@ -2985,6 +2987,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
     };
     assert!(matches!(
         route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&placement_config),
             request: &unrelated_request,
             cleanup_after: None,

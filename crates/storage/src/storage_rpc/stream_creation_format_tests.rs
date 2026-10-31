@@ -4,8 +4,8 @@
 //! Immutable evidence for stream creation's atomic generation ownership.
 //! The raw expected-command carrier has no inner command marker; its layout is
 //! introduced in RPC v28, independently of the versioned build-response envelope.
-//! V29 preserves that payload grammar. Both prior frame corpora remain literal,
-//! rejection-only evidence.
+//! V30 adds the creation builder's portable deadline. Prior frame corpora remain
+//! literal, rejection-only evidence.
 //! These are metadata-only specimens, not readable encrypted payload fixtures.
 
 use super::*;
@@ -16,7 +16,9 @@ const REQUEST_ID: u64 = 0x0102_0304_0506_0708;
 const RETIRED: &str = include_str!("testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex");
 const RETIRED_V28: &str =
     include_str!("testdata/stream_creation_rpc_v28_command_v12_sse_s3_v5.hex");
-const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v29_command_v12_sse_s3_v5.hex");
+const RETIRED_V29: &str =
+    include_str!("testdata/stream_creation_rpc_v29_command_v12_sse_s3_v5.hex");
+const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v30_command_v12_sse_s3_v5.hex");
 
 enum Specimen {
     Match(Box<StorageRpcStreamUploadMatchRequest>),
@@ -283,16 +285,33 @@ fn specimens() -> BTreeMap<String, Specimen> {
                 }
             };
             for precondition in preconditions {
-                add(
-                    format!("build-{}-{cleanup}", precondition_name(&precondition)),
-                    Specimen::Build(Box::new(StorageRpcCreateStreamUploadCommandBuildRequest {
-                        object: object.clone(),
-                        request: request.clone(),
-                        cleanup_after,
-                        precondition,
-                        bucket_write_reservation: proof.clone(),
-                    })),
-                );
+                for (deadline, effect_deadline) in [
+                    ("none", None),
+                    (
+                        "bounded",
+                        Some(StorageRpcAdmittedRouteEffectDeadline {
+                            authority_valid_until_ms: 5_000,
+                            portable_wall_valid_until_ms: 4_000,
+                        }),
+                    ),
+                ] {
+                    add(
+                        format!(
+                            "build-{}-{cleanup}-deadline-{deadline}",
+                            precondition_name(&precondition)
+                        ),
+                        Specimen::Build(Box::new(
+                            StorageRpcCreateStreamUploadCommandBuildRequest {
+                                effect_deadline,
+                                object: object.clone(),
+                                request: request.clone(),
+                                cleanup_after,
+                                precondition: precondition.clone(),
+                                bucket_write_reservation: proof.clone(),
+                            },
+                        )),
+                    );
+                }
             }
         }
     }
@@ -373,11 +392,11 @@ fn frozen_specimens(input: &str) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn stream_creation_rpc_v29_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 29);
+fn stream_creation_rpc_v30_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 30);
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
-    assert_eq!(current.len(), 27);
+    assert_eq!(current.len(), 37);
     assert_eq!(
         current.keys().collect::<Vec<_>>(),
         frozen.keys().collect::<Vec<_>>()
@@ -392,7 +411,7 @@ fn stream_creation_rpc_v29_writers_match_frozen_command_v12_sse_s3_v5_evidence()
 }
 
 #[test]
-fn stream_creation_rpc_v29_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
+fn stream_creation_rpc_v30_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(
@@ -401,6 +420,50 @@ fn stream_creation_rpc_v29_readers_decode_frozen_command_v12_sse_s3_v5_evidence(
     );
     for (name, bytes) in frozen {
         current[&name].assert_decodes(&bytes);
+    }
+}
+
+#[test]
+fn stream_creation_deadline_codec_rejects_missing_malformed_and_trailing_fields() {
+    for (name, specimen) in specimens() {
+        let Specimen::Build(request) = specimen else {
+            continue;
+        };
+        let bytes = encode_create_stream_upload_command_build_request(&request).unwrap();
+        let deadline_len = if request.effect_deadline.is_some() {
+            17
+        } else {
+            1
+        };
+        for end in bytes.len() - deadline_len..bytes.len() {
+            assert!(
+                decode_create_stream_upload_command_build_request(&bytes[..end]).is_err(),
+                "{name}: truncated deadline"
+            );
+        }
+        let mut invalid_tag = bytes.clone();
+        invalid_tag[bytes.len() - deadline_len] = 2;
+        assert!(
+            decode_create_stream_upload_command_build_request(&invalid_tag).is_err(),
+            "{name}: invalid option tag"
+        );
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(
+            decode_create_stream_upload_command_build_request(&trailing).is_err(),
+            "{name}: trailing byte"
+        );
+        if let Some(deadline) = request.effect_deadline {
+            // Erase the conservative skew margin; an authenticated peer cannot
+            // extend the permitted cutoff to the raw authority timestamp.
+            let mut extended = bytes;
+            let end = extended.len();
+            extended[end - 8..].copy_from_slice(&deadline.authority_valid_until_ms.to_le_bytes());
+            assert!(
+                decode_create_stream_upload_command_build_request(&extended).is_err(),
+                "{name}: nonconservative deadline"
+            );
+        }
     }
 }
 
@@ -427,6 +490,19 @@ fn retired_stream_creation_rpc_v28_frames_are_rejected() {
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
             Err(StorageRpcFrameError::UnsupportedVersion(28)),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn retired_stream_creation_rpc_v29_frames_are_rejected() {
+    let frozen = frozen_specimens(RETIRED_V29);
+    assert_eq!(frozen.len(), 27);
+    for (name, bytes) in frozen {
+        assert_eq!(
+            decode_storage_rpc_frame(&bytes),
+            Err(StorageRpcFrameError::UnsupportedVersion(29)),
             "{name}"
         );
     }

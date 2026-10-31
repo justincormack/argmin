@@ -87,6 +87,13 @@ and all durable grammars remain unchanged. Immutable v28 frame and authenticatio
 binding composites remain rejection evidence alongside v29; this adds neither
 negotiation nor compatibility readers.
 
+Stream-creation building subsequently advances storage-node RPC framing to v30:
+the request now carries the original portable effect deadline, independently of
+the cleanup timestamp. The receiver intersects it with its captured route fence
+and checks it at command construction under the PG lock. Command v12 and durable
+formats remain unchanged. The complete v29 corpus and authentication composites
+remain immutable rejection evidence; v30 appends both deadline alternatives.
+
 ## Non-Goals
 
 This plan does not version the public S3 protocol, promise Rust API stability, select a new

@@ -1535,6 +1535,7 @@ pub(crate) struct StorageRpcMultipartUploadMatchResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcCreateStreamUploadCommandBuildRequest {
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: CreateStreamUploadReq,
     pub(crate) cleanup_after: Option<u64>,

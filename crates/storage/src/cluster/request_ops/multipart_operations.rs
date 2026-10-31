@@ -280,6 +280,7 @@ impl super::StorageCluster {
                 require_valid_route()?;
                 let command = match stream_creation_route.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
+                        effect_fence,
                         placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                         request: &create,
                         cleanup_after,
@@ -1491,6 +1492,7 @@ impl super::StorageCluster {
             let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
                     placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &create,
                     cleanup_after,
@@ -1762,6 +1764,7 @@ impl super::StorageCluster {
             }
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    effect_fence,
                     placement: super::PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &create,
                     cleanup_after,

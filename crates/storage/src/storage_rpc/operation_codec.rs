@@ -2071,6 +2071,7 @@ pub(crate) fn encode_create_stream_upload_command_build_request(
     put_optional_u64(&mut out, request.cleanup_after);
     put_create_stream_upload_precondition(&mut out, &request.precondition);
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -2083,6 +2084,8 @@ pub(crate) fn decode_create_stream_upload_command_build_request(
     let cleanup_after = decoder.read_optional_u64()?;
     let precondition = decoder.read_create_stream_upload_precondition()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("stream upload command build")?;
     decoder.finish()?;
     validate_create_stream_upload_request_identity(&object, &request)?;
     validate_create_stream_upload_precondition_identity(&object, &precondition)?;
@@ -2092,6 +2095,7 @@ pub(crate) fn decode_create_stream_upload_command_build_request(
         ));
     }
     Ok(StorageRpcCreateStreamUploadCommandBuildRequest {
+        effect_deadline,
         object,
         request,
         cleanup_after,

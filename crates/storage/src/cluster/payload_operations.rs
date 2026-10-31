@@ -6836,6 +6836,7 @@ impl StorageCluster {
             );
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
+                    effect_fence: route.effect_fence,
                     placement: PayloadPlacementInput::from_local_map(&self.local_map),
                     request: &request,
                     cleanup_after,

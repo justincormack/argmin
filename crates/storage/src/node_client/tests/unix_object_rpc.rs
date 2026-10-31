@@ -1781,6 +1781,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     ));
     let stream_command_error = wrong_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &stream_request,
             cleanup_after: None,
@@ -2441,6 +2442,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let part_create_command = correct_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
@@ -2458,6 +2460,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let wrong_part_create_error = wrong_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
@@ -2476,6 +2479,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
     let crossed_part_create_error = correct_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &new_part_create,
             cleanup_after: None,
@@ -3888,6 +3892,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         .unwrap());
     let stream_command = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &stream_request,
             cleanup_after: Some(12_345),
@@ -3931,6 +3936,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
             ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 placement: PayloadPlacementInput::from_server_config(&config),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
@@ -3963,6 +3969,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
             ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 placement: PayloadPlacementInput::from_server_config(&config),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
@@ -4000,6 +4007,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     };
     let err = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &missing_upload_part_stream_request,
             cleanup_after: None,
@@ -4179,6 +4187,7 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
         .unwrap();
     let err = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            effect_fence: AdmittedRouteEffectFence::unbounded(stale_epoch),
             placement: PayloadPlacementInput::from_server_config(&config),
             request: &request,
             cleanup_after: None,

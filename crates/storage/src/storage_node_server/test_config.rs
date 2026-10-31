@@ -3,6 +3,8 @@
 
 #[path = "allocation_lifetime_tests.rs"]
 mod allocation_lifetime_tests;
+#[path = "stream_creation_deadline_tests.rs"]
+mod stream_creation_deadline_tests;
 
     use super::*;
     use crate::control_plane_auth::{
@@ -5630,7 +5632,7 @@ mod allocation_lifetime_tests;
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 30] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 31] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());

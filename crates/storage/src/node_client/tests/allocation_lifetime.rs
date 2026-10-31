@@ -109,6 +109,7 @@ fn allocation_lifetime_matrix(remote: bool) {
         let placement = PayloadPlacementInput::from_server_config(&config);
         let build = || {
             route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 placement,
                 request: &request,
                 cleanup_after: Some(10_000),

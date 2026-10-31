@@ -1641,6 +1641,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    #[cfg(test)]
     fn build_create_stream_upload_command(
         &self,
         request: &CreateStreamUploadReq,
@@ -1648,7 +1649,28 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         precondition: CreateStreamUploadPrecondition<'_>,
         bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.build_create_stream_upload_command_with_effect_fence(
+            request,
+            cleanup_after,
+            precondition,
+            bucket_write_reservation,
+            AdmittedRouteEffectFence::unbounded(self.route.fence.cluster_epoch),
+        )
+    }
+
+    fn build_create_stream_upload_command_with_effect_fence(
+        &self,
+        request: &CreateStreamUploadReq,
+        cleanup_after: Option<u64>,
+        precondition: CreateStreamUploadPrecondition<'_>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
         self.require_create_stream_upload_subject(request, "stream upload command build")?;
+        let effect_fence = self.route.fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(ObjectPgActionError::Store)
+            .map_err(StorageNodeObjectRouteError::Object)?;
         let expected_operation_kind = match (&request.target, &precondition) {
             (
                 StreamUploadTarget::PutObject,
@@ -1717,6 +1739,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         )
         .and_then(|route| {
             route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                effect_fence,
                 placement: crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(&self.route.handler.config),
                 request,
                 cleanup_after,

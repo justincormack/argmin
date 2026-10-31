@@ -5244,11 +5244,14 @@ impl StorageNodeConnectionHandler {
                 CreateStreamUploadPrecondition::UploadPart { expected_upload }
             }
         };
-        let response = match route.build_create_stream_upload_command(
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
+        let response = match route.build_create_stream_upload_command_with_effect_fence(
             &request.request,
             request.cleanup_after,
             precondition,
             &request.bucket_write_reservation,
+            effect_fence,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
             Err(StorageNodeObjectRouteError::Object(

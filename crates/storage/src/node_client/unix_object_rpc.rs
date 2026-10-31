@@ -4632,6 +4632,9 @@ impl StreamUploadCreationMetadataRoute for UnixStreamUploadCreationMetadataRoute
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         self.require_build_subject(&request)?;
+        request
+            .effect_fence
+            .require_valid_for(self.route_cluster_epoch)?;
         let precondition = match request.precondition {
             CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {} => {
                 StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {}
@@ -4648,6 +4651,12 @@ impl StreamUploadCreationMetadataRoute for UnixStreamUploadCreationMetadataRoute
             }
         };
         let rpc_request = StorageRpcCreateStreamUploadCommandBuildRequest {
+            effect_deadline: request.effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
             object: self
                 .client
                 .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),

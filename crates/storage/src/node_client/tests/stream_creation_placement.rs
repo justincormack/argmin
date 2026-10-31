@@ -205,6 +205,7 @@ fn creation_placement_matrix(remote: bool) {
             let mut frontend_config = config.clone();
             frontend_config.pg_routes[selected_pg as usize].state = crate::PgState::Active;
             let build = BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 placement: PayloadPlacementInput::from_server_config(if remote {
                     &frontend_config
                 } else {
@@ -249,6 +250,7 @@ fn creation_placement_matrix(remote: bool) {
                 let mut crossed_catalogue = frontend_config.clone();
                 crossed_catalogue.pg_routes[selected_pg as usize].state = crate::PgState::Peering;
                 let crossed = BuildCreateStreamUploadCommandReq {
+                    effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                     placement: PayloadPlacementInput::from_server_config(&crossed_catalogue),
                     request: &request,
                     cleanup_after: Some(10_000),
