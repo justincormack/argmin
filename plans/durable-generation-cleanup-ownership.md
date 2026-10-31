@@ -84,6 +84,11 @@ The [owner-introduction model](#owner-introduction-and-proof-custody-model--2026
 now covers the pending-command-to-materialized-owner handoff and preservation
 of release evidence across compaction/restart. It is abstract model evidence,
 not implementation of durable owner/window records or physical exclusion.
+The [pre-install retirement contract](#pre-install-orphan-retirement-contract--2026-10-31)
+separates reservation expiry from authoritative absence of an accepted
+introduction. Its bounded model covers delayed duplicate installation and
+inspection under shared serialization; replacement-primary reconciliation
+remains an integration prerequisite, not a modelled guarantee.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -4022,3 +4027,131 @@ expected counterexamples. Exploration has a 250,000-state hard cap; reaching it
 is a failure, not a bounded success. Full `cargo nextest run --offline` passed
 all 9,158 tests (two slow, six skipped) in 239.617s. Strict all-target/all-feature
 Clippy, the storage boundary checker, formatting and `git diff --check` passed.
+
+## Pre-Install Orphan Retirement Contract — 2026-10-31
+
+### Existing boundaries and the missing distinction
+
+The source audit distinguishes three operations which must not be conflated:
+
+- `acquire_durable_bucket_write_reservation` in
+  `pg_store/metadata/metadata_store.rs` persists the bucket proof before the
+  object-PG generation command exists. The row already carries bucket
+  incarnation, operation, target context and originating epoch. It does not
+  carry a separate immutable introduction cutoff or object-PG custody state.
+- `try_install_object_pg_built_pending_command` in
+  `cluster/metadata_operations.rs` serializes build/install with a
+  **cluster-runtime-local** PG lock. Remote construction and pending installation
+  are separate operations. That frontend lock is not a storage-primary
+  installation/inspection barrier shared by all frontends.
+- `wait_for_durable_bucket_write_reservations_empty` in
+  `cluster/request_ops/bucket_delete.rs` currently releases expired reservation
+  records before continuing its drain. It does not first establish absence of
+  an introducing pending command or retained owner. This existing expiry policy
+  is **not** the future owner-aware orphan-discovery protocol.
+
+The previous model intentionally left the pre-install row unresolved. A scan of
+that row can discover the attempt, but neither expiry alone nor an early empty
+object-PG inspection proves it was never accepted. In particular, checking an
+effect fence immediately before a write does not bound the write's completion
+time: a transaction can finish after the cutoff. Inspection must also serialize
+against that in-flight installation.
+
+### Selected integration contract
+
+1. Persist an immutable **introduction acceptance cutoff** with the exact bucket
+   reservation in its existing acquisition transaction. It is distinct from the
+   renewable bucket lease and from subsequent physical-write window horizons.
+   Captured route authority can shorten it, never extend it; heartbeat and
+   restart must not restart it. Use the established absolute conservative
+   wall-clock upper bound and receiver-local monotonic binding, not a transmitted
+   duration or monotonic timestamp. Clock uncertainty fails closed. The row must
+   also retain enough exact subject/routing evidence to locate the authoritative
+   object PG until the handoff or orphan release is confirmed.
+2. Every fresh installation using this proof must enforce that cutoff at the
+   **storage-primary** pending-slot boundary. Hold the shared primary
+   installation/inspection serialization from the final check through commit
+   (or authoritative rollback). A request checked earlier, delayed in transport
+   or queued for the lock must recheck there. A commit that completes after the
+   cutoff remains an accepted command, not an orphan. Replica convergence of an
+   already accepted command is not fresh installation and must not independently
+   fail because its acceptance cutoff passed.
+3. After the immutable cutoff, inspect the exact proof's pending/materialized
+   custody under that same serialization. Return an opaque classified result:
+   **pending custodian**, **retained owner**, or **closed and absent**. The last
+   result requires a settled authoritative publication prefix, no relevant
+   pending/partial creation, and no materialized owner; absence of command-log
+   rows alone is insufficient after compaction. An unavailable witness,
+   unsettled route, failed inspection or unknown transport result is not absence.
+   Do not retire the bucket row in those cases.
+4. Release a pre-install orphan only from closed-and-absent evidence bound to
+   the exact reservation identity, bucket incarnation, object subject, cutoff
+   and authoritative route/prefix. Release is a separate bucket-PG transaction;
+   **do not hold the object-PG serialization or physical locks across it**.
+   Absence stays valid because fresh installation is closed, including delayed
+   duplicates. Retry failed/ambiguous release idempotently; conflicting replacement
+   rows must remain untouched. A restart can discard the inspection and inspect
+   again from the durable bucket record. No additional orphan tombstone is needed
+   *provided* closure survives restart and route replacement as required below.
+5. For either positive custody result, hand the attempt to exact command/owner
+   recovery. Do not let the orphan reaper, bucket-delete expiry path or frontend
+   release a still-owned proof merely because its lease expired. Existing normal
+   successful release timing remains provenance-specific; this contract does not
+   force a completed upload to keep a live bucket reservation until physical
+   owner retirement.
+
+Replacement-primary safety is a hard integration gate: the successor must
+settle the old accepted prefix/materialized owner state, and the old issuer must
+be fenced from fresh installation, before it can certify closed-and-absent.
+A local lock plus a local empty database is not sufficient. The existing
+settled-prefix and issuer-lifetime designs supply requirements for that work;
+this slice does not implement or prove their composition. Retain the required
+bucket/object historical routes throughout the unresolved handoff. Do not infer
+historical absence from an unavailable or pruned route.
+
+This uses the existing acquisition, pending insertion and owner-materialization
+transactions, plus exceptional read-only inspection and the existing exact
+release transaction. It proposes no additional ordinary-path fsync. Persisted
+cutoff/discovery fields, owner proof obligations, command/wire/state version
+advances, owner-aware bucket draining and frontend handoff must be implemented
+together. The current frontend scope's release policy is not changed by this
+model, and no proof-only command change is safe to land independently.
+
+### Bounded evidence and remaining implementation tests
+
+[`preinstall.rs`](../crates/storage/src/cleanup_ownership_model/preinstall.rs)
+models two delayed duplicate deliveries, separate bucket proof validation and
+object installation, one immutable cutoff, one restart and one failed exact
+release, with a foreign-proof canary. Installation keeps serialization across
+its check/commit gap, so time can advance while it is still in flight. A separate
+ordered test explicitly proves inspection cannot run in that gap, then observes
+the pending custodian and rejects the delayed duplicate after the cutoff.
+Another ordered trace requires failed release → restart → reinspection →
+release → rejection of both previously validated deliveries. It asserts that
+restart forgets the inspection, that release is disabled until reinspection,
+and that stale bucket-PG validation cannot authorize installation afterward.
+
+The positive exploration must exhaust and reach orphan release with both
+deliveries rejected, cutoff during installation, pending-custodian discovery,
+compacted-owner discovery after restart, and release retry across restart. Six
+independent mutations require counterexamples: early inspection, inspection
+outside serialization, missing installation fence, pending loss on restart,
+ignoring an owner after log compaction, and releasing the foreign proof.
+
+This is an **abstract candidate model**, not production-connected verification.
+It assumes one settled primary and healthy clocks; it does not model route
+replacement, replica reconciliation, lease renewal, wire rebinding, physical
+writes or terminal release. Materialization collapses converged creation/slot
+retirement; the preceding introduction model covers those replica steps
+separately. Exhaustion proves the stated finite safety properties, not fairness
+or eventual cleanup. Neither model substitutes for installed Unix/TLS delayed
+delivery, locked-insertion expiry, failed release/restart, or successor-primary
+regressions in the coordinated implementation. All six original cleanup
+regressions remain open.
+
+Validation: all four new model tests passed. The positive graph exhausted
+295 states / 721 transitions, and all six independent mutations produced their
+expected counterexamples. The 100,000-state cap fails rather than reporting
+success if exhausted. Full `cargo nextest run --offline` passed all 9,162 tests
+(two slow, six skipped) in 238.097s. Strict all-target/all-feature Clippy, the
+storage boundary checker, formatting and `git diff --check` passed.

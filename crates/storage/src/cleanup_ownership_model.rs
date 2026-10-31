@@ -22,6 +22,7 @@ mod fanout;
 mod introduction;
 mod issuer;
 mod lookahead;
+mod preinstall;
 mod publication;
 mod renewal;
 
