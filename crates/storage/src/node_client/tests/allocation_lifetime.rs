@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND;
 use crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND;
 
 #[test]
@@ -125,10 +126,13 @@ fn allocation_lifetime_matrix(remote: bool) {
         };
         let candidate = generation_route.next_object_generation_id().unwrap();
         let direct_id = crate::tests::stream_session_id("direct");
+        let mut direct_proof = proof.clone();
+        direct_proof.operation_kind = PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.into();
         let build_direct = || {
             generation_route.build_reserve_put_object_generation_command(
                 &direct_id,
                 candidate,
+                &direct_proof,
                 placement,
                 AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )

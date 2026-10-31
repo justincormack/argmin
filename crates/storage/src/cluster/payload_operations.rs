@@ -741,6 +741,21 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
+        // Owner-local allocator/replica fixtures do not load a bucket snapshot.
+        // Supply structural proof input only; production callers pass their
+        // already validated durable reservation through ActivePutObjectRoute.
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: reservation_id.as_str().into(),
+            owner_token: "generation-fixture".into(),
+            cluster_epoch: self.operation_epoch(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.into(),
+            target_context: Some(key.as_str().into()),
+            created_at: 1,
+            lease_deadline: 2,
+        };
         self.reserve_put_object_generation_with_route_validation(
             PutObjectMutationEffectRoute {
                 bucket_pg_id: self.bucket_metadata_pg(bucket),
@@ -750,6 +765,7 @@ impl StorageCluster {
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             },
             reservation_id,
+            &proof,
             || Ok(()),
         )
     }
@@ -776,6 +792,7 @@ impl StorageCluster {
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         reservation_id: &SessionId,
+        bucket_write_reservation: &BucketWriteReservationProof,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let publisher =
@@ -928,7 +945,7 @@ impl StorageCluster {
                 Some(effect_fence),
                 &mut work_budget,
                 || generation_route.build_reserve_put_object_generation_command(
-                    reservation_id, generation_id, placement, effect_fence,
+                    reservation_id, generation_id, bucket_write_reservation, placement, effect_fence,
                 ),
             ) {
                 Ok(install) => install,

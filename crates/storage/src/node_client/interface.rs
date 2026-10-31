@@ -424,6 +424,7 @@ pub(crate) trait ObjectGenerationMetadataRoute: Send {
         &self,
         reservation_id: &SessionId,
         expected_generation: GenerationId,
+        bucket_write_reservation: &BucketWriteReservationProof,
         placement: PayloadPlacementInput<'_>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;

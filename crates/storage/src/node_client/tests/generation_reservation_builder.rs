@@ -2,12 +2,138 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND;
 use crate::storage_rpc::{
     encode_object_generation_reserve_command_build_request,
     encode_object_metadata_command_build_response,
     StorageRpcObjectGenerationReserveCommandBuildRequest,
     StorageRpcObjectMetadataCommandBuildResponse,
 };
+
+fn direct_proof(bucket: &BucketName, key: &ObjectKey) -> BucketWriteReservationProof {
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), key);
+    proof.operation_kind = PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.into();
+    proof
+}
+
+#[test]
+fn generation_reservation_builder_rejects_crossed_proofs_before_storage_or_transport() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.default_ec_shape = EcShape { k: 1, m: 0 };
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let node = server.test_storage_node();
+    let bucket = crate::tests::bucket_name("generation-proof");
+    let key = crate::tests::object_key("key");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let reservation_id = crate::tests::stream_session_id("reserve");
+    let local = LocalStorageNodeClient::new(config.node_id, node.clone());
+    // No listener at this endpoint: PayloadDecode must precede transport.
+    let unavailable = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        tmp.path().join("absent.sock"),
+    );
+    let unix = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let _server = spawn_test_storage_node_server(server);
+    let observe = || {
+        let pg = node.get_pg(0).unwrap();
+        (
+            pg.metadata_command_checkpoint(config.node_id.as_u32(), config.cluster_epoch)
+                .unwrap(),
+            pg.pending_metadata_command_envelope(config.node_id.as_u32(), config.cluster_epoch)
+                .unwrap(),
+            pg.max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            PgMetadataStore::next_generation_id(&*pg, &bucket, &key).unwrap(),
+        )
+    };
+    let before = observe();
+    for crossed in 0..5 {
+        let mut proof = direct_proof(&bucket, &key);
+        match crossed {
+            0 => proof.bucket = crate::tests::bucket_name("other-bucket"),
+            1 => proof.target_context = Some("other-key".into()),
+            2 => proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.into(),
+            3 => proof.cluster_epoch = ClusterEpoch::new(2).unwrap(),
+            4 => proof.target_context = None,
+            _ => unreachable!(),
+        }
+        for client in [
+            &local as &dyn ObjectGenerationMetadataNodeClient,
+            &unavailable,
+        ] {
+            let route = client
+                .open_object_generation_metadata_route(config.cluster_epoch, pg_id, &bucket, &key)
+                .unwrap();
+            let error = route
+                .build_reserve_put_object_generation_command(
+                    &reservation_id,
+                    GenerationId::MIN,
+                    &proof,
+                    PayloadPlacementInput::from_server_config(&config),
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "build direct PUT generation reservation",
+                    }) | ObjectPgActionError::Store(StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::PayloadDecode,
+                        operation: "build direct PUT generation reservation",
+                        ..
+                    })
+                ),
+                "crossed={crossed}: {error:?}"
+            );
+            assert_eq!(observe(), before);
+        }
+        // Bypass the sender preflight to exercise the installed server's own
+        // route capability. All subjects map to this PG; placement cannot mask it.
+        let payload = encode_object_generation_reserve_command_build_request(
+            &StorageRpcObjectGenerationReserveCommandBuildRequest {
+                object: unix.object_request(pg_id.pg_id(), &bucket, &key),
+                reservation_id: reservation_id.clone(),
+                expected_generation: GenerationId::MIN,
+                bucket_write_reservation: proof,
+                effect_deadline: None,
+            },
+        );
+        let error = unix
+            .rpc_request(
+                StorageRpcMessageKind::ObjectGenerationReserveCommandBuild,
+                payload,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode, detail, ..
+        } if detail.as_str().contains("bucket write reservation proof does not match")),
+            "{error:?}"
+        );
+        assert_eq!(observe(), before);
+    }
+    let route = unix
+        .open_object_generation_metadata_route(config.cluster_epoch, pg_id, &bucket, &key)
+        .unwrap();
+    route
+        .build_reserve_put_object_generation_command(
+            &reservation_id,
+            GenerationId::MIN,
+            &direct_proof(&bucket, &key),
+            PayloadPlacementInput::from_server_config(&config),
+            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+        )
+        .unwrap();
+    assert_eq!(observe(), before, "positive read-only builder canary");
+}
 
 #[test]
 fn embedded_generation_reservation_builder_checks_primary_state_and_placement() {
@@ -76,6 +202,7 @@ fn builder_matrix(remote: bool) {
             .open_object_generation_metadata_route(config.cluster_epoch, pg_id, &bucket, &key)
             .unwrap();
         let reservation_id = crate::tests::stream_session_id("reserve");
+        let proof = direct_proof(&bucket, &key);
         let observe = || {
             let pg = node.get_pg(pg_id.get()).unwrap();
             (
@@ -98,6 +225,7 @@ fn builder_matrix(remote: bool) {
         let result = route.build_reserve_put_object_generation_command(
             &reservation_id,
             GenerationId::MIN,
+            &proof,
             placement,
             fence,
         );
@@ -142,6 +270,7 @@ fn builder_matrix(remote: bool) {
             route.build_reserve_put_object_generation_command(
                 &reservation_id,
                 GenerationId::new(2).unwrap(),
+                &proof,
                 placement,
                 fence,
             ),
@@ -156,6 +285,7 @@ fn builder_matrix(remote: bool) {
                     object: unix.object_request(pg_id.pg_id(), &bucket, &key),
                     reservation_id: reservation_id.clone(),
                     expected_generation: GenerationId::MIN,
+                    bucket_write_reservation: proof.clone(),
                     effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                         authority_valid_until_ms: 10_000,
                         portable_wall_valid_until_ms: 9_000,
@@ -196,6 +326,7 @@ fn builder_matrix(remote: bool) {
                 route.build_reserve_put_object_generation_command(
                     &reservation_id,
                     applied.3,
+                    &proof,
                     placement,
                     fence,
                 ),
@@ -256,6 +387,7 @@ fn unix_generation_reservation_builder_rejects_crossed_peer_commands() {
             MetadataCommandPayload::ReserveObjectGeneration(payload),
         ));
     }
+    let expected_proof = direct_proof(&bucket, &key);
     let server = thread::spawn(move || {
         for command in commands {
             let (mut connection, _) = listener.accept().unwrap();
@@ -263,6 +395,15 @@ fn unix_generation_reservation_builder_rejects_crossed_peer_commands() {
             assert_eq!(
                 request.kind,
                 StorageRpcMessageKind::ObjectGenerationReserveCommandBuild
+            );
+            assert_eq!(
+                crate::storage_rpc::decode_object_generation_reserve_command_build_request(
+                    &request.payload
+                )
+                .unwrap()
+                .bucket_write_reservation,
+                expected_proof,
+                "transport must preserve the complete proof, not just its route subject",
             );
             let payload = encode_object_metadata_command_build_response(
                 &StorageRpcObjectMetadataCommandBuildResponse {
@@ -300,6 +441,7 @@ fn unix_generation_reservation_builder_rejects_crossed_peer_commands() {
             .build_reserve_put_object_generation_command(
                 &reservation_id,
                 GenerationId::MIN,
+                &direct_proof(&bucket, &key),
                 PayloadPlacementInput::from_server_config(&config),
                 AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )

@@ -3049,6 +3049,7 @@ impl StorageNodeConnectionHandler {
         let outcome = match route.build_reserve_put_object_generation_command(
             &request.reservation_id,
             request.expected_generation,
+            &request.bucket_write_reservation,
             fence,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),

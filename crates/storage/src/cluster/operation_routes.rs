@@ -1107,6 +1107,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .reserve_put_object_generation_with_route_validation(
                 self.effect_route(),
                 reservation_id,
+                bucket_write_reservation,
                 || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::DirectPutFailure::from_object_pg_action)?;

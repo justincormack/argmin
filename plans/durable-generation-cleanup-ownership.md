@@ -62,6 +62,9 @@ now supplies the actual-primary construction boundary needed by future window
 issuance, without adding owner records or changing durable command semantics.
 The [explicit reservation disposition](#explicit-command-reservation-disposition--2026-10-31)
 unifies current foreground/restart release policy before adding durable obligations.
+The [Direct PUT primary proof input](#primary-direct-put-reservation-proof-input--2026-10-31)
+carries and checks the reservation subject at the builder; durable proof ownership
+and the owner/window state remain part of the coordinated integration.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3389,8 +3392,9 @@ that the live-lifetime check establishes exclusive issuance. The input and
 transaction audit below identifies the remaining changes that must land with
 that state. No owner/window table or physical grant is implemented by this audit.
 
-Subsequent prerequisite slices implement the primary-owned append builder and
-the explicit command reservation disposition below. The audit's source snapshot
+Subsequent prerequisite slices implement the primary-owned append builder,
+explicit command reservation disposition and Direct PUT primary proof input
+below. The audit's source snapshot
 and remaining coordinated-state requirements are otherwise retained.
 
 ### Bind persisted windows, not the lifetime of a frontend route object
@@ -3606,3 +3610,52 @@ Validation: six focused tests passed. Full Nextest passed 9,144 tests (one slow,
 six skipped) in 255.215s. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and diff checks passed. The six skipped cleanup regressions
 are unchanged and remain unresolved.
+
+## Primary Direct PUT Reservation Proof Input — 2026-10-31
+
+The next missing primary-builder input from the integration audit now reaches
+the actual object-PG owner. `ActivePutObjectRoute` passes its already validated
+bucket-write reservation unchanged through the generation-reservation workflow,
+the scoped node client and the installed Unix/TLS builder. Embedded and Unix
+clients reject crossed bucket, key/absent target, operation or epoch before PG
+inspection or transport; the storage-node capability independently checks the
+same subject before delegating to the local builder. The builder's existing
+placement, candidate, lifetime and captured-deadline checks remain in place.
+
+This is **structural proof-subject preflight**, not another bucket-PG durable
+record validation or a persisted ownership link. The existing admitted frontend
+continues to validate the exact live reservation. The introducing metadata
+command still does not carry the proof; attaching it to retained owner/resource
+state and preserving it through recovery remains part of the coordinated state
+slice. No extra bucket-PG lookup under the object-PG lock, SQL transaction or
+fsync is added. Owner-local allocator fixtures supply explicitly structural
+metadata-only proof inputs, rather than acquiring unrelated bucket state and
+altering their original command/placement scenarios.
+
+RPC v32 adds the full proof to kind 176. The frame cap adds its maximum encoded
+size, not a nested request's unrelated header. Command v12 and schema v9 remain
+unchanged. The previous raw request specimens, v31 frames, 37 creation specimens
+and authentication composites remain immutable rejection evidence; current v32
+fixtures are appended. The unchanged append payload still matches its original
+v31 payload specimen under the new containing frame.
+
+Coverage includes same-PG crossed proofs through the embedded route, a Unix
+client with no listener (proving pre-transport rejection), and raw requests to
+the installed server (bypassing sender checks). Complete checkpoint, pending
+slot, log index and generation observations remain unchanged after each rejected
+request and a successful read-only build. A peer regression compares the entire
+transported proof. Authenticated TLS exercises the actual fenced client with
+independent sender/receiver monotonic origins, including receiver-side expiry.
+
+Durable owner/windows, release obligations, settled-prefix confirmation and
+physical exclusion remain unimplemented. All six original cleanup regressions
+remain open; this input slice does not claim to fix them.
+
+Validation: 231 focused tests and the installed-server version-rejection test
+passed. Full Nextest passed 9,147 tests (two slow, six skipped) in 241.111s;
+strict all-target/all-feature Clippy, storage boundary checks, formatting and
+diff checks passed. The initial focused run exposed the test helper's unintended
+bucket-acquisition prerequisite and an unplaceable positive fixture; those were
+corrected without changing production validation. Both codec and installed-server
+future-version rejection matrices were updated from v32 to v33, adding v31
+rejection. All prior long RPC/authentication hex specimens remain unchanged.

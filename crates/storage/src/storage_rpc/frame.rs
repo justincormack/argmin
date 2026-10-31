@@ -538,6 +538,7 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectGenerationReserveCommandBuild => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN + 8 + 1 + 16
+                + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN
         }
         StorageRpcMessageKind::ObjectStreamAppendCommandBuild => {
             STORAGE_RPC_MAX_STREAM_APPEND_COMMAND_BUILD_REQUEST_PAYLOAD_LEN

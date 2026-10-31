@@ -1072,6 +1072,7 @@ pub(crate) struct StorageRpcObjectGenerationReserveCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) reservation_id: SessionId,
     pub(crate) expected_generation: GenerationId,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 

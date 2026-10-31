@@ -2330,6 +2330,7 @@ impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
         &self,
         reservation_id: &SessionId,
         expected_generation: GenerationId,
+        bucket_write_reservation: &BucketWriteReservationProof,
         placement: PayloadPlacementInput<'_>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
@@ -2338,6 +2339,21 @@ impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
             StorageRpcObjectGenerationReserveCommandBuildRequest,
         };
         let epoch = self.client.cluster_epoch;
+        if !bucket_write_reservation.matches_exact_mutation_subject(
+            epoch,
+            &self.bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(self.key.as_str()),
+        ) {
+            return Err(self
+                .client
+                .rpc_payload_error(
+                    "build direct PUT generation reservation",
+                    "bucket write reservation proof does not match the route, epoch, or operation"
+                        .into(),
+                )
+                .into());
+        }
         effect_fence.require_valid_for(epoch)?;
         placement.require_direct_put_placement(
             epoch,
@@ -2352,6 +2368,7 @@ impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
                 .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
             reservation_id: reservation_id.clone(),
             expected_generation,
+            bucket_write_reservation: bucket_write_reservation.clone(),
             effect_deadline: effect_fence.deadline().map(|deadline| {
                 StorageRpcAdmittedRouteEffectDeadline {
                     authority_valid_until_ms: deadline.authority_valid_until_ms(),

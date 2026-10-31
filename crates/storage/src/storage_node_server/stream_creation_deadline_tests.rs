@@ -320,6 +320,23 @@ fn tls_stream_append_builder_rebinds_sender_deadline_across_monotonic_origins() 
 }
 
 fn tls_stream_command_deadline_matrix(append: bool) {
+    tls_command_deadline_matrix(if append { TlsBuilder::Append } else { TlsBuilder::Create });
+}
+
+#[derive(Clone, Copy)]
+enum TlsBuilder {
+    Create,
+    Append,
+    DirectGeneration,
+}
+
+#[test]
+fn tls_generation_builder_carries_proof_and_rebinds_sender_deadline() {
+    tls_command_deadline_matrix(TlsBuilder::DirectGeneration);
+}
+
+fn tls_command_deadline_matrix(kind: TlsBuilder) {
+    let append = matches!(kind, TlsBuilder::Append);
     for part in [false, true] {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -340,6 +357,11 @@ fn tls_stream_command_deadline_matrix(append: bool) {
         });
         let node = server.test_storage_node();
         let fixture = CreationFixture::new(&node, part);
+        let candidate = PgMetadataStore::next_generation_id(
+            &*node.get_pg(0).unwrap(), &fixture.request.bucket, &fixture.request.key,
+        ).unwrap();
+        let mut direct_proof = fixture.proof.clone();
+        direct_proof.operation_kind = PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.into();
         let segment = append.then(|| fixture.seed_append(&node, &config));
         let before = node
             .get_pg(0)
@@ -379,6 +401,16 @@ fn tls_stream_command_deadline_matrix(append: bool) {
                 if late { 3_500 } else { 2_500 },
                 if late { 11_000 } else { 10_000 },
                 || {
+                    if matches!(kind, TlsBuilder::DirectGeneration) {
+                        return client.open_object_generation_metadata_route(
+                            config.cluster_epoch, ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                            &fixture.request.bucket, &fixture.request.key,
+                        )?.build_reserve_put_object_generation_command(
+                            &fixture.request.session_id, candidate, &direct_proof,
+                            PayloadPlacementInput::from_server_config(&config),
+                            AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500),
+                        );
+                    }
                     fixture.build_command(
                         &client,
                         &config,

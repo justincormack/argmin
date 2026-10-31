@@ -2877,9 +2877,21 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
         &self,
         reservation_id: &SessionId,
         expected_generation: GenerationId,
+        bucket_write_reservation: &BucketWriteReservationProof,
         placement: PayloadPlacementInput<'_>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        if !bucket_write_reservation.matches_exact_mutation_subject(
+            self.route_cluster_epoch,
+            &self.bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(self.key.as_str()),
+        ) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build direct PUT generation reservation",
+            }
+            .into());
+        }
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let node = &self.client.storage_node;
         let pg = node.get_pg(self.pg_id.get())?;

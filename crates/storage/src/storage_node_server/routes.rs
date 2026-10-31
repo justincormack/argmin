@@ -2527,9 +2527,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         &self,
         reservation_id: &SessionId,
         expected_generation: GenerationId,
+        bucket_write_reservation: &BucketWriteReservationProof,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
-        self.route.require_valid_now()?;
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            "build direct PUT generation reservation",
+        )?;
         let effect_fence = self.route.fence.intersect_effect_fence(effect_fence)
             .map_err(ObjectPgActionError::Store).map_err(StorageNodeObjectRouteError::Object)?;
         let client = LocalStorageNodeClient::new(
@@ -2539,7 +2544,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             &client, self.route.handler.config.cluster_epoch, self.route.pg_id,
             self.route.bucket, self.route.key,
         ).and_then(|route| route.build_reserve_put_object_generation_command(
-            reservation_id, expected_generation,
+            reservation_id, expected_generation, bucket_write_reservation,
             crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(&self.route.handler.config), effect_fence,
         )).map_err(StorageNodeObjectRouteError::Object)
     }

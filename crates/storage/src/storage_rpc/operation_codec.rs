@@ -1191,6 +1191,7 @@ pub(crate) fn encode_object_generation_reserve_command_build_request(
     let mut out = encode_object_request(&request.object);
     put_string(&mut out, request.reservation_id.as_str());
     put_u64(&mut out, request.expected_generation.get());
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
     put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     out
 }
@@ -1203,6 +1204,7 @@ pub(crate) fn decode_object_generation_reserve_command_build_request(
         object: decoder.read_rpc_object_request()?,
         reservation_id: decoder.read_session_id()?,
         expected_generation: decoder.read_generation_id()?,
+        bucket_write_reservation: decoder.read_bucket_write_reservation_proof()?,
         effect_deadline: decoder.read_admitted_route_effect_deadline("object generation reserve command build")?,
     };
     decoder.finish()?;
