@@ -71,6 +71,9 @@ lock. This remains preflight, not persisted window authority.
 The [primary preparation check](#primary-append-preparation-binding--2026-10-31)
 also rejects unallocated or crossed local slots before fresh command construction;
 it does not bind a persisted window to its issuing lifetime.
+The [Direct PUT handoff audit](#direct-put-proof-handoff-integration-gate--2026-10-31)
+identifies the remaining frontend ownership change that must accompany command
+proof persistence. Do not land a proof-only reservation-command change.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3490,6 +3493,9 @@ separate decisions.
    primary append construction, preparation, terminal retention and route-history
    references as one coherent state slice. Include the primary-owned inputs above;
    do not introduce nullable "not yet enforced" owner fields into live commands.
+   Include the Direct PUT frontend proof-handoff contract below: the existing
+   terminal-only transfer flag cannot govern a proof now owned by generation
+   reservation publication or a retained owner.
 2. Advance affected schema, command, RPC and canonical-state formats together,
    following their actual containment rules. Preserve the committed schema-9,
    command-12, RPC-30 and checkpoint/state composite specimens unchanged; append
@@ -3749,3 +3755,100 @@ checks, formatting and diff checks passed. An initial focused fixture failure
 was corrected by supplying the exact loaded session/generation to preparation,
 rather than bypassing its required authority with `None`. No production check
 was relaxed. The six skipped cleanup regressions remain unresolved.
+
+## Direct PUT Proof Handoff Integration Gate — 2026-10-31
+
+The next command change cannot safely be limited to adding the already-validated
+bucket proof to `ReserveObjectGeneration`. That is necessary evidence, but the
+frontend still owns release until terminal publication. This audit refines the
+coordinated state slice; it does not change production ownership or formats.
+
+### Current ownership path
+
+- [`put.rs`](../crates/server-core/src/coordinator/put.rs),
+  `put_object_from_authorized_write_on_admitted_route`, sets
+  `proof_transferred_to_command` only immediately before `commit_direct_object`.
+  Generation reservation, encryption and shard
+  writing occur earlier. Any returned error from those steps selects
+  `BucketWriteSnapshotAction::release`.
+- [`bucket_delete.rs`](../crates/storage/src/cluster/request_ops/bucket_delete.rs),
+  `with_put_object_bucket_write_snapshot_for_command_with_route_validation`, acts
+  on that decision by releasing the durable bucket reservation; the snapshot
+  callback does not return exact generation-publication ownership evidence.
+- [`payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs),
+  `reserve_put_object_generation_with_route_validation`, returns only a generation
+  or `ObjectPgActionError`. It can leave an installed/partially applied command
+  for recovery. The error type does not tell the coordinator whether its own
+  generation command took custody of the bucket proof, as opposed to an unrelated
+  contender blocking progress.
+- [`metadata_operations.rs`](../crates/storage/src/cluster/metadata_operations.rs),
+  `validate_metadata_command_bucket_write_reservation_inner`, validates a
+  command-carried primary proof against the durable bucket-PG record. Once the
+  reservation command carries that proof, releasing it on the earlier frontend
+  error path can prevent later validation of otherwise recoverable work.
+
+Today the generation command carries no bucket proof, so this audit does not
+claim the additional validation failure already occurs. It is a dependency of
+the proposed format change. Conversely, simply setting the frontend transfer
+flag before calling reservation is also wrong: a rejected build/install would
+then leave no durable recipient responsible for releasing the proof.
+
+### Required closed handoff contract
+
+The storage-owned attempt must distinguish the following states/outcomes; a
+generic error, a boolean set before a call, or the mere presence of some pending
+command is not sufficient evidence.
+
+| Boundary/outcome | Owner of exact bucket-proof release responsibility |
+| --- | --- |
+| Before installation; read-only build rejection; authoritative proof that this attempt was never installed | Frontend reservation scope; release normally. An unrelated contender does not acquire this attempt's proof. |
+| This attempt's exact installation may have applied, publication started, or any replica applied | Exact command/recovery handoff; frontend must not independently release. Preserve the full introducing envelope and pending route dependencies until convergence/authorized abandonment. |
+| Generation reservation and retained owner applied, including lost success response | Retained owner; generation, owner, proof obligation and first window are committed together. Do not require the frontend to receive a capability before durable custody exists. |
+| Encryption, shard-write or pre-terminal failure after reservation | Retained owner/cancellation transition; preserve its proof and all issued-window obligations before relinquishing the frontend. Do not restore frontend-only release because no terminal command was installed. |
+| Terminal publication or authoritative unstarted abandonment | The exact command/owner transition decides existing release timing. Persist unresolved responsibility before removing its previous owner; partial/ambiguous publication still converges. |
+
+Keep logical request failure separate from this ownership result. The scoped
+storage workflow should own the decision, including cancellation/drop; the
+coordinator should map the S3 error without reconstructing custody from an error
+code. A successful return must bind the same generation, reservation identity,
+bucket incarnation and exact stable bucket proof as the durable owner. Recovery
+of a matching reservation must not substitute a newly supplied proof. If exact
+installation outcome is unknown, retain/handoff conservatively rather than
+release on a failed inspection.
+
+Persisting the proof only in the introducing log/receipt is insufficient after
+compaction or transfer. Add it to the retained resource obligation in the same
+apply transaction. Preserve the explicit disposition: reservation apply retains
+the live proof for staging; it is not ordinary release-on-apply. The pending
+command pins the bucket-PG route until materialization, and the owner pins that
+exact PG/epoch until release responsibility is durably retired. No new normal-path
+transaction or standalone proof-handoff command is selected.
+
+### Implementation and regression consequences
+
+Land the introducing-command proof, retained owner/resource state, central
+subject/identity validation, pending route references and frontend handoff
+together. Update the exact command matcher and Unix response validation to bind
+the transported proof, not merely bucket/key/generation. Keep already-published
+and authoritatively unstarted outcomes distinct through reissue and recovery.
+
+The current owner-local raw generation helper supplies only a structural proof,
+and numerous publication fixtures use proof-free generation commands. They must
+not gain a `cfg(test)` bypass around new production proof validation. Fixtures
+which exercise fanout/recovery must acquire real bucket reservations and preserve
+their unrelated-resource canaries. Metadata-only codec/store fixtures can supply
+explicitly synthetic proof records without claiming bucket-PG authorization.
+
+Acceptance must independently cover rejection before install, unrelated-contender
+failure, accepted-install response loss, witness-first partial apply, slot-removal
+failure after apply, lost reservation success, encryption/write failure before
+terminal publication, cancellation, reissue, checkpoint/import and reopen. For
+each case assert exactly which component owns the proof, that an unrelated proof
+is unchanged, and that later authorized recovery converges. Include the actual
+coordinator path so its snapshot callback cannot silently release a handed-off
+proof. Successful reservation must demonstrably retain the proof, and successful
+terminal publication must retain the existing release timing.
+
+No production code or encoding is changed by this audit. All six cleanup
+regressions remain open. Validation: source call-chain review and
+`git diff --check`; no Rust test run for this documentation-only change.
