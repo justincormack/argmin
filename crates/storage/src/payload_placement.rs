@@ -32,6 +32,24 @@ enum PlacementSource<'a> {
 }
 
 impl<'a> PayloadPlacementInput<'a> {
+    pub(in crate::node_runtime) fn require_direct_put_placement(
+        self,
+        epoch: crate::ClusterEpoch,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        reservation_id: &crate::SessionId,
+        generation: GenerationId,
+    ) -> Result<(), StoreError> {
+        let (pg_id, ec) = self.stream_data_pg(bucket, key, 0, generation, None)?;
+        self.require_segment_placement(
+            epoch,
+            pg_id,
+            ec,
+            &crate::direct_put_segment_key_hash(reservation_id, 0),
+            generation,
+        )
+    }
+
     pub(in crate::node_runtime) fn first_stream_data_pg(
         self,
         build: &super::clients::BuildCreateStreamUploadCommandReq<'_>,

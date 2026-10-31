@@ -420,6 +420,14 @@ pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
 }
 
 pub(crate) trait ObjectGenerationMetadataRoute: Send {
+    fn build_reserve_put_object_generation_command(
+        &self,
+        reservation_id: &SessionId,
+        expected_generation: GenerationId,
+        placement: PayloadPlacementInput<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
     fn object_generation_reservation(
         &self,
         reservation_id: &SessionId,

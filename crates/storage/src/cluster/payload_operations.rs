@@ -921,30 +921,26 @@ impl StorageCluster {
             )?;
             self.maybe_run_before_metadata_command_pending_install_hook();
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
+            let install = match self.install_allocator_cleanup_built_metadata_command(
                 publisher,
                 pg_id,
                 bucket,
-                AllocatorCleanupFreshInstallAdmission {
-                    completion_admission: false,
-                    effect_fence: Some(effect_fence),
-                },
+                Some(effect_fence),
                 &mut work_budget,
-                |command_id| {
-                    MetadataCommandEnvelope::new(
-                        command_id,
-                        MetadataCommandPayload::ReserveObjectGeneration(
-                            ReserveObjectGenerationCommand::new(
-                                bucket.clone(),
-                                key.clone(),
-                                reservation_id.clone(),
-                                generation_id,
-                                crate::clock::current_time_millis(),
-                            ),
-                        ),
-                    )
+                || generation_route.build_reserve_put_object_generation_command(
+                    reservation_id, generation_id, placement, effect_fence,
+                ),
+            ) {
+                Ok(install) => install,
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    work_budget.sleep_after_contention(
+                        "object generation reservation primary revalidation retry budget exhausted",
+                    ).map_err(ObjectPgActionError::Store)?;
+                    continue;
                 },
-            )? {
+                Err(error) => return Err(error),
+            };
+            let command = match install {
                 AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
                 AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget

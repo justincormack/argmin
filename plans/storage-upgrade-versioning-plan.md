@@ -80,6 +80,13 @@ unchanged. Exact v11/v27 specimens remain rejection evidence beside new v12/v28
 composites; this is not mixed-version support. See the normative
 [format ledger](../guides/storage-format-ledger.md#atomic-stream-creation-format-vector-2026-10-29).
 
+The primary-side Direct PUT generation-reservation builder subsequently advances
+storage-node RPC framing to v29 (new kind 176). Its request binds the reservation
+identity, expected generation and portable effect deadline. Metadata-command v12
+and all durable grammars remain unchanged. Immutable v28 frame and authentication
+binding composites remain rejection evidence alongside v29; this adds neither
+negotiation nor compatibility readers.
+
 ## Non-Goals
 
 This plan does not version the public S3 protocol, promise Rust API stability, select a new

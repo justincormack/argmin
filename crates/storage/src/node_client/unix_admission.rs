@@ -558,6 +558,7 @@ pub(crate) fn storage_rpc_admission_class(
         StorageRpcMessageKind::BucketCreateCommandBuild
         | StorageRpcMessageKind::ObjectGenerationNext
         | StorageRpcMessageKind::ObjectGenerationReservation
+        | StorageRpcMessageKind::ObjectGenerationReserveCommandBuild
         | StorageRpcMessageKind::ObjectVersionNext
         | StorageRpcMessageKind::BucketWriteReservationAcquire
         | StorageRpcMessageKind::MetadataCommandNextId

@@ -3,8 +3,9 @@
 
 //! Immutable evidence for stream creation's atomic generation ownership.
 //! The raw expected-command carrier has no inner command marker; its layout is
-//! owned by RPC v28, independently of the versioned build-response envelope.
-//! The prior v27/v11 corpus remains literal, rejection-only evidence.
+//! introduced in RPC v28, independently of the versioned build-response envelope.
+//! V29 preserves that payload grammar. Both prior frame corpora remain literal,
+//! rejection-only evidence.
 //! These are metadata-only specimens, not readable encrypted payload fixtures.
 
 use super::*;
@@ -13,7 +14,9 @@ use std::collections::BTreeMap;
 
 const REQUEST_ID: u64 = 0x0102_0304_0506_0708;
 const RETIRED: &str = include_str!("testdata/stream_creation_rpc_v27_command_v11_sse_s3_v5.hex");
-const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v28_command_v12_sse_s3_v5.hex");
+const RETIRED_V28: &str =
+    include_str!("testdata/stream_creation_rpc_v28_command_v12_sse_s3_v5.hex");
+const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v29_command_v12_sse_s3_v5.hex");
 
 enum Specimen {
     Match(Box<StorageRpcStreamUploadMatchRequest>),
@@ -370,8 +373,8 @@ fn frozen_specimens(input: &str) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn stream_creation_rpc_v28_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 28);
+fn stream_creation_rpc_v29_writers_match_frozen_command_v12_sse_s3_v5_evidence() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 29);
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(current.len(), 27);
@@ -389,7 +392,7 @@ fn stream_creation_rpc_v28_writers_match_frozen_command_v12_sse_s3_v5_evidence()
 }
 
 #[test]
-fn stream_creation_rpc_v28_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
+fn stream_creation_rpc_v29_readers_decode_frozen_command_v12_sse_s3_v5_evidence() {
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(
@@ -411,6 +414,19 @@ fn retired_stream_creation_rpc_v27_frames_are_rejected() {
                 decode_storage_rpc_frame(&bytes),
                 Err(StorageRpcFrameError::UnsupportedVersion(27))
             ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn retired_stream_creation_rpc_v28_frames_are_rejected() {
+    let frozen = frozen_specimens(RETIRED_V28);
+    assert_eq!(frozen.len(), 27);
+    for (name, bytes) in frozen {
+        assert_eq!(
+            decode_storage_rpc_frame(&bytes),
+            Err(StorageRpcFrameError::UnsupportedVersion(28)),
             "{name}"
         );
     }

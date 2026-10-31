@@ -583,8 +583,15 @@ contention; other construction errors propagate without installing a slot.
 The returned envelope must match the PG and route epoch, and insertion retains
 the supplied immutable effect fence. This frontend serialization is not a
 substitute for primary-side transactional validation or deadline checks in a
-remote builder. Current reservation/version/release builders still use the
-fresh-ID adapter; the storage-primary Direct PUT builder is not yet implemented.
+remote builder. Direct PUT's scoped generation route now supplies a primary-built
+reservation command: under the primary PG lock it checks reservation absence,
+revalidates the expected generation, resolves the selected data placement and
+checks the effect fence immediately before selecting the command ID. A stale
+candidate returns to the outer loop without installation. Unix/TLS intersects the
+delegated deadline with the server's captured route fence and validates the
+returned PG, epoch, bucket, key, reservation ID and generation. Version/release
+builders retain the fresh-ID adapter. Neither builder path publishes a pending
+slot; that ownership transfer remains the installer's responsibility.
 Terminal-session publishers use
 `install_terminal_session_retry_metadata_command`, whose exhaustive result
 distinguishes installation, a matching visible contender, an unrelated visible

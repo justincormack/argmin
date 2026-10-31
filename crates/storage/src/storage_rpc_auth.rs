@@ -1555,6 +1555,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::BucketCreateCommandBuild
         | StorageRpcMessageKind::ObjectGenerationNext
         | StorageRpcMessageKind::ObjectGenerationReservation
+        | StorageRpcMessageKind::ObjectGenerationReserveCommandBuild
         | StorageRpcMessageKind::BucketSnapshotLoad
         | StorageRpcMessageKind::DirectPutCommitSnapshotLoad
         | StorageRpcMessageKind::DirectPutCommitCommandBuild
@@ -2231,7 +2232,19 @@ mod tests {
             decode_binding(&retired),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        assert_eq!(hex_bytes(&request), "4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d651c0008070605040302010300030000001a5f26d7c4b7e16f616263");
+        const V28_REQUEST_HEX: &str = "4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d651c0008070605040302010300030000001a5f26d7c4b7e16f616263";
+        let retired = V28_REQUEST_HEX
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_binding(&retired),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        assert_eq!(hex_bytes(&request), "4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d651d0008070605040302010300030000000bac1943ff079898616263");
 
         let transcript = storage_rpc_request_transcript(b"fixed authenticated request envelope");
         assert_eq!(
@@ -2258,7 +2271,19 @@ mod tests {
             decode_binding(&retired),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        assert_eq!(hex_bytes(&response), "41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d651c0008070605040302010300030000001a5f26d7c4b7e16f616263");
+        const V28_RESPONSE_HEX: &str = "41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d651c0008070605040302010300030000001a5f26d7c4b7e16f616263";
+        let retired = V28_RESPONSE_HEX
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_binding(&retired),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        assert_eq!(hex_bytes(&response), "41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d651d0008070605040302010300030000000bac1943ff079898616263");
 
         let decoded_request = decode_binding(&request).unwrap();
         assert!(decoded_request.request_transcript.is_none());
@@ -2671,7 +2696,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 172, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 173, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

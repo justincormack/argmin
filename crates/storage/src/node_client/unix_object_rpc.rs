@@ -2326,6 +2326,64 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
+    fn build_reserve_put_object_generation_command(
+        &self,
+        reservation_id: &SessionId,
+        expected_generation: GenerationId,
+        placement: PayloadPlacementInput<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        use crate::storage_rpc::{
+            encode_object_generation_reserve_command_build_request,
+            StorageRpcObjectGenerationReserveCommandBuildRequest,
+        };
+        let epoch = self.client.cluster_epoch;
+        effect_fence.require_valid_for(epoch)?;
+        placement.require_direct_put_placement(
+            epoch,
+            &self.bucket,
+            &self.key,
+            reservation_id,
+            expected_generation,
+        )?;
+        let request = StorageRpcObjectGenerationReserveCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            reservation_id: reservation_id.clone(),
+            expected_generation,
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectGenerationReserveCommandBuild,
+            self.pg_id.pg_id(), encode_object_generation_reserve_command_build_request(&request),
+            "decode object generation reserve command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                let valid = command.id().pg_id() == self.pg_id.pg_id()
+                    && command.id().cluster_epoch() == epoch
+                    && matches!(command.payload(), MetadataCommandPayload::ReserveObjectGeneration(reservation)
+                        if reservation.matches_request(&self.bucket, &self.key, reservation_id)
+                            && reservation.generation_id == expected_generation);
+                if !valid {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate object generation reserve command build response",
+                        "command does not match the requested generation reservation".into(),
+                    )));
+                }
+                Ok(())
+            },
+        )?.ok_or_else(|| self.client.rpc_payload_error(
+            "decode object generation reserve command build response",
+            "generation reservation command build cannot return missing".into(),
+        ).into())
+    }
+
     fn object_generation_reservation(
         &self,
         reservation_id: &SessionId,

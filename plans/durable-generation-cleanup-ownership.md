@@ -3223,3 +3223,54 @@ Validation: all 39 focused allocator/generation/Unix race tests passed. Full
 Nextest passed 9,121 tests (one slow, six skipped) in 256.099s. Strict
 all-target/all-feature Clippy, storage boundary checks, formatting and diff
 checks passed.
+
+## Primary-Side Direct PUT Reservation Builder — 2026-10-31
+
+Fresh Direct PUT now obtains its complete `ReserveObjectGeneration` command
+through the scoped object-generation node route. The frontend retains candidate
+and captured-placement preflight; the actual metadata-primary builder locks its
+PG, requires reservation absence, selects the current generation read-only and
+compares it to that candidate, resolves index-zero placement from actual store
+topology and captured routes, and validates the immutable effect fence just
+before command-ID selection. The creation timestamp is primary-owned. Building
+does not install a pending slot or insert a reservation. The existing allocator
+installer still owns publication, one-contender draining, request budgets and
+exact recovery handoffs. Stale candidates restart the outer loop before fresh
+installation; post-build races remain protected by ordinary install/apply
+conflict validation.
+
+RPC kind 176 carries the exact subject/reservation ID, expected generation and
+optional conservative absolute wall-clock deadline. The handler admits the
+active primary route, rebinds that portable cutoff and intersects it with its
+own captured route deadline before local construction. The client validates
+every returned subject field, PG, epoch and generation; missing or crossed
+commands are `PayloadDecode`, not successful reservation evidence. No process-
+local monotonic timestamp is serialized. The shared client supports Unix/TLS;
+this slice's new installed-server regressions use Unix.
+
+Embedded/Unix matrices distinguish the selected data PG from the object PG,
+reject unavailable selected placement even with a healthy frontend catalogue,
+permit unrelated Peering PGs, reject stale generations and existing identities,
+and compare reservation absence, pending slots, log/replica state and generation
+candidates. A bounded successful request exercises sender conversion; an expired
+raw portable request exercises receiver rejection. A malicious peer crosses PG,
+epoch, bucket, key, reservation ID and generation independently. Deterministic
+frontend pre-install races verify the primary check rejects a stale candidate
+without publishing/abandoning an extra command. Unix race observations now use
+the live server-owned node rather than reopening its files.
+
+Storage RPC advances v28 → v29; metadata commands remain v12 and durable formats
+are unchanged. Frozen request evidence covers both deadline branches and exact
+maximum-frame admission. Original v28 frames, stream-creation corpus and v2/v28
+authentication bindings remain immutable rejection evidence; current v29
+composites are appended. No transaction or fsync is added. This supplies the
+actual-primary construction boundary, not the durable issuer/window descriptor,
+owner retention, confirmation or physical deletion exclusion. Those integrations
+and all six ignored cleanup regressions remain open.
+
+Validation: all 237 focused generation, race and RPC-format tests passed. Full
+Nextest passed 9,128 tests (one slow, six skipped) in 265.085s. Strict
+all-target/all-feature Clippy, storage boundary checks, formatting and diff
+checks passed. An initial focused run caught the authentication-binding golden
+still expecting the nested v28 frame; its literal request/response specimens
+are now preserved as rejection evidence beside the appended v29 composites.

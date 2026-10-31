@@ -1185,6 +1185,30 @@ pub(crate) fn encode_object_generation_reservation_request(
     out
 }
 
+pub(crate) fn encode_object_generation_reserve_command_build_request(
+    request: &StorageRpcObjectGenerationReserveCommandBuildRequest,
+) -> Vec<u8> {
+    let mut out = encode_object_request(&request.object);
+    put_string(&mut out, request.reservation_id.as_str());
+    put_u64(&mut out, request.expected_generation.get());
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
+    out
+}
+
+pub(crate) fn decode_object_generation_reserve_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectGenerationReserveCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let request = StorageRpcObjectGenerationReserveCommandBuildRequest {
+        object: decoder.read_rpc_object_request()?,
+        reservation_id: decoder.read_session_id()?,
+        expected_generation: decoder.read_generation_id()?,
+        effect_deadline: decoder.read_admitted_route_effect_deadline("object generation reserve command build")?,
+    };
+    decoder.finish()?;
+    Ok(request)
+}
+
 pub(crate) fn decode_object_generation_reservation_request(
     bytes: &[u8],
 ) -> Result<StorageRpcObjectGenerationReservationRequest, StorageRpcPayloadError> {

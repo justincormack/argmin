@@ -5443,6 +5443,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+    let remote = server.test_storage_node();
     let _server_guard = spawn_storage_node_server(server);
 
     let build_frontend = |name: &str| {
@@ -5514,13 +5515,14 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
         ),
         Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
     ));
-    let remote = SharedStorageNode::open_with_default_ec_shape(
-        &server_config.data_dir,
-        &server_config.pg_ids,
-        server_config.default_ec_shape,
-    )
-    .unwrap();
     let remote_pg = remote.get_pg(0).unwrap();
+    assert_eq!(
+        remote_pg
+            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+            .unwrap(),
+        2,
+        "frontend reinspection must avoid publishing the stale candidate"
+    );
     assert_eq!(
         crate::PgMetadataStore::get_object_generation_reservation(
             &*remote_pg,
@@ -5578,6 +5580,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
+    let remote = server.test_storage_node();
     let _server_guard = spawn_storage_node_server(server);
 
     let build_frontend = |name: &str| {
@@ -5645,13 +5648,9 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
         ),
         Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
     ));
-    let remote = SharedStorageNode::open_with_default_ec_shape(
-        &server_config.data_dir,
-        &server_config.pg_ids,
-        server_config.default_ec_shape,
-    )
-    .unwrap();
     let remote_pg = remote.get_pg(0).unwrap();
+    assert_eq!(remote_pg.max_metadata_command_log_index(ClusterEpoch::INITIAL).unwrap(), 2,
+        "primary revalidation must reject the stale candidate before installing/abandoning an extra command");
     assert_eq!(
         crate::PgMetadataStore::get_object_generation_reservation(
             &*remote_pg,

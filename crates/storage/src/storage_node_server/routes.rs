@@ -2472,6 +2472,27 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn build_reserve_put_object_generation_command(
+        &self,
+        reservation_id: &SessionId,
+        expected_generation: GenerationId,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let effect_fence = self.route.fence.intersect_effect_fence(effect_fence)
+            .map_err(ObjectPgActionError::Store).map_err(StorageNodeObjectRouteError::Object)?;
+        let client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id, Arc::clone(&self.route.handler.node),
+        );
+        ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
+            &client, self.route.handler.config.cluster_epoch, self.route.pg_id,
+            self.route.bucket, self.route.key,
+        ).and_then(|route| route.build_reserve_put_object_generation_command(
+            reservation_id, expected_generation,
+            crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(&self.route.handler.config), effect_fence,
+        )).map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn generation_reservation(
         &self,
         reservation_id: &SessionId,

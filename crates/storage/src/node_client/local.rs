@@ -99,9 +99,9 @@ struct LocalObjectReadMetadataRoute {
     authorization: MetadataReadAuthorization,
 }
 
-struct LocalObjectGenerationMetadataRoute {
-    storage_node: Arc<SharedStorageNode>,
-    _route_cluster_epoch: ClusterEpoch,
+struct LocalObjectGenerationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
     bucket: BucketName,
     key: ObjectKey,
@@ -2838,8 +2838,8 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
         }
         self.storage_node.require_open_pg(pg_id.get())?;
         Ok(Box::new(LocalObjectGenerationMetadataRoute {
-            storage_node: Arc::clone(&self.storage_node),
-            _route_cluster_epoch: route_cluster_epoch,
+            client: self,
+            route_cluster_epoch,
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
@@ -2847,12 +2847,71 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
-impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute {
+impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
+    fn build_reserve_put_object_generation_command(
+        &self,
+        reservation_id: &SessionId,
+        expected_generation: GenerationId,
+        placement: PayloadPlacementInput<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let node = &self.client.storage_node;
+        let pg = node.get_pg(self.pg_id.get())?;
+        match PgMetadataStore::get_object_generation_reservation(
+            &*pg,
+            &self.bucket,
+            &self.key,
+            reservation_id,
+        ) {
+            Ok(_) => return Err(ObjectPgActionError::StaleObjectReadSubject),
+            Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let generation = PgMetadataStore::next_generation_id(&*pg, &self.bucket, &self.key)?;
+        if generation != expected_generation {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let data_pg = node.pg_topology().object_generation_segment_data_pg(
+            &self.bucket,
+            &self.key,
+            generation,
+            0,
+        );
+        placement.require_segment_placement(
+            self.route_cluster_epoch,
+            data_pg.get(),
+            node.default_ec_shape(),
+            &crate::direct_put_segment_key_hash(reservation_id, 0),
+            generation,
+        )?;
+        // Candidate, reservation absence, placement and ID are inspected under
+        // the actual primary PG lock. Building never installs a pending slot.
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            id,
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    self.bucket.clone(),
+                    self.key.clone(),
+                    reservation_id.clone(),
+                    generation,
+                    crate::clock::current_time_millis(),
+                ),
+            ),
+        ))
+    }
+
     fn object_generation_reservation(
         &self,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         Ok(PgMetadataStore::get_object_generation_reservation(
             &*pg,
             &self.bucket,
@@ -2862,7 +2921,7 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute {
     }
 
     fn next_object_generation_id(&self) -> Result<GenerationId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         Ok(PgMetadataStore::next_generation_id(
             &*pg,
             &self.bucket,

@@ -183,13 +183,22 @@ fn direct_put_reservation_rejects_unavailable_selected_placement_before_publicat
 
 #[test]
 fn direct_put_reservation_rechecks_new_candidate_placement_after_generation_race() {
+    recheck_candidate_placement_after_race(false);
+}
+
+#[test]
+fn direct_put_reservation_primary_recheck_prevents_stale_pending_installation() {
+    recheck_candidate_placement_after_race(true);
+}
+
+fn recheck_candidate_placement_after_race(after_frontend_preflight: bool) {
     let f = Fixture::new();
     let restricted = f.unavailable(f.second_pg);
     let loser = crate::tests::stream_session_id("loser");
     let winner = crate::tests::stream_session_id("winner");
     let after_winner = Arc::new(Mutex::new(None));
     let ran = Arc::new(AtomicBool::new(false));
-    let _hook = restricted.test_install_before_object_generation_command_id_hook({
+    let hook = {
         let healthy = f.healthy.clone();
         let map = f.map.clone();
         let (bucket, key, loser, winner) = (
@@ -209,8 +218,15 @@ fn direct_put_reservation_rechecks_new_candidate_placement_after_generation_race
                 );
                 *observed.lock().unwrap() = Some(observe(&map, &bucket, &key, &loser));
             }
-        })
-    });
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+    // The later hook is after both frontend candidate reads and placement
+    // preflight. Only primary-side revalidation can avoid installing and then
+    // abandoning a stale generation command in this case.
+    let _early_hook = (!after_frontend_preflight)
+        .then(|| restricted.test_install_before_object_generation_command_id_hook(hook.clone()));
+    let _late_hook = after_frontend_preflight
+        .then(|| restricted.test_install_before_metadata_command_pending_install_hook(hook));
     assert!(
         matches!(restricted.reserve_put_object_generation(&f.bucket, &f.key, &loser),
         Err(ObjectPgActionError::Store(StoreError::PgNotActive { pg_id, .. })) if pg_id == f.second_pg)

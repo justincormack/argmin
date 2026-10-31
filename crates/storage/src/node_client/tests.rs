@@ -4407,6 +4407,9 @@ mod unix_metadata_rpc;
 mod publication_transport_model;
 #[path = "tests/stream_creation_placement.rs"]
 mod stream_creation_placement;
+
+#[path = "tests/generation_reservation_builder.rs"]
+mod generation_reservation_builder;
 #[path = "tests/stream_extent.rs"]
 mod stream_extent;
 #[path = "tests/unix_object_rpc.rs"]
