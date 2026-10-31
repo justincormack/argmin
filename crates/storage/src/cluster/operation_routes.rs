@@ -190,6 +190,124 @@ pub struct ActivePutObjectRoute<'admission> {
     object_pg_id: ObjectMetadataPgId,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectPutProofCustody {
+    Frontend,
+    GenerationAttempted,
+    TerminalPublication,
+}
+
+/// Storage-owned release responsibility for one Direct PUT bucket reservation.
+/// The callback cannot declare a handoff: entering terminal publication through
+/// this scope transfers the exact proof. Earlier failures retain normal release
+/// timing. This is not yet durable generation/owner custody or crash cleanup.
+/// Generations and staged payloads carry this scope's exact proof and cannot be
+/// passed to another scope, even for the same object on the same admission.
+/// The callback cannot return a live generation reservation:
+///
+/// ```compile_fail
+/// use storage::{ActivePutObjectRoute, DirectPutGenerationReservation};
+/// fn escape<'a>(route: &'a ActivePutObjectRoute<'a>) -> DirectPutGenerationReservation<'a> {
+///     route.with_direct_put_scope(Default::default(), |_, scope| scope.reserve_generation())
+///         .unwrap().unwrap()
+/// }
+/// ```
+///
+/// Downstream code cannot bypass the scope to enter terminal publication:
+///
+/// ```compile_fail
+/// use storage::{ActivePutObjectRoute, DirectPutPayloadWrite, PreparedDirectPutObjectCommit};
+/// fn bypass(route: &ActivePutObjectRoute<'_>, payload: DirectPutPayloadWrite<'_>,
+///           prepared: &PreparedDirectPutObjectCommit) {
+///     route.commit_direct_object(payload, prepared, |_| Ok::<(), ()>(()));
+/// }
+/// ```
+pub struct DirectPutWriteScope<'route, 'admission> {
+    route: &'route ActivePutObjectRoute<'admission>,
+    proof: BucketWriteReservationProof,
+    custody: std::cell::Cell<DirectPutProofCustody>,
+}
+
+impl std::fmt::Debug for DirectPutWriteScope<'_, '_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutWriteScope")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirectPutWriteScope<'_, '_> {
+    fn require_frontend_custody(&self) -> Result<(), crate::DirectPutFailure> {
+        if self.custody.get() == DirectPutProofCustody::TerminalPublication {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT proof already transferred to terminal publication".into(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reservation_proof(&self) -> &BucketWriteReservationProof {
+        &self.proof
+    }
+
+    pub fn reserve_generation(
+        &self,
+    ) -> Result<DirectPutGenerationReservation<'_>, crate::DirectPutFailure> {
+        self.require_frontend_custody()?;
+        if self.custody.get() != DirectPutProofCustody::Frontend {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT scope already attempted generation reservation".into(),
+                },
+            ));
+        }
+        // Even a failed call can have an ambiguous reservation outcome. Never
+        // start another generation under this proof; retries belong inside the
+        // storage reservation workflow, preserving its exact identity.
+        self.custody.set(DirectPutProofCustody::GenerationAttempted);
+        self.route.reserve_generation(&self.proof)
+    }
+
+    pub fn write_payload<'scope>(
+        &'scope self,
+        reservation: DirectPutSegmentEncryptionReservation<'scope>,
+        data: &[u8],
+    ) -> Result<DirectPutPayloadWrite<'scope>, crate::DirectPutFailure> {
+        self.require_frontend_custody()?;
+        if reservation.generation.bucket_write_reservation != self.proof {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT generation belongs to a different reservation scope".into(),
+                },
+            ));
+        }
+        self.route
+            .write_direct_object_segment_payload(reservation, data)
+    }
+
+    pub fn commit<E>(
+        &self,
+        payload: DirectPutPayloadWrite<'_>,
+        prepared: &PreparedDirectPutObjectCommit,
+        action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, crate::DirectPutFailure> {
+        self.require_frontend_custody()?;
+        if prepared.bucket_write_reservation != self.proof
+            || payload.bucket_write_reservation != self.proof
+        {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT terminal proof does not match its reservation scope".into(),
+                },
+            ));
+        }
+        self.custody.set(DirectPutProofCustody::TerminalPublication);
+        self.route.commit_direct_object(payload, prepared, action)
+    }
+}
+
 /// Opaque ownership of one reserved direct-PutObject generation.
 ///
 /// The reservation identity is minted internally by an admitted
@@ -218,6 +336,7 @@ pub struct DirectPutGenerationReservation<'admission> {
     reservation_id: SessionId,
     generation_id: GenerationId,
     bucket_incarnation_generation: u64,
+    bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl<'admission> DirectPutGenerationReservation<'admission> {
@@ -1010,13 +1129,10 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn with_bucket_write_snapshot_for_command<T, E>(
+    pub fn with_direct_put_scope<T, E>(
         &self,
         request: BucketSnapshotRequest,
-        action: impl FnOnce(
-            BucketSnapshot,
-            BucketWriteReservationProof,
-        ) -> BucketWriteSnapshotAction<T, E>,
+        action: impl FnOnce(BucketSnapshot, &DirectPutWriteScope<'_, 'admission>) -> Result<T, E>,
     ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
@@ -1024,12 +1140,28 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 self.effect_route(),
                 || self.admission.require_valid_now_raw(),
                 request,
-                action,
+                |snapshot, proof| {
+                    let scope = DirectPutWriteScope {
+                        route: self,
+                        proof,
+                        custody: std::cell::Cell::new(DirectPutProofCustody::Frontend),
+                    };
+                    let result = action(snapshot, &scope);
+                    match scope.custody.get() {
+                        DirectPutProofCustody::Frontend
+                        | DirectPutProofCustody::GenerationAttempted => {
+                            BucketWriteSnapshotAction::release(result)
+                        }
+                        DirectPutProofCustody::TerminalPublication => {
+                            BucketWriteSnapshotAction::transferred_to_command(result)
+                        }
+                    }
+                },
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn reserve_generation(
+    pub(super) fn reserve_generation(
         &self,
         bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
@@ -1120,6 +1252,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             generation_id,
             bucket_incarnation_generation: bucket_write_reservation
                 .bucket_incarnation_generation,
+            bucket_write_reservation: bucket_write_reservation.clone(),
         })
     }
 
@@ -1975,7 +2108,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    pub fn write_direct_object_segment_payload(
+    pub(super) fn write_direct_object_segment_payload(
         &self,
         encryption_reservation: DirectPutSegmentEncryptionReservation<'admission>,
         data: &[u8],
@@ -1998,7 +2131,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         let payload = self.write_direct_object_payload_for_reserved_generation(
             &generation_reservation.reservation_id,
             generation_reservation.generation_id,
-            generation_reservation.bucket_incarnation_generation,
+            &generation_reservation.bucket_write_reservation,
             encryption_subject,
             data,
         )?;
@@ -2025,7 +2158,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         &self,
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
-        bucket_incarnation_generation: u64,
+        bucket_write_reservation: &BucketWriteReservationProof,
         encryption_subject: SegmentEncryptionSubject,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
@@ -2046,13 +2179,14 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::DirectPutFailure::from_store)?;
         let logical_size = encryption_subject.logical_plaintext_len();
         Ok(DirectPutPayloadWrite {
+            bucket_write_reservation: bucket_write_reservation.clone(),
             owner: self.admission,
             armed: std::cell::Cell::new(true),
             bucket: self.bucket.clone(),
             key: self.key.clone(),
             generation_reservation_id: generation_reservation_id.clone(),
             generation_id,
-            bucket_incarnation_generation,
+            bucket_incarnation_generation: bucket_write_reservation.bucket_incarnation_generation,
             encryption_subject,
             logical_size,
             segment_index,
@@ -2106,13 +2240,13 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         self.write_direct_object_payload_for_reserved_generation(
             generation_reservation_id,
             generation_id,
-            bucket_incarnation_generation,
+            &proof,
             encryption_subject,
             data,
         )
     }
 
-    pub fn commit_direct_object<E>(
+    pub(super) fn commit_direct_object<E>(
         &self,
         payload: DirectPutPayloadWrite<'_>,
         prepared: &PreparedDirectPutObjectCommit,

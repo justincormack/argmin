@@ -99,7 +99,7 @@ pub use cluster::{
     ActiveObjectReadRoute, ActivePutObjectRoute, AuthorizedStreamPartSegment,
     AuthorizedStreamPutFinalization, AuthorizedStreamPutSegment, BucketIdentityGenerations,
     BucketWriteSnapshotAction, DirectPutEncryptionReservation, DirectPutGenerationReservation,
-    DirectPutSegmentEncryptionReservation, LeasedObjectReadSnapshot,
+    DirectPutSegmentEncryptionReservation, DirectPutWriteScope, LeasedObjectReadSnapshot,
     LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,

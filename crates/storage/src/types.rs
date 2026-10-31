@@ -6260,6 +6260,7 @@ pub(crate) struct DirectPutWrittenSegment {
 /// constructed physical metadata. An armed handle cleans issuer-owned staging
 /// when dropped.
 pub struct DirectPutPayloadWrite<'admission> {
+    pub(crate) bucket_write_reservation: crate::BucketWriteReservationProof,
     pub(crate) owner: &'admission crate::cluster::StorageClusterRouteAdmission,
     pub(crate) armed: std::cell::Cell<bool>,
     pub(crate) bucket: BucketName,

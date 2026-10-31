@@ -289,173 +289,139 @@ impl Coordinator {
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
         let expected_bucket_owner = authorized.expected_bucket_owner();
         put_route
-            .with_bucket_write_snapshot_for_command(
-                request.resolve_to_storage_request(),
-                |snapshot, proof| {
-                    let bucket_handle = match self
-                        .bucket_handle_loader()
-                        .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
+            .with_direct_put_scope(request.resolve_to_storage_request(), |snapshot, scope| {
+                let bucket_handle = self
+                    .bucket_handle_loader()
+                    .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)?;
+                #[cfg(test)]
+                self.maybe_run_bucket_write_handle_loaded_hook(authorized.bucket());
+                let proof = scope.reservation_proof().clone();
+                let bucket_info = bucket_handle.bucket().clone();
+                let lifecycle = self.cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?;
+                let stored_tags = Self::stored_object_tags(authorized.tags())?;
+                let write_encryption = &authorized.write_encryption;
+                Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+                let acl = authorized.acl();
+                Self::ensure_put_object_write_acl_supported(&bucket_info, &acl)?;
+                let resolved_object_lock = Self::resolve_new_object_lock_state(
+                    &bucket_info,
+                    authorized.requested_object_lock(),
+                )?;
+                let system_metadata = Self::object_system_metadata_with_default_checksum(
+                    req.system_metadata,
+                    write_encryption,
+                    object_crc64,
+                );
+                let owner =
+                    Self::effective_put_object_owner(&bucket_info, authorized.requester(), &acl);
+                let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
+                let public_read = Self::acl_grants_public_read(&acl_grants);
+                let (system_metadata_blob, checksum) =
+                    Self::prepare_unsealed_stored_system_metadata(&system_metadata)?;
+                let generation_reservation = scope
+                    .reserve_generation()
+                    .map_err(Coordinator::map_direct_put_failure)?;
+                let encryption_reservation = generation_reservation
+                    .bind_encryption(&write_encryption.object_encryption())
+                    .bind_standard_segment(req.data.len() as u64);
+                let storage_bytes = write_encryption.encrypt_standard_object_segment(
+                    encryption_reservation.encryption_subject(),
+                    0,
+                    req.data,
+                )?;
+                let encryption = write_encryption.seal_committed_object_encryption(
+                    encryption_reservation.object_encryption_subject(),
+                    checksum.as_ref(),
+                )?;
+                let encryption_reservation = encryption_reservation
+                    .bind_committed_encryption(&encryption)
+                    .map_err(Coordinator::map_direct_put_failure)?;
+
+                let written_payload = scope
+                    .write_payload(encryption_reservation, &storage_bytes)
+                    .map_err(Coordinator::map_direct_put_failure)?;
+                let prepared_commit = PreparedDirectPutObjectCommit {
+                    versioning: bucket_info.versioning,
+                    owner,
+                    acl_grants,
+                    public_read,
+                    etag_crc64: object_crc64,
+                    object_lock: resolved_object_lock,
+                    encryption,
+                    tags: stored_tags,
+                    metadata_blob,
+                    system_metadata_blob,
+                    bucket_write_reservation: proof,
+                };
+                #[cfg(test)]
+                if self.should_probe_direct_put_commit(authorized.bucket()) {
+                    let object_pg_ready = match put_route
+                        .try_probe_object_pg_available()
+                        .map_err(Coordinator::map_direct_put_failure)
                     {
-                        Ok(bucket) => bucket,
+                        Ok(object_pg_ready) => object_pg_ready,
                         Err(error) => {
-                            return storage::BucketWriteSnapshotAction::release(Err(error))
+                            put_route
+                                .discard_direct_object_payload(written_payload)
+                                .map_err(Coordinator::map_direct_put_failure)?;
+                            return Err(error);
                         }
                     };
-                    #[cfg(test)]
-                    self.maybe_run_bucket_write_handle_loaded_hook(authorized.bucket());
-                    let mut proof_transferred_to_command = false;
-                    let result = (|| {
-                        let bucket_info = bucket_handle.bucket().clone();
-                        let lifecycle =
-                            self.cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?;
-                        let stored_tags = Self::stored_object_tags(authorized.tags())?;
-                        let write_encryption = &authorized.write_encryption;
-                        Self::ensure_sse_c_allowed(
-                            &bucket_info,
-                            write_encryption.is_sse_customer(),
-                        )?;
-                        let acl = authorized.acl();
-                        Self::ensure_put_object_write_acl_supported(&bucket_info, &acl)?;
-                        let resolved_object_lock = Self::resolve_new_object_lock_state(
-                            &bucket_info,
-                            authorized.requested_object_lock(),
-                        )?;
-                        let system_metadata = Self::object_system_metadata_with_default_checksum(
-                            req.system_metadata,
-                            write_encryption,
-                            object_crc64,
-                        );
-                        let owner = Self::effective_put_object_owner(
-                            &bucket_info,
-                            authorized.requester(),
-                            &acl,
-                        );
-                        let acl_grants =
-                            Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
-                        let public_read = Self::acl_grants_public_read(&acl_grants);
-                        let (system_metadata_blob, checksum) =
-                            Self::prepare_unsealed_stored_system_metadata(&system_metadata)?;
-                        let generation_reservation = put_route
-                            .reserve_generation(&proof)
+                    if !object_pg_ready {
+                        put_route
+                            .discard_direct_object_payload(written_payload)
                             .map_err(Coordinator::map_direct_put_failure)?;
-                        let encryption_reservation = generation_reservation
-                            .bind_encryption(&write_encryption.object_encryption())
-                            .bind_standard_segment(req.data.len() as u64);
-                        let storage_bytes = write_encryption.encrypt_standard_object_segment(
-                            encryption_reservation.encryption_subject(),
-                            0,
-                            req.data,
-                        )?;
-                        let encryption = write_encryption.seal_committed_object_encryption(
-                            encryption_reservation.object_encryption_subject(),
-                            checksum.as_ref(),
-                        )?;
-                        let encryption_reservation = encryption_reservation
-                            .bind_committed_encryption(&encryption)
-                            .map_err(Coordinator::map_direct_put_failure)?;
-
-                        let written_payload = put_route
-                            .write_direct_object_segment_payload(
-                                encryption_reservation,
-                                &storage_bytes,
-                            )
-                            .map_err(Coordinator::map_direct_put_failure)?;
-                        let prepared_commit = PreparedDirectPutObjectCommit {
-                            versioning: bucket_info.versioning,
-                            owner,
-                            acl_grants,
-                            public_read,
-                            etag_crc64: object_crc64,
-                            object_lock: resolved_object_lock,
-                            encryption,
-                            tags: stored_tags,
-                            metadata_blob,
-                            system_metadata_blob,
-                            bucket_write_reservation: proof,
-                        };
-                        #[cfg(test)]
-                        if self.should_probe_direct_put_commit(authorized.bucket()) {
-                            let object_pg_ready = match put_route
-                                .try_probe_object_pg_available()
-                                .map_err(Coordinator::map_direct_put_failure)
-                            {
-                                Ok(object_pg_ready) => object_pg_ready,
-                                Err(error) => {
-                                    put_route
-                                        .discard_direct_object_payload(written_payload)
-                                        .map_err(Coordinator::map_direct_put_failure)?;
-                                    return Err(error);
-                                }
-                            };
-                            if !object_pg_ready {
-                                put_route
-                                    .discard_direct_object_payload(written_payload)
-                                    .map_err(Coordinator::map_direct_put_failure)?;
-                                return Err(ServerError::InternalError {
-                                    reason: "test probe: object pg still locked before direct put commit"
-                                        .to_string(),
-                                });
-                            }
-                        }
-                        proof_transferred_to_command = true;
-                        let outcome = put_route
-                            .commit_direct_object(
-                                written_payload,
-                                &prepared_commit,
-                                |snapshot| {
-                                    if matches!(
-                                        req.cond,
-                                        crate::conditional::WriteCondition::IfMatch(_)
-                                    ) && snapshot.existing_etag.is_none()
-                                    {
-                                        return Err(ServerError::ObjectNotFound {
-                                            bucket: authorized.bucket().to_string(),
-                                            key: authorized.key().to_string(),
-                                        });
-                                    }
-                                    crate::conditional::check_write_conditions(
-                                        req.cond,
-                                        snapshot.existing_etag.as_deref(),
-                                    )?;
-                                    Ok(())
-                                },
-                            )
-                            .map_err(|error| {
-                                Coordinator::map_put_object_direct_failure(
-                                    authorized.key(),
-                                    req.cond,
-                                    error,
-                                )
-                            })??;
-                        let lifecycle_expiration =
-                            Self::current_object_write_lifecycle_expiration_for_config(
-                                lifecycle.as_ref(),
-                                authorized.key(),
-                                outcome.live_tags.as_deref(),
-                                outcome.live_size,
-                                outcome.live_last_modified,
-                            );
-                        if let Some(generation_id) = outcome.stale_generation_id {
-                            put_route.enqueue_object_payload_reclaim(generation_id);
-                        }
-
-                        Ok(PutObjectResult {
-                            etag: format_etag(object_crc64),
-                            last_modified: outcome.live_last_modified,
-                            version_id: outcome.version_id,
-                            bucket_versioning: bucket_info.versioning,
-                            system_metadata,
-                            managed_encryption: outcome.encryption.managed_encryption_algorithm(),
-                            lifecycle_expiration,
-                        })
-                    })();
-                    if proof_transferred_to_command {
-                        storage::BucketWriteSnapshotAction::transferred_to_command(result)
-                    } else {
-                        storage::BucketWriteSnapshotAction::release(result)
+                        return Err(ServerError::InternalError {
+                            reason: "test probe: object pg still locked before direct put commit"
+                                .to_string(),
+                        });
                     }
-                },
-            )
+                }
+                let outcome = scope
+                    .commit(written_payload, &prepared_commit, |snapshot| {
+                        if matches!(req.cond, crate::conditional::WriteCondition::IfMatch(_))
+                            && snapshot.existing_etag.is_none()
+                        {
+                            return Err(ServerError::ObjectNotFound {
+                                bucket: authorized.bucket().to_string(),
+                                key: authorized.key().to_string(),
+                            });
+                        }
+                        crate::conditional::check_write_conditions(
+                            req.cond,
+                            snapshot.existing_etag.as_deref(),
+                        )?;
+                        Ok(())
+                    })
+                    .map_err(|error| {
+                        Coordinator::map_put_object_direct_failure(
+                            authorized.key(),
+                            req.cond,
+                            error,
+                        )
+                    })??;
+                let lifecycle_expiration =
+                    Self::current_object_write_lifecycle_expiration_for_config(
+                        lifecycle.as_ref(),
+                        authorized.key(),
+                        outcome.live_tags.as_deref(),
+                        outcome.live_size,
+                        outcome.live_last_modified,
+                    );
+                if let Some(generation_id) = outcome.stale_generation_id {
+                    put_route.enqueue_object_payload_reclaim(generation_id);
+                }
+
+                Ok(PutObjectResult {
+                    etag: format_etag(object_crc64),
+                    last_modified: outcome.live_last_modified,
+                    version_id: outcome.version_id,
+                    bucket_versioning: bucket_info.versioning,
+                    system_metadata,
+                    managed_encryption: outcome.encryption.managed_encryption_algorithm(),
+                    lifecycle_expiration,
+                })
+            })
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 

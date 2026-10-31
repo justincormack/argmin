@@ -74,6 +74,9 @@ it does not bind a persisted window to its issuing lifetime.
 The [Direct PUT handoff audit](#direct-put-proof-handoff-integration-gate--2026-10-31)
 identifies the remaining frontend ownership change that must accompany command
 proof persistence. Do not land a proof-only reservation-command change.
+The [storage-owned frontend scope](#storage-owned-direct-put-frontend-scope--2026-10-31)
+now owns the existing terminal handoff decision instead of a coordinator flag.
+It does not move custody to generation reservation or implement durable owners.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3852,3 +3855,42 @@ terminal publication must retain the existing release timing.
 No production code or encoding is changed by this audit. All six cleanup
 regressions remain open. Validation: source call-chain review and
 `git diff --check`; no Rust test run for this documentation-only change.
+
+## Storage-Owned Direct PUT Frontend Scope — 2026-10-31
+
+Implemented the frontend-boundary prerequisite identified by the preceding
+handoff audit. `ActivePutObjectRoute::with_direct_put_scope` issues an opaque,
+non-cloneable `DirectPutWriteScope` carrying the acquired bucket proof. The
+coordinator no longer maintains `proof_transferred_to_command` or chooses a
+`BucketWriteSnapshotAction`. Storage records the handoff when the scope enters
+terminal publication; an ordinary earlier error still releases the proof through
+the existing snapshot wrapper.
+
+Each scope permits one generation attempt (including an ambiguous failure), so
+one proof cannot back multiple independently live generation tokens. Generation
+and payload tokens borrow the scope and retain its exact proof.
+Staging and commit reject crossed scopes, including two valid reservations for
+the same object. Terminal preparation must supply that same proof. After terminal
+handoff, the scope rejects further generation allocation, staging or commit.
+The raw route reserve/write/commit entry points are no longer downstream-public.
+Compile-fail examples pin the scope lifetime and private terminal entry point.
+
+This preserves existing release timing; it is not the early durable handoff in
+the preceding contract. In particular, panic/cancellation, lost generation
+reservation responses and pre-terminal crash cleanup are not resolved by this
+scope. The introducing-command proof, retained owner/window state, central
+validation and route retention must still land together before changing custody
+at reservation. There are no schema/command/RPC changes and no new fsyncs. All six
+ignored cleanup regressions remain open.
+
+Owner-local regressions cover an early error with an unrelated exact-row canary,
+same-key proof substitution before terminal entry, successful publication, and a
+failed trailing replica. The last case verifies that returning from the callback
+preserves the pending command's proof, then exact recovery releases only that
+proof. Nested same-object scopes also exercise generation and payload crossing.
+
+Validation: the final `cargo nextest run --offline` passed all 9,152 tests
+(one slow, six skipped) in 257.207s, including all four new scope regressions.
+All 35 storage doctests passed, including both new compile-fail examples.
+`cargo clippy --offline --all-targets --all-features -- -D warnings`, the storage
+boundary checker, `cargo fmt --all --check` and `git diff --check` passed.
