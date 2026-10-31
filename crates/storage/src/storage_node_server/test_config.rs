@@ -3,6 +3,8 @@
 
 #[path = "allocation_lifetime_tests.rs"]
 mod allocation_lifetime_tests;
+#[path = "payload_participant_tests.rs"]
+mod payload_participant_tests;
 #[path = "stream_creation_deadline_tests.rs"]
 mod stream_creation_deadline_tests;
 

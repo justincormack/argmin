@@ -93,6 +93,10 @@ The [Direct PUT successor-evidence tests](#direct-put-successor-evidence--2026-1
 now exercise real pending slots, witness-first application, peering decisions and
 compacted generation-reservation transfer. They do not supply a replacement
 primary's route certificate or the still-missing retained owner/proof obligation.
+The [participant-capture extraction](#captured-file-and-acknowledgement-participants--2026-10-31)
+now returns the shared resolver's actual shard locations and independent
+acknowledgement primary. Existing builders still use it only for preflight;
+durable owner/window integration remains outstanding.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -4238,3 +4242,57 @@ Clippy, the storage boundary checker, formatting and `git diff --check` passed.
 The initial focused run failed before exercising storage because the fixture
 label encoded to a 38-character session ID; shortening the label fixed that
 fixture error. No production test failure was suppressed or reclassified.
+
+## Captured File And Acknowledgement Participants — 2026-10-31
+
+Starting the owner-state integration exposed one remaining data-shape issue:
+`PayloadPlacementInput::require_segment_placement` computed canonical file
+locations and then discarded them. The future owner must retain those exact
+locations **and** the data-PG acknowledgement primary, which is not inferred
+from a shard index and need not hold any file when there are spare candidates.
+
+The shared resolver in
+[`payload_placement.rs`](../crates/storage/src/payload_placement.rs) now exposes
+`capture_segment_participants` inside the node runtime. It returns owned
+placement data: the acknowledgement-primary NodeId and the complete canonical
+shard-index-ordered locations, each with its data PG and epoch. The old preflight
+entry point delegates to that same implementation and discards the result.
+Existing Direct PUT, creation, preparation and append callers therefore retain
+their current validation and error behavior; there is no second placement
+algorithm or additional placement pass.
+
+This result is **not an authority token or a complete window descriptor**. The
+caller still has to bind the exact segment hash/VID, owner, generation, issuer,
+EC/geometry, immutable cutoff and publication evidence in the future durable
+record. The extraction does not serialize live route authority or supply
+permission to write/delete at any returned participant. It adds no lookup,
+RPC, mutation, durable format change or fsync.
+
+[`payload_participant_tests.rs`](../crates/storage/src/storage_node_server/payload_participant_tests.rs)
+exercises both the embedded-map and captured storage-node-config inputs:
+
+- A 2+1 layout on four candidates chooses the unused node as acknowledgement
+  primary and asserts it is absent from the complete three-file placement.
+  Both resolver inputs must return identical participants, and captured file
+  locations must match the existing placed-write resolver for the exact
+  segment hash/generation.
+- Acting-set reordering preserves shard-index assignment. Changing only the
+  primary changes only the acknowledgement owner; the earlier owned result
+  remains exact, and an independent PG retains its own route subject/primary.
+- Independent negatives pin operation-epoch mismatch, route-epoch mismatch,
+  Peering state, a primary outside the acting set, crossed EC shape, duplicate
+  candidates and a missing PG route. Each asserts its specific error class for
+  both inputs, followed by a valid positive canary.
+
+These are resolver tests, not installed Unix/TLS transport or retained-window
+confirmation tests. The next durable record must consume this captured result
+under the primary build lock; persisting only a placement seed and recomputing
+against a later map would lose the guarantee. No optional owner fields were
+added to live commands, and all six original cleanup regressions remain open.
+
+Validation: both participant-capture tests passed. Full `cargo nextest run
+--offline` passed all 9,166 tests (one slow, six skipped) in 259.970s. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and
+`git diff --check` passed. Initial test setup errors (a private import path and
+omitting the convenience map opener's required node 0) were corrected without
+changing production validation.

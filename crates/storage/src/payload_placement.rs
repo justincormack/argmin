@@ -212,6 +212,26 @@ impl<'a> PayloadPlacementInput<'a> {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
     ) -> Result<(), StoreError> {
+        self.capture_segment_participants(operation_epoch, data_pg_id, ec, segment_okh, segment_vid)
+            .map(|_| ())
+    }
+
+    /// Resolve the complete participant set from this captured catalogue:
+    /// acknowledgement metadata primary, then file locations in shard-index
+    /// order. The primary need not own any file when the acting set has spare
+    /// nodes. Each file location carries the exact data PG and placement epoch.
+    ///
+    /// This is owned placement data, NOT allocation/write/cleanup authority.
+    /// Current callers use it for preflight; persisting it in an owner/window
+    /// still requires subject, issuer, cutoff and publication validation.
+    pub(in crate::node_runtime) fn capture_segment_participants(
+        self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<(NodeId, Vec<ShardLocation>), StoreError> {
         let (epoch, configured_ec, route_epoch, state, primary, acting_set) = match self.source {
             PlacementSource::Embedded(map) => {
                 let route =
@@ -277,7 +297,7 @@ impl<'a> PayloadPlacementInput<'a> {
         let data_pg_id = DataPgId::from_validated_placement(PgId::new(data_pg_id));
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         place_payload_shards_for_pg_route(epoch, data_pg_id, ec, &placement_key, acting_set)
-            .map(|_| ())
+            .map(|locations| (primary, locations))
             .map_err(|error| StoreError::PayloadShardSetMismatch {
                 reason: format!("captured payload placement: {error}"),
             })
