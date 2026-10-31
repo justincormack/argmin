@@ -53,6 +53,10 @@ authority and durable descriptors are not implemented by that extraction.
 The [captured creation inputs](#captured-placement-inputs-for-stream-creation--2026-10-30)
 extend placement validation to generation-selecting stream creation builders.
 They remain computational inputs, not durable first-window authority.
+The [integration boundary audit](#ownerwindow-integration-boundary-audit--2026-10-31)
+pins the remaining primary-builder inputs and resource-release responsibilities
+for the next coordinated durable state slice; route-local lifetime capture is
+not a substitute for persisted window/issuer binding.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3372,3 +3376,126 @@ boundary checks, formatting and diff checks passed. TLS test setup was corrected
 to use a separate connection per receiver-clock scope and keep authenticated
 response timestamps within the supported skew; it still exercises production
 sender conversion and receiver rebinding with distinct monotonic origins.
+
+## Owner/Window Integration Boundary Audit — 2026-10-31
+
+The next change is the coordinated durable state integration, not another claim
+that the live-lifetime check establishes exclusive issuance. The input and
+transaction audit below identifies the remaining changes that must land with
+that state. No owner/window table or physical grant is implemented by this audit.
+
+### Bind persisted windows, not the lifetime of a frontend route object
+
+`require_live_allocation_lifetime()` proves only that the store currently has an
+active issuer. It deliberately does not compare that issuer with a durable
+window. Capturing a nonce in an embedded node-client route and comparing it on
+each call would not establish the intended guarantee: Unix creates the local
+route again for each frame, whereas an embedded caller can retain its route
+across calls. Reopening either route must not authorize an old attempt to resume.
+Also, today's route constructors use `require_open_pg()` without acquiring the
+store mutex; adding an incidental lock there would change their lock contract.
+
+Keep the binding at the existing primary mutation lock instead. Mint the
+descriptor's `(primary NodeId, PG-open lifetime)` there, encode it in the
+introducing command, and persist the exact value on every replica. Preparation
+loads the descriptor and compares its issuer to the current store lifetime under
+the same lock immediately before consuming the slot. Route reconstruction,
+successful replacement, replica apply and session-row equality cannot renew that
+binding. Already-issued commands may still converge without consulting a
+replica's local lifetime. The original process-local nonce stays private; this
+work adds a durable issuer identity, not a serializable live guard.
+
+### Missing inputs and construction boundaries
+
+| Boundary | Current evidence | Required integration |
+| --- | --- | --- |
+| Direct PUT reserve | `ActivePutObjectRoute::reserve_generation_with_id` validates the exact bucket proof and incarnation, but passes only the reservation ID and effect route into `reserve_put_object_generation_with_route_validation`. The primary builder receives placement/fence, not that proof. | Carry the already-validated proof to the primary builder and introducing command. Bind the owner to its bucket incarnation, exact reservation subject and historical bucket-PG release route. Do not reload an unrelated latest bucket snapshot to recover these fields. |
+| Stream create | `BuildCreateStreamUploadCommandReq` now carries placement, proof and captured fence; the primary selects the payload generation under its PG lock. UploadPart placement additionally uses the loaded MPU generation. | Derive owner and first window there. Preserve both part payload generation and MPU placement generation. Persist owner/window with reservation, high-water and session in the existing apply transaction. |
+| Stream append | `commit_stream_segment_append_with_work_budget` still constructs `AppendStreamSegmentCommand` in a frontend closure supplied to `install_apply_validated_metadata_command_with_fresh_id`. Its current payload contains only bucket/key, target and selected segment. | Move window-bearing construction behind an actual-primary builder before attaching a new issuer or cutoff. It must validate the durable owner, current window and selected append, and return the exact next descriptor. A frontend-generated nonce or frontend shadow-store lifetime is not acceptable. |
+| Preparation | The local route already checks the expected session/generation, placement, captured fence and current lifetime under the allocator lock. | Add the durable window/issuer comparison at that same boundary; keep the replicated reserved end separate from the local consumed cursor. Do not add an inspection RPC followed by an unchecked allocator RPC. |
+| Terminal/abort/release | Existing apply paths remove session/reservation rows; command recovery and terminal cleanup have separate resource-release handling. | Retain or transfer owner/window state in those same apply transactions before removing the old rows. Preserve exact selected references and all unused lookahead windows. |
+
+Relevant implementations are in
+[`operation_routes.rs`](../crates/storage/src/cluster/operation_routes.rs),
+[`payload_operations.rs`](../crates/storage/src/cluster/payload_operations.rs),
+[`local.rs`](../crates/storage/src/node_client/local.rs), and
+[`command_mutations.rs`](../crates/storage/src/pg_store/metadata/command_mutations.rs).
+
+Moving append construction must preserve its current publication behavior:
+one observed contender per owner-loop retry, the original work budget and effect
+fence, matching-command success, exact recovery handoff, and reference-checked
+payload cleanup after an ambiguous install. Reissue preserves the entire window
+descriptor; a log-index conflict does not authorize a new cutoff or issuer. Do
+not mint another window merely because the caller did not receive a reply.
+
+### Resource ownership is not just proof presence
+
+The owner records an exact release obligation, not permission to release every
+proof that occurs in an introducing command. In
+[`metadata_operations.rs`](../crates/storage/src/cluster/metadata_operations.rs),
+`release_applied_metadata_command_bucket_write_reservations` currently preserves
+streamed PUT's creation proof but releases UploadPart's creation proof. Direct
+PUT's generation command currently has no proof for that helper to extract.
+Adding one without updating this classification would release it before payload
+publication.
+
+The integration must distinguish these responsibilities explicitly:
+
+- Direct PUT: successful generation reservation transfers the live proof to the
+  attempt; it does not release it. Terminal publication/cancellation retains the
+  existing release timing, with the owner retaining unresolved release evidence.
+- Streamed PUT: creation keeps its live proof through the session. Heartbeat
+  deadlines may change, but stable proof identity and the original release route
+  remain bound. Terminal/abort transfers any unresolved release obligation before
+  removing the session.
+- UploadPart: creation's proof is short-lived and is released after creation
+  settles. The retained owner may remember an unresolved release, but must not
+  treat this proof as continuing mutation authority. Finalization uses its own
+  separately validated proof; it cannot overwrite the creation obligation or be
+  confused with it. Represent both obligations when both remain unresolved.
+
+Use a closed responsibility state, not `Option<Proof>` to mean both "no proof
+was required" and "release succeeded." Confirmation of exact release is
+idempotent. No ordinary successful write should gain a standalone command merely
+to erase retained evidence: keep that evidence until an eligible existing owner
+transition or eventual cleanup transaction can retire it. Its exact historical
+bucket-PG route must remain pinned until the durable obligation is retired.
+Fanout, abandonment and recovery must validate internal subject consistency
+before attempting release; authorization validation and release timing are
+separate decisions.
+
+### Reviewable implementation sequence
+
+1. Define the private owner/window and resource-obligation records together with
+   SQL constraints and canonical table membership. Integrate reserve/create,
+   primary append construction, preparation, terminal retention and route-history
+   references as one coherent state slice. Include the primary-owned inputs above;
+   do not introduce nullable "not yet enforced" owner fields into live commands.
+2. Advance affected schema, command, RPC and canonical-state formats together,
+   following their actual containment rules. Preserve the committed schema-9,
+   command-12, RPC-30 and checkpoint/state composite specimens unchanged; append
+   new current evidence. Checkpoint table membership and semantic validation live
+   in [`command_log.rs`](../crates/storage/src/pg_store/command_log.rs), not just
+   the schema catalogue. Review maximum RPC carrier overhead as well as command
+   size. Do not preassign the next versions until the complete diff is known.
+3. Prove complete rows/obligations survive rollback, exact replay, reissue,
+   witness-first apply, checkpoint/import, reopen and two route transitions.
+   Include same-node/new-lifetime preparation rejection over both embedded and
+   installed Unix paths; a newly opened route must not make the negative pass.
+   Independently pin each proof's release timing and an unresolved pair of
+   UploadPart creation/finalization obligations.
+4. Then integrate settled-prefix confirmation, bounded physical write/ack
+   admission and local exclusion, followed by cleanup discovery. Owner rows by
+   themselves do not stop delayed physical writes. Keep all six original cleanup
+   regressions open until their actual end-to-end invariants pass.
+
+This is a source-backed refinement of the existing transaction candidate. It
+does not select another publisher class, new ordinary-path fsync, per-write
+journal, or optional legacy representation. No production code or format changes
+are included in this audit slice.
+
+Validation: full Nextest passed 9,135 tests (one slow, six skipped) in 236.295s;
+strict all-target/all-feature Clippy, storage boundary checks, formatting and
+diff checks passed. These are unchanged-code regression results, not evidence
+that the proposed owner/window integration is implemented. The six cleanup
+regressions remain unresolved.
