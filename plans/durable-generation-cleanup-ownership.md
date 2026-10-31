@@ -97,6 +97,10 @@ The [participant-capture extraction](#captured-file-and-acknowledgement-particip
 now returns the shared resolver's actual shard locations and independent
 acknowledgement primary. Existing builders still use it only for preflight;
 durable owner/window integration remains outstanding.
+The [reservation-kind apply guard](#direct-put-reservation-kind-at-apply--2026-10-31)
+now rejects a standalone Direct PUT reservation command naming a live stream's
+generation. Exact Direct PUT replay/reissue remains supported; this does not yet
+persist the retained owner or change the frontend proof handoff.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -4296,3 +4300,53 @@ all-target/all-feature Clippy, the storage boundary checker, formatting and
 `git diff --check` passed. Initial test setup errors (a private import path and
 omitting the convenience map opener's required node 0) were corrected without
 changing production validation.
+
+## Direct PUT Reservation Kind At Apply — 2026-10-31
+
+Reviewing the creation/replay boundary for retained owners exposed the reverse
+of the stream-creation adoption gap fixed earlier. The primary Direct PUT builder
+requires reservation absence, but decoded `ReserveObjectGeneration` application
+used the generic idempotent reservation allocator directly. An existing PUT or
+UploadPart session with the same reservation ID, bucket, key and generation was
+therefore accepted as if it were a standalone Direct PUT reservation reissue.
+
+Application now checks for the stream session before invoking the allocator, in
+the existing apply/log transaction. A live session is a different durable owner
+kind, even when every reservation field matches. Session lookup failures other
+than authoritative absence propagate. No local clock, network call, new table,
+format change, transaction or fsync is introduced; this adds one local session
+lookup to standalone reservation apply. Stream creation still reserves its
+generation directly inside its own atomic creation transaction.
+
+An unconditional existing-reservation rejection would be incorrect: a genuine
+same-payload Direct PUT reissue can encounter materialized state after the
+original log and receipt have been compacted. The allocator's existing exact
+subject/generation idempotence remains available when no stream owns the ID.
+This check does not manufacture provenance for a standalone row, bind a future
+owner/window descriptor, or make a generation reservation into bucket-proof
+custody. Those remain part of the coordinated integration, as do cleanup/release
+authority and physical write exclusion.
+
+The owner-local regressions cover:
+
+- PUT and UploadPart creation followed by a separately encoded/decoded standalone
+  reservation envelope with identical ID, bucket, key, generation **and creation
+  time**. Both must reject with the ownership diagnostic before SQLite changes,
+  preserving the complete session, reservation, high-water, checkpoint and log,
+  including after reopen.
+- Exact Direct PUT log replay, followed by original-log/receipt compaction and
+  reopen, then a decoded same-payload command at a new log index. Application
+  must succeed without changing any canonical table block. This is store-level
+  reissue application evidence, not a distributed recovery authorization test.
+- Release followed by reopen and another decoded reservation reissue. The durable
+  generation high-water must reject resurrection without changing the released
+  checkpoint or advancing the log.
+
+All six original cleanup regressions remain open. This is a central creation-kind
+validation correction, not implementation of durable owner/window state or the
+pre-install orphan-retirement protocol.
+
+Validation: both focused regressions passed. Full `cargo nextest run --offline`
+passed all 9,168 tests (one slow, six skipped) in 263.745s. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and
+`git diff --check` passed. No format fixtures or ignored tests changed.

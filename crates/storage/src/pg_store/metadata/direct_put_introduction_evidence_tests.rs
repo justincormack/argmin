@@ -57,6 +57,120 @@ fn assert_reserved(store: &PgStore, reserve: &ReserveObjectGenerationCommand) {
     );
 }
 
+#[test]
+fn direct_put_reservation_reissue_preserves_ownership_but_cannot_resurrect_release() {
+    let dir = test_util::tempdir();
+    let store = PgStore::open(dir.path(), 1).unwrap();
+    let (reserve, original) = fixture(&store);
+    let applied = store
+        .apply_metadata_command_and_record(0, &original)
+        .unwrap();
+    assert_eq!(
+        store
+            .apply_metadata_command_and_record(0, &original)
+            .unwrap(),
+        applied,
+        "exact log replay must remain idempotent"
+    );
+    let later = create_bucket_probe_command(1, 2, trusted_bucket_name("later-prefix"), 20);
+    store.apply_metadata_command_and_record(0, &later).unwrap();
+    let before = store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    store
+        .compact_metadata_command_log_with_receipt_retention(ClusterEpoch::INITIAL, 1)
+        .unwrap();
+    assert_eq!(
+        store
+            .applied_metadata_command_log_entry_hashes(0, &original)
+            .unwrap(),
+        None
+    );
+    drop(store);
+    let store = PgStore::open(dir.path(), 1).unwrap();
+    let decode_at = |index, payload| {
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(index).unwrap(),
+            ),
+            payload,
+        );
+        let decoded = decode_metadata_command_envelope(
+            &command.command_bytes(),
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+        .unwrap();
+        assert_eq!(decoded, command);
+        decoded
+    };
+    let reissued = decode_at(3, original.payload().clone());
+    assert!(reissued
+        .payload()
+        .is_ordinary_pending_slot_reissue_of(original.payload()));
+    // Exercise payload application, not the original command's AlreadyApplied
+    // shortcut. The exact materialized reservation must support same-payload
+    // reissue even when its original log/receipt has been compacted away.
+    assert_eq!(
+        store
+            .apply_metadata_command_and_record(0, &reissued)
+            .unwrap()
+            .applied_log_index,
+        3
+    );
+    assert_reserved(&store, &reserve);
+    assert_eq!(
+        store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .table_blocks,
+        before.table_blocks
+    );
+    let release = decode_at(
+        4,
+        MetadataCommandPayload::ReleaseObjectGeneration(
+            crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                reserve.bucket.clone(),
+                reserve.key.clone(),
+                reserve.reservation_id.clone(),
+            ),
+        ),
+    );
+    store
+        .apply_metadata_command_and_record(0, &release)
+        .unwrap();
+    let released = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    drop(store);
+    let store = PgStore::open(dir.path(), 1).unwrap();
+    let changes = store.conn.total_changes();
+    let error = store
+        .apply_metadata_command_and_record(0, &decode_at(5, original.payload().clone()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            BucketSnapshotLoadError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    assert_eq!(store.conn.total_changes(), changes);
+    assert_eq!(
+        store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap(),
+        released
+    );
+    assert!(matches!(
+        store.get_object_generation_reservation_by_id(&reserve.reservation_id),
+        Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+    ));
+}
+
 fn replica(store: &PgStore, node: u32) -> PgPeeringReplicaReconstructionInput {
     PgPeeringReplicaReconstructionInput {
         node_id: NodeId::new(node),

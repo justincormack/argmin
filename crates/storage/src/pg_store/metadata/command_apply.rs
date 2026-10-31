@@ -900,6 +900,21 @@ impl PgStore {
         &self,
         command: &ReserveObjectGenerationCommand,
     ) -> Result<(), MetadataError> {
+        // Standalone reservation commands belong to Direct PUT. Stream creation
+        // owns its reservation atomically with the session; an identical row is
+        // not evidence that this different command may adopt it. Keep the check
+        // in the apply transaction, including for decoded/recovered commands.
+        match self.get_stream_upload(&command.reservation_id) {
+            Ok(_) => {
+                return Err(MetadataError::InvariantViolation {
+                    context: "reserve object generation command stream-owned reservation",
+                    reason: "a standalone reservation cannot adopt a stream session's generation"
+                        .into(),
+                });
+            }
+            Err(MetadataError::StreamSessionNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
         self.reserve_object_generation_explicit(
             &command.bucket,
             &command.key,

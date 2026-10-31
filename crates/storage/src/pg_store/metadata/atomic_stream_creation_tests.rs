@@ -508,3 +508,84 @@ fn decoded_stream_creation_cannot_adopt_an_independent_generation_reservation() 
         assert_rejected_without_mutation(&reopened);
     }
 }
+
+#[test]
+fn decoded_direct_put_reservation_cannot_adopt_a_stream_generation() {
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        store
+            .apply_metadata_command_and_record(0, &envelope(&create, 1))
+            .unwrap();
+        let before = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let session = store.get_stream_upload(&create.session.session_id).unwrap();
+        let reservation = store
+            .get_object_generation_reservation_by_id(&create.session.session_id)
+            .unwrap();
+        // Every reservation field matches, including creation time. Only its
+        // durable stream ownership distinguishes this from Direct PUT reissue.
+        let crossed = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(
+                crate::metadata_command::ReserveObjectGenerationCommand::new(
+                    create.session.bucket.clone(),
+                    create.session.key.clone(),
+                    create.session.session_id.clone(),
+                    create.payload_generation,
+                    create.session.created_at,
+                ),
+            ),
+        );
+        let decoded = decode_metadata_command_envelope(
+            &crossed.command_bytes(),
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+        .unwrap();
+        assert_eq!(decoded, crossed);
+        let assert_rejected = |store: &PgStore| {
+            let changes = store.conn.total_changes();
+            let error = store
+                .apply_metadata_command_and_record(0, &decoded)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                        context: "reserve object generation command stream-owned reservation",
+                        ..
+                    })
+                ),
+                "part={part}: {error:?}"
+            );
+            assert_eq!(store.conn.total_changes(), changes);
+            assert_eq!(
+                store.get_stream_upload(&create.session.session_id).unwrap(),
+                session
+            );
+            assert_eq!(
+                store
+                    .get_object_generation_reservation_by_id(&create.session.session_id)
+                    .unwrap(),
+                reservation
+            );
+            assert_present(store, &create);
+            assert_eq!(
+                store
+                    .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                    .unwrap(),
+                before
+            );
+        };
+        assert_rejected(&store);
+        drop(store);
+        let reopened = PgStore::open(dir.path(), 1).unwrap();
+        assert_rejected(&reopened);
+    }
+}
