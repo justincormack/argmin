@@ -80,6 +80,10 @@ It does not move custody to generation reservation or implement durable owners.
 The [scope unwind follow-up](#direct-put-scope-unwind-release--2026-10-31) adds
 best-effort release for a still-frontend-owned proof when its callback unwinds;
 process loss and failed cleanup still require durable ownership.
+The [owner-introduction model](#owner-introduction-and-proof-custody-model--2026-10-31)
+now covers the pending-command-to-materialized-owner handoff and preservation
+of release evidence across compaction/restart. It is abstract model evidence,
+not implementation of durable owner/window records or physical exclusion.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3940,3 +3944,81 @@ Validation: all seven focused scope tests passed. Full `cargo nextest run
 --offline` passed all 9,155 tests (two slow, six skipped) in 278.896s. All 35
 storage doctests, strict all-target/all-feature Clippy, the storage boundary
 checker, formatting and `git diff --check` passed.
+
+## Owner Introduction And Proof Custody Model — 2026-10-31
+
+Added the independent storage-owned
+[`introduction.rs`](../crates/storage/src/cleanup_ownership_model/introduction.rs)
+model to cover the introducing-command gap left by the earlier terminal
+publication model, which starts with an owner already durable. This is test-only
+protocol modelling, not a new production command, schema or write grant.
+
+### Boundaries and evidence
+
+The finite state graph has one introducing command, three object-PG replicas,
+one own bucket proof and one unrelated proof, one restart and at most one failed
+release. It separates dispatch, primary acceptance, response receipt/loss,
+publication-start, witness/primary/trailing apply and inspection, slot removal,
+per-replica log compaction, exact release, observation of absence and owner
+retirement. Each replica's creation apply atomically stores generation, retained
+owner, exact proof obligation and its introducing log record.
+
+Publication/cancellation after creation is deliberately collapsed to an
+authorized, converged owner transition. Both remove the generation reservation
+while retaining the owner and unresolved release obligation. Successful live
+proof release need not wait for owner retirement. Restart preserves durable rows
+and pending intent but forgets inspections, release confirmation and frontend/
+recovery activity; authorized recovery must reacquire evidence.
+
+The positive exploration requires reachable canaries for:
+
+- Authoritative rejection releasing only the frontend's proof.
+- Frontend loss before primary acceptance retaining an unresolved bucket record.
+- Lost installation reply leaving a pending custodian before owner application.
+- Witness-first owner materialization surviving restart before primary apply.
+- Staging proof identity surviving complete log compaction and restart.
+- Successful publication releasing its live proof while the retained owner stays.
+- Failed release, restart and eventual exact release/owner retirement.
+- Authoritatively unstarted abandonment releasing before its pending slot is removed.
+
+Ten independently enabled mutations must each produce the expected invariant
+violation: release on unknown installation, release on creation apply, generation
+without owner, proof kept only in the command log, early slot removal, abandoned
+slot removal before release, owner loss on restart, retirement before release,
+retirement after release but before observing it, and release of the unrelated proof. The
+ordered regression additionally walks lost reply → replica convergence → complete
+log compaction → cancellation → failed release → restart → exact release →
+retirement. It asserts that restart finds owner-carried proof without log rows.
+
+### Explicit limits and implementation consequence
+
+This does **not** model cross-PG proof validation/installation atomicity, lease
+expiry/heartbeat races, storage RPC authorization or encoding, multiple owners,
+route history, physical files/acknowledgements or the full terminal fanout. The
+accepted-install transition assumes exact proof validation; it is not evidence
+that today's separate bucket-PG check and object-PG install close that interval.
+The previous physical, publication and issuer models are not automatically
+composed with this state graph.
+
+In particular, frontend loss while dispatch is still unaccepted retains the
+bucket reservation but has no fictitious object-PG custodian. Discovery and safe
+retirement of that pre-install reservation remain an explicit implementation/
+modelling gate. The graph proves neither eventual progress nor a lease-expiry
+algorithm. An unknown transport outcome cannot be treated as authoritative
+rejection merely because an immediate inspection sees no owner: the request may
+still arrive. The introducing command must preserve exact responsibility once
+accepted, and its materialized owner must retain that evidence independently of
+the compactable command log before the pending custodian is removed.
+
+The coordinated production slice remains unchanged: owner/window records,
+introducing proof, central validation, retained route references and frontend
+handoff must land together. No optional, unenforced owner fields or extra
+ordinary-path fsyncs were added, and all six production cleanup regressions
+remain open.
+
+Validation: all three focused tests passed. The positive graph exhausted
+21,559 states / 69,833 transitions; all ten independent mutations produced their
+expected counterexamples. Exploration has a 250,000-state hard cap; reaching it
+is a failure, not a bounded success. Full `cargo nextest run --offline` passed
+all 9,158 tests (two slow, six skipped) in 239.617s. Strict all-target/all-feature
+Clippy, the storage boundary checker, formatting and `git diff --check` passed.

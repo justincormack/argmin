@@ -19,6 +19,7 @@ use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
 mod confirmation;
 mod fanout;
+mod introduction;
 mod issuer;
 mod lookahead;
 mod publication;
