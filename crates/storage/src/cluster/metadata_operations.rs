@@ -6317,29 +6317,23 @@ impl StorageCluster {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
-        let preserve_command_reservation = matches!(
-            command.payload(),
-            MetadataCommandPayload::CreateStreamUpload(create)
-                if create.session.target == StreamUploadTarget::PutObject
-        );
-        if !preserve_command_reservation {
-            let expected_reservation_id =
-                Self::metadata_command_bucket_write_reservation_proof(command)
-                    .map(|proof| proof.reservation_id.as_str());
-            match self.release_metadata_command_bucket_write_reservation(command) {
-                Ok(()) => {}
-                Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::BucketWriteReservationNotFound { reservation_id },
-                )) if expected_reservation_id == Some(reservation_id.as_str()) => {}
-                Err(error) => return Err(error),
+        use crate::metadata_command::MetadataCommandReservationDisposition;
+        match command.payload().bucket_write_reservation_disposition() {
+            MetadataCommandReservationDisposition::NoCommandProof
+            | MetadataCommandReservationDisposition::RetainForStream(_) => Ok(()),
+            MetadataCommandReservationDisposition::ReleaseOnApply(proof) => {
+                match self.release_metadata_command_bucket_write_reservation(command) {
+                    Ok(()) => Ok(()),
+                    Err(BucketSnapshotLoadError::Metadata(
+                        MetadataError::BucketWriteReservationNotFound { reservation_id },
+                    )) if proof.reservation_id == reservation_id => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(proof) => {
+                self.release_stream_create_bucket_write_reservation_proof(proof)
             }
         }
-        if let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() {
-            if let Some(proof) = &abort.stream_create_bucket_write_reservation {
-                self.release_stream_create_bucket_write_reservation_proof(proof)?;
-            }
-        }
-        Ok(())
     }
 
     fn release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(

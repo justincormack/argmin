@@ -510,6 +510,26 @@ Publisher classes:
   top-of-loop matching branch; generic drain can delete the session before the
   retry can validate or finish the matching command.
 
+Command-carried bucket reservations have one exhaustive
+`MetadataCommandReservationDisposition`, shared by foreground terminal cleanup,
+local-open convergence, authorization-proof selection and pending route retention:
+
+- Ordinary command proofs are released after successful application. This includes
+  UploadPart's short-lived creation proof and its separate finalization proof.
+- Streamed PUT creation retains its proof for the live session. Successful
+  creation is not permission to release it; later commit or abort owns release.
+- Stream abort's optional creation proof is cleanup evidence, not the abort's
+  own mutation proof. Applied abort releases it; abandoning an unstarted abort
+  must preserve the live session's proof.
+- A command with no carried proof does not establish that an external resource
+  was released. Direct PUT's generation-reservation command currently carries
+  no bucket proof; its classification destructures all fields so adding the
+  planned owner proof forces a release-policy review.
+
+Route retention includes both retained and releasable proofs until pending work
+settles. Do not use that dependency iterator as a generic release list. This is
+current command policy, not the future durable owner-obligation/release receipt.
+
 Direct streamed `PutObject` session liveness is represented by the
 stream-create bucket-write reservation proof, not by the stream row age. A live
 frontend refreshes that proof while the request can still append or finalize.

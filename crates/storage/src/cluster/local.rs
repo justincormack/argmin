@@ -7242,47 +7242,14 @@ fn release_open_applied_metadata_command_bucket_write_reservations(
     pg_routes: &BTreeMap<PgId, LocalPgRoute>,
     command: &MetadataCommandEnvelope,
 ) -> Result<(), ClusterBuildError> {
-    if matches!(
-        command.payload(),
-        crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create)
-            if create.session.target == crate::StreamUploadTarget::PutObject
-    ) {
-        return Ok(());
-    }
-    let topology = nodes
-        .values()
-        .next()
-        .expect("local cluster must contain at least one node")
-        .runtime()
-        .pg_topology();
-    for proof in command
-        .payload()
-        .bucket_write_reservation_route_dependencies()
-    {
-        let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
-        let primary_node_id = pg_routes
-            .get(&bucket_pg_id)
-            .expect("validated bucket PG id should have a route")
-            .primary_node_id();
-        let node = nodes
-            .get(&primary_node_id)
-            .expect("validated route primary must be in local node set");
-        let bucket_pg = node.runtime().bucket_metadata_pg_for(&proof.bucket);
-        node.retained_bucket_write_reservation_client()
-            .open_retained_bucket_write_reservation_route(bucket_pg, &proof.bucket)
-            .and_then(|route| route.release_metadata_command_bucket_write_reservation(proof))
-            .map_err(|source| {
-                ClusterBuildError::open_local_node(
-                    primary_node_id.as_u32(),
-                    StoreError::Io {
-                        context:
-                            "release metadata command bucket write reservations on local cluster open",
-                        source: std::io::Error::other(source),
-                    },
-                )
-            })?;
-    }
-    Ok(())
+    use crate::metadata_command::MetadataCommandReservationDisposition;
+    let proof = match command.payload().bucket_write_reservation_disposition() {
+        MetadataCommandReservationDisposition::NoCommandProof
+        | MetadataCommandReservationDisposition::RetainForStream(_) => return Ok(()),
+        MetadataCommandReservationDisposition::ReleaseOnApply(proof)
+        | MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(proof) => proof,
+    };
+    release_open_bucket_write_reservation(nodes, pg_routes, proof)
 }
 
 fn release_open_unpublished_metadata_command_bucket_write_reservation(

@@ -846,6 +846,17 @@ pub(crate) enum MetadataCommandPayload {
     AdvanceMultipartCompletionBarrier(AdvanceMultipartCompletionBarrierCommand),
 }
 
+/// What successful application does with a command-carried bucket reservation.
+/// This is command classification, not evidence that a durable release happened.
+/// In particular, retaining a proof for a stream does not renew its lease.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MetadataCommandReservationDisposition<'a> {
+    NoCommandProof,
+    ReleaseOnApply(&'a BucketWriteReservationProof),
+    RetainForStream(&'a BucketWriteReservationProof),
+    ReleaseStreamCreationOnApply(&'a BucketWriteReservationProof),
+}
+
 impl MetadataCommandPayload {
     pub(crate) fn kind_name(&self) -> &'static str {
         metadata_command_payload_kind_name(self.kind_id())
@@ -923,17 +934,65 @@ impl MetadataCommandPayload {
     pub(crate) fn primary_bucket_write_reservation_proof(
         &self,
     ) -> Option<&BucketWriteReservationProof> {
+        match self.bucket_write_reservation_disposition() {
+            MetadataCommandReservationDisposition::ReleaseOnApply(proof)
+            | MetadataCommandReservationDisposition::RetainForStream(proof) => Some(proof),
+            MetadataCommandReservationDisposition::NoCommandProof
+            | MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(_) => None,
+        }
+    }
+
+    /// Keep release timing separate from proof presence and route retention.
+    /// New command variants must choose a disposition explicitly.
+    pub(crate) fn bucket_write_reservation_disposition(
+        &self,
+    ) -> MetadataCommandReservationDisposition<'_> {
+        use MetadataCommandReservationDisposition::{
+            NoCommandProof, ReleaseOnApply, ReleaseStreamCreationOnApply, RetainForStream,
+        };
         match self {
-            Self::CommitDirectPutObject(commit) => Some(&commit.bucket_write_reservation),
-            Self::CommitMultipartObject(commit) => Some(&commit.bucket_write_reservation),
-            Self::CreateStreamUpload(create) => Some(&create.bucket_write_reservation),
-            Self::CommitStreamPart(commit) => Some(&commit.bucket_write_reservation),
-            Self::PutObjectMetadata(update) => Some(&update.bucket_write_reservation),
-            Self::DeleteObjectVersion(delete) => Some(&delete.bucket_write_reservation),
-            Self::InsertDeleteMarker(marker) => Some(&marker.bucket_write_reservation),
-            Self::CreateMultipartUpload(create) => Some(create.bucket_write_reservation()),
-            Self::AbortMultipartUpload(abort) => Some(&abort.bucket_write_reservation),
-            _ => None,
+            Self::CommitDirectPutObject(commit) => ReleaseOnApply(&commit.bucket_write_reservation),
+            Self::CommitMultipartObject(commit) => ReleaseOnApply(&commit.bucket_write_reservation),
+            Self::CreateStreamUpload(create) => match create.session.target {
+                StreamUploadTarget::PutObject => RetainForStream(&create.bucket_write_reservation),
+                StreamUploadTarget::UploadPart { .. } => {
+                    ReleaseOnApply(&create.bucket_write_reservation)
+                }
+            },
+            Self::CommitStreamPart(commit) => ReleaseOnApply(&commit.bucket_write_reservation),
+            Self::PutObjectMetadata(update) => ReleaseOnApply(&update.bucket_write_reservation),
+            Self::DeleteObjectVersion(delete) => ReleaseOnApply(&delete.bucket_write_reservation),
+            Self::InsertDeleteMarker(marker) => ReleaseOnApply(&marker.bucket_write_reservation),
+            Self::CreateMultipartUpload(create) => {
+                ReleaseOnApply(create.bucket_write_reservation())
+            }
+            Self::AbortMultipartUpload(abort) => ReleaseOnApply(&abort.bucket_write_reservation),
+            Self::AbortStreamUpload(abort) => match &abort.stream_create_bucket_write_reservation {
+                Some(proof) => ReleaseStreamCreationOnApply(proof),
+                None => NoCommandProof,
+            },
+            // Deliberately destructure every field: adding the planned Direct PUT
+            // owner proof must force review of its release timing, even though the
+            // command variant itself does not change.
+            Self::ReserveObjectGeneration(ReserveObjectGenerationCommand {
+                bucket: _,
+                key: _,
+                reservation_id: _,
+                generation_id: _,
+                created_at_millis: _,
+            }) => NoCommandProof,
+            Self::CreateBucket(_)
+            | Self::PutBucketVersioning(_)
+            | Self::PutBucketAcl(_)
+            | Self::PutBucketProperty(_)
+            | Self::PutBucketSubresource(_)
+            | Self::MarkBucketDeleting(_)
+            | Self::DeleteFinalizedBucket(_)
+            | Self::ReleaseObjectGeneration(_)
+            | Self::ReserveObjectVersion(_)
+            | Self::AppendStreamSegment(_)
+            | Self::DeleteObjectPayloadReclaim(_)
+            | Self::AdvanceMultipartCompletionBarrier(_) => NoCommandProof,
         }
     }
 
@@ -941,13 +1000,15 @@ impl MetadataCommandPayload {
     pub(crate) fn bucket_write_reservation_route_dependencies(
         &self,
     ) -> impl Iterator<Item = &BucketWriteReservationProof> {
-        let auxiliary = match self {
-            Self::AbortStreamUpload(abort) => abort.stream_create_bucket_write_reservation.as_ref(),
-            _ => None,
+        let proof = match self.bucket_write_reservation_disposition() {
+            MetadataCommandReservationDisposition::NoCommandProof => None,
+            MetadataCommandReservationDisposition::ReleaseOnApply(proof)
+            | MetadataCommandReservationDisposition::RetainForStream(proof)
+            | MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(proof) => {
+                Some(proof)
+            }
         };
-        [self.primary_bucket_write_reservation_proof(), auxiliary]
-            .into_iter()
-            .flatten()
+        proof.into_iter()
     }
 
     pub(crate) fn is_ordinary_pending_slot_reissue_of(&self, source: &Self) -> bool {
@@ -5744,6 +5805,70 @@ mod tests {
             let decoded = decode_metadata_command_envelope_for_test(&bytes).unwrap();
             assert_eq!(decoded.command_bytes(), bytes);
         }
+    }
+
+    #[test]
+    fn reservation_dispositions_keep_authorization_release_and_route_retention_distinct() {
+        // Independent expectations for the immutable object-command corpus:
+        // no proof, ordinary release, or stream retention. These bytes also pin
+        // behavior for decoded/recovered envelopes, not only builder output.
+        let expected = [
+            "none", "none", "none", "release", "release", "release", "release", "release",
+            "release", "release", "release", "release", "release", "release", "release", "release",
+            "release", "release", "release", "retain", "release", "retain", "none", "none",
+            "release", "none", "none", "release", "none", "none",
+        ];
+        let commands = immutable_v12_sse_s3_v5_object_command_bytes()
+            .into_iter()
+            .map(|bytes| decode_metadata_command_envelope_for_test(&bytes).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), expected.len());
+        for (command, expected) in commands.iter().zip(expected) {
+            let payload = command.payload();
+            let (actual, proof) = match payload.bucket_write_reservation_disposition() {
+                MetadataCommandReservationDisposition::NoCommandProof => ("none", None),
+                MetadataCommandReservationDisposition::ReleaseOnApply(proof) => {
+                    ("release", Some(proof))
+                }
+                MetadataCommandReservationDisposition::RetainForStream(proof) => {
+                    ("retain", Some(proof))
+                }
+                MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(_) => {
+                    panic!("corpus abort has no proof")
+                }
+            };
+            assert_eq!(actual, expected, "{}", payload.kind_name());
+            assert_eq!(payload.primary_bucket_write_reservation_proof(), proof);
+            assert_eq!(
+                payload
+                    .bucket_write_reservation_route_dependencies()
+                    .collect::<Vec<_>>(),
+                proof.into_iter().collect::<Vec<_>>()
+            );
+        }
+
+        let proof = commands[19]
+            .payload()
+            .primary_bucket_write_reservation_proof()
+            .unwrap()
+            .clone();
+        let MetadataCommandPayload::AbortStreamUpload(mut abort) = commands[23].payload().clone()
+        else {
+            panic!("expected abort fixture")
+        };
+        abort.stream_create_bucket_write_reservation = Some(proof.clone());
+        let payload = MetadataCommandPayload::AbortStreamUpload(abort);
+        assert!(matches!(payload.bucket_write_reservation_disposition(),
+            MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(actual) if *actual == proof));
+        // An unstarted abort is not the owner of the still-live session proof.
+        assert_eq!(payload.primary_bucket_write_reservation_proof(), None);
+        // But a pending abort must pin the cleanup proof's historical bucket route.
+        assert_eq!(
+            payload
+                .bucket_write_reservation_route_dependencies()
+                .collect::<Vec<_>>(),
+            vec![&proof]
+        );
     }
 
     fn immutable_v11_sse_s3_v5_object_command_bytes() -> Vec<Vec<u8>> {

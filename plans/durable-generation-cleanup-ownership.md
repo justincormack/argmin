@@ -60,6 +60,8 @@ not a substitute for persisted window/issuer binding.
 The [primary-owned append builder](#primary-owned-stream-append-construction--2026-10-31)
 now supplies the actual-primary construction boundary needed by future window
 issuance, without adding owner records or changing durable command semantics.
+The [explicit reservation disposition](#explicit-command-reservation-disposition--2026-10-31)
+unifies current foreground/restart release policy before adding durable obligations.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -2631,56 +2633,6 @@ independent file/ack exclusion with retained cleanup. These lifetime hooks still
 do not authorize allocation or physical writes. The six ignored cleanup
 regressions remain unresolved.
 
-## Primary-owned stream append construction — 2026-10-31
-
-Implemented the append-builder prerequisite identified by the integration audit.
-The production frontend no longer constructs `AppendStreamSegment` from an ID
-selected separately. The scoped stream-session route builds it on the actual
-object-PG primary under its PG lock. Shared read-only preflight checks the exact
-bucket/key/session/target, InProgress session and MPU, segment extent, checked
-VID successor, encrypted geometry/integrity witness and existing segment. The
-builder then requires a live allocation lifetime and revalidates the captured
-effect fence before selecting the command ID. Replica apply independently uses
-the same durable validation in its existing transaction; it does not require a
-live issuer lifetime to converge already-built commands.
-
-Unix/TLS kind 177 carries the exact target/segment and absolute portable deadline.
-The server intersects delegated authority with its own captured route fence; the
-client rejects substituted PG, epoch, bucket, key, target or segment responses.
-The typed ApplyValidated installer accepts a fallible primary-built envelope and
-retains the existing pending-slot fence, one-observed-contender retry, work-budget,
-recovery handoff and reference-aware payload cleanup behavior. Construction is
-read-only: no additional durable command, transaction or fsync. Remote operation
-does introduce a builder RPC; this slice makes no performance improvement claim.
-
-Storage RPC advances from v30 to v31; command v12 and durable formats do not
-change. All v30 frames, 37 creation specimens and authentication composites remain
-unchanged rejection evidence. New v31 composites and eight append-request
-specimens are appended. The request cap includes the complete 256-entry encoded
-witness index space (the codec's bound, not a new supported EC runtime shape).
-
-Coverage includes embedded and installed Unix PUT/UploadPart construction with
-exact checkpoint, pending-slot, log, session and segment non-mutation canaries;
-crossed request and malicious response subjects; retired-lifetime rejection while
-already-built commands still apply/replay; and deterministic expiry after the
-initial check but before the PG lock. Unix cases cover both sender-first and
-server-first deadlines, including an absent delegated deadline. TLS cases use the
-real client conversion with different frontend/storage monotonic origins. Codec
-tests pin optional branches, truncation/trailing rejection and exact maximum
-framed admission. Existing append contention/recovery tests remain in scope.
-
-This is **not** persisted issuer/window binding, settled-prefix confirmation or
-physical write/cleanup exclusion. Owner/resource-obligation schema integration
-and all six original cleanup regressions remain open. Future append-window
-issuance must derive its persisted issuer from this primary boundary; merely
-checking the currently live lifetime is not replacement-primary authorization.
-
-Validation: 270 focused tests passed. Full Nextest passed 9,142 tests (one slow,
-six skipped) in 265.901s; strict all-target/all-feature Clippy, storage boundary
-checks, formatting, shell syntax and diff checks passed. All pre-existing long
-hex specimens in the changed RPC/authentication tests remain present. The six
-skipped cleanup regressions are unchanged and remain unresolved.
-
 Validation for this embedded publication slice: all five focused publication
 tests passed; the full suite, including the additional owner-local batch test,
 passed 9,088 tests (one slow, six skipped) in 269.495 seconds using
@@ -3437,6 +3389,10 @@ that the live-lifetime check establishes exclusive issuance. The input and
 transaction audit below identifies the remaining changes that must land with
 that state. No owner/window table or physical grant is implemented by this audit.
 
+Subsequent prerequisite slices implement the primary-owned append builder and
+the explicit command reservation disposition below. The audit's source snapshot
+and remaining coordinated-state requirements are otherwise retained.
+
 ### Bind persisted windows, not the lifetime of a frontend route object
 
 `require_live_allocation_lifetime()` proves only that the store currently has an
@@ -3552,3 +3508,101 @@ strict all-target/all-feature Clippy, storage boundary checks, formatting and
 diff checks passed. These are unchanged-code regression results, not evidence
 that the proposed owner/window integration is implemented. The six cleanup
 regressions remain unresolved.
+
+## Primary-owned stream append construction — 2026-10-31
+
+Implemented the append-builder prerequisite identified by the integration audit.
+The production frontend no longer constructs `AppendStreamSegment` from an ID
+selected separately. The scoped stream-session route builds it on the actual
+object-PG primary under its PG lock. Shared read-only preflight checks the exact
+bucket/key/session/target, InProgress session and MPU, segment extent, checked
+VID successor, encrypted geometry/integrity witness and existing segment. The
+builder then requires a live allocation lifetime and revalidates the captured
+effect fence before selecting the command ID. Replica apply independently uses
+the same durable validation in its existing transaction; it does not require a
+live issuer lifetime to converge already-built commands.
+
+Unix/TLS kind 177 carries the exact target/segment and absolute portable deadline.
+The server intersects delegated authority with its own captured route fence; the
+client rejects substituted PG, epoch, bucket, key, target or segment responses.
+The typed ApplyValidated installer accepts a fallible primary-built envelope and
+retains the existing pending-slot fence, one-observed-contender retry, work-budget,
+recovery handoff and reference-aware payload cleanup behavior. Construction is
+read-only: no additional durable command, transaction or fsync. Remote operation
+does introduce a builder RPC; this slice makes no performance improvement claim.
+
+Storage RPC advances from v30 to v31; command v12 and durable formats do not
+change. All v30 frames, 37 creation specimens and authentication composites remain
+unchanged rejection evidence. New v31 composites and eight append-request
+specimens are appended. The request cap includes the complete 256-entry encoded
+witness index space (the codec's bound, not a new supported EC runtime shape).
+
+Coverage includes embedded and installed Unix PUT/UploadPart construction with
+exact checkpoint, pending-slot, log, session and segment non-mutation canaries;
+crossed request and malicious response subjects; retired-lifetime rejection while
+already-built commands still apply/replay; and deterministic expiry after the
+initial check but before the PG lock. Unix cases cover both sender-first and
+server-first deadlines, including an absent delegated deadline. TLS cases use the
+real client conversion with different frontend/storage monotonic origins. Codec
+tests pin optional branches, truncation/trailing rejection and exact maximum
+framed admission. Existing append contention/recovery tests remain in scope.
+
+This is **not** persisted issuer/window binding, settled-prefix confirmation or
+physical write/cleanup exclusion. Owner/resource-obligation schema integration
+and all six original cleanup regressions remain open. Future append-window
+issuance must derive its persisted issuer from this primary boundary; merely
+checking the currently live lifetime is not replacement-primary authorization.
+
+Validation: 270 focused tests passed. Full Nextest passed 9,142 tests (one slow,
+six skipped) in 265.901s; strict all-target/all-feature Clippy, storage boundary
+checks, formatting, shell syntax and diff checks passed. All pre-existing long
+hex specimens in the changed RPC/authentication tests remain present. The six
+skipped cleanup regressions are unchanged and remain unresolved.
+
+## Explicit Command Reservation Disposition — 2026-10-31
+
+The owner-obligation audit requires release timing to remain separate from proof
+presence. Before adding the planned Direct PUT proof or persisted obligations,
+replace the two independent foreground/open-time stream-creation exceptions with
+one exhaustive command classification. `MetadataCommandReservationDisposition`
+now distinguishes no command-carried proof, release on application, retention for
+a live PUT stream, and stream-creation cleanup after an applied abort.
+
+Both foreground terminal cleanup and local-open convergence consume that
+classification. Authorization-proof selection deliberately excludes abort's
+auxiliary cleanup proof: abandoning an unstarted abort must not release a still-
+live session's reservation. Pending route dependencies include all carried
+proofs, including retained PUT creation and abort cleanup, regardless of whether
+successful application releases them. Ordinary release validation and existing
+idempotent/error handling remain in place; classification alone grants no new
+authority to release a proof.
+
+The match is exhaustive over command variants. The currently proof-free
+`ReserveObjectGenerationCommand` is also destructured without `..`, so adding the
+planned proof field forces an explicit policy decision even without a new enum
+variant. That future introducing command must retain the proof through staging,
+not inherit ordinary release-on-apply. This safeguard does not claim that adding
+arbitrary fields to every other payload is compiler-inventoried.
+
+Independent disposition expectations cover the immutable decoded object-command
+corpus plus abort with a cleanup proof. A three-replica storage regression builds
+PUT and UploadPart creation through the primary, persists an exact pending command
+and applies it on every replica. It verifies that application alone releases
+neither proof, then checks foreground cleanup/retry and actual close/reopen
+convergence: PUT retains its exact creation reservation; UploadPart releases only
+its creation reservation. A second same-object proof remains an exact-row canary
+(a separate finalization proof for UploadPart). Subsequent abort releases only the
+PUT session's proof and preserves that canary. Existing unstarted creation/abort
+restart regressions separately pin abandonment behavior.
+
+No durable or wire format changes, SQL statements, commits or fsyncs are added.
+This is a prerequisite refactoring of current responsibility, **not** a persisted
+release receipt or durable owner/window implementation. The coordinated schema,
+command and runtime integration remains next; the six cleanup regressions remain
+open. The previous append-builder ledger has been moved beside this entry so the
+embedded-publication validation remains attached to its original section.
+
+Validation: six focused tests passed. Full Nextest passed 9,144 tests (one slow,
+six skipped) in 255.215s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and diff checks passed. The six skipped cleanup regressions
+are unchanged and remain unresolved.

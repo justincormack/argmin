@@ -8,6 +8,9 @@ use crate::metadata_command::ReleaseObjectGenerationCommand;
 use crate::test_support::StorageClusterFailureTestSupport as _;
 use crate::BucketSnapshotLoadError;
 
+#[path = "stream_commands/reservation_disposition.rs"]
+mod reservation_disposition;
+
 struct StreamPayloadCleanupFixture {
     _tmp: test_util::TempDir,
     cluster: Arc<crate::StorageCluster>,
