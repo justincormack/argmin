@@ -308,6 +308,9 @@ pub(crate) enum StoreError {
     #[error("PG {pg_id} durable identity is invalid: {reason}")]
     PgDurableIdentityInvalid { pg_id: u32, reason: String },
 
+    #[error("PG {pg_id} has no live allocation lifetime")]
+    PgAllocationLifetimeUnavailable { pg_id: u32 },
+
     #[error("cluster-map history route reference count {count} exceeds maximum {max}")]
     ClusterMapHistoryReferenceLimitExceeded { count: usize, max: usize },
 
@@ -816,6 +819,7 @@ impl StoreError {
             | Self::PgNotActive { .. }
             | Self::ShardPgNotActive { .. }
             | Self::MetadataCommandTerminalEntryPending { .. }
+            | Self::PgAllocationLifetimeUnavailable { .. }
             | Self::OperationDeadlineExceeded { .. } => {
                 StoreOperationFailureClass::RetryableConvergence
             }
@@ -937,6 +941,7 @@ impl StoreError {
             | Self::PgNotActive { .. }
             | Self::ShardPgNotActive { .. }
             | Self::StalePayloadOperation { .. }
+            | Self::PgAllocationLifetimeUnavailable { .. }
             | Self::StaleMetadataPrimaryBridge { .. }
             | Self::StaleMetadataOperation { .. }
             | Self::StaleMetadataRoute { .. }
@@ -1143,6 +1148,7 @@ impl StoreError {
                 "object_payload_reclaim_fence_authority_mismatch"
             }
             Self::PgDurableIdentityInvalid { .. } => "pg_durable_identity_invalid",
+            Self::PgAllocationLifetimeUnavailable { .. } => "pg_allocation_lifetime_unavailable",
             Self::ClusterMapHistoryReferenceLimitExceeded { .. } => {
                 "cluster_map_history_reference_limit_exceeded"
             }
@@ -4182,6 +4188,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Peering,
             },
+            StoreError::PgAllocationLifetimeUnavailable { pg_id: 2 },
             remote_failure(StorageRpcErrorCode::StaleShardLocation),
             remote_failure(StorageRpcErrorCode::InactivePgRoute),
             remote_failure(StorageRpcErrorCode::NonActingSetAccess),

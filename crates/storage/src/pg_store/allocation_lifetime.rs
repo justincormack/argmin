@@ -3,9 +3,11 @@
 
 //! Local identity for the future replicated staging-window issuer binding.
 //!
-//! This is NOT a write grant. No allocator consumes it yet: route admission,
-//! durable window coverage, publication confirmation and physical exclusion are
-//! still required. It is deliberately absent from checkpoints and SQL state.
+//! Direct PUT/stream creation builders and stream preparation require a live
+//! lifetime under the PG lock. This is NOT a write grant: route admission,
+//! durable window coverage, issuer matching, publication confirmation and physical
+//! exclusion are still required. It is deliberately absent from checkpoints and
+//! SQL state.
 
 use std::cell::Cell;
 
@@ -43,6 +45,15 @@ impl PgAllocationLifetime {
         Ok(Self {
             state: Cell::new(State::Active(fresh_identity()?)),
         })
+    }
+
+    pub(super) fn require_active(&self, pg_id: u32) -> Result<(), StoreError> {
+        match self.state.get() {
+            State::Active(_) => Ok(()),
+            State::Replacing(_) | State::Retired => {
+                Err(StoreError::PgAllocationLifetimeUnavailable { pg_id })
+            }
+        }
     }
 
     /// Called under PG serialization, before attempting a state replacement.
@@ -98,6 +109,27 @@ impl Drop for ReplacementLifetime<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_allocation_lifetime_rejects_issuance_until_replacement_completes() {
+        let lifetime = PgAllocationLifetime::new().unwrap();
+        let rejected = || {
+            assert!(matches!(
+                lifetime.require_active(7),
+                Err(StoreError::PgAllocationLifetimeUnavailable { pg_id: 7 })
+            ));
+        };
+        lifetime.require_active(7).unwrap();
+        let replacement = lifetime.begin_replacement().unwrap();
+        rejected();
+        drop(replacement);
+        rejected();
+        let replacement = lifetime.begin_replacement().unwrap();
+        rejected();
+        replacement.complete().unwrap();
+        lifetime.require_active(7).unwrap();
+        assert!(PgAllocationLifetime::retired().require_active(7).is_err());
+    }
 
     #[test]
     fn pg_allocation_lifetime_abandoned_replacement_cannot_restore_old_identity() {

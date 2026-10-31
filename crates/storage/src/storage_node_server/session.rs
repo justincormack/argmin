@@ -878,6 +878,10 @@ fn validate_metadata_command_request_epoch(
 
 fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
     match error {
+        error @ StoreError::PgAllocationLifetimeUnavailable { .. } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::InactivePgRoute,
+            message: error.to_string(),
+        },
         StoreError::NotFound => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::NotFound,
             message: "not found".to_string(),
@@ -1040,7 +1044,8 @@ fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorRespon
                 message: format!("metadata command contention during {context}"),
             }
         }
-        ObjectPgActionError::Store(error @ StoreError::RouteMapExpired { .. }) => {
+        ObjectPgActionError::Store(error @ (StoreError::RouteMapExpired { .. }
+        | StoreError::PgAllocationLifetimeUnavailable { .. })) => {
             store_error_response(error)
         }
         ObjectPgActionError::Store(error @ StoreError::RouteCapabilitySubjectMismatch { .. }) => {

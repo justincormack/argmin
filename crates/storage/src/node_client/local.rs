@@ -414,6 +414,7 @@ impl LocalStreamUploadSessionMetadataRoute<'_> {
             session.next_segment_vid,
         )?;
         effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
+        pg.require_live_allocation_lifetime()?;
         let segment_vid = allocate_stream_segment_for_preparation(&pg, request)?;
         let segment_record = StreamUploadSegmentRecord {
             session_id: request.session_id.clone(),
@@ -2888,6 +2889,7 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
         // Candidate, reservation absence, placement and ID are inspected under
         // the actual primary PG lock. Building never installs a pending slot.
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        pg.require_live_allocation_lifetime()?;
         let id = self.client.next_metadata_command_id_from_locked_pg(
             self.pg_id.pg_id(),
             self.route_cluster_epoch,
@@ -5552,6 +5554,7 @@ impl LocalStorageNodeClient {
             &crate::stream_segment_key_hash(&request.request.session_id, 0),
             GenerationId::MIN,
         )?;
+        pg.require_live_allocation_lifetime()?;
         let command_id =
             self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;
         Ok(MetadataCommandEnvelope::new(

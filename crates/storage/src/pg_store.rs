@@ -1168,6 +1168,14 @@ fn open_and_validate_existing_pg_database_file(
 }
 
 impl PgStore {
+    /// Fresh allocation/building only, under the actual node's PG lock. A
+    /// retired store may still inspect or converge already published commands.
+    pub(in crate::node_runtime) fn require_live_allocation_lifetime(
+        &self,
+    ) -> Result<(), StoreError> {
+        self.allocation_lifetime.require_active(self.pg_id)
+    }
+
     /// The node holds PG serialization until route publication either succeeds
     /// or fails. Replacement is volatile and cannot restore the old identity.
     pub(in crate::node_runtime) fn begin_allocation_lifetime_replacement(

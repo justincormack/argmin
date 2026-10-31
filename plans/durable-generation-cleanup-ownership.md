@@ -3274,3 +3274,45 @@ all-target/all-feature Clippy, storage boundary checks, formatting and diff
 checks passed. An initial focused run caught the authentication-binding golden
 still expecting the nested v28 frame; its literal request/response specimens
 are now preserved as rejection evidence beside the appended v29 composites.
+
+## Live Allocation Lifetime At Fresh Builder Boundaries — 2026-10-31
+
+The actual-primary builder audit exposed an unconnected prerequisite: PG
+replacement already retired the volatile allocation lifetime, including after
+failed route publication/import, but fresh builders and append preparation did
+not consult it. An unchanged installed route could therefore continue issuing
+work from a retired store. Connect this check before attaching durable window
+issuers to those builders.
+
+The shared local routes now require a live allocation lifetime under the actual
+storage node's PG lock immediately before Direct PUT reservation-command ID
+selection, stream-creation command ID selection, and stream append VID allocation.
+Both `Replacing` and `Retired` reject fresh work. Installed Unix/TLS dispatch uses
+these same local routes; Unix regression coverage checks the exact
+`InactivePgRoute` response and diagnostic. Embedded and remote failures retain
+retryable-convergence classification, not a conditional-conflict classification.
+No new wire error tag, format version, SQL transaction or fsync is introduced.
+
+The check deliberately does not guard replica apply, exact command replay,
+matching-session inspection or existing-reservation lookup. A retired primary
+must not strand work already issued/published, and replica application must not
+depend on a replica's local issuer lifetime. Tests cover Direct PUT construction,
+PUT/UploadPart creation and preparation, comparing checkpoints, pending/log
+state, generation candidates, complete sessions and staged rows after rejection.
+Positive controls exercise active construction, apply/replay while retired,
+inspection while retired and preparation after a successful lifetime replacement.
+The lifetime unit test independently rejects the in-progress replacement state.
+
+This is **liveness gating only**, not the persisted issuer/session binding. A
+successfully replaced PG still cannot distinguish an old window from a new one
+until the command/schema work lands. It also does not revalidate a command's
+issuer between construction and installation. The retained owner/window records,
+atomic creation/append/terminal retention, confirmation and physical exclusion
+remain the next complete state integration; all six cleanup regressions remain
+unresolved. Do not treat this check as a physical grant or cleanup safety fix.
+
+Validation: all 22 focused lifetime tests passed. Full Nextest passed 9,131 tests
+(one slow, six skipped) in 265.133s. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and diff checks passed. The reported slow Raft
+heartbeat write-amplification test completed successfully in 94.690s; no rerun or
+test change was needed.

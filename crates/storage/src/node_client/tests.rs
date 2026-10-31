@@ -4408,6 +4408,8 @@ mod publication_transport_model;
 #[path = "tests/stream_creation_placement.rs"]
 mod stream_creation_placement;
 
+#[path = "tests/allocation_lifetime.rs"]
+mod allocation_lifetime;
 #[path = "tests/generation_reservation_builder.rs"]
 mod generation_reservation_builder;
 #[path = "tests/stream_extent.rs"]
