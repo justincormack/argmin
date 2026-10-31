@@ -36,11 +36,40 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
             let tmp = test_util::tempdir();
             let mut config = test_config(&tmp);
             config.default_ec_shape = EcShape { k: 1, m: 0 };
+            config.pg_ids = (0..8).collect();
+            config.pg_routes = config
+                .pg_ids
+                .iter()
+                .map(|&pg_id| StorageNodePgRoute {
+                    pg_id,
+                    ..config.pg_routes[0].clone()
+                })
+                .collect();
+            let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+            let bucket = crate::tests::bucket_name("append-builder");
+            let payload_generation = GenerationId::new(2).unwrap();
+            let key = (0..10_000)
+                .map(|n| crate::tests::object_key(format!("key-{n}")))
+                .find(|key| {
+                    topology.object_pg_for(&bucket, key) == 0
+                        && topology.object_generation_multipart_part_segment_data_pg(
+                            &bucket,
+                            key,
+                            GenerationId::MIN,
+                            1,
+                            0,
+                        ) != topology.object_generation_multipart_part_segment_data_pg(
+                            &bucket,
+                            key,
+                            payload_generation,
+                            1,
+                            0,
+                        )
+                })
+                .unwrap();
             private_socket_dir(config.socket_path.parent().unwrap());
             let server = StorageNodeServer::bind(config.clone()).unwrap();
             let node = server.test_storage_node();
-            let bucket = crate::tests::bucket_name("append-builder");
-            let key = crate::tests::object_key("key");
             let session_id = crate::tests::stream_session_id("session");
             let encryption = metadata_only_test_encryption();
             let upload_request = CreateMultipartUploadReq {
@@ -92,7 +121,8 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 config.node_id,
                 config.cluster_epoch,
                 config.socket_path.clone(),
-            );
+            )
+            .with_pg_topology(Arc::clone(&topology));
             let client: &dyn ObjectMutationMetadataNodeClient = if remote { &unix } else { &local };
             let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
             let fence = AdmittedRouteEffectFence::unbounded(config.cluster_epoch);
@@ -150,9 +180,38 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 )
             };
             let before = observe();
-            let segment = segment(&session_id, &encryption);
+            let reserved = PgMetadataStore::get_object_generation_reservation(
+                &*node.get_pg(0).unwrap(),
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap();
+            assert_eq!(reserved, payload_generation);
+            assert_eq!(upload.object_generation_id, GenerationId::MIN);
+            let mut segment = segment(&session_id, &encryption);
+            segment.data_pg_id = if part {
+                topology
+                    .object_generation_multipart_part_segment_data_pg(
+                        &bucket,
+                        &key,
+                        upload.object_generation_id,
+                        1,
+                        0,
+                    )
+                    .get()
+            } else {
+                topology
+                    .object_generation_segment_data_pg(&bucket, &key, reserved, 0)
+                    .get()
+            };
             let built = route
-                .build_append_command(&target, &segment, fence)
+                .build_append_command(
+                    &target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config),
+                )
                 .unwrap();
             assert_eq!(built.id().log_index().get(), before.2 + 1);
             assert!(
@@ -160,6 +219,100 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 if append.bucket == bucket && append.key == key && append.target == target && append.segment == segment)
             );
             assert_eq!(observe(), before, "healthy construction must be read-only");
+            // These mutations retain coherent witness geometry. In particular,
+            // the part case crosses only MPU-vs-payload generation placement.
+            for case in 0..3 {
+                let mut crossed = segment.clone();
+                match case {
+                    0 => {
+                        crossed.data_pg_id = if part {
+                            topology
+                                .object_generation_multipart_part_segment_data_pg(
+                                    &bucket, &key, reserved, 1, 0,
+                                )
+                                .get()
+                        } else {
+                            (segment.data_pg_id + 1) % 8
+                        }
+                    }
+                    1 => crossed.placement_cluster_epoch = ClusterEpoch::new(2).unwrap(),
+                    2 => {
+                        crossed.ec_m = 1;
+                        let (crc, witness) =
+                            crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                                EcShape { k: 1, m: 1 },
+                                encryption.segment_stored_size(crossed.size).unwrap(),
+                            );
+                        crossed.segment_crc64 = crc;
+                        crossed.shard_integrity = Some(witness);
+                    }
+                    _ => unreachable!(),
+                }
+                let error = route
+                    .build_append_command(
+                        &target,
+                        &crossed,
+                        fence,
+                        PayloadPlacementInput::from_server_config(&config),
+                    )
+                    .unwrap_err();
+                match &error {
+                    ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                        operation,
+                    }) => {
+                        assert_eq!(
+                            *operation,
+                            if remote && case == 2 {
+                                "stream preparation captured placement"
+                            } else {
+                                "stream append placement subject"
+                            }
+                        );
+                    }
+                    ObjectPgActionError::Store(StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::PayloadDecode,
+                        detail,
+                        ..
+                    }) if remote && case == 0 => {
+                        assert!(
+                            detail.as_str().contains("stream append placement subject"),
+                            "{detail}"
+                        );
+                    }
+                    _ => panic!("case={case} remote={remote}: {error:?}"),
+                }
+                assert_eq!(observe(), before);
+                if remote {
+                    // Bypass sender preflight so epoch/EC failures must also be
+                    // rejected independently by the installed primary builder.
+                    let error = unix
+                        .rpc_request(
+                            StorageRpcMessageKind::ObjectStreamAppendCommandBuild,
+                            crate::storage_rpc::encode_stream_append_command_build_request(
+                                &crate::storage_rpc::StorageRpcStreamAppendCommandBuildRequest {
+                                    object: unix.object_request(pg_id.pg_id(), &bucket, &key),
+                                    target: target.clone(),
+                                    segment: crossed,
+                                    effect_deadline: None,
+                                },
+                            ),
+                        )
+                        .unwrap_err();
+                    let StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::PayloadDecode,
+                        detail,
+                        ..
+                    } = error
+                    else {
+                        panic!("{error:?}");
+                    };
+                    assert!(
+                        detail.as_str().contains("stream append placement subject"),
+                        "{detail}"
+                    );
+                    assert_eq!(observe(), before);
+                }
+            }
             for case in 0..5 {
                 let mut crossed = segment.clone();
                 match case {
@@ -172,7 +325,12 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 }
                 assert!(
                     route
-                        .build_append_command(&target, &crossed, fence)
+                        .build_append_command(
+                            &target,
+                            &crossed,
+                            fence,
+                            PayloadPlacementInput::from_server_config(&config)
+                        )
                         .is_err(),
                     "case={case} remote={remote}"
                 );
@@ -187,25 +345,39 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 }
             };
             assert!(route
-                .build_append_command(&wrong_target, &segment, fence)
+                .build_append_command(
+                    &wrong_target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config)
+                )
                 .is_err());
             let wrong_key = client
                 .open_stream_upload_session_metadata_route(
                     config.cluster_epoch,
                     pg_id,
                     &bucket,
-                    &crate::tests::object_key("foreign"),
+                    &(0..10_000)
+                        .map(|n| crate::tests::object_key(format!("foreign-{n}")))
+                        .find(|key| topology.object_pg_for(&bucket, key) == 0)
+                        .unwrap(),
                     &session_id,
                 )
                 .unwrap();
             assert!(wrong_key
-                .build_append_command(&target, &segment, fence)
+                .build_append_command(
+                    &target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config)
+                )
                 .is_err());
             assert!(route
                 .build_append_command(
                     &target,
                     &segment,
-                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 2_000, 1)
+                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 2_000, 1),
+                    PayloadPlacementInput::from_server_config(&config)
                 )
                 .is_err());
             assert_eq!(observe(), before);
@@ -216,7 +388,12 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     .unwrap(),
             );
             let error = route
-                .build_append_command(&target, &segment, fence)
+                .build_append_command(
+                    &target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config),
+                )
                 .unwrap_err();
             assert!(
                 if remote {
@@ -255,7 +432,8 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
 #[test]
 fn unix_stream_append_builder_rejects_crossed_peer_responses() {
     let tmp = test_util::tempdir();
-    let config = test_config(&tmp);
+    let mut config = test_config(&tmp);
+    config.default_ec_shape = EcShape { k: 1, m: 0 };
     private_socket_dir(config.socket_path.parent().unwrap());
     let listener = UnixListener::bind(&config.socket_path).unwrap();
     let bucket = crate::tests::bucket_name("append-peer");
@@ -352,6 +530,7 @@ fn unix_stream_append_builder_rejects_crossed_peer_responses() {
                 &target,
                 &segment,
                 AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                PayloadPlacementInput::from_server_config(&config),
             )
             .unwrap_err();
         assert!(
@@ -370,7 +549,8 @@ fn unix_stream_append_builder_rejects_crossed_peer_responses() {
             .build_append_command(
                 &target,
                 &segment,
-                AdmittedRouteEffectFence::unbounded(config.cluster_epoch)
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                PayloadPlacementInput::from_server_config(&config),
             )
             .unwrap()
             .id(),

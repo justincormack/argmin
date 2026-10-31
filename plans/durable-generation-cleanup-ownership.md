@@ -65,6 +65,9 @@ unifies current foreground/restart release policy before adding durable obligati
 The [Direct PUT primary proof input](#primary-direct-put-reservation-proof-input--2026-10-31)
 carries and checks the reservation subject at the builder; durable proof ownership
 and the owner/window state remain part of the coordinated integration.
+The [append placement input](#captured-placement-input-for-append-construction--2026-10-31)
+checks fresh append placement against durable PUT/MPU generation under the primary
+lock. This remains preflight, not persisted window authority.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3659,3 +3662,38 @@ bucket-acquisition prerequisite and an unplaceable positive fixture; those were
 corrected without changing production validation. Both codec and installed-server
 future-version rejection matrices were updated from v32 to v33, adding v31
 rejection. All prior long RPC/authentication hex specimens remain unchanged.
+
+## Captured Placement Input for Append Construction — 2026-10-31
+
+Fresh append construction now receives the immutable placement catalogue already
+captured by the request. The embedded builder loads the durable placement
+generation under the same object-PG lock as session/target/witness validation:
+the PUT generation reservation, or the enclosing MPU generation for UploadPart
+(not the separately reserved part payload generation). It verifies the selected
+data PG, placement epoch, configured EC shape and selected route availability
+before command-ID allocation. The installed Unix/TLS handler supplies its own
+captured configuration; the Unix client additionally rejects crossed epoch/EC or
+unavailable selected routes before transport.
+
+The multi-PG regression exercises embedded and installed Unix PUT/UploadPart
+builders. Its MPU and part generations deliberately select different data PGs;
+crossed PG, epoch and coherent-but-crossed EC witnesses must reject without
+changing checkpoint, pending slot, log index, session or segment rows. Raw Unix
+requests bypass sender checks to pin independent receiver validation. A successful
+build is read-only, and the already-built command still applies/replays after
+retiring the issuer lifetime.
+
+No new wire field, format version, transaction or fsync is introduced. Replica
+apply and exact pending-command recovery are unchanged: this is fresh-builder
+preflight, not a new active-route requirement for converging accepted work.
+Persisted owner/window state, release obligations, settled-prefix confirmation
+and physical exclusion are still unimplemented; all six cleanup regressions
+remain open.
+
+Validation: all 60 focused tests passed. Full Nextest passed 9,147 tests (two
+slow, six skipped) in 280.642s. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and diff checks passed. Initial focused failures
+were assertion mistakes in the new regression: public error formatting redacts
+diagnostics. The corrected tests match the typed error and use storage's
+test-only remote-detail accessor, retaining exact `PayloadDecode` and placement
+diagnostic assertions. The six skipped cleanup regressions remain unresolved.

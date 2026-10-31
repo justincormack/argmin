@@ -32,6 +32,59 @@ enum PlacementSource<'a> {
 }
 
 impl<'a> PayloadPlacementInput<'a> {
+    /// Check the selected append against its durable placement generation. For
+    /// UploadPart this is the enclosing MPU generation, not the part's payload
+    /// generation. The caller loads it under the same lock as command preflight.
+    pub(in crate::node_runtime) fn require_stream_append_placement(
+        self,
+        epoch: ClusterEpoch,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        target: &crate::StreamUploadTarget,
+        placement_generation: GenerationId,
+        segment: &crate::StreamUploadSegmentRecord,
+    ) -> Result<(), StoreError> {
+        let part = match target {
+            crate::StreamUploadTarget::PutObject => None,
+            crate::StreamUploadTarget::UploadPart { part_number, .. } => Some(*part_number),
+        };
+        let (data_pg, ec) = self.stream_data_pg(
+            bucket,
+            key,
+            segment.segment_index,
+            placement_generation,
+            part,
+        )?;
+        if data_pg != segment.data_pg_id || ec.k != segment.ec_k || ec.m != segment.ec_m {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream append placement subject",
+            });
+        }
+        self.require_captured_stream_segment_placement(epoch, segment)
+    }
+
+    pub(in crate::node_runtime) fn require_captured_stream_segment_placement(
+        self,
+        epoch: ClusterEpoch,
+        segment: &crate::StreamUploadSegmentRecord,
+    ) -> Result<(), StoreError> {
+        if segment.placement_cluster_epoch != epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream append placement subject",
+            });
+        }
+        self.require_segment_placement(
+            epoch,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        )
+    }
+
     pub(in crate::node_runtime) fn require_direct_put_placement(
         self,
         epoch: crate::ClusterEpoch,

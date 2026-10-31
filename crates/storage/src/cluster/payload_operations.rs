@@ -7713,6 +7713,7 @@ impl StorageCluster {
                         target,
                         segment_record,
                         route.effect_fence,
+                        PayloadPlacementInput::from_local_map(&self.local_map),
                     )?;
                     self.maybe_run_after_stream_append_command_id_allocated_hook(command.id());
                     Ok(command)

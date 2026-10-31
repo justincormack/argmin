@@ -4758,6 +4758,7 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
         target: &StreamUploadTarget,
         segment: &StreamUploadSegmentRecord,
         effect_fence: AdmittedRouteEffectFence,
+        placement: PayloadPlacementInput<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         use crate::storage_rpc::{
             encode_stream_append_command_build_request, StorageRpcStreamAppendCommandBuildRequest,
@@ -4772,6 +4773,7 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
             }
             .into());
         }
+        placement.require_captured_stream_segment_placement(self.route_cluster_epoch, segment)?;
         let request = StorageRpcStreamAppendCommandBuildRequest {
             object: self
                 .client

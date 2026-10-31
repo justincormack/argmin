@@ -1774,7 +1774,10 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.key,
             &segment.session_id,
         )
-        .and_then(|route| route.build_append_command(target, segment, effect_fence))
+        .and_then(|route| route.build_append_command(
+            target, segment, effect_fence,
+            crate::node_runtime::payload_placement::PayloadPlacementInput::from_server_config(&self.route.handler.config),
+        ))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

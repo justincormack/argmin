@@ -734,6 +734,7 @@ pub(crate) trait StreamUploadSessionMetadataRoute: Send {
         target: &StreamUploadTarget,
         segment: &StreamUploadSegmentRecord,
         effect_fence: AdmittedRouteEffectFence,
+        placement: PayloadPlacementInput<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError>;

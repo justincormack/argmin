@@ -4042,6 +4042,7 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
         target: &StreamUploadTarget,
         segment: &StreamUploadSegmentRecord,
         effect_fence: AdmittedRouteEffectFence,
+        placement: PayloadPlacementInput<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         if segment.session_id != self.session_id
@@ -4065,6 +4066,22 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             segment: segment.clone(),
         };
         pg.validate_append_stream_segment_command(&command)?;
+        let placement_generation = match target {
+            StreamUploadTarget::PutObject => {
+                pg.get_object_generation_reservation(&self.bucket, &self.key, &self.session_id)?
+            }
+            StreamUploadTarget::UploadPart { upload_id, .. } => {
+                pg.get_multipart_upload(upload_id)?.object_generation_id
+            }
+        };
+        placement.require_stream_append_placement(
+            self.route_cluster_epoch,
+            &self.bucket,
+            &self.key,
+            target,
+            placement_generation,
+            segment,
+        )?;
         pg.require_live_allocation_lifetime()?;
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let id = self.client.next_metadata_command_id_from_locked_pg(

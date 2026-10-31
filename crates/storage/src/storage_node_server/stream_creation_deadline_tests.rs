@@ -30,7 +30,8 @@ impl CreationFixture {
                     &self.request.key,
                     &self.request.session_id,
                 )?
-                .build_append_command(&self.request.target, segment, fence)
+                .build_append_command(&self.request.target, segment, fence,
+                    PayloadPlacementInput::from_server_config(config))
         } else {
             client
                 .open_stream_upload_creation_metadata_route(
