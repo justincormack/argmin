@@ -17,6 +17,9 @@ mod publication_model;
 #[path = "atomic_stream_creation_tests.rs"]
 mod atomic_stream_creation;
 
+#[path = "direct_put_introduction_evidence_tests.rs"]
+mod direct_put_introduction_evidence;
+
 fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
 }

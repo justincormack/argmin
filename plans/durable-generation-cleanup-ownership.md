@@ -89,6 +89,10 @@ separates reservation expiry from authoritative absence of an accepted
 introduction. Its bounded model covers delayed duplicate installation and
 inspection under shared serialization; replacement-primary reconciliation
 remains an integration prerequisite, not a modelled guarantee.
+The [Direct PUT successor-evidence tests](#direct-put-successor-evidence--2026-10-31)
+now exercise real pending slots, witness-first application, peering decisions and
+compacted generation-reservation transfer. They do not supply a replacement
+primary's route certificate or the still-missing retained owner/proof obligation.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -4155,3 +4159,82 @@ expected counterexamples. The 100,000-state cap fails rather than reporting
 success if exhausted. Full `cargo nextest run --offline` passed all 9,162 tests
 (two slow, six skipped) in 238.097s. Strict all-target/all-feature Clippy, the
 storage boundary checker, formatting and `git diff --check` passed.
+
+## Direct PUT Successor Evidence — 2026-10-31
+
+### What the existing recovery primitives establish
+
+The preceding pre-install model assumes a settled authoritative primary. This
+slice tests the existing store and peering primitives that the implementation
+must use to establish that precondition; it does not simply extend the model
+with an unconditional "successor settled" transition.
+
+`reconstruct_pg_peering_from_primary_retained_log` in `peering.rs` rejects a
+pending slot on any supplied replica, a replica ahead of the selected primary,
+and equal-index proof disagreement. Its input is **not itself authority**: the
+helper does not establish that the supplied replicas form the certified route
+or that an unavailable old primary has been fenced. The future closed-and-absent
+result still needs the admitted current-primary route, the correct witness/
+certified-import proof, and old-issuer closure from the earlier contract.
+
+The control-plane `pending_metadata_command_recovery_for_pg` listing is based
+on reported observations and rejects conflicting reports. Absence from that
+listing is not synchronous proof that an unreported, delayed or unavailable
+primary never accepted a command. Do not use listing absence as the orphan
+retirement certificate.
+
+For Direct PUT specifically, today's `ReserveObjectGeneration` application
+persists a generation reservation/high-water but no retained owner, physical
+window or bucket-proof obligation. Keeping that row across transfer is necessary
+evidence, not sufficient cleanup authority. The coordinated production slice
+must add those missing records to the same canonical-state machinery.
+
+### Production-store regression matrix
+
+[`direct_put_introduction_evidence_tests.rs`](../crates/storage/src/pg_store/metadata/direct_put_introduction_evidence_tests.rs)
+adds two tests using production pending-slot, apply, checkpoint, compaction,
+import and reopen methods. They are metadata-only: no fabricated encrypted
+payload or physical-write grant is involved.
+
+The first starts three stores from an identical checkpoint and selects a still
+empty successor candidate while the original primary retains the introduction:
+
+| Durable stage | Candidate's local observation | Required recovery result |
+| --- | --- | --- |
+| Accepted but publication unstarted; original primary reopened | No generation row, empty slot, valid local checkpoint | Reject reconstruction because the original primary has the exact pending command |
+| Publication-start recorded but no replica applied | Same locally empty candidate | Reject on the pending command; preserve publication-start and every inspected state |
+| Witness applied, original primary still pending | Candidate still empty; witness has the reserved generation | Reject pending evidence; even when the original primary is omitted from the input, reject the witness-ahead prefix |
+| All three applied and the exact pending slot removed | Matching materialized reservation and prefixes | Positive `AlreadyConverged` result |
+
+The tests compare complete pending-slot bytes/identity, publication-start,
+replica state and SQLite change counters around rejected inspection. The
+original primary is reopened both before publication starts and after witness
+application. The final primitive slot removal is deliberately labelled: this
+test does **not** execute distributed authorized recovery or activate a new route.
+
+The second applies Direct PUT reservation and a real later command, then uses
+the production compactor with a one-receipt window. The introducing log and
+receipt disappear while the exact reservation and next-generation high-water
+remain. Reopen preserves both. Two successive checkpoint-base imports (epochs
+two and three), each followed by reopen, preserve the complete table blocks,
+table digests, state digest and reservation subject/generation while rebasing
+the applied index/hash to zero. No exact old-command receipt is manufactured.
+
+### Remaining gate
+
+These tests pin concrete existing behavior used by the design. They do not
+prove safe orphan release, route-history retention, old-primary fencing,
+cross-PG proof handoff or physical cleanup, and do not add a new command, schema,
+RPC, transaction or fsync. In particular, an unavailable old primary plus an
+empty candidate is still **unknown**, unless the actual certified recovery/
+transfer protocol establishes the required settled prefix and issuer closure.
+The next coordinated state integration must preserve this evidence for the
+retained owner/resource obligation, not just today's generation reservation.
+All six original cleanup regressions remain open.
+
+Validation: both focused tests passed. Full `cargo nextest run --offline` passed
+all 9,164 tests (two slow, six skipped) in 237.579s. Strict all-target/all-feature
+Clippy, the storage boundary checker, formatting and `git diff --check` passed.
+The initial focused run failed before exercising storage because the fixture
+label encoded to a 38-character session ID; shortening the label fixed that
+fixture error. No production test failure was suppressed or reclassified.
