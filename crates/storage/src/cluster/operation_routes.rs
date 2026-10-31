@@ -195,12 +195,15 @@ enum DirectPutProofCustody {
     Frontend,
     GenerationAttempted,
     TerminalPublication,
+    ReturnedToSnapshotWrapper,
 }
 
 /// Storage-owned release responsibility for one Direct PUT bucket reservation.
 /// The callback cannot declare a handoff: entering terminal publication through
 /// this scope transfers the exact proof. Earlier failures retain normal release
-/// timing. This is not yet durable generation/owner custody or crash cleanup.
+/// timing. Unwinding before handoff attempts exact retained proof release;
+/// normal returns leave release/error reporting to the snapshot wrapper.
+/// This is not yet durable generation/owner custody or crash cleanup.
 /// Generations and staged payloads carry this scope's exact proof and cannot be
 /// passed to another scope, even for the same object on the same admission.
 /// The callback cannot return a live generation reservation:
@@ -237,8 +240,28 @@ impl std::fmt::Debug for DirectPutWriteScope<'_, '_> {
 }
 
 impl DirectPutWriteScope<'_, '_> {
+    fn finish<T, E>(self, result: Result<T, E>) -> BucketWriteSnapshotAction<T, E> {
+        match self
+            .custody
+            .replace(DirectPutProofCustody::ReturnedToSnapshotWrapper)
+        {
+            DirectPutProofCustody::Frontend | DirectPutProofCustody::GenerationAttempted => {
+                BucketWriteSnapshotAction::release(result)
+            }
+            DirectPutProofCustody::TerminalPublication => {
+                BucketWriteSnapshotAction::transferred_to_command(result)
+            }
+            DirectPutProofCustody::ReturnedToSnapshotWrapper => {
+                unreachable!("scope already returned")
+            }
+        }
+    }
+
     fn require_frontend_custody(&self) -> Result<(), crate::DirectPutFailure> {
-        if self.custody.get() == DirectPutProofCustody::TerminalPublication {
+        if !matches!(
+            self.custody.get(),
+            DirectPutProofCustody::Frontend | DirectPutProofCustody::GenerationAttempted
+        ) {
             return Err(crate::DirectPutFailure::from_object_pg_action(
                 ObjectPgActionError::InvalidRequest {
                     reason: "direct PUT proof already transferred to terminal publication".into(),
@@ -305,6 +328,35 @@ impl DirectPutWriteScope<'_, '_> {
         }
         self.custody.set(DirectPutProofCustody::TerminalPublication);
         self.route.commit_direct_object(payload, prepared, action)
+    }
+}
+
+impl Drop for DirectPutWriteScope<'_, '_> {
+    fn drop(&mut self) {
+        if !matches!(
+            self.custody.get(),
+            DirectPutProofCustody::Frontend | DirectPutProofCustody::GenerationAttempted
+        ) {
+            return;
+        }
+        // The callback did not return normally. Its borrowed generation/payload
+        // guards unwind first. Release only the exact frontend-owned bucket
+        // proof; never release a proof handed to terminal publication/recovery.
+        // This is one best-effort attempt, not a crash-safe cleanup obligation.
+        let deadline = Instant::now() + BUCKET_WRITE_DRAIN_RETRY_BUDGET;
+        if let Err(error) = self
+            .route
+            .admission
+            .cluster
+            .release_bucket_write_reservation_proof_until(&self.proof, deadline)
+        {
+            let failure = crate::BucketSnapshotLoadFailure::from(error);
+            let _ = observability::event(
+                TRACE_TARGET,
+                "direct_put_scope_unwind_release_failed",
+                Some(format_args!("cause={}", failure.diagnostic_cause_label())),
+            );
+        }
     }
 }
 
@@ -1147,15 +1199,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                         custody: std::cell::Cell::new(DirectPutProofCustody::Frontend),
                     };
                     let result = action(snapshot, &scope);
-                    match scope.custody.get() {
-                        DirectPutProofCustody::Frontend
-                        | DirectPutProofCustody::GenerationAttempted => {
-                            BucketWriteSnapshotAction::release(result)
-                        }
-                        DirectPutProofCustody::TerminalPublication => {
-                            BucketWriteSnapshotAction::transferred_to_command(result)
-                        }
-                    }
+                    scope.finish(result)
                 },
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)

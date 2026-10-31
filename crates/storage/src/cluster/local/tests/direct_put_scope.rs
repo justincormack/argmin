@@ -259,6 +259,15 @@ fn direct_put_scope_rejects_crossed_generation_and_payload_for_same_object() {
 
 #[test]
 fn direct_put_scope_preserves_terminal_proof_until_trailing_recovery() {
+    check_terminal_proof_survives_scope_exit(false);
+}
+
+#[test]
+fn direct_put_scope_unwind_preserves_terminal_proof_until_trailing_recovery() {
+    check_terminal_proof_survives_scope_exit(true);
+}
+
+fn check_terminal_proof_survives_scope_exit(unwind: bool) {
     let tmp = test_util::tempdir();
     let map = Arc::new(
         LocalClusterMap::open(
@@ -309,33 +318,46 @@ fn direct_put_scope_preserves_terminal_proof_until_trailing_recovery() {
             Ok(())
         },
     ));
-    let owned = route
-        .with_direct_put_scope(Default::default(), |_, scope| {
-            let generation = scope.reserve_generation().unwrap();
-            prepared.encryption = committed_test_object_encryption(
-                &fixture,
-                scope.reservation_proof(),
-                &bucket,
-                &key,
-                generation.generation_id(),
-            );
-            prepared.bucket_write_reservation = scope.reservation_proof().clone();
-            let authority = generation
-                .bind_encryption(&fixture.encryption)
-                .bind_standard_segment(fixture.logical_size)
-                .bind_committed_encryption(&prepared.encryption)
-                .unwrap();
-            let payload = scope
-                .write_payload(authority, &fixture.storage_bytes)
-                .unwrap();
-            scope
-                .commit(payload, &prepared, |_| Ok::<(), ()>(()))
-                .unwrap()
-                .unwrap();
-            Ok::<_, ()>(scope.reservation_proof().clone())
-        })
-        .unwrap()
-        .unwrap();
+    let mut owned = None;
+    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        route
+            .with_direct_put_scope(Default::default(), |_, scope| {
+                owned = Some(scope.reservation_proof().clone());
+                let generation = scope.reserve_generation().unwrap();
+                prepared.encryption = committed_test_object_encryption(
+                    &fixture,
+                    scope.reservation_proof(),
+                    &bucket,
+                    &key,
+                    generation.generation_id(),
+                );
+                prepared.bucket_write_reservation = scope.reservation_proof().clone();
+                let authority = generation
+                    .bind_encryption(&fixture.encryption)
+                    .bind_standard_segment(fixture.logical_size)
+                    .bind_committed_encryption(&prepared.encryption)
+                    .unwrap();
+                let payload = scope
+                    .write_payload(authority, &fixture.storage_bytes)
+                    .unwrap();
+                scope
+                    .commit(payload, &prepared, |_| Ok::<(), ()>(()))
+                    .unwrap()
+                    .unwrap();
+                if unwind {
+                    panic!("injected scope cancellation");
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap()
+    }));
+    if unwind {
+        assert_scope_cancellation(exit.unwrap_err());
+    } else {
+        exit.unwrap();
+    }
+    let owned = owned.unwrap();
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let after = reservations(&map, &bucket);
     assert_eq!(
@@ -361,4 +383,169 @@ fn direct_put_scope_preserves_terminal_proof_until_trailing_recovery() {
     );
     assert_eq!(reservations(&map, &bucket), before);
     assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
+}
+
+fn assert_scope_cancellation(error: Box<dyn std::any::Any + Send>) {
+    assert_eq!(
+        error.downcast_ref::<&str>(),
+        Some(&"injected scope cancellation")
+    );
+}
+
+#[test]
+fn direct_put_scope_unwind_releases_frontend_proof_and_staging() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("scope-unwind");
+    let key = crate::tests::object_key("key");
+    create_test_bucket(&cluster, &bucket);
+    let _foreign = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let before = reservations(&map, &bucket);
+    assert_eq!(before.len(), 1);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let fixture = crate::tests::sse_s3_segment_test_fixture(b"unwind staging", 0);
+    for stage in 0..3 {
+        let mut generation_id = None;
+        let mut identity = None;
+        let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<Result<(), ()>, _> =
+                route.with_direct_put_scope(Default::default(), |_, scope| {
+                    assert_eq!(reservations(&map, &bucket).len(), 2);
+                    if stage == 0 {
+                        panic!("injected scope cancellation");
+                    }
+                    let generation = scope.reserve_generation().unwrap();
+                    generation_id = Some(generation.reservation_id.clone());
+                    if stage == 1 {
+                        panic!("injected scope cancellation");
+                    }
+                    let authority = generation
+                        .bind_encryption(&fixture.encryption)
+                        .bind_standard_segment(fixture.logical_size);
+                    let payload = scope
+                        .write_payload(authority, &fixture.storage_bytes)
+                        .unwrap();
+                    identity = Some(direct_payload_test_identity(&payload));
+                    assert_direct_payload_shards_exist(&cluster, identity.unwrap());
+                    panic!("injected scope cancellation");
+                });
+        }));
+        assert_scope_cancellation(exit.unwrap_err());
+        assert_eq!(
+            reservations(&map, &bucket),
+            before,
+            "stage {stage}: release only the scope's proof"
+        );
+        if let Some(reservation_id) = generation_id {
+            for node in map.nodes.values() {
+                let pg = node.storage_node().get_pg(0).unwrap();
+                assert!(matches!(
+                    crate::PgMetadataStore::get_object_generation_reservation(
+                        &*pg,
+                        &bucket,
+                        &key,
+                        &reservation_id,
+                    ),
+                    Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+                ));
+            }
+            if let Some(identity) = identity {
+                assert_direct_payload_staging_cleaned(
+                    &map,
+                    &cluster,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                    identity,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_put_scope_unwind_release_conflict_preserves_replacement_and_original_panic() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("scope-unwind-conflict");
+    let key = crate::tests::object_key("key");
+    create_test_bucket(&cluster, &bucket);
+    let _foreign = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let before = reservations(&map, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let mut expected = None;
+    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<Result<(), ()>, _> =
+            route.with_direct_put_scope(Default::default(), |_, scope| {
+                let proof = scope.reservation_proof();
+                let node = map.node(NodeId::new(0)).unwrap();
+                let pg = node.storage_node().get_pg(0).unwrap();
+                let record = crate::PgMetadataStore::durable_bucket_write_reservation(
+                    &*pg,
+                    &bucket,
+                    &proof.reservation_id,
+                )
+                .unwrap()
+                .unwrap();
+                // Owner-local adversarial reuse of the reservation ID: release must
+                // fail closed on the other owner, without replacing the active panic.
+                crate::PgMetadataStore::release_durable_bucket_write_reservation(&*pg, &record)
+                    .unwrap();
+                let replacement = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+                    &*pg,
+                    crate::traits::DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: &record.reservation_id,
+                        owner_token: "replacement-owner",
+                        cluster_epoch: record.cluster_epoch,
+                        operation_kind: &record.operation_kind,
+                        created_at: record.created_at,
+                        lease_deadline: record.lease_deadline,
+                        target_context: record.target_context.as_deref(),
+                    },
+                )
+                .unwrap();
+                assert!(!proof.matches_record(&replacement));
+                drop(pg);
+                expected = Some(reservations(&map, &bucket));
+                panic!("injected scope cancellation");
+            });
+    }));
+    assert_scope_cancellation(exit.unwrap_err());
+    let expected = expected.unwrap();
+    assert_eq!(expected.len(), 2);
+    assert!(expected.contains(&before[0]));
+    assert_eq!(reservations(&map, &bucket), expected);
 }

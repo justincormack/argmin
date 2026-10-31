@@ -77,6 +77,9 @@ proof persistence. Do not land a proof-only reservation-command change.
 The [storage-owned frontend scope](#storage-owned-direct-put-frontend-scope--2026-10-31)
 now owns the existing terminal handoff decision instead of a coordinator flag.
 It does not move custody to generation reservation or implement durable owners.
+The [scope unwind follow-up](#direct-put-scope-unwind-release--2026-10-31) adds
+best-effort release for a still-frontend-owned proof when its callback unwinds;
+process loss and failed cleanup still require durable ownership.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -3894,3 +3897,46 @@ Validation: the final `cargo nextest run --offline` passed all 9,152 tests
 All 35 storage doctests passed, including both new compile-fail examples.
 `cargo clippy --offline --all-targets --all-features -- -D warnings`, the storage
 boundary checker, `cargo fmt --all --check` and `git diff --check` passed.
+
+## Direct PUT Scope Unwind Release — 2026-10-31
+
+The preceding scope still relied on its callback returning a
+`BucketWriteSnapshotAction`. A panic before terminal handoff skipped the snapshot
+wrapper's normal release even when the bucket PG remained available. Added
+storage-owned unwind handling without changing the reservation-command format
+or moving proof custody earlier.
+
+The scope now has an explicit returned-to-wrapper state. Consuming normal finish
+selects the existing release/transfer action and disarms Drop; normal release
+errors continue through the snapshot wrapper. If the callback unwinds while the
+scope owns the proof, borrowed generation/payload guards unwind first, then the
+scope makes one exact retained bucket-proof release attempt. It uses the existing
+bucket-work deadline for connection/lock admission, with no retry loop. This is
+not a bound on total unwinding time: existing payload/generation cleanup and
+already-admitted persistence have their own completion behavior.
+
+Terminal entry disarms frontend unwind release before invoking the publisher.
+Neither a failed terminal call nor unwinding afterward authorizes the frontend
+to release a proof potentially owned by an accepted command. Release failure on
+unwind emits only the bounded diagnostic category and preserves the original
+panic; it does not report cleanup completion or claim a durable handoff.
+
+Regressions independently cover cancellation before generation allocation, with
+a live generation token, with staged ciphertext, and after a successful terminal
+publication leaves a failed trailing replica. They compare the complete unrelated
+same-key reservation row, verify generation/shard cleanup where applicable, and
+verify that pending terminal authority survives until exact recovery. An
+owner-local replacement-token adversary forces retained release to fail and
+checks that neither its replacement row nor the original panic is lost.
+
+This handles synchronous unwinding while the process and stores remain alive.
+It does not handle aborting the process, forgotten guards, failed remote cleanup,
+or the accepted-generation/response-loss custody problem. The coordinated owner/
+window, introducing proof and release-obligation integration remains next; all
+six original ignored cleanup regressions remain open. No new normal-path
+transaction or fsync is added.
+
+Validation: all seven focused scope tests passed. Full `cargo nextest run
+--offline` passed all 9,155 tests (two slow, six skipped) in 278.896s. All 35
+storage doctests, strict all-target/all-feature Clippy, the storage boundary
+checker, formatting and `git diff --check` passed.
