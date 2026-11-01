@@ -7603,7 +7603,12 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
     ) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         effect_fence.require_valid_for(command.id().cluster_epoch())?;
-        pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
+        pg.try_insert_pending_metadata_command_slot_with_effect_fence(
+            self.node_id.as_u32(),
+            command,
+            bucket,
+            effect_fence,
+        )
     }
 
     fn try_insert_pending_metadata_command_slot_with_effect_fence_until(
@@ -7617,7 +7622,12 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
         effect_fence.require_valid_for(command.id().cluster_epoch())?;
         require_metadata_command_operation_deadline(deadline)?;
-        pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
+        pg.try_insert_pending_metadata_command_slot_with_effect_fence(
+            self.node_id.as_u32(),
+            command,
+            bucket,
+            effect_fence,
+        )
     }
 
     fn try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
@@ -7637,10 +7647,11 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
             .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
         require_metadata_command_operation_deadline(deadline)
             .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
-        pg.try_insert_pending_metadata_command_slot_classified(
+        pg.try_insert_pending_metadata_command_slot_with_effect_fence_classified(
             self.node_id.as_u32(),
             command,
             bucket,
+            effect_fence,
         )
         .map_err(|error| match error {
             crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(source) => {
@@ -7675,10 +7686,11 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
     ) -> Result<bool, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         effect_fence.require_valid_for(command.id().cluster_epoch())?;
-        pg.try_insert_bucket_control_pending_metadata_command_slot(
+        pg.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
             self.node_id.as_u32(),
             command,
             bucket,
+            effect_fence,
         )
     }
 
@@ -7709,10 +7721,11 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
         effect_fence.require_valid_for(command.id().cluster_epoch())?;
         require_metadata_command_operation_deadline(deadline)?;
-        pg.try_insert_bucket_control_pending_metadata_command_slot(
+        pg.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
             self.node_id.as_u32(),
             command,
             bucket,
+            effect_fence,
         )
     }
 

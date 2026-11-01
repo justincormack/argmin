@@ -4749,3 +4749,70 @@ physical exclusion protocol. All six original cleanup regressions remain open.
 Validation: all 12 focused tests passed. The full Nextest suite passed all 9,196
 tests (one slow, six skipped) in 263.804s. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and `git diff --check` passed.
+
+## Transactional Pending-Slot Acceptance Fence — 2026-11-01
+
+The next acceptance-boundary audit found the same pre-transaction gap in pending
+installation: fenced embedded clients checked authority under the PG mutex, then
+called unfenced store methods which acquired SQLite write serialization and
+prepared/validated the insertion later. Installed generic and bucket-control RPCs
+also checked the receiving route early without carrying that bound into the
+transaction. These gaps must close before the immutable introduction-cutoff and
+closed-and-absent inspection protocol can rely on pending installation.
+
+All five fenced client entry points now pass the captured fence through to the
+store: generic, generic-until, classified-generic-until, bucket-control and
+bucket-control-until. Both installed RPC handlers intersect the delegated fence
+with their captured receiving-node route fence. Within the existing pending-slot
+transaction, prerequisite reads and statement preparation precede the final
+fence check immediately before INSERT. The slot and its reference/dependency
+sidecars remain under the same write serialization through commit or rollback.
+Trusted raw/recovery callers retain their existing unbounded entry points; this
+does not turn historical convergence into fresh request admission.
+
+No successful-path transaction, commit/fsync, command, schema or wire version is
+added. Trace canaries pin one BEGIN IMMEDIATE and one COMMIT for each slot kind;
+outer-transaction tests prove insertion neither commits its caller's transaction
+nor survives its rollback. A rejected pre-effect fence remains a definitive
+insertion failure. An injected INSERT failure is also definitive; an injected
+COMMIT failure preserves the conservative MayHaveApplied classification, with
+rollback and subsequent successful retry tested independently. The bucket-control
+API retains its existing unclassified error contract.
+
+Owner-local tests cover vacant and occupied slots, complete canonical table
+blocks/replica state, exact pending state and SQLite total_changes. Rejection
+cannot pass by inserting then rolling back, and an unrelated unapplied canary
+remains untouched. Fresh insertion and exact retry are positive controls in the
+vacant-slot cases. A separate trace-controlled schedule advances time only once
+INSERT executes: acceptance before the cutoff may finish committing afterward,
+and its exact slot must remain visible. This preserves the pre-install orphan
+contract's distinction between late completion and rejection before acceptance.
+
+Embedded and installed Unix matrices exercise all five APIs. The one-shot hook
+runs after SQLite admission and statement preparation, renews the raw same-epoch
+route and advances time from 1,000 to 4,500 ms, past the captured effective cutoff
+but before the 5,000 ms authority timestamp. Unix cases cover client-first expiry,
+server-first expiry and absent client deadlines. Rejected calls leave the full
+checkpoint, pending slot and independent bucket reservation unchanged. The
+classified client must return Definitive; genuinely fresh insertion and exact
+retry succeed without advancing replica state. Checkpoint export is intentionally
+unavailable with a pending slot, so post-install observations use replica state
+and exact pending/reservation records rather than treating export failure as
+evidence of equality.
+
+This implements the existing captured-route acceptance boundary only. Persisting
+the introduction cutoff, retained owner/window state, replacement-primary
+settlement and physical exclusion remain outstanding. All six original cleanup
+regressions remain open.
+
+Moving the final check before the interleaving hook deliberately made all three
+expiry tests install a slot and fail. Independently removing only the
+bucket-control receiving-node intersection made the Unix matrix fail at its
+server-first BucketControl case, after all generic cases and the client-first
+bucket case passed. Both mutations were restored before full-suite validation.
+Initial fixture failures were corrected by respecting checkpoint-export exclusion
+and leaving an unrelated unapplied canary installed rather than removing it.
+
+Validation: all 17 focused tests passed. The full Nextest suite passed all 9,203
+tests (one slow, six skipped) in 254.441s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed.

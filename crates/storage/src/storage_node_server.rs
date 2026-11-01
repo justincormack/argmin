@@ -9129,7 +9129,16 @@ impl StorageNodeConnectionHandler {
         };
         metadata_mutation_route_guard_or_return!(self);
         let effect_fence =
-            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline);
+            match StorageNodeRouteFence::current(&self.config, self.current_route_map_lease())
+                .intersect_effect_fence(admitted_route_effect_fence(
+                    request.cluster_epoch,
+                    request.effect_deadline,
+                )) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error))
+                }
+            };
         let pg = match operation_deadline {
             Some(deadline) => self.node.get_pg_until(request.pg_id.get(), deadline),
             None => self.node.get_pg(request.pg_id.get()),
@@ -9140,10 +9149,11 @@ impl StorageNodeConnectionHandler {
                 effect_fence
                     .require_valid_for(request.command.id().cluster_epoch())
                     .map_err(crate::pg_store::PendingMetadataCommandSlotInsertError::definitive)?;
-                pg.try_insert_pending_metadata_command_slot_classified(
+                pg.try_insert_pending_metadata_command_slot_with_effect_fence_classified(
                     self.config.node_id.as_u32(),
                     &request.command,
                     Some(&canonical_scope_bucket),
+                    effect_fence,
                 )
             }) {
             Ok(()) => {
@@ -9272,18 +9282,29 @@ impl StorageNodeConnectionHandler {
         };
         metadata_mutation_route_guard_or_return!(self);
         let effect_fence =
-            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline);
+            match StorageNodeRouteFence::current(&self.config, self.current_route_map_lease())
+                .intersect_effect_fence(admitted_route_effect_fence(
+                    request.cluster_epoch,
+                    request.effect_deadline,
+                )) {
+                Ok(fence) => fence,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error))
+                }
+            };
         let pg = match operation_deadline {
             Some(deadline) => self.node.get_pg_until(request.pg_id.get(), deadline),
             None => self.node.get_pg(request.pg_id.get()),
         };
         let response = match pg.and_then(|pg| {
             effect_fence.require_valid_for(request.command.id().cluster_epoch())?;
-            let inserted = pg.try_insert_bucket_control_pending_metadata_command_slot(
-                self.config.node_id.as_u32(),
-                &request.command,
-                &canonical_scope_bucket,
-            )?;
+            let inserted = pg
+                .try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+                    self.config.node_id.as_u32(),
+                    &request.command,
+                    &canonical_scope_bucket,
+                    effect_fence,
+                )?;
             if inserted {
                 return Ok(true);
             }

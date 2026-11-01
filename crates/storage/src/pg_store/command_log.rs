@@ -10,6 +10,19 @@ use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
 
+#[cfg(test)]
+#[path = "pending_slot_effect_tests.rs"]
+mod pending_slot_effect_tests;
+
+#[cfg(test)]
+type PendingSlotEffectHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PENDING_SLOT_EFFECT: std::cell::RefCell<Option<PendingSlotEffectHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
 const METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH: usize = 8;
@@ -3812,6 +3825,37 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_classified(
+            node_id,
+            command,
+            scope_bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        )
+    }
+
+    pub(crate) fn try_insert_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_classified(
+            node_id,
+            command,
+            scope_bucket,
+            effect_fence,
+        )
+        .map_err(PendingMetadataCommandSlotInsertError::into_source)
+    }
+
+    pub(crate) fn try_insert_pending_metadata_command_slot_with_effect_fence_classified(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), PendingMetadataCommandSlotInsertError> {
         if command.payload().is_bucket_control_pending_slot_payload() {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -3873,7 +3917,7 @@ impl PgStore {
                 scope_bucket,
                 crate::clock::current_time_millis(),
             )?;
-            let inserted = self.execute_cached(
+            let inserted = self.execute_pending_slot_insert_with_effect_fence(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
                   placed_segment_reference_count, reclaim_reference_count, scope_bucket) \
@@ -3890,6 +3934,8 @@ impl PgStore {
                     scope_bucket.map(BucketName::as_str),
                 ],
                 "insert metadata command pending slot",
+                command.id().cluster_epoch(),
+                effect_fence,
             )?;
             if inserted == 1 {
                 self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
@@ -3989,6 +4035,21 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         bucket: &BucketName,
     ) -> Result<bool, StoreError> {
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+            node_id,
+            command,
+            bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        )
+    }
+
+    pub(crate) fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<bool, StoreError> {
         if !command.payload().is_bucket_control_pending_slot_payload() {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
                 operation: "insert bucket-control pending metadata command",
@@ -4031,7 +4092,7 @@ impl PgStore {
         } = self.encode_pending_shard_scavenger_reference_pages(command)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_transaction(|| {
-            let inserted = self.execute_cached(
+            let inserted = self.execute_pending_slot_insert_with_effect_fence(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
                   placed_segment_reference_count, reclaim_reference_count, scope_bucket) \
@@ -4052,6 +4113,8 @@ impl PgStore {
                     bucket.as_str(),
                 ],
                 "insert bucket control pending metadata command slot",
+                command.id().cluster_epoch(),
+                effect_fence,
             )?;
             if inserted == 1 {
                 self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
@@ -4065,6 +4128,51 @@ impl PgStore {
             }
             Ok(inserted == 1)
         })
+    }
+
+    /// Both callers hold SQLite write serialization. Keep statement preparation
+    /// and all prerequisite reads before the final authority check, then retain
+    /// serialization through the slot and sidecar writes and transaction commit.
+    fn execute_pending_slot_insert_with_effect_fence<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+        context: &'static str,
+        cluster_epoch: ClusterEpoch,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<usize, StoreError> {
+        let mut statement = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_PENDING_SLOT_EFFECT.with(|slot| slot.borrow_mut().take()) {
+            hook(!self.conn.is_autocommit());
+        }
+        effect_fence.require_valid_for(cluster_epoch)?;
+        statement.execute(params).map_err(|source| StoreError::Db {
+            context,
+            source: source.into(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_before_pending_slot_effect_hook<T>(
+        hook: impl FnOnce(bool) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<PendingSlotEffectHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_PENDING_SLOT_EFFECT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset =
+            Reset(BEFORE_PENDING_SLOT_EFFECT.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
     }
 
     pub(crate) fn remove_pending_metadata_command_slot(
