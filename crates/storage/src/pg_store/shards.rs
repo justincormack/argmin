@@ -8,6 +8,19 @@ use super::*;
 mod deadline_tests;
 
 #[cfg(test)]
+#[path = "shard_ack_deadline_tests.rs"]
+mod ack_deadline_tests;
+
+#[cfg(test)]
+type ShardAckEffectHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SHARD_ACK_EFFECT: std::cell::RefCell<Option<ShardAckEffectHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 type ShardPublicationHook = Box<dyn FnOnce()>;
 
 #[cfg(test)]
@@ -562,6 +575,39 @@ impl PgStore {
         &self,
         shards: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
+        self.register_written_shards_batch_exact_checked(shards, || Ok(()))
+    }
+
+    pub(crate) fn register_written_shards_batch_exact_with_effect_fence(
+        &self,
+        shards: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        self.register_written_shards_batch_exact_checked(shards, || {
+            effect_fence.require_valid_for(effect_fence.cluster_epoch())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_before_shard_ack_effect_hook<T>(
+        hook: impl FnOnce(bool) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<ShardAckEffectHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_SHARD_ACK_EFFECT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(BEFORE_SHARD_ACK_EFFECT.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
+    }
+
+    fn register_written_shards_batch_exact_checked(
+        &self,
+        shards: &[(&ShardKey, WriteAck)],
+        check_effect: impl Fn() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::register_written_shards_batch_exact",
@@ -598,6 +644,8 @@ impl PgStore {
                     source: e.into(),
                 })?;
 
+            check_effect()?;
+
             for (key, ack) in shards {
                 let row: Option<(i64, i64, i64)> = lookup
                     .query_row(params![key.as_bytes().as_slice()], |row| {
@@ -608,6 +656,15 @@ impl PgStore {
                         context: "register written shards batch exact (lookup shard record)",
                         source: e.into(),
                     })?;
+
+                #[cfg(test)]
+                if let Some(hook) = BEFORE_SHARD_ACK_EFFECT.with(|slot| slot.borrow_mut().take()) {
+                    hook(!self.conn.is_autocommit());
+                }
+                // Reads/SQLite admission can outlive the captured route. Check
+                // beside every insertion (and exact retry), not only before
+                // opening the transaction. The existing batch remains atomic.
+                check_effect()?;
 
                 if let Some((actual_size, actual_crc, status)) = row {
                     let actual_size = actual_size as u64;

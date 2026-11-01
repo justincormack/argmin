@@ -3724,6 +3724,10 @@ impl StorageNodeActivePrimaryDataRoute<'_> {
     ) -> Result<(), StorageNodeDataRouteError> {
         self.require_valid_now()
             .map_err(StorageNodeDataRouteError::Route)?;
+        let effect_fence = self
+            .fence
+            .intersect_effect_fence(AdmittedRouteEffectFence::unbounded(self.fence.cluster_epoch))
+            .map_err(StorageNodeDataRouteError::Store)?;
         let shard_batch: Vec<(&ShardKey, WriteAck)> = items
             .iter()
             .map(|item| (&item.shard_key, item.ack))
@@ -3731,7 +3735,9 @@ impl StorageNodeActivePrimaryDataRoute<'_> {
         self.handler
             .node
             .get_pg(self.pg_id.get())
-            .and_then(|pg| pg.register_written_shards_batch_exact(&shard_batch))
+            .and_then(|pg| {
+                pg.register_written_shards_batch_exact_with_effect_fence(&shard_batch, effect_fence)
+            })
             .map_err(StorageNodeDataRouteError::Store)
     }
 

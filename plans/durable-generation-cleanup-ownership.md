@@ -4984,3 +4984,53 @@ restored before full validation.
 Validation: all 12 focused tests passed. The full Nextest suite passed all
 9,220 tests (two slow, six skipped) in 262.494s. Strict all-target/all-feature
 Clippy, the storage boundary checker, formatting and `git diff --check` passed.
+
+## Receiving-Node Shard Acknowledgement Acceptance Fence — 2026-11-01
+
+The next audit found a distinct durable effect after file publication:
+`ShardAckRecord` checked the receiving frame's route before acquiring the PG
+mutex, then inserted acknowledgement rows without that captured bound. SQLite
+admission, statement preparation or row lookup could cross the deadline while
+a same-epoch renewal kept the raw runtime map live.
+
+The installed primary data route now carries its own immutable effect fence
+into exact batch registration. The store checks it inside the existing
+BEGIN IMMEDIATE transaction after preparation and after each row lookup,
+immediately before insertion or accepting an exact existing row. If a batch
+crosses the cutoff after an earlier accepted insertion, the next check rejects
+and rolls back the whole batch. Once all rows have been accepted, COMMIT may
+finish after the cutoff; it is not replaced with post-commit expiry/rollback.
+This adds no transaction, fsync, schema or wire-format change. Raw trusted
+registration keeps its existing behavior and does not acquire request expiry
+semantics implicitly.
+
+Store canaries preserve already-durable files, independent acknowledgement rows
+and occupied exact-retry rows. Expiry after lookup but before the first effect
+leaves SQLite total_changes unchanged, excluding insert-then-rollback as a
+false positive. Further canaries cover a later conflicting row, expiry between
+two insertions, exact retry, one successful batch transaction, and accepted
+commit completion after cutoff. The installed Unix regression renews the raw
+map inside the transaction, then crosses the captured effective cutoff while
+remaining before the authority wall timestamp; a freshly admitted batch and
+its exact retry succeed.
+
+Scope remains deliberately narrower than complete acknowledgement ownership.
+The shared acknowledgement client API and wire batch do **not** carry the
+frontend's captured deadline. Embedded registration and a newly admitted Unix
+frame can therefore still outlive the initiating request's deadline. The next
+delegation slice must distinguish fresh Direct PUT/append registration from
+exact-command convergence and maintenance, carry a portable deadline for fresh
+effects, and retain non-request-expiring convergence authority. The existing
+registration helper serves those different paths; blindly adding expiry to
+all its callers would be incorrect. This receiver-side check also establishes
+neither a retained owner/window nor physical write/cleanup exclusion. The six
+original cleanup regressions remain open.
+
+All 24 focused tests passed. Removing the per-row final check made the store
+post-lookup test, the between-inserts test and the installed Unix renewal test
+all accept expired registration and fail. The check was restored before full
+validation.
+
+Validation: the full Nextest suite passed all 9,224 tests (one slow, six skipped)
+in 268.040s. Strict all-target/all-feature Clippy, the storage boundary checker,
+formatting and `git diff --check` passed.
