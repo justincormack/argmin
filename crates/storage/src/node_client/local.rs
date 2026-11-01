@@ -560,8 +560,12 @@ impl PlacedShardRoute for LocalPlacedShardRoute {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, StoreError> {
         effect_fence.require_valid_for(self.location.cluster_epoch())?;
-        self.storage_node
-            .write_shard_file(self.location.data_pg_id().get(), &self.key, data)
+        self.storage_node.write_shard_file_with_effect_fence(
+            self.location.data_pg_id().get(),
+            &self.key,
+            data,
+            effect_fence,
+        )
     }
 
     fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {

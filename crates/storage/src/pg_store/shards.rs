@@ -3,6 +3,26 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "shard_publication_deadline_tests.rs"]
+mod deadline_tests;
+
+#[cfg(test)]
+type ShardPublicationHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SHARD_PUBLICATION: std::cell::RefCell<Option<ShardPublicationHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_shard_publication_hook() {
+    if let Some(hook) = BEFORE_SHARD_PUBLICATION.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
 /// fsync a directory to ensure renames are durable.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let f = fs::File::open(dir)?;
@@ -102,6 +122,18 @@ impl PgStore {
         Self::write_shard_file_durable_with_prefix_sync(tmp_dir, shards_dir, key, data, fsync_dir)
     }
 
+    pub(crate) fn write_shard_file_durable_with_effect_fence(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        Self::write_shard_file_durable_checked(tmp_dir, shards_dir, key, data, fsync_dir, || {
+            effect_fence.require_valid_for(effect_fence.cluster_epoch())
+        })
+    }
+
     fn write_shard_file_durable_with_prefix_sync<S>(
         tmp_dir: &Path,
         shards_dir: &Path,
@@ -112,15 +144,39 @@ impl PgStore {
     where
         S: FnOnce(&Path) -> std::io::Result<()>,
     {
+        Self::write_shard_file_durable_checked(
+            tmp_dir,
+            shards_dir,
+            key,
+            data,
+            sync_shards_dir,
+            || Ok(()),
+        )
+    }
+
+    fn write_shard_file_durable_checked<S, C>(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        sync_shards_dir: S,
+        check_effect: C,
+    ) -> Result<WriteAck, StoreError>
+    where
+        S: FnOnce(&Path) -> std::io::Result<()>,
+        C: Fn() -> Result<(), StoreError>,
+    {
         let crc = checksum::crc64::checksum(data);
         let stored_size = data.len() as u64;
         let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+        check_effect()?;
         prepare_durable_shard_prefix(shards_dir, &shard_path, sync_shards_dir)?;
 
         // Write to temp file with O_EXCL (unique name via pid + timestamp).
         let tmp_name = format!("shard-{}-{}-{key}", std::process::id(), Self::now_secs());
         let tmp_path = tmp_dir.join(&tmp_name);
 
+        check_effect()?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -147,7 +203,15 @@ impl PgStore {
             }
         })?;
 
-        // Atomic rename.
+        // Temporary data is not publication. Recheck after all blocking file
+        // preparation; expiry must never replace an existing final shard.
+        #[cfg(test)]
+        run_before_shard_publication_hook();
+        check_effect().inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
+        // Acceptance precedes rename; once accepted, durability may finish
+        // after the cutoff. Future owner/window exclusion must span that tail.
         fs::rename(&tmp_path, &shard_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             StoreError::Io {
@@ -170,6 +234,7 @@ impl PgStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn write_shard_file_durable_if_absent(
         tmp_dir: &Path,
         shards_dir: &Path,
@@ -181,29 +246,75 @@ impl PgStore {
         )
     }
 
+    pub(crate) fn write_shard_file_durable_if_absent_with_effect_fence(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        Self::write_shard_file_durable_if_absent_checked(
+            tmp_dir,
+            shards_dir,
+            key,
+            data,
+            fsync_dir,
+            fsync_dir,
+            || effect_fence.require_valid_for(effect_fence.cluster_epoch()),
+        )
+    }
+
+    #[cfg(test)]
     fn write_shard_file_durable_if_absent_with_directory_syncs<R, P>(
         tmp_dir: &Path,
         shards_dir: &Path,
         key: &ShardKey,
         data: &[u8],
         sync_shards_dir: R,
-        mut sync_prefix_dir: P,
+        sync_prefix_dir: P,
     ) -> Result<WriteAck, StoreError>
     where
         R: FnOnce(&Path) -> std::io::Result<()>,
         P: FnMut(&Path) -> std::io::Result<()>,
+    {
+        Self::write_shard_file_durable_if_absent_checked(
+            tmp_dir,
+            shards_dir,
+            key,
+            data,
+            sync_shards_dir,
+            sync_prefix_dir,
+            || Ok(()),
+        )
+    }
+
+    fn write_shard_file_durable_if_absent_checked<R, P, C>(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        sync_shards_dir: R,
+        mut sync_prefix_dir: P,
+        check_effect: C,
+    ) -> Result<WriteAck, StoreError>
+    where
+        R: FnOnce(&Path) -> std::io::Result<()>,
+        P: FnMut(&Path) -> std::io::Result<()>,
+        C: Fn() -> Result<(), StoreError>,
     {
         let expected = WriteAck {
             crc64: checksum::crc64::checksum(data),
             stored_size: data.len() as u64,
         };
         let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+        check_effect()?;
         prepare_durable_shard_prefix(shards_dir, &shard_path, sync_shards_dir)?;
 
         for _ in 0..2 {
             let sequence = SHARD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let tmp_name = format!("shard-{}-{sequence}-{key}", std::process::id());
             let tmp_path = tmp_dir.join(&tmp_name);
+            check_effect()?;
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -229,6 +340,11 @@ impl PgStore {
             })?;
             drop(file);
 
+            #[cfg(test)]
+            run_before_shard_publication_hook();
+            check_effect().inspect_err(|_| {
+                let _ = fs::remove_file(&tmp_path);
+            })?;
             match fs::hard_link(&tmp_path, &shard_path) {
                 Ok(()) => {
                     let _ = fs::remove_file(&tmp_path);
@@ -289,6 +405,22 @@ impl PgStore {
         }
 
         Err(StoreError::NotFound)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_before_shard_publication_hook<T>(
+        hook: impl FnOnce() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<ShardPublicationHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_SHARD_PUBLICATION.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset =
+            Reset(BEFORE_SHARD_PUBLICATION.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
     }
 
     pub fn register_written_shard(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError> {

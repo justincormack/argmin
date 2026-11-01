@@ -3617,12 +3617,16 @@ impl StorageNodeActiveShardRoute<'_> {
     ) -> Result<WriteAck, StorageNodeDataRouteError> {
         self.require_valid_now()
             .map_err(StorageNodeDataRouteError::Route)?;
+        let effect_fence = self.fence.intersect_effect_fence(effect_fence)
+            .map_err(|error| StorageNodeDataRouteError::Route(store_error_response(error)))?;
         effect_fence
             .require_valid_for(self.location.cluster_epoch())
             .map_err(|error| StorageNodeDataRouteError::Route(store_error_response(error)))?;
         self.handler
             .node
-            .write_shard_file_if_absent(self.location.data_pg_id().get(), self.shard_key, payload)
+            .write_shard_file_if_absent_with_effect_fence(
+                self.location.data_pg_id().get(), self.shard_key, payload, effect_fence,
+            )
             .map_err(StorageNodeDataRouteError::Store)
     }
 

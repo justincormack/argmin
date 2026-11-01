@@ -58,17 +58,17 @@ use crate::pg_topology::PgTopology;
 use crate::types::CreateBucketConfig;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::ListMultipartUploadsReq;
+use crate::types::{
+    AdmittedRouteEffectFence, BucketDeleteFinalizeRoot, BucketInfo, BucketName, BucketSnapshot,
+    BucketSnapshotRequest, BucketSubresourceKind, EcShape, GenerationId, LoadedBucketSubresource,
+    ObjectKey, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ShardKey,
+    StoredObject, WriteAck,
+};
 #[cfg(test)]
 use crate::types::{
     AuthorizedMultipartUploadRecord, BucketState, ListObjectVersionsReq, ListPartsReq,
     ListedMultipartParts, MultipartCompletionPreflight, MultipartCompletionSnapshot,
     MultipartUploadManagementLookup, ObjectReadSnapshotOutcome,
-};
-use crate::types::{
-    BucketDeleteFinalizeRoot, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest,
-    BucketSubresourceKind, EcShape, GenerationId, LoadedBucketSubresource, ObjectKey,
-    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ShardKey,
-    StoredObject, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
@@ -1909,6 +1909,7 @@ impl SharedStorageNode {
         PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_shard_file_if_absent(
         &self,
         pg_id: u32,
@@ -1928,6 +1929,62 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         PgStore::write_shard_file_durable_if_absent(&paths.tmp_dir, &paths.shards_dir, key, data)
+    }
+
+    pub(crate) fn write_shard_file_with_effect_fence(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::write_shard_file_with_effect_fence",
+            "pg_id={} shard={} bytes={}",
+            pg_id,
+            key,
+            data.len()
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::write_shard_file_durable_with_effect_fence(
+            &paths.tmp_dir,
+            &paths.shards_dir,
+            key,
+            data,
+            effect_fence,
+        )
+    }
+
+    pub(crate) fn write_shard_file_if_absent_with_effect_fence(
+        &self,
+        pg_id: u32,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::write_shard_file_if_absent_with_effect_fence",
+            "pg_id={} shard={} bytes={}",
+            pg_id,
+            key,
+            data.len()
+        );
+        let paths = self
+            .pg_paths
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        PgStore::write_shard_file_durable_if_absent_with_effect_fence(
+            &paths.tmp_dir,
+            &paths.shards_dir,
+            key,
+            data,
+            effect_fence,
+        )
     }
 
     /// Read a shard file directly without taking the per-PG mutex.

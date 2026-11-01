@@ -4927,3 +4927,60 @@ Validation: all 22 focused tests passed after refreshing the raw fixture's
 metadata digest before checkpoint export. The full Nextest suite passed all
 9,215 tests (one slow, six skipped) in 266.929s. Strict all-target/all-feature
 Clippy, the storage boundary checker, formatting and `git diff --check` passed.
+
+## Physical Shard Publication Effect Fence — 2026-11-01
+
+The physical-write audit found that fresh fenced shard writes checked captured
+authority before CRC calculation, prefix preparation, temporary-file I/O and
+sync, then published through unfenced rename/hard-link helpers. The installed
+shard route also checked its own captured deadline early without carrying that
+bound to file publication. Those delays could therefore publish a final shard
+after request authority expired under a same-epoch renewed raw map.
+
+Fenced embedded writes now carry their immutable effect fence to the filesystem
+helper. Installed writes intersect the delegated bound with the receiving
+frame's captured route fence and pass it through the write-if-absent path. Both
+helpers check after CRC work before prefix preparation, after prefix sync before
+creating a temporary file, and after temporary data sync immediately before the
+atomic rename/hard link. Rejection at the last boundary unlinks only that
+attempt's temporary path; an existing final shard and independent temporary
+files remain untouched. No acknowledgement is returned and no shard row is
+registered. As with the existing I/O error cleanup, temporary unlink is best
+effort, not a new crash-recovery or durable scavenging guarantee. A prepared empty
+prefix may remain. The unbounded write-if-absent convenience wrappers now have
+only owner-local test callers and are test-gated; trusted repair/raw rename
+paths retain their existing behavior.
+
+The acceptance point is the final pre-publication check, not completion of the
+following filesystem call or directory sync. Once accepted, publication may
+finish after the cutoff. This explicitly does **not** establish physical
+write/cleanup exclusion: the planned local grant/exclusion lifetime must span
+that completion tail, and a cleanup worker cannot treat the cutoff alone as
+proof of quiescence. No new file/directory sync, metadata transaction, durable
+record, format version or ordinary-path network request is introduced.
+
+Store regressions cover both publication protocols with vacant and occupied
+final keys, exact original bytes/acknowledgements, independent shard/temp canaries,
+unchanged SQL total_changes, and fresh retry. A prefix-sync schedule verifies
+expiry before temporary creation; a hard-link schedule verifies accepted writes
+and matching-existing retries still complete directory sync after the cutoff.
+Embedded and installed Unix matrices pause after temporary-data sync, renew the
+raw same-epoch route and cross the effective deadline while remaining before
+the authority timestamp. Client-first, server-first and absent-client cases
+reject with the existing expiry classification, preserve exact files/rows and
+remove the attempt's temp; fresh requests succeed.
+
+This remains a prerequisite to the coordinated owner/window integration. It
+does not persist write horizons, confirm settled prefixes, bind physical effects
+to retained owners, or fence acknowledgement registration against cleanup. All
+six original cleanup regressions remain open.
+
+Moving the final check before the interleaving hook made all three expiry
+regressions publish a shard and return an acknowledgement. Independently omitting
+the receiving-node intersection made the Unix server-first case return an
+acknowledgement after both client-first cases passed. Both mutations were
+restored before full validation.
+
+Validation: all 12 focused tests passed. The full Nextest suite passed all
+9,220 tests (two slow, six skipped) in 262.494s. Strict all-target/all-feature
+Clippy, the storage boundary checker, formatting and `git diff --check` passed.

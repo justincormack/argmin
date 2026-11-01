@@ -12,6 +12,9 @@ mod bucket_reservation_deadline_tests;
 
 #[path = "bucket_drain_deadline_tests.rs"]
 mod bucket_drain_deadline_tests;
+
+#[path = "shard_publication_deadline_tests.rs"]
+mod shard_publication_deadline_tests;
 #[path = "pending_slot_deadline_tests.rs"]
 mod pending_slot_deadline_tests;
 
