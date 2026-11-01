@@ -118,6 +118,9 @@ The [fresh acknowledgement delegation slice](#fresh-acknowledgement-deadline-del
 carries captured request deadlines to embedded/Unix/TLS acknowledgement insertion,
 while preserving accepted-command convergence. File publication and acknowledgement
 fences still do not implement retained owners or physical cleanup exclusion.
+The [reservation lifecycle evidence gate](#reservation-lifecycle-evidence-before-introduction-custody--2026-11-01)
+pins the existing wire records before the coordinated introduction-cutoff and
+custody change. It adds no ownership fields or new mutation authority.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5155,3 +5158,53 @@ Validation: the corrected full Nextest run passed all 9,235 tests (one slow,
 six skipped) in 259.427s. Strict all-target/all-feature Clippy, the storage
 boundary checker, formatting and `git diff --check` passed. The flagged Raft
 heartbeat write-amplification test completed successfully in 101.779s.
+
+## Reservation Lifecycle Evidence Before Introduction Custody — 2026-11-01
+
+The next durable integration must include the pre-install handoff, not merely
+owner/window rows: the bucket reservation needs its immutable introduction
+acceptance cutoff and exact discovery subject; object-PG pending installation,
+retained owner materialization and frontend release policy must agree about
+custody. A renewable lease deadline or a request-only effect fence is not that
+durable cutoff. The coordinated-state and successor-primary requirements above
+remain in force.
+
+The predecessor audit found round-trip reservation codec tests and some
+heartbeat cap coverage, but no immutable lifecycle wire corpus. Under the
+versioning guide, that evidence must exist in a committed parent while its
+production writer is still unchanged. This slice therefore freezes v34 rather
+than adding partial cutoff fields or bumping a format before the complete state
+change is ready.
+
+The 91-frame owner-local corpus covers acquisition, proof validation, heartbeat,
+record release, retained proof release, stream-row proof update and listing.
+It distinguishes optional object targets, effect deadlines and release-operation
+deadlines; same/older proof epochs on the current route; renewed lease values;
+all acquisition outcomes; empty/one/two-record lists; representative wire errors;
+and reusable/closing replies. Explicit outcome matching has no wildcard, and
+the exact case-name set must match the literal corpus. This is a targeted
+reservation-family contract, not a claim that every nested proof carrier or
+every operation-specific error has been enumerated.
+
+Tests compare writer bytes, decode independent literals and pass requests through
+bounded frame admission. Negatives require actual decoder errors for truncation,
+trailing data and unknown option/outcome tags, not merely inequality with an
+expected value. The tests also pin resealed older/newer frame rejection, maximum
+wire-field requests, current per-kind caps and rejection one byte above each cap.
+Acquisition's one-byte cap slack is recorded rather than changed in evidence-only
+work. Maximum wire-field coverage does not authorize those values at the SQL or
+operation-subject boundary. The format ledger records the corpus identity.
+
+No production behavior, durable schema, command/RPC version, transaction or fsync
+changes. There are still no retained owner/window rows or physical exclusion
+grants, and all six original cleanup regressions remain open. After this evidence
+lands, the next state change must follow the coordinated implementation sequence
+above, including exact release obligations, pending/materialized custody,
+route-history retention and checkpoint/canonical-state membership.
+
+Validation: all six focused tests passed. The full Nextest run passed all 9,239
+tests (two slow, six skipped) in 248.896s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed. The two
+tests flagged as slow both completed successfully: the Raft heartbeat
+write-amplification gate in 112.967s and the oversized version-list pagination
+test in 64.364s.

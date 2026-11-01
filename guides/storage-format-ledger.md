@@ -20,6 +20,38 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Bucket Reservation Lifecycle Evidence Before Introduction Custody — 2026-11-01
+
+`storage_rpc/testdata/bucket_reservation_rpc_v34.hex` freezes **91** complete
+frames from the unchanged v34 writer. Its SHA-256 is
+`849fa9b36ff6f746c6caff0dea07258a01441538e21339a8e0e97ce3de6a9d34`.
+The targeted family is acquisition (38), validation (39), heartbeat (123),
+record release (40), retained proof release (11), stream-proof update (84) and
+reservation listing (83). This is not an exhaustive corpus of all RPCs that
+embed a reservation proof or of every error code.
+
+The matrix pins optional target context, optional delegated effect authority,
+the distinct optional release-operation deadline, original proof epoch versus
+current route epoch, original versus renewed lease deadlines, every acquisition
+outcome, empty/single/multiple-record lists, representative errors, and both
+connection dispositions. Stream updates use exact-key stream-create proofs;
+bucket-wide records separately exercise the absent-target representation.
+Writer comparison and independent literal decoding are supplemented by
+truncation/trailing-data, unknown optional/outcome tag, impossible list-count,
+resealed noncurrent frame and bounded request-admission tests.
+
+The frozen per-kind caps in the same order are 2,566, 2,572, 2,597, 2,572,
+2,581, 6,276 and 83 bytes. Maximum-field valid **wire** requests fit them;
+acquisition's existing cap allows one unused byte. This records protocol
+admission, not a claim that every maximum wire string is a valid SQL value or
+an authorized operation. No cap or production codec changes in this slice.
+
+The proposed immutable introduction cutoff and discovery/custody binding are
+not present in these records. Adding them must advance the affected containing
+formats and append new evidence while retaining this corpus unchanged. Keep
+release-operation deadlines, renewable reservation leases, introduction
+acceptance cutoffs and physical-window horizons semantically distinct.
+
 ## Shard Acknowledgement Deadline Delegation — 2026-11-01
 
 Storage RPC advances **33 → 34**. `ShardAckRecord` (12) now prefixes the batch
