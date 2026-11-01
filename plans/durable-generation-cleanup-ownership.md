@@ -4569,3 +4569,48 @@ all-target/all-feature Clippy, the storage boundary checker, formatting and
 including CLI/admin proof inputs; those were corrected with predecessor evidence
 preserved and explicit retired-proof rejection checks. The final run includes the
 deadline check moved after the issuer lookup, before allocation.
+
+## Installed Primary Move And Return — 2026-11-01
+
+The issuer acceptance matrix now composes actual storage-node route publication
+with Unix stream construction, replica application and append preparation. The
+prior direct lifetime-replacement tests remain; these additional tests do not
+manually rotate or overwrite a store's issuer identity.
+
+Separate PUT and UploadPart regressions use three independent storage runtimes
+and an installed Unix endpoint on each. Creation is built by the current primary
+and applied witness-first through RPC to every replica. The resulting replica
+states must agree even though the three process lifetimes are independent.
+Actual runtime-config installation moves the primary away and then returns it to
+the original still-open process. Keeping the epoch fixed isolates lifetime
+binding from stale-route-epoch rejection; this deliberately is not a test of a
+control-plane election or certified epoch transfer.
+
+At each replacement, the old session is still InProgress, has its first unused
+VID, has no appended segments, and supplies a freshly loaded expected session
+and the exact durable payload generation. Its preparation request must reach the
+installed peer and fail specifically with the allocation-lifetime route error.
+Full checkpoints, pending slots, sessions and segment rows remain exact on all
+three replicas. Returning to the original node additionally isolates the nonce
+binding: node identity alone is unchanged and cannot authorize allocation.
+
+Positive controls create and prepare a fresh session under every published
+primary, asserting its exact stored node/lifetime, VID allocation, and that only
+the primary advances its local cursor. Exact old-command replay and creation
+matching continue to succeed without mutation after replacement. The original
+session and its issuer remain unchanged throughout. Fixtures are metadata-only;
+they exercise no encrypted payload or physical deletion path.
+
+This closes an installed-route coverage gap for the existing stream issuer
+binding. There are no production behavior, schema, wire or fsync changes. Retained
+owner/window state, authoritative-prefix confirmation, physical exclusion and
+the six original cleanup regressions remain outstanding.
+
+Both focused regressions passed. A deliberate mutation that compared only the
+issuer's node ID, ignoring its process lifetime, made both tests fail at the
+return-to-original-primary stage: the old session incorrectly allocated VID 1.
+The full issuer comparison was restored before the full suite. This pins the
+lifetime check independently of node identity and route epoch. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and
+`git diff --check` passed. The full Nextest suite passed all 9,182 tests (one
+slow, six skipped) in 272.361s.

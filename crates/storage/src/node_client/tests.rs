@@ -91,6 +91,12 @@ impl Drop for TestStorageNodeServerGuard {
 }
 
 fn spawn_test_storage_node_server(server: StorageNodeServer) -> TestStorageNodeServerGuard {
+    spawn_shared_test_storage_node_server(Arc::new(server))
+}
+
+fn spawn_shared_test_storage_node_server(
+    server: Arc<StorageNodeServer>,
+) -> TestStorageNodeServerGuard {
     let socket_path = server.socket_path_for_test();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
