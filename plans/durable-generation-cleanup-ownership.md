@@ -5034,3 +5034,66 @@ validation.
 Validation: the full Nextest suite passed all 9,224 tests (one slow, six skipped)
 in 268.040s. Strict all-target/all-feature Clippy, the storage boundary checker,
 formatting and `git diff --check` passed.
+
+## Acknowledgement Delegation Call-Path And Format Gate — 2026-11-01
+
+The delegation audit distinguishes three current registration paths in
+`cluster/payload_operations.rs`:
+
+| Path | Current caller and ownership | Required next-slice authority |
+| --- | --- | --- |
+| Fresh Direct PUT | The no-pending-command branch constructs the validated integrity witness and registers before building/installing its terminal command; `payload_acks_registered = true` on this branch. | Carry the request's immutable effect fence into registration. Preserve the existing pre-command cleanup and error handling. |
+| Matching Direct PUT pending command | The `is_matching_direct_put` branch returns `new_pending_command = false`, `payload_acks_registered = false`; the later registration may restore acknowledgement rows for this exact accepted command. | Preserve exact-command convergence, not a newly sampled or expired frontend deadline. Bind the convergence path explicitly to the matching command instead of letting an optional fence silently choose it. |
+| Fresh stream append | After pending-command handling and exact-segment replay checks, registration precedes append build/install. | Carry the captured append fence through registration; retain the existing staged-payload cleanup classification. |
+
+Repair, backfill and copied-shard maintenance use the separate
+`register_maintenance_payload_shard_acks` helper. They must not inherit a dead
+frontend's deadline. The embedded and Unix `ShardAckRoute` implementations
+currently provide only the unbounded registration method; this remains an open
+gap for the two fresh paths, not a justification for changing convergence.
+
+Before changing the wire, the audit found only a round-trip acknowledgement
+batch test, not independent exact representation evidence. The versioning guide
+requires that predecessor evidence at a commit boundary **before** changing its
+writer. This slice therefore freezes the unchanged v33 codec rather than
+introducing the delegation field or claiming that gap resolved.
+
+The new 16-frame corpus covers record and validate requests with one/two exact
+keys, success and representative expiry/integrity errors, and reusable/closing
+response envelopes. Separate tests pin exact-cap admission for both kinds,
+invalid counts, truncated/trailing payloads and resealed unsupported versions.
+The corpus's exact case identities are compared against the constructed matrix;
+this is a targeted acknowledgement-family corpus, not a claim of exhaustive
+coverage of all storage RPC kinds or all error codes. No production behavior,
+wire version, command, schema, transaction or fsync changes in this slice.
+
+After this evidence is committed, the next implementation slice must:
+
+1. Separate fresh registration from explicit matching-command/maintenance
+   registration at the cluster/client boundary; no default fence may silently
+   turn fresh mutation into unbounded convergence.
+2. Carry the immutable fence into the embedded transaction and a portable
+   absolute conservative wall-clock upper bound over Unix/TLS, shortened for
+   inter-host skew and rebound to the receiver's own monotonic clock. Never
+   serialize an absolute monotonic timestamp or restart a remaining duration.
+3. Intersect delegated authority with the receiving frame's captured route
+   fence before using the existing per-row transactional checks. Preserve
+   receiver-only fencing for independently authorized convergence/maintenance.
+4. Advance the storage-RPC version once, append exact bounded/unbounded
+   mutation and authentication composite evidence, retain these v33 frames,
+   and pin the new mutation request cap. Keep validation's logical payload
+   unchanged rather than giving a read operation mutation authority.
+5. Test fresh Direct PUT and append expiry at registration with a renewed raw
+   map, client-first/server-first/absent delegated bounds, independent receiver
+   clock origins, exact non-mutation canaries and fresh retry. Separately prove
+   an accepted matching command can converge without the originating request's
+   expired authority.
+
+Durable owner/window integration, pre-install orphan custody and physical
+grant/exclusion remain separate outstanding work; all six original cleanup
+regressions remain open.
+
+Validation: all 26 focused acknowledgement tests passed. The full Nextest suite
+passed all 9,227 tests (one slow, six skipped) in 271.513s. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and
+`git diff --check` passed.

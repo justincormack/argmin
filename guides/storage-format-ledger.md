@@ -56,6 +56,32 @@ of today's table registry. Current aggregate hashes are:
 The historical evidence sections below describe their named vectors, not an
 instruction to regenerate those vectors from current structs.
 
+## Shard Acknowledgement Evidence Before Deadline Delegation — 2026-11-01
+
+`storage_rpc/testdata/shard_ack_rpc_v33.hex` freezes 16 complete acknowledgement
+batch frames from the unchanged production codec at `e5707f0b`. Its file SHA-256
+is `2c1f50dfd6bc56f6ed05604ef7e3a997dcd3c41afaeaf0e200d875659a70cb05`.
+Both `ShardAckRecord` (12) and `ShardAckValidate` (13) use the same untagged
+route/count/key/acknowledgement payload, owned by storage RPC v33. The corpus
+pins single- and two-item requests, empty success, representative expiry and
+integrity errors, and both response connection dispositions. Error specimens
+pin the shared envelope grammar, not an exhaustive operation-specific error
+set or every RPC message kind.
+
+Owner-local tests compare current writer output with the independent literals,
+decode those literals directly and through bounded request admission, reject
+truncation/trailing data and invalid counts, and reject correctly checksummed
+v32/v34 frames. Both kinds admit the exact 4,096-item / 184,340-byte request cap
+and reject one additional byte. This is evidence-only: no schema, frame,
+authentication or durable-state version advances here.
+
+Adding delegated effect authority changes the untagged registration request and
+therefore requires a subsequent storage-RPC version advance. Keep these v33
+specimens unchanged as rejection evidence, append new request/response and
+authentication composites, and adjust the mutation request's cap for its full
+portable deadline representation. Do not add a deadline to validation merely
+because it currently shares the registration codec.
+
 ## Baseline Rules
 
 The completed ownership inventory established one explicit current baseline version for each format.

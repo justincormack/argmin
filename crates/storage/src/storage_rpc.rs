@@ -107,3 +107,7 @@ mod stream_creation_format_tests;
 #[cfg(test)]
 #[path = "storage_rpc/stream_append_format_tests.rs"]
 mod stream_append_format_tests;
+
+#[cfg(test)]
+#[path = "storage_rpc/shard_ack_format_tests.rs"]
+mod shard_ack_format_tests;
