@@ -11,9 +11,20 @@ use rusqlite::params;
 
 use super::PgStore;
 use crate::{
-    error::MetadataError, node_runtime::traits::PgMetadataStore, GenerationId, SessionId,
-    StreamUploadState,
+    error::{MetadataError, StoreError},
+    node_runtime::traits::PgMetadataStore,
+    types::AdmittedRouteEffectFence,
+    GenerationId, NodeId, SessionId, StreamUploadState,
 };
+
+#[cfg(test)]
+type AllocationEffectHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_ALLOCATION_EFFECT: std::cell::RefCell<Option<AllocationEffectHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn exhausted_window() -> MetadataError {
     MetadataError::InvariantViolation {
@@ -55,10 +66,74 @@ pub(super) fn checked_segment_vid_window(
 }
 
 impl PgStore {
+    /// Acquire SQLite's write transaction before checking authority. A check
+    /// before an implicit UPDATE transaction can expire while waiting for the
+    /// database writer. This replaces that transaction, not a second commit.
+    /// The caller also holds the PG lock across session/placement validation.
+    pub(in crate::node_runtime) fn allocate_stream_segment_vid_for_admitted_append(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+        node_id: NodeId,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<Option<GenerationId>, MetadataError> {
+        self.with_immediate_txn(
+            "allocate stream segment VID (begin txn)",
+            "allocate stream segment VID (commit txn)",
+            |store| {
+                store
+                    .allocate_stream_segment_vid_window_inner(
+                        session_id,
+                        NonZeroU32::MIN,
+                        Some(segment_index),
+                        || {
+                            let local_issuer = store
+                                .stream_allocation_issuer(node_id)
+                                .map_err(|source| MetadataError::RouteEffectRejected { source })?;
+                            if store.load_stream_allocation_issuer(session_id)? != local_issuer {
+                                return Err(MetadataError::RouteEffectRejected {
+                                    source: StoreError::PgAllocationLifetimeUnavailable {
+                                        pg_id: store.pg_id,
+                                    },
+                                });
+                            }
+                            #[cfg(test)]
+                            if let Some(hook) =
+                                BEFORE_ALLOCATION_EFFECT.with(|slot| slot.borrow_mut().take())
+                            {
+                                hook(!store.conn.is_autocommit());
+                            }
+                            effect_fence
+                                .require_valid_for(effect_fence.cluster_epoch())
+                                .map_err(|source| MetadataError::RouteEffectRejected { source })
+                        },
+                    )
+                    .map(|window| window.map(|window| window.start()))
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_before_stream_segment_allocation_effect_hook<T>(
+        hook: impl FnOnce(bool) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<AllocationEffectHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_ALLOCATION_EFFECT.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset =
+            Reset(BEFORE_ALLOCATION_EFFECT.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
+    }
+
     /// One outstanding local preparation, until its append is applied. This
     /// bounds speculative allocation only: replica cursors do not establish
     /// exclusive issuer continuity or durable cleanup authority.
-    pub(in crate::node_runtime) fn allocate_stream_segment_vid_for_append(
+    #[cfg(test)]
+    pub(super) fn allocate_stream_segment_vid_for_append(
         &self,
         session_id: &SessionId,
         segment_index: u32,
@@ -67,22 +142,23 @@ impl PgStore {
             session_id,
             NonZeroU32::MIN,
             Some(segment_index),
+            || Ok(()),
         )
         .map(|window| window.map(|window| window.start()))
     }
 
     /// Consumes a finite interval from this node's local allocator. It is not a
     /// replicated reserved end and cannot authorize replacement-primary reuse.
-    /// The one-statement bound is checked by SQLite before the update; Rust only
-    /// projects the checked result. Keep the normal single-VID path one statement
-    /// with no extra transaction or pre-read between admission and mutation.
+    /// This test-only arithmetic path checks bounds in its single UPDATE; Rust
+    /// only projects the checked result. Production preparation must use the
+    /// admitted transaction above, not this unfenced fixture path.
     #[cfg(test)]
     pub(super) fn allocate_stream_segment_vid_window(
         &self,
         session_id: &SessionId,
         count: NonZeroU32,
     ) -> Result<CheckedSegmentVidWindow, MetadataError> {
-        self.allocate_stream_segment_vid_window_inner(session_id, count, None)?
+        self.allocate_stream_segment_vid_window_inner(session_id, count, None, || Ok(()))?
             .ok_or_else(exhausted_window)
     }
 
@@ -91,10 +167,12 @@ impl PgStore {
         session_id: &SessionId,
         count: NonZeroU32,
         next_segment_index: Option<u32>,
+        validate_effect: impl FnOnce() -> Result<(), MetadataError>,
     ) -> Result<Option<CheckedSegmentVidWindow>, MetadataError> {
         let count_sql = i64::from(count.get());
-        let allocated = (|| -> rusqlite::Result<Option<GenerationId>> {
-            let mut statement = self.conn.prepare_cached(
+        let mut statement = self
+            .conn
+            .prepare_cached(
                 "UPDATE stream_uploads \
              SET next_segment_vid = next_segment_vid + ?3 \
              WHERE session_id = ?1 AND state = ?2 AND next_segment_vid <= ?4 \
@@ -106,7 +184,15 @@ impl PgStore {
                                         FROM stream_upload_segments WHERE session_id = ?1)\
              )) \
              RETURNING next_segment_vid - ?3",
-            )?;
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "prepare stream segment VID allocation",
+                source: source.into(),
+            })?;
+        // Keep validation after statement preparation and authority reads, and
+        // directly before the first mutating statement in the held transaction.
+        validate_effect()?;
+        let allocated = (|| -> rusqlite::Result<Option<GenerationId>> {
             let mut rows = statement.query(params![
                 session_id.as_str(),
                 StreamUploadState::InProgress as u8,
@@ -431,6 +517,188 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn admitted_stream_allocation_expiry_precedes_sql_update() {
+        let time = crate::clock::test_time_override_guard(1_000);
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let id = session(&store, "11");
+        let before = store.get_stream_upload(&id).unwrap();
+        let changes = store.conn.total_changes();
+        let control = time.control();
+        let error = PgStore::test_with_before_stream_segment_allocation_effect_hook(
+            move |in_write_transaction| {
+                assert!(in_write_transaction);
+                control.set(4_500);
+            },
+            || {
+                store.allocate_stream_segment_vid_for_admitted_append(
+                    &id,
+                    0,
+                    NodeId::new(0),
+                    AdmittedRouteEffectFence::bounded(crate::ClusterEpoch::INITIAL, 5_000, 4_000),
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetadataError::RouteEffectRejected {
+                    source: StoreError::RouteMapExpired {
+                        valid_until_ms: 5_000,
+                        now_ms: 4_500,
+                        ..
+                    }
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(store.conn.is_autocommit());
+        assert_eq!(
+            store.conn.total_changes(),
+            changes,
+            "expiry must precede UPDATE, not just roll it back"
+        );
+        assert_eq!(store.get_stream_upload(&id).unwrap(), before);
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_admitted_append(
+                    &id,
+                    0,
+                    NodeId::new(0),
+                    AdmittedRouteEffectFence::bounded(crate::ClusterEpoch::INITIAL, 8_000, 7_000),
+                )
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+    }
+
+    #[test]
+    fn admitted_stream_allocation_uses_one_write_transaction() {
+        use rusqlite::trace::{TraceEvent, TraceEventCodes};
+        use std::sync::{Arc, Mutex};
+
+        let dir = test_util::tempdir();
+        let mut store = PgStore::open(dir.path(), 0).unwrap();
+        let id = session(&store, "11");
+        let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&statements);
+        store
+            .conn
+            .trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(move |event: TraceEvent<'_>| {
+                    if let TraceEvent::Stmt(_, sql) = event {
+                        if !sql.starts_with("--") {
+                            captured.lock().unwrap().push(sql.to_owned());
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_admitted_append(
+                    &id,
+                    0,
+                    NodeId::new(0),
+                    AdmittedRouteEffectFence::unbounded(crate::ClusterEpoch::INITIAL),
+                )
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+        let observed = statements.lock().unwrap();
+        let kinds = observed
+            .iter()
+            .map(|sql| sql.split_whitespace().next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            ["BEGIN", "SELECT", "UPDATE", "COMMIT"],
+            "{observed:?}"
+        );
+        assert_eq!(observed[0], "BEGIN IMMEDIATE");
+        assert!(
+            observed[1].starts_with("SELECT allocation_issuer_node, allocation_issuer_lifetime")
+        );
+        assert!(observed[2].starts_with("UPDATE stream_uploads"));
+        assert!(store.conn.is_autocommit());
+    }
+
+    #[test]
+    fn admitted_stream_allocation_joins_existing_transaction() {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let id = session(&store, "11");
+        let before = store.get_stream_upload(&id).unwrap();
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            store
+                .allocate_stream_segment_vid_for_admitted_append(
+                    &id,
+                    0,
+                    NodeId::new(0),
+                    AdmittedRouteEffectFence::unbounded(crate::ClusterEpoch::INITIAL),
+                )
+                .unwrap(),
+            Some(GenerationId::MIN)
+        );
+        assert!(
+            !store.conn.is_autocommit(),
+            "allocation must not commit its caller's transaction"
+        );
+        assert_eq!(
+            store.get_stream_upload(&id).unwrap().next_segment_vid.get(),
+            2
+        );
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(store.get_stream_upload(&id).unwrap(), before);
+    }
+
+    #[test]
+    fn admitted_stream_allocation_rolls_back_update_and_commit_failures() {
+        for fail_commit in [false, true] {
+            let dir = test_util::tempdir();
+            let store = PgStore::open(dir.path(), 0).unwrap();
+            let id = session(&store, "11");
+            let before = store.get_stream_upload(&id).unwrap();
+            if fail_commit {
+                store.fail_next_metadata_txn_commit();
+            } else {
+                store.conn.execute_batch(
+                    "CREATE TEMP TRIGGER fail_allocation BEFORE UPDATE OF next_segment_vid ON stream_uploads \
+                     BEGIN SELECT RAISE(ABORT, 'injected allocation failure'); END"
+                ).unwrap();
+            }
+            let allocate = || {
+                store.allocate_stream_segment_vid_for_admitted_append(
+                    &id,
+                    0,
+                    NodeId::new(0),
+                    AdmittedRouteEffectFence::unbounded(crate::ClusterEpoch::INITIAL),
+                )
+            };
+            let error = allocate().unwrap_err();
+            assert!(
+                matches!(&error, MetadataError::Db { context, .. }
+                    if *context == if fail_commit { "allocate stream segment VID (commit txn)" } else { "allocate stream segment VID" }
+                ),
+                "{error:?}"
+            );
+            assert!(store.conn.is_autocommit());
+            assert_eq!(store.get_stream_upload(&id).unwrap(), before);
+            if !fail_commit {
+                store
+                    .conn
+                    .execute_batch("DROP TRIGGER fail_allocation")
+                    .unwrap();
+            }
+            assert_eq!(allocate().unwrap(), Some(GenerationId::MIN));
+            assert_eq!(allocate().unwrap(), None);
+        }
     }
 
     #[test]

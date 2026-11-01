@@ -437,16 +437,13 @@ impl LocalStreamUploadSessionMetadataRoute<'_> {
             &segment_okh,
             session.next_segment_vid,
         )?;
-        if pg.load_stream_allocation_issuer(&request.session_id)?
-            != pg.stream_allocation_issuer(self.client.node_id)?
-        {
-            return Err(StoreError::PgAllocationLifetimeUnavailable {
-                pg_id: self.pg_id.get(),
-            }
-            .into());
-        }
         effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
-        let segment_vid = allocate_stream_segment_for_preparation(&pg, request)?;
+        let segment_vid = allocate_stream_segment_for_preparation(
+            &pg,
+            request,
+            self.client.node_id,
+            effect_fence,
+        )?;
         let segment_record = StreamUploadSegmentRecord {
             session_id: request.session_id.clone(),
             segment_index: request.segment_index,

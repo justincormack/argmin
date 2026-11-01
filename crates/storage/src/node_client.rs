@@ -667,12 +667,22 @@ fn reject_duplicate_stream_segment_index(
 fn allocate_stream_segment_for_preparation(
     pg: &PgStore,
     request: &PrepareStreamUploadSegmentAppendReq,
+    node_id: NodeId,
+    effect_fence: AdmittedRouteEffectFence,
 ) -> Result<GenerationId, ObjectPgActionError> {
-    pg.allocate_stream_segment_vid_for_append(&request.session_id, request.segment_index)?
-        .ok_or_else(|| ObjectPgActionError::InvalidRequest {
-            reason: "stream preparation requires the next segment and an unconsumed local slot"
-                .into(),
-        })
+    pg.allocate_stream_segment_vid_for_admitted_append(
+        &request.session_id,
+        request.segment_index,
+        node_id,
+        effect_fence,
+    )
+    .map_err(|error| match error {
+        MetadataError::RouteEffectRejected { source } => ObjectPgActionError::Store(source),
+        error => ObjectPgActionError::Metadata(error),
+    })?
+    .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+        reason: "stream preparation requires the next segment and an unconsumed local slot".into(),
+    })
 }
 
 fn validate_stream_put_finalize_session(

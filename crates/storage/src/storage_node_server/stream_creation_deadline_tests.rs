@@ -6,6 +6,9 @@ use crate::node_client::BuildCreateStreamUploadCommandReq;
 use crate::node_runtime::client_facade::LocalStorageNodeClient;
 use crate::node_runtime::payload_placement::PayloadPlacementInput;
 
+#[path = "stream_preparation_deadline_tests.rs"]
+mod preparation;
+
 struct CreationFixture {
     request: CreateStreamUploadReq,
     upload: MultipartUploadRecord,
@@ -44,11 +47,11 @@ impl CreationFixture {
         }
     }
 
-    fn seed_append(
+    fn seed_session(
         &self,
         node: &Arc<SharedStorageNode>,
         config: &StorageNodeProcessConfig,
-    ) -> StreamUploadSegmentRecord {
+    ) {
         let client = LocalStorageNodeClient::new(config.node_id, Arc::clone(node));
         let command = self
             .build_command(
@@ -62,6 +65,15 @@ impl CreationFixture {
             .unwrap()
             .apply_metadata_command_and_record(config.node_id.as_u32(), &command)
             .unwrap();
+    }
+
+    fn seed_append(
+        &self,
+        node: &Arc<SharedStorageNode>,
+        config: &StorageNodeProcessConfig,
+    ) -> StreamUploadSegmentRecord {
+        self.seed_session(node, config);
+        let client = LocalStorageNodeClient::new(config.node_id, Arc::clone(node));
         // Metadata-only preflight fixture: no ciphertext is exposed or written.
         let (crc, witness) = crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
             EcShape { k: 1, m: 0 },

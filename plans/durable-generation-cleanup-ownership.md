@@ -4655,3 +4655,52 @@ epoch 2; the full issuer comparison was restored before full-suite validation.
 The final full Nextest suite passed all 9,184 tests (one slow, six skipped) in
 263.805s. Strict all-target/all-feature Clippy, the storage boundary checker,
 formatting and `git diff --check` passed.
+
+## Transactional Stream Allocation Fence — 2026-11-01
+
+Reviewing the next owner/window integration found a remaining allocation effect
+gap: preparation checked its fence under the PG mutex, then entered an implicit
+SQLite UPDATE transaction. A wait for SQLite write admission or statement
+preparation could cross the captured deadline after that check. A renewed raw
+route must not authorize the resulting cursor mutation.
+
+Production preparation now passes its node identity and captured effect fence
+into the storage-owned allocator. The allocator enters `BEGIN IMMEDIATE`, prepares
+the UPDATE, compares the durable session issuer with the current local issuer,
+then checks the fence immediately before issuing the UPDATE. The PG mutex remains
+held throughout the existing session/generation/placement validation and this
+transaction. The unfenced arithmetic/preparation entry points are test-only;
+production cannot call them. Expiry and issuer rejection retain their existing
+typed route-error mapping through embedded and Unix paths.
+
+The explicit transaction replaces the UPDATE's former implicit transaction; it
+does not add another successful-path commit or a new metadata command. A SQLite
+trace canary pins one BEGIN, one issuer SELECT, one UPDATE and one COMMIT. An
+outer-transaction canary verifies allocation neither commits its caller's work
+nor survives its rollback. UPDATE and COMMIT failure canaries preserve the cursor
+and prove a subsequent successful call still obtains the first VID. No durable
+schema, canonical encoding or wire representation changes.
+
+Separate embedded and installed Unix regressions cover PUT and UploadPart. A
+one-shot hook runs after SQLite admission and issuer lookup, renews only the raw
+route's validity, and advances time from 1,000 to 4,500 ms: after the captured
+effective cutoff at 4,000 but before the raw authority timestamp at 5,000. Unix
+cases independently cover the client deadline, a shorter receiving-node deadline,
+and an absent client deadline. Full checkpoint, pending slot, session and segment
+rows remain unchanged; genuinely fresh admission can consume the untouched first
+slot. The owner-local canary also requires SQLite's total change count to remain
+unchanged, ruling out an UPDATE followed only by rollback.
+
+Moving validation before the hook deliberately caused all three independent
+expiry tests (owner-local, embedded and Unix) to allocate VID 1 and fail. Correct
+ordering was restored afterward. An initial Unix fixture failure was traced to
+placing the hook around the client's preliminary session-load RPC; the fixture
+now explicitly serves that frame before wrapping the allocation frame.
+
+This hardens an existing mutation boundary without implementing retained
+owner/window state or physical-write/cleanup exclusion. All six original cleanup
+regressions remain open.
+
+Validation: all 49 focused tests passed. The full Nextest suite passed all 9,190
+tests (one slow, six skipped) in 262.307s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed.
