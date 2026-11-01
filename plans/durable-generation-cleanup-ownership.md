@@ -4816,3 +4816,66 @@ and leaving an unrelated unapplied canary installed rather than removing it.
 Validation: all 17 focused tests passed. The full Nextest suite passed all 9,203
 tests (one slow, six skipped) in 254.441s. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and `git diff --check` passed.
+
+### Transactional Stream Reservation Heartbeat Fences
+
+The acceptance-boundary audit next found that streamed PUT heartbeat checked
+captured authority under the PG mutex, but both its bucket reservation renewal
+and stream-row proof update subsequently entered SQLite without that fence.
+The bucket update also compared lease expiry with time sampled before write
+admission. A delayed heartbeat could therefore renew an expired reservation or
+mutate either record after its immutable route cutoff under a renewed raw map.
+
+Both updates now acquire or join SQLite write serialization, prepare the exact
+UPDATE, and validate the effect fence immediately before mutation. The bucket
+update samples lease time there as well. Installed Unix/TLS handlers intersect
+the caller's delegated fence with the receiving frame's captured route fence;
+neither same-epoch renewal nor an absent/longer caller deadline extends it.
+The existing portable deadline representation is unchanged. The old durable
+proof epoch remains independent of the current route authorizing renewal.
+
+These remain two separately committed operations, not a new cross-PG transaction.
+If the bucket renewal succeeds and the stream update expires, the renewed bucket
+record and old stream proof remain intact for the existing refresh/retry path.
+Each successful hop still has one commit/fsync; explicit BEGIN IMMEDIATE replaces
+its former implicit write transaction. Nested callers retain ownership of their
+transaction. No command, schema, format version, or successful-path durable write
+is added. Trusted raw test/store callers retain their explicit-time interface;
+request-admitted heartbeat resamples time at the effect.
+
+Owner-local regressions cover expiry after statement preparation, exact records,
+checkpoint and SQLite total_changes non-mutation, lease expiry during admission,
+UPDATE/COMMIT failure and retry, one-commit traces and outer rollback. The stream
+proof cases first commit the real bucket renewal. Embedded and installed Unix
+matrices renew the raw map inside the transaction hook and advance time past the
+effective cutoff but before the authority timestamp. Client-first, server-first,
+and absent-client deadlines each reject; fresh retries succeed, preserving an
+independent reservation. A two-hop Unix canary renews an epoch-1 proof through an
+epoch-2 route and verifies both durable records.
+
+This closes heartbeat's existing captured-route effect boundary only. It does
+not implement retained owner/window renewal, introduction-cutoff persistence,
+replacement-primary settlement, or physical write exclusion. All six original
+cleanup regressions remain open. The adjacent bucket-delete drain acquisition
+still needs its own transactional effect-boundary audit; this slice does not
+claim to cover that separate operation.
+
+Moving the final fence and time sampling ahead of the interleaving hook made
+both owner-local expiry canaries accept the write and fail. Independently
+removing only the stream update's receiving-node intersection made the Unix
+matrix fail at its server-first StreamProof case, after all bucket cases and the
+client-first stream case passed. Both mutations were restored. Fixture setup
+errors were corrected by selecting 1+0 for the one-node placement and supplying
+finite validity for runtime-map refresh; they did not require production changes.
+
+The first full run passed 9,209 tests and failed
+`active_object_routes_keep_their_captured_deadline_after_validity_extension`:
+the new stream intersection classified an already-expired receiving route as an
+object error before the existing route check could return its route error.
+The handler now preserves that early route check and still carries the
+intersected fence to the SQL effect. The existing regression is unchanged.
+
+Validation: all ten final focused tests passed, including the unchanged
+route-expiry regression. The final full Nextest suite passed all 9,210 tests
+(one slow, six skipped) in 260.576s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed.

@@ -10,6 +10,11 @@ mod segment_vid_window;
 #[path = "metadata/bucket_reservation_acquire.rs"]
 mod bucket_reservation_acquire;
 
+#[path = "metadata/reservation_heartbeat.rs"]
+mod reservation_heartbeat;
+#[cfg(test)]
+pub(crate) use reservation_heartbeat::HeartbeatEffect;
+
 include!("metadata/support.rs");
 include!("metadata/command_apply.rs");
 include!("metadata/command_mutations.rs");

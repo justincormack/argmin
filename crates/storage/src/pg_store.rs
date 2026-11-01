@@ -55,6 +55,8 @@ use crate::node_runtime::traits::{
 };
 use crate::node_runtime::MetadataCommandDecodeAuthority;
 use crate::types::*;
+#[cfg(test)]
+pub(crate) use metadata::HeartbeatEffect;
 use placement::NodeId;
 
 #[derive(Debug)]

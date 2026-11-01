@@ -2227,8 +2227,7 @@ impl LocalStorageNodeClient {
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
-        Ok(PgMetadataStore::heartbeat_durable_bucket_write_reservation(
-            &*pg,
+        pg.heartbeat_durable_bucket_write_reservation_with_effect_fence(
             DurableBucketWriteReservationHeartbeat {
                 name: &proof.bucket,
                 reservation_id: &proof.reservation_id,
@@ -2240,7 +2239,12 @@ impl LocalStorageNodeClient {
                 lease_deadline,
                 now: crate::clock::current_time_millis(),
             },
-        )?)
+            effect_fence,
+        )
+        .map_err(|error| match error {
+            MetadataError::RouteEffectRejected { source } => BucketSnapshotLoadError::Store(source),
+            error => BucketSnapshotLoadError::Metadata(error),
+        })
     }
 }
 
@@ -4187,14 +4191,16 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             .into());
         }
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
-        Ok(
-            PgMetadataStore::update_stream_upload_bucket_write_reservation(
-                &*pg,
-                &self.session_id,
-                current,
-                renewed,
-            )?,
+        pg.update_stream_upload_bucket_write_reservation_with_effect_fence(
+            &self.session_id,
+            current,
+            renewed,
+            effect_fence,
         )
+        .map_err(|error| match error {
+            MetadataError::RouteEffectRejected { source } => ObjectPgActionError::Store(source),
+            error => ObjectPgActionError::Metadata(error),
+        })
     }
 }
 

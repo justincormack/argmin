@@ -280,77 +280,7 @@ impl PgMetadataStore for PgStore {
         &self,
         heartbeat: DurableBucketWriteReservationHeartbeat<'_>,
     ) -> Result<BucketWriteReservationRecord, MetadataError> {
-        let generation =
-            i64::try_from(heartbeat.bucket_execution_generation).map_err(|source| {
-                MetadataError::Db {
-                    context: "heartbeat durable bucket write reservation generation",
-                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
-                        source,
-                    )),
-                }
-            })?;
-        let incarnation =
-            i64::try_from(heartbeat.bucket_incarnation_generation).map_err(|source| {
-                MetadataError::Db {
-                    context: "heartbeat durable bucket write reservation incarnation",
-                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
-                        source,
-                    )),
-                }
-            })?;
-        let lease_deadline =
-            i64::try_from(heartbeat.lease_deadline).map_err(|source| MetadataError::Db {
-                context: "heartbeat durable bucket write reservation lease deadline",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let current_lease_deadline =
-            i64::try_from(heartbeat.current_lease_deadline).map_err(|source| {
-                MetadataError::Db {
-                    context: "heartbeat durable bucket write reservation current lease deadline",
-                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
-                        source,
-                    )),
-                }
-            })?;
-        let now = i64::try_from(heartbeat.now).map_err(|source| MetadataError::Db {
-            context: "heartbeat durable bucket write reservation now",
-            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-        })?;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE bucket_write_reservations \
-                 SET lease_deadline = ?8 \
-                 WHERE bucket_name = ?1 AND reservation_id = ?2 \
-                   AND owner_token = ?3 AND cluster_epoch = ?4 \
-                   AND bucket_execution_generation = ?5 \
-                   AND bucket_incarnation_generation = ?6 \
-                   AND lease_deadline = ?7 AND lease_deadline > ?9",
-                params![
-                    heartbeat.name.as_str(),
-                    heartbeat.reservation_id,
-                    heartbeat.owner_token,
-                    heartbeat.cluster_epoch.get(),
-                    generation,
-                    incarnation,
-                    current_lease_deadline,
-                    lease_deadline,
-                    now,
-                ],
-            )
-            .map_err(|source| MetadataError::Db {
-                context: "heartbeat durable bucket write reservation",
-                source: source.into(),
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketWriteReservationNotFound {
-                reservation_id: heartbeat.reservation_id.to_string(),
-            });
-        }
-        self.durable_bucket_write_reservation(heartbeat.name, heartbeat.reservation_id)?
-            .ok_or_else(|| MetadataError::BucketWriteReservationNotFound {
-                reservation_id: heartbeat.reservation_id.to_string(),
-            })
+        self.heartbeat_bucket_reservation_at_recorded_time(heartbeat)
     }
 
     fn release_durable_bucket_write_reservation(
@@ -5518,85 +5448,12 @@ impl PgMetadataStore for PgStore {
         current: &BucketWriteReservationProof,
         renewed: &BucketWriteReservationProof,
     ) -> Result<(), MetadataError> {
-        if !current.has_same_stable_identity(renewed) {
-            return Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: current.reservation_id.clone(),
-            });
-        }
-
-        let current_cluster_epoch =
-            i64::try_from(current.cluster_epoch.get()).map_err(|source| MetadataError::Db {
-                context: "update stream upload bucket write reservation current cluster epoch",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let current_execution_generation = i64::try_from(current.bucket_execution_generation)
-            .map_err(|source| MetadataError::Db {
-                context:
-                    "update stream upload bucket write reservation current execution generation",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let current_incarnation_generation = i64::try_from(current.bucket_incarnation_generation)
-            .map_err(|source| MetadataError::Db {
-            context: "update stream upload bucket write reservation current incarnation generation",
-            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-        })?;
-        let current_created_at =
-            i64::try_from(current.created_at).map_err(|source| MetadataError::Db {
-                context: "update stream upload bucket write reservation current created_at",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let current_lease_deadline =
-            i64::try_from(current.lease_deadline).map_err(|source| MetadataError::Db {
-                context: "update stream upload bucket write reservation current lease deadline",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let renewed_lease_deadline =
-            i64::try_from(renewed.lease_deadline).map_err(|source| MetadataError::Db {
-                context: "update stream upload bucket write reservation renewed lease deadline",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE stream_uploads \
-                 SET bucket_write_lease_deadline = ?12 \
-                 WHERE session_id = ?1 AND state = ?2 \
-                   AND bucket = ?3 \
-                   AND bucket_write_reservation_id = ?4 \
-                   AND bucket_write_owner_token = ?5 \
-                   AND bucket_write_cluster_epoch = ?6 \
-                   AND bucket_write_execution_generation = ?7 \
-                   AND bucket_write_incarnation_generation = ?8 \
-                   AND bucket_write_operation_kind = ?9 \
-                   AND bucket_write_created_at = ?10 \
-                   AND bucket_write_lease_deadline = ?11 \
-                   AND bucket_write_target_context IS ?13",
-                params![
-                    session_id.as_str(),
-                    StreamUploadState::InProgress as u8,
-                    current.bucket.as_str(),
-                    current.reservation_id.as_str(),
-                    current.owner_token.as_str(),
-                    current_cluster_epoch,
-                    current_execution_generation,
-                    current_incarnation_generation,
-                    current.operation_kind.as_str(),
-                    current_created_at,
-                    current_lease_deadline,
-                    renewed_lease_deadline,
-                    current.target_context.as_deref(),
-                ],
-            )
-            .map_err(|source| MetadataError::Db {
-                context: "update stream upload bucket write reservation",
-                source: source.into(),
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: current.reservation_id.clone(),
-            });
-        }
-        Ok(())
+        self.update_stream_upload_bucket_write_reservation_with_effect_fence(
+            session_id,
+            current,
+            renewed,
+            AdmittedRouteEffectFence::unbounded(current.cluster_epoch),
+        )
     }
 
     #[cfg(test)]

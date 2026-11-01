@@ -9,6 +9,9 @@ use crate::node_runtime::payload_placement::PayloadPlacementInput;
 #[path = "stream_preparation_deadline_tests.rs"]
 mod preparation;
 
+#[path = "reservation_heartbeat_deadline_tests.rs"]
+mod heartbeat;
+
 struct CreationFixture {
     request: CreateStreamUploadReq,
     upload: MultipartUploadRecord,

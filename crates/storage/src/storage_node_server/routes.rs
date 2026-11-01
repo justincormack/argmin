@@ -487,6 +487,10 @@ impl StorageNodeActiveBucketRoute<'_> {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
+        let effect_fence = self.fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
         effect_fence
             .require_valid_for(self.fence.cluster_epoch)
             .map_err(BucketSnapshotLoadError::Store)
@@ -1793,6 +1797,11 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         renewed: &BucketWriteReservationProof,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let effect_fence = self.route.fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(ObjectPgActionError::Store)
+            .map_err(StorageNodeObjectRouteError::Object)?;
         effect_fence
             .require_valid_for(self.route.fence.cluster_epoch)
             .map_err(ObjectPgActionError::Store)
