@@ -2432,6 +2432,138 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
 }
 
 #[test]
+fn unix_bucket_reservation_record_release_rejects_crossed_immutable_fields() {
+    // Each call has exactly one installed-server acceptor. Inspect the full
+    // record set through RPC after every rejection, without opening a second
+    // runtime over the server's files.
+    fn rpc<T>(server: &Arc<StorageNodeServer>, action: impl FnOnce() -> T) -> T {
+        let server = Arc::clone(server);
+        let task = thread::spawn(move || server.accept_one().unwrap());
+        let result = action();
+        task.join().unwrap();
+        result
+    }
+
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("exact-release-rpc");
+    let records = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        for (id, target) in [("a-keyed", Some("key")), ("b-bucket-wide", None)] {
+            records.push(
+                PgMetadataStore::acquire_durable_bucket_write_reservation(
+                    &*pg,
+                    crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: id,
+                        owner_token: "owner-token",
+                        cluster_epoch: config.cluster_epoch,
+                        operation_kind: if target.is_some() {
+                            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                        } else {
+                            "bucket-write-snapshot"
+                        },
+                        created_at: 10,
+                        lease_deadline: crate::clock::current_time_millis().saturating_add(60_000),
+                        target_context: target,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        pg.refresh_metadata_command_state_digest().unwrap();
+        records
+    };
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let active = bucket_write_reservation_route(
+        &client,
+        config.cluster_epoch,
+        bucket_pg_id_for_test(0),
+        &bucket,
+    );
+    let retained = retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket);
+    assert_eq!(
+        rpc(&server, || active.durable_bucket_write_reservations()).unwrap(),
+        records
+    );
+    for original in &records {
+        for field in ["operation", "created_at", "target"] {
+            let mut crossed = original.clone();
+            match field {
+                "operation" => crossed.operation_kind = "another-operation".into(),
+                "created_at" => crossed.created_at += 1,
+                "target" => crossed.target_context = Some("other-key".into()),
+                _ => unreachable!(),
+            }
+            let error = rpc(&server, || {
+                retained.release_durable_bucket_write_reservation(&crossed)
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationNotFound { ref reservation_id }) if reservation_id == &original.reservation_id),
+                "{field}: {error:?}"
+            );
+            assert_eq!(
+                rpc(&server, || active.durable_bucket_write_reservations()).unwrap(),
+                records,
+                "{field}"
+            );
+        }
+    }
+    let mut absent_target = records[0].clone();
+    absent_target.target_context = None;
+    let error = rpc(&server, || {
+        retained.release_durable_bucket_write_reservation(&absent_target)
+    })
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationNotFound { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        rpc(&server, || active.durable_bucket_write_reservations()).unwrap(),
+        records
+    );
+    for (index, record) in records.iter().enumerate() {
+        rpc(&server, || {
+            retained.release_durable_bucket_write_reservation(record)
+        })
+        .unwrap();
+        assert_eq!(
+            rpc(&server, || active.durable_bucket_write_reservations()).unwrap(),
+            records[index + 1..]
+        );
+    }
+}
+
+#[test]
 fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);

@@ -16,6 +16,9 @@ mod bucket_drain_begin;
 #[path = "metadata/reservation_heartbeat.rs"]
 mod reservation_heartbeat;
 #[cfg(test)]
+#[path = "metadata/reservation_release_tests.rs"]
+mod reservation_release_tests;
+#[cfg(test)]
 pub(crate) use reservation_heartbeat::HeartbeatEffect;
 
 include!("metadata/support.rs");

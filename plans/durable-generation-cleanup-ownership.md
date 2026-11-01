@@ -121,6 +121,9 @@ fences still do not implement retained owners or physical cleanup exclusion.
 The [reservation lifecycle evidence gate](#reservation-lifecycle-evidence-before-introduction-custody--2026-11-01)
 pins the existing wire records before the coordinated introduction-cutoff and
 custody change. It adds no ownership fields or new mutation authority.
+The [exact record-release correction](#exact-bucket-reservation-record-release--2026-11-01)
+closes an existing compare-and-delete identity gap before retained obligations
+reuse that boundary. It does not implement owner-aware orphan retirement.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5208,3 +5211,58 @@ the storage boundary checker, formatting and `git diff --check` passed. The two
 tests flagged as slow both completed successfully: the Raft heartbeat
 write-amplification gate in 112.967s and the oversized version-list pagination
 test in 64.364s.
+
+## Exact Bucket Reservation Record Release — 2026-11-01
+
+The release-obligation audit found that the existing record-based SQL DELETE
+matched bucket, reservation ID, owner, epoch, bucket execution/incarnation and
+lease deadline, but omitted operation kind, creation time and optional target.
+The embedded retained route and installed Unix handler validate the bucket/PG
+route, not those omitted fields against the durable row. A crossed record could
+therefore delete an independently identified reservation. The new owner-local
+regression reproduced this before the fix: changing only the operation returned
+`Ok(())` rather than rejection.
+
+The DELETE now compares the complete record in the same atomic statement,
+including null-safe target equality. Creation time is checked for SQLite integer
+representability before executing the statement. This adds no preliminary
+lookup, transaction, publication command or fsync. It changes neither schema nor
+wire encoding; the committed v34 evidence remains unchanged.
+
+The two release contracts remain deliberately distinct:
+
+- **Observed record release:** all fields, including the observed lease deadline,
+  must match. A mismatched or renewed row returns the existing typed not-found
+  result without mutation; it is not permission to delete whatever currently
+  occupies that reservation ID.
+- **Command-proof release:** the existing transaction matches every stable
+  identity field, ignores only the renewable lease deadline, and permits an
+  idempotent repeat after confirmed absence. This preserves cleanup/recovery
+  after a legitimate heartbeat; the new record predicate must not be copied
+  indiscriminately into that path.
+
+Owner-local tests independently cross all ten record fields, both optional-target
+directions and same-target different values, assert unchanged SQL change counts
+and exact complete reservation rows, and positively release exact keyed and
+bucket-wide records while preserving a second reservation. A real heartbeat
+proves stale record rejection and stable-proof release/replay, with independent
+operation/time/target proof negatives. Installed Unix coverage repeats the three
+new identity negatives and nullable-target cases, checks exact typed responses,
+lists both records after each rejection, then successfully releases each exact
+record. Each RPC has one joined acceptor, and no second runtime is opened over
+the serving node's files.
+
+This is a correction to an existing resource-release boundary, not the durable
+custody integration. The current bucket-side coordination rows are primary-local,
+outside command canonical state; they must not be mistaken for replicated owner
+evidence merely because they survive local restart. The coordinated owner/window,
+introduction-cutoff, successor-prefix, retention and frontend-handoff requirements
+remain open, as do all six original cleanup regressions.
+
+Validation: all five focused tests passed, and the full Nextest run passed all
+9,242 tests (two slow, six skipped) in 270.048s. The flagged Raft heartbeat
+write-amplification and oversized version-list pagination tests completed in
+94.972s and 64.964s respectively. Strict all-target/all-feature Clippy passed
+after naming the test-only mutation tuple type; boundary checks, formatting and
+`git diff --check` passed. All five focused tests passed again after that
+type-alias-only lint cleanup.

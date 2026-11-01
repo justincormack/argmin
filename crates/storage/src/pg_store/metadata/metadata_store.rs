@@ -308,6 +308,14 @@ impl PgMetadataStore for PgStore {
                 context: "release durable bucket write reservation lease deadline",
                 source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
+        let created_at = i64::try_from(record.created_at).map_err(|source| MetadataError::Db {
+            context: "release durable bucket write reservation created_at",
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
+        })?;
+        // Record-based release is an exact compare-and-delete, including the
+        // renewable deadline. Proof-based convergence below deliberately uses
+        // stable identity instead; do not weaken this expiry/observation path
+        // to match a different target or a row renewed since it was observed.
         let deleted = self
             .conn
             .execute(
@@ -316,7 +324,8 @@ impl PgMetadataStore for PgStore {
                    AND owner_token = ?3 AND cluster_epoch = ?4 \
                    AND bucket_execution_generation = ?5 \
                    AND bucket_incarnation_generation = ?6 \
-                   AND lease_deadline = ?7",
+                   AND lease_deadline = ?7 AND operation_kind = ?8 \
+                   AND created_at = ?9 AND target_context IS ?10",
                 params![
                     name.as_str(),
                     reservation_id,
@@ -325,6 +334,9 @@ impl PgMetadataStore for PgStore {
                     generation,
                     incarnation,
                     lease_deadline,
+                    record.operation_kind,
+                    created_at,
+                    record.target_context,
                 ],
             )
             .map_err(|source| MetadataError::Db {

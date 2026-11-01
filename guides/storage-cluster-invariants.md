@@ -101,6 +101,13 @@ Every public `StorageCluster` operation must fit one of these classes:
   begin uses `bucket_write_drains`. The legacy bucket-row write-drain counters
   have been removed and are not production fence authority. The Phase 9.4 model
   and publisher audit live in [bucket-write-drain.md](bucket-write-drain.md).
+- Record-based bucket reservation release is an atomic exact compare-and-delete:
+  it matches every stored identity field, the optional target, and the observed
+  lease deadline. A stale observation must not erase a renewed reservation.
+  Command-proof release has a different contract: it matches the complete stable
+  identity under its existing transaction, deliberately ignoring the renewable
+  deadline, and treats confirmed absence as idempotent success. Neither release
+  mode may ignore operation kind, creation time or target context.
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.
