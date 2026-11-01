@@ -8,6 +8,9 @@ use crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KI
 #[path = "allocation_lifetime_publication.rs"]
 mod publication;
 
+#[path = "allocation_lifetime_transfer.rs"]
+mod transfer;
+
 #[test]
 fn embedded_retired_allocation_lifetime_rejects_fresh_work_but_allows_convergence() {
     allocation_lifetime_matrix(false);

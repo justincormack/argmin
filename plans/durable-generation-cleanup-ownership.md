@@ -4614,3 +4614,44 @@ lifetime check independently of node identity and route epoch. Strict
 all-target/all-feature Clippy, the storage boundary checker, formatting and
 `git diff --check` passed. The full Nextest suite passed all 9,182 tests (one
 slow, six skipped) in 272.361s.
+
+## Installed Checkpoint Transfer And Reopen — 2026-11-01
+
+The stream issuer acceptance matrix now connects checkpoint export/import,
+peering suffix replay, route activation and runtime reopen through installed
+Unix endpoints. Separate PUT and UploadPart tests use independent stores with
+the **same node ID**, isolating the fresh PG lifetime from node identity. The
+source runtime is stopped before the destination starts; the destination is
+fully dropped before reopening its files.
+
+The source exports a checkpoint before preparing its first segment, then builds
+and applies one append through its active primary route. The destination imports
+that checkpoint through the Peering RPC, preserving the exact table blocks,
+state digest, generation reservation and original issuer. Its local lifetime is
+different while the imported cursor is still unused. An already-issued append
+is rebased onto the destination epoch's initial log position and replayed through
+the installed peering route. Its resulting digest must match the source's;
+exact replay remains idempotent. This exercises the storage transfer/apply
+boundary, not control-plane certification or distributed prefix selection.
+
+After activation, a freshly loaded InProgress session with one selected segment
+and an unused next slot must reject preparation through the current epoch's
+Unix route with the exact allocation-lifetime error. The request must reach the
+peer. Full checkpoint bytes, pending slot, session, segments, generation and
+issuer remain unchanged. The same checks run again after reopening, with an
+additional exact full-checkpoint comparison across restart. Fresh-session
+creation and preparation succeed under each new lifetime, so rejection cannot
+be explained by an inactive route or generally disabled allocator.
+
+These are metadata-only fixtures: the selected segment has coherent stored
+geometry and integrity evidence but no physical payload is written or read.
+There are no production, schema, wire or fsync changes. The retained owner/window
+integration and all six cleanup regressions remain open; preserving a historical
+issuer is not physical-write or cleanup authority.
+
+The two focused regressions passed. A deliberate node-ID-only preparation
+mutation made both fail by allocating VID 2 for the transferred session under
+epoch 2; the full issuer comparison was restored before full-suite validation.
+The final full Nextest suite passed all 9,184 tests (one slow, six skipped) in
+263.805s. Strict all-target/all-feature Clippy, the storage boundary checker,
+formatting and `git diff --check` passed.
