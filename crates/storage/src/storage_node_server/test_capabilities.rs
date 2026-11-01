@@ -148,12 +148,13 @@
             encryption: crate::tests::metadata_only_test_encryption(),
         };
         let mut expected_stream_command =
-            CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+            CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
                 stream_create_request.clone(),
                 crate::GenerationId::MIN,
                 1_000,
                 Some(4_000),
                 stream_proof.clone(),
+                server._node.get_pg(0).unwrap().stream_allocation_issuer(config.node_id).unwrap(),
             );
         let new_stream_create_request = CreateStreamUploadReq {
             session_id: crate::tests::stream_session_id("active-new"),

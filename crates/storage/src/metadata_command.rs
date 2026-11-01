@@ -40,7 +40,7 @@ impl MetadataCommandLogHashIssuer {
 }
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 12;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 13;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 
@@ -1884,12 +1884,19 @@ impl BucketWriteReservationProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamAllocationIssuer {
+    pub(crate) node_id: crate::NodeId,
+    pub(crate) lifetime: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateStreamUploadCommand {
     pub(crate) session: StreamUploadCommandRecord,
     pub(crate) payload_generation: GenerationId,
     pub(crate) initial_next_segment_vid: GenerationId,
     pub(crate) cleanup_after: Option<u64>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) allocation_issuer: StreamAllocationIssuer,
 }
 
 impl CreateStreamUploadCommand {
@@ -1918,6 +1925,9 @@ impl CreateStreamUploadCommand {
         )
     }
 
+    /// Protocol/store fixtures may describe a stream whose issuer is no longer
+    /// present. Tests that prepare new segments must use the actual primary builder.
+    #[cfg(test)]
     pub(crate) fn from_request_with_bucket_write_reservation_and_cleanup_deadline(
         request: CreateStreamUploadReq,
         payload_generation: GenerationId,
@@ -1925,7 +1935,29 @@ impl CreateStreamUploadCommand {
         cleanup_after: Option<u64>,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
+        Self::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
+            request,
+            payload_generation,
+            created_at_millis,
+            cleanup_after,
+            bucket_write_reservation,
+            StreamAllocationIssuer {
+                node_id: crate::NodeId::new(0),
+                lifetime: [0xA1; 16],
+            },
+        )
+    }
+
+    pub(crate) fn from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
+        request: CreateStreamUploadReq,
+        payload_generation: GenerationId,
+        created_at_millis: u64,
+        cleanup_after: Option<u64>,
+        bucket_write_reservation: BucketWriteReservationProof,
+        allocation_issuer: StreamAllocationIssuer,
+    ) -> Self {
         Self {
+            allocation_issuer,
             payload_generation,
             session: StreamUploadCommandRecord {
                 session_id: request.session_id,
@@ -2221,6 +2253,9 @@ impl MetadataCommandEnvelope {
     #[cfg(test)]
     pub(crate) fn command_bytes_with_encoding_version_for_test(&self, version: u16) -> Vec<u8> {
         let mut bytes = canonical_command_bytes_with_version(self.id, &self.payload, version);
+        if version < 13 && matches!(self.payload, MetadataCommandPayload::CreateStreamUpload(_)) {
+            bytes.truncate(bytes.len() - 20);
+        }
         // Test-only reconstruction of frozen pre-v12 evidence. Production has
         // one current writer and rejects older versions before decoding.
         if version < 12 {
@@ -2933,6 +2968,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         .read_generation_id("initial next stream segment VID")?,
                     cleanup_after: self.read_optional_u64_value()?,
                     bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
+                    allocation_issuer: StreamAllocationIssuer {
+                        node_id: crate::NodeId::new(self.read_u32()?),
+                        lifetime: self.read_exact(16)?.try_into().expect("exact length"),
+                    },
                 })),
             ),
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => Ok(
@@ -3539,7 +3578,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_nonzero_u64("stream payload generation")?;
         self.read_nonzero_u64("next stream segment VID")?;
         self.skip_optional_u64()?;
-        self.skip_required_bucket_write_reservation_proof()
+        self.skip_required_bucket_write_reservation_proof()?;
+        self.read_u32()?;
+        self.read_exact(16)?;
+        Ok(())
     }
 
     fn skip_required_bucket_write_reservation_proof(&mut self) -> Result<(), String> {
@@ -4489,6 +4531,8 @@ fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCo
     put_u64(out, command.initial_next_segment_vid.get());
     encode_optional_u64(out, command.cleanup_after);
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    put_u32(out, command.allocation_issuer.node_id.as_u32());
+    out.extend_from_slice(&command.allocation_issuer.lifetime);
 }
 
 fn encode_append_stream_segment(
@@ -5775,7 +5819,19 @@ mod tests {
     ];
 
     fn immutable_v12_sse_s3_v5_object_command_bytes() -> Vec<Vec<u8>> {
-        let specimens = include_str!("metadata_command_v12_sse_s3_v5_object_corpus.hex")
+        immutable_object_command_bytes(include_str!(
+            "metadata_command_v12_sse_s3_v5_object_corpus.hex"
+        ))
+    }
+
+    fn immutable_v13_sse_s3_v5_object_command_bytes() -> Vec<Vec<u8>> {
+        immutable_object_command_bytes(include_str!(
+            "metadata_command_v13_sse_s3_v5_object_corpus.hex"
+        ))
+    }
+
+    fn immutable_object_command_bytes(corpus: &str) -> Vec<Vec<u8>> {
+        let specimens = corpus
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .enumerate()
@@ -5794,8 +5850,15 @@ mod tests {
     }
 
     #[test]
-    fn immutable_v12_sse_s3_v5_object_specimens_decode_independently_of_builders() {
+    fn immutable_v12_sse_s3_v5_object_specimens_are_rejected() {
         for bytes in immutable_v12_sse_s3_v5_object_command_bytes() {
+            assert_unsupported_applied_command(&bytes, 12);
+        }
+    }
+
+    #[test]
+    fn immutable_v13_sse_s3_v5_object_specimens_decode_independently_of_builders() {
+        for bytes in immutable_v13_sse_s3_v5_object_command_bytes() {
             let decoded = decode_metadata_command_envelope_for_test(&bytes).unwrap();
             assert_eq!(decoded.command_bytes(), bytes);
         }
@@ -5812,7 +5875,7 @@ mod tests {
             "release", "release", "release", "retain", "release", "retain", "none", "none",
             "release", "none", "none", "release", "none", "none",
         ];
-        let commands = immutable_v12_sse_s3_v5_object_command_bytes()
+        let commands = immutable_v13_sse_s3_v5_object_command_bytes()
             .into_iter()
             .map(|bytes| decode_metadata_command_envelope_for_test(&bytes).unwrap())
             .collect::<Vec<_>>();
@@ -6405,8 +6468,10 @@ mod tests {
         let mut proof_bytes = Vec::new();
         encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
         let mut proofless_bytes = command.command_bytes();
+        let issuer_bytes = proofless_bytes.split_off(proofless_bytes.len() - 20);
         assert!(proofless_bytes.ends_with(&proof_bytes));
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
+        proofless_bytes.extend_from_slice(&issuer_bytes);
 
         assert!(
             decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
@@ -6695,14 +6760,17 @@ mod tests {
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
         assert_immutable_v11_command_is_rejected(&envelope, 9_984_392_612_141_401_546);
-        assert_eq!(envelope.checksum_crc64(), 5340925160279046424);
+        let historical = envelope.command_bytes_with_encoding_version_for_test(12);
+        assert_eq!(checksum::crc64::checksum(&historical), 5340925160279046424);
+        assert_unsupported_applied_command(&historical, 12);
+        assert_eq!(envelope.checksum_crc64(), 14868097638223044961);
         assert_immutable_v8_command_is_rejected(&envelope, 0x328ff7137ea3be2a);
     }
 
     #[test]
-    fn current_metadata_command_v12_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
+    fn current_metadata_command_v13_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
     ) {
-        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 12);
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 13);
 
         let cases = [
             (None, &[0_u8][..]),
@@ -6860,7 +6928,7 @@ mod tests {
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        for version in [6_u16, 7_u16, 8_u16, 9_u16, 10_u16, 11_u16, 13_u16] {
+        for version in [6_u16, 7_u16, 8_u16, 9_u16, 10_u16, 11_u16, 12_u16, 14_u16] {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
@@ -7035,7 +7103,10 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_immutable_v11_command_is_rejected(&envelope, 15_935_521_339_035_943_997);
-        assert_eq!(envelope.checksum_crc64(), 2141232060927113455);
+        let historical = envelope.command_bytes_with_encoding_version_for_test(12);
+        assert_eq!(checksum::crc64::checksum(&historical), 2141232060927113455);
+        assert_unsupported_applied_command(&historical, 12);
+        assert_eq!(envelope.checksum_crc64(), 11096851972186693782);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -7065,7 +7136,10 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_immutable_v11_command_is_rejected(&envelope, 5_778_476_916_891_768_401);
-        assert_eq!(envelope.checksum_crc64(), 10421383616758622851);
+        let historical = envelope.command_bytes_with_encoding_version_for_test(12);
+        assert_eq!(checksum::crc64::checksum(&historical), 10421383616758622851);
+        assert_unsupported_applied_command(&historical, 12);
+        assert_eq!(envelope.checksum_crc64(), 1506715804262085370);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -7132,7 +7206,10 @@ mod tests {
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
         assert_immutable_v11_command_is_rejected(&envelope, 595_941_723_278_502_698);
-        assert_eq!(envelope.checksum_crc64(), 14471265013765019640);
+        let historical = envelope.command_bytes_with_encoding_version_for_test(12);
+        assert_eq!(checksum::crc64::checksum(&historical), 14471265013765019640);
+        assert_unsupported_applied_command(&historical, 12);
+        assert_eq!(envelope.checksum_crc64(), 5520460959216013185);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -7183,6 +7260,7 @@ mod tests {
 
         let mut checksums = Vec::new();
         let mut current_checksums = Vec::new();
+        let mut v12_checksums = Vec::new();
         for (offset, mutation) in mutations.into_iter().enumerate() {
             let command = PutBucketPropertyCommand::from_bucket_and_mutation(
                 test_bucket_record("bucket", 20 + offset as u64),
@@ -7211,6 +7289,9 @@ mod tests {
             let old_bytes = envelope.command_bytes_with_encoding_version_for_test(11);
             assert_unsupported_applied_command(&old_bytes, 11);
             checksums.push(checksum::crc64::checksum(&old_bytes));
+            let v12 = envelope.command_bytes_with_encoding_version_for_test(12);
+            assert_unsupported_applied_command(&v12, 12);
+            v12_checksums.push(checksum::crc64::checksum(&v12));
             current_checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -7226,7 +7307,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            current_checksums,
+            v12_checksums,
             [
                 9842364773350212228,
                 14678486834036300484,
@@ -7235,6 +7316,18 @@ mod tests {
                 17938078216565354233,
                 8883599192674108707,
                 6031841541038255576
+            ]
+        );
+        assert_eq!(
+            current_checksums,
+            [
+                10912587109789017923,
+                12193601415835729785,
+                17300676144819950700,
+                12373639655931012453,
+                9186591498383359745,
+                18374753825768775002,
+                15292228441593101344
             ]
         );
     }
@@ -7289,6 +7382,7 @@ mod tests {
 
         let mut checksums = Vec::new();
         let mut current_checksums = Vec::new();
+        let mut v12_checksums = Vec::new();
         for (offset, mutation) in mutations.into_iter().enumerate() {
             let command =
                 PutBucketSubresourceCommand::new(bucket.clone(), mutation, 30 + offset as u64);
@@ -7315,6 +7409,9 @@ mod tests {
             let old_bytes = envelope.command_bytes_with_encoding_version_for_test(11);
             assert_unsupported_applied_command(&old_bytes, 11);
             checksums.push(checksum::crc64::checksum(&old_bytes));
+            let v12 = envelope.command_bytes_with_encoding_version_for_test(12);
+            assert_unsupported_applied_command(&v12, 12);
+            v12_checksums.push(checksum::crc64::checksum(&v12));
             current_checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
@@ -7331,7 +7428,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            current_checksums,
+            v12_checksums,
             [
                 18295482942162702091,
                 3796804497177253286,
@@ -7341,6 +7438,19 @@ mod tests {
                 18152928438784817655,
                 18289611886067522607,
                 399331299382658569
+            ]
+        );
+        assert_eq!(
+            current_checksums,
+            [
+                3041004612619120061,
+                367822690477888094,
+                17318391703964459313,
+                6449638629744474001,
+                9303019181127764116,
+                14575365177345228303,
+                323663674642877997,
+                3756148222653776369
             ]
         );
     }
@@ -7915,7 +8025,8 @@ mod tests {
         ];
 
         let frozen_commands = immutable_v11_sse_s3_v5_object_command_bytes();
-        let current_frozen_commands = immutable_v12_sse_s3_v5_object_command_bytes();
+        let previous_frozen_commands = immutable_v12_sse_s3_v5_object_command_bytes();
+        let current_frozen_commands = immutable_v13_sse_s3_v5_object_command_bytes();
         assert_eq!(payloads.len(), frozen_commands.len());
         assert_eq!(payloads.len(), current_frozen_commands.len());
         let mut checksums = Vec::new();
@@ -7944,7 +8055,11 @@ mod tests {
             assert_eq!(
                 envelope.command_bytes(),
                 current_frozen_commands[offset],
-                "v12 case {offset}"
+                "v13 case {offset}"
+            );
+            assert_eq!(
+                envelope.command_bytes_with_encoding_version_for_test(12),
+                previous_frozen_commands[offset]
             );
             assert_immutable_v10_sse_s3_v1_command_is_rejected(
                 &envelope,

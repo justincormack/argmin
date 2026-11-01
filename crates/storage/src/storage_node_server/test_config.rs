@@ -609,9 +609,7 @@ mod stream_creation_deadline_tests;
             },
         ];
 
-        assert_eq!(
-            encode_control_plane_runtime_config(&config),
-            concat!(
+        let historical_state_v8 = concat!(
                 "argmin-storage-node-runtime-config-v5\n",
                 "node_id 7\n",
                 "cluster_epoch 9\n",
@@ -628,8 +626,14 @@ mod stream_creation_deadline_tests;
                 "0 3 1 7 - 8 404 1 505 8 606 2 7 8\n",
                 "2 6 2 8 - - - - - - - 2 8 7\n",
                 "pending_metadata_command_recoveries 0\n",
-            )
-        );
+            );
+        let current_state_v9 = historical_state_v8
+            .replace("101 1 202 8 303", "101 1 202 9 303")
+            .replace("404 1 505 8 606", "404 1 505 9 606");
+        assert_eq!(encode_control_plane_runtime_config(&config), current_state_v9);
+        assert!(decode_control_plane_runtime_config(
+            &config.data_dir.join("historical-runtime-config"), config.data_dir.clone(), config.default_ec_shape, historical_state_v8,
+        ).is_err());
 
         config.persist_control_plane_runtime_config().unwrap();
         let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
@@ -683,16 +687,16 @@ mod stream_creation_deadline_tests;
                 crate::control_plane::PgMetadataProof::current(9, 10, 11),
             ));
         let current = encode_control_plane_runtime_config(&config);
-        assert!(current.contains("0 1 1 7 - 7 9 1 10 8 11 1 7\n"));
+        assert!(current.contains("0 1 1 7 - 7 9 1 10 9 11 1 7\n"));
         let path = tmp.path().join("runtime-config");
 
         for (unsupported, expected) in [
             (
-                current.replacen(" 9 1 10 8 11 ", " 9 2 10 8 11 ", 1),
+                current.replacen(" 9 1 10 9 11 ", " 9 2 10 9 11 ", 1),
                 "unsupported metadata-command log-hash encoding version 2",
             ),
             (
-                current.replacen(" 9 1 10 8 11 ", " 9 1 10 7 11 ", 1),
+                current.replacen(" 9 1 10 9 11 ", " 9 1 10 7 11 ", 1),
                 "unsupported canonical-state digest encoding version 7",
             ),
         ] {
@@ -708,7 +712,8 @@ mod stream_creation_deadline_tests;
             ));
         }
 
-        let incomplete = current.replacen(" 9 1 10 8 11 ", " 9 - 10 8 11 ", 1);
+        let incomplete = current.replacen(" 9 1 10 9 11 ", " 9 - 10 9 11 ", 1);
+        assert_ne!(incomplete, current);
         let error = decode_control_plane_runtime_config(
             &path,
             config.data_dir,
@@ -5497,7 +5502,7 @@ mod stream_creation_deadline_tests;
             Some(storage_rpc_client_auth(credential, 9)),
         );
 
-        for unsupported_version in [1_u16, 2, 3, 4, 5, 7] {
+        for unsupported_version in [1_u16, 2, 3, 4, 5, 6, 8] {
             let mut unsupported = checkpoint.clone();
             PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported,
@@ -5587,7 +5592,7 @@ mod stream_creation_deadline_tests;
             command: command.clone(),
         };
 
-        for unsupported_version in [8_u16, 9, 10, 11, 13] {
+        for unsupported_version in [8_u16, 9, 10, 11, 12, 14] {
             let command_bytes =
                 command.command_bytes_with_encoding_version_for_test(unsupported_version);
             let payload = encode_metadata_command_request_with_raw_command_for_test(
@@ -5634,7 +5639,7 @@ mod stream_creation_deadline_tests;
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());

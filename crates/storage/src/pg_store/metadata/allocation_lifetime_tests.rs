@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Owner-local tests of the production PG lifetime hooks. Stream fixtures are
-//! metadata-only. Lifetime tracking does not yet authorize or fence allocation.
+//! metadata-only. The durable creation issuer survives restart/import, while the
+//! replacement local lifetime must never grant that old session new allocation.
 
 use super::*;
 
@@ -17,6 +18,7 @@ fn pg_allocation_lifetime_reopen_preserves_session_but_not_issuer_identity() {
         let store = PgStore::open(dir.path(), 1).unwrap();
         let original = identity(&store).unwrap();
         let create = fixture(&store, part);
+        assert_eq!(create.allocation_issuer.lifetime, original);
         store
             .apply_metadata_command_and_record(0, &envelope(&create, 1))
             .unwrap();
@@ -29,6 +31,18 @@ fn pg_allocation_lifetime_reopen_preserves_session_but_not_issuer_identity() {
 
         let reopened = PgStore::open(dir.path(), 1).unwrap();
         assert_ne!(identity(&reopened).unwrap(), original);
+        assert_eq!(
+            reopened
+                .load_stream_allocation_issuer(&create.session.session_id)
+                .unwrap(),
+            create.allocation_issuer
+        );
+        assert_ne!(
+            reopened
+                .stream_allocation_issuer(crate::NodeId::new(0))
+                .unwrap(),
+            create.allocation_issuer
+        );
         assert_eq!(
             reopened
                 .get_stream_upload(&create.session.session_id)

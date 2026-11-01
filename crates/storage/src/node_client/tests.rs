@@ -3436,8 +3436,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     let pg = storage_node.get_pg(0).unwrap();
     for session_id in [&first_session, &second_session] {
         PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, session_id).unwrap();
-        PgMetadataStore::create_stream_upload(
-            &*pg,
+        pg.test_create_stream_upload_on_node(
             &CreateStreamUploadReq {
                 session_id: session_id.clone(),
                 bucket: bucket.clone(),
@@ -3445,6 +3444,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
                 target: StreamUploadTarget::PutObject,
                 encryption: metadata_only_test_encryption(),
             },
+            NodeId::new(7),
         )
         .unwrap();
     }

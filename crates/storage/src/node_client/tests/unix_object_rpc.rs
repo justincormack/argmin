@@ -2197,12 +2197,9 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             acting_set: vec![NodeId::new(7)],
         },
     ];
-    let node = SharedStorageNode::open_with_default_ec_shape(
-        &config.data_dir,
-        &config.pg_ids,
-        config.default_ec_shape,
-    )
-    .unwrap();
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let node = server.test_storage_node();
     let (bucket, key, correct_pg_id) = (0..100)
         .map(|index| {
             let bucket = crate::tests::bucket_name(format!("stream-rpc-wrong-pg-bucket-{index}"));
@@ -2272,19 +2269,21 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
                     create.clone(),
                     generation,
                     1_000,
                     Some(9_000),
                     current_proof.clone(),
+                    pg.stream_allocation_issuer(config.node_id).unwrap(),
                 ),
             )),
         );
         pg.apply_metadata_command(&stream_create_command).unwrap();
         PgMetadataStore::create_multipart_upload(&*pg, &multipart_create).unwrap();
         PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &part_session_id).unwrap();
-        PgMetadataStore::create_stream_upload(&*pg, &part_create).unwrap();
+        pg.test_create_stream_upload_on_node(&part_create, config.node_id)
+            .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
         if let Some(expected) = reserved_generation {
             assert_eq!(
@@ -2300,8 +2299,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             .unwrap();
     drop(node);
 
-    private_socket_dir(config.socket_path.parent().unwrap());
-    let server = StorageNodeServer::bind(config.clone()).unwrap();
     let _server_guard = spawn_test_storage_node_server(server);
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
@@ -3955,38 +3952,47 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         })
     ));
 
-    let mut bad_cleanup_payload = stream_command.payload().clone();
-    let MetadataCommandPayload::CreateStreamUpload(bad_cleanup_create) = &mut bad_cleanup_payload
-    else {
-        panic!("expected create stream upload command");
-    };
-    bad_cleanup_create.cleanup_after = Some(12_346);
-    let bad_cleanup_command =
-        MetadataCommandEnvelope::new(stream_command.id(), bad_cleanup_payload);
-    let err = client
-        .validate_create_stream_upload_command_response(
-            &bad_cleanup_command,
-            ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            ClusterEpoch::new(1).unwrap(),
-            &BuildCreateStreamUploadCommandReq {
-                effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
-                placement: PayloadPlacementInput::from_server_config(&config),
-                request: &stream_request,
-                cleanup_after: Some(12_345),
-                precondition: CreateStreamUploadPrecondition::PutObject {
-                    expected_current: Some(&stored),
+    for cross_issuer in [false, true] {
+        let mut bad_cleanup_payload = stream_command.payload().clone();
+        let MetadataCommandPayload::CreateStreamUpload(bad_cleanup_create) =
+            &mut bad_cleanup_payload
+        else {
+            panic!("expected create stream upload command");
+        };
+        if cross_issuer {
+            bad_cleanup_create.allocation_issuer.node_id =
+                NodeId::new(bad_cleanup_create.allocation_issuer.node_id.as_u32() + 1);
+        } else {
+            bad_cleanup_create.cleanup_after = Some(12_346);
+        }
+        let bad_cleanup_command =
+            MetadataCommandEnvelope::new(stream_command.id(), bad_cleanup_payload);
+        let err = client
+            .validate_create_stream_upload_command_response(
+                &bad_cleanup_command,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                ClusterEpoch::new(1).unwrap(),
+                &BuildCreateStreamUploadCommandReq {
+                    effect_fence: AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+                    placement: PayloadPlacementInput::from_server_config(&config),
+                    request: &stream_request,
+                    cleanup_after: Some(12_345),
+                    precondition: CreateStreamUploadPrecondition::PutObject {
+                        expected_current: Some(&stored),
+                    },
+                    bucket_write_reservation: &stream_proof,
                 },
-                bucket_write_reservation: &stream_proof,
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            operation: "validate stream upload command build response",
-            ..
-        })
-    ));
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "validate stream upload command build response",
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ));
+    }
 
     let missing_upload_id = crate::tests::multipart_upload_id("mut-stream-rpc-missing-upload");
     let missing_upload = test_multipart_upload_record(

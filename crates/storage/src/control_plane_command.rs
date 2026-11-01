@@ -2779,13 +2779,14 @@ mod tests {
         let mut bytes = Vec::new();
         write_pg_metadata_proof(&mut bytes, proof);
 
-        assert_eq!(
-            bytes,
-            [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13, 0x14, 0x15,
-                0x16, 0x17, 0x18, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
-            ]
-        );
+        let historical_v8 = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x18, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        ];
+        let mut current_v9 = historical_v8;
+        current_v9[17] = 9;
+        assert_eq!(bytes, current_v9);
+        assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v8)).is_err());
         let mut reader = PayloadReader::new(&bytes);
         assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);
         assert_eq!(reader.remaining_len(), 0);
@@ -3466,6 +3467,16 @@ mod tests {
 
     #[test]
     fn control_plane_command_v20_aggregate_encoding_is_stable() {
+        let historical = crate::tests::frozen_hex_fixture(include_str!(
+            "control_plane_command_v20_canonical_v8_aggregate.hex"
+        ));
+        assert_eq!(
+            checksum::sha256::digest(&historical),
+            [
+                35, 127, 124, 116, 165, 201, 183, 61, 1, 213, 122, 218, 26, 116, 117, 82, 120, 214,
+                98, 111, 139, 213, 233, 180, 234, 252, 64, 249, 107, 14, 164, 164
+            ]
+        );
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -3485,8 +3496,8 @@ mod tests {
             (
                 2_799,
                 [
-                    35, 127, 124, 116, 165, 201, 183, 61, 1, 213, 122, 218, 26, 116, 117, 82, 120,
-                    214, 98, 111, 139, 213, 233, 180, 234, 252, 64, 249, 107, 14, 164, 164,
+                    172, 118, 97, 155, 65, 124, 181, 87, 239, 152, 82, 67, 216, 4, 249, 137, 209,
+                    188, 91, 185, 130, 120, 74, 135, 1, 218, 96, 144, 36, 220, 252, 193,
                 ],
             )
         );

@@ -1459,6 +1459,10 @@ impl<'a> StorageRpcDecoder<'a> {
             )?,
             cleanup_after: self.read_optional_u64()?,
             bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
+            allocation_issuer: crate::metadata_command::StreamAllocationIssuer {
+                node_id: NodeId::new(self.read_u32()?),
+                lifetime: self.read_exact(16)?.try_into().expect("exact length"),
+            },
         })
     }
 

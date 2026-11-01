@@ -477,7 +477,41 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 "{error:?}"
             );
             assert_eq!(observe(), before);
-            // Already-built commands still converge on a retired replica.
+            node.get_pg(0)
+                .unwrap()
+                .begin_allocation_lifetime_replacement()
+                .unwrap()
+                .complete()
+                .unwrap();
+            let error = route
+                .build_append_command(
+                    &target,
+                    &segment,
+                    fence,
+                    PayloadPlacementInput::from_server_config(&config),
+                )
+                .unwrap_err();
+            assert!(
+                if remote {
+                    matches!(
+                        error,
+                        ObjectPgActionError::Store(StoreError::StorageRpc {
+                            failure: StorageRpcErrorCode::InactivePgRoute,
+                            ..
+                        })
+                    )
+                } else {
+                    matches!(
+                        error,
+                        ObjectPgActionError::Store(
+                            StoreError::PgAllocationLifetimeUnavailable { .. }
+                        )
+                    )
+                },
+                "replacement adopted an old stream issuer: {error:?}"
+            );
+            assert_eq!(observe(), before);
+            // Already-built commands still converge after issuer replacement.
             node.get_pg(0)
                 .unwrap()
                 .apply_metadata_command_and_record(config.node_id.as_u32(), &built)

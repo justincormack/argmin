@@ -118,13 +118,16 @@ fn preparation_rejects_before_allocation(remote: bool, checks: PreparationChecks
                 .unwrap();
             // Metadata-only preparation fixture: no ciphertext is supplied or
             // persisted. The positive control tests allocation, not payload IO.
-            pg.create_stream_upload(&CreateStreamUploadReq {
-                session_id: session_id.clone(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-                target: target.clone(),
-                encryption: metadata_only_test_encryption(),
-            })
+            pg.test_create_stream_upload_on_node(
+                &CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: target.clone(),
+                    encryption: metadata_only_test_encryption(),
+                },
+                config.node_id,
+            )
             .unwrap();
             let session = pg.get_stream_upload(&session_id).unwrap();
             let expected = match target {

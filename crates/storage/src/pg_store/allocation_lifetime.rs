@@ -1,13 +1,13 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local identity for the future replicated staging-window issuer binding.
+//! Local identity for stream allocation and future replicated staging windows.
 //!
 //! Direct PUT/stream creation builders and stream preparation require a live
 //! lifetime under the PG lock. This is NOT a write grant: route admission,
-//! durable window coverage, issuer matching, publication confirmation and physical
-//! exclusion are still required. It is deliberately absent from checkpoints and
-//! SQL state.
+//! durable window coverage, publication confirmation and physical exclusion are
+//! still required. Sessions persist their original issuer identity, but this live
+//! state is never restored from SQL/checkpoints: opening a PG mints a fresh lifetime.
 
 use std::cell::Cell;
 
@@ -48,8 +48,12 @@ impl PgAllocationLifetime {
     }
 
     pub(super) fn require_active(&self, pg_id: u32) -> Result<(), StoreError> {
+        self.identity(pg_id).map(|_| ())
+    }
+
+    pub(super) fn identity(&self, pg_id: u32) -> Result<[u8; 16], StoreError> {
         match self.state.get() {
-            State::Active(_) => Ok(()),
+            State::Active(identity) => Ok(identity),
             State::Replacing(_) | State::Retired => {
                 Err(StoreError::PgAllocationLifetimeUnavailable { pg_id })
             }

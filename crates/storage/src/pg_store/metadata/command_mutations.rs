@@ -22,6 +22,29 @@ impl StreamAppendCommandPreflight {
 }
 
 impl PgStore {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_create_stream_upload_on_node(
+        &self,
+        req: &CreateStreamUploadReq,
+        node_id: crate::NodeId,
+    ) -> Result<(), MetadataError> {
+        let session = StreamUploadCommandRecord {
+            session_id: req.session_id.clone(),
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            target: req.target.clone(),
+            state: StreamUploadState::InProgress,
+            created_at: PgStore::now_millis(),
+            bucket_incarnation_generation: 1,
+            encryption: req.encryption.clone(),
+        };
+        let issuer = self.stream_allocation_issuer(node_id).map_err(|error| MetadataError::InvariantViolation {
+            context: "test stream allocation issuer",
+            reason: error.to_string(),
+        })?;
+        self.create_stream_upload_explicit(&session, GenerationId::MIN, None, None, &issuer)
+    }
+
     fn apply_put_object_metadata_command(
         &self,
         command: &PutObjectMetadataCommand,
@@ -128,12 +151,34 @@ impl PgStore {
             && stored.encryption == object.encryption
     }
 
+    pub(in crate::node_runtime) fn load_stream_allocation_issuer(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<crate::metadata_command::StreamAllocationIssuer, MetadataError> {
+        let (node_id, lifetime): (u32, Vec<u8>) = self.conn.query_row(
+            "SELECT allocation_issuer_node, allocation_issuer_lifetime FROM stream_uploads WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|error| MetadataError::Db {
+            context: "load stream allocation issuer",
+            source: error.into(),
+        })?;
+        Ok(crate::metadata_command::StreamAllocationIssuer {
+            node_id: crate::NodeId::new(node_id),
+            lifetime: lifetime.try_into().map_err(|_| MetadataError::InvariantViolation {
+                context: "load stream allocation issuer",
+                reason: "allocation lifetime must contain exactly 16 bytes".into(),
+            })?,
+        })
+    }
+
     fn create_stream_upload_explicit(
         &self,
         session: &StreamUploadCommandRecord,
         initial_next_segment_vid: GenerationId,
         cleanup_after: Option<u64>,
         bucket_write_reservation: Option<&BucketWriteReservationProof>,
+        allocation_issuer: &crate::metadata_command::StreamAllocationIssuer,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -174,8 +219,8 @@ impl PgStore {
                  (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, cleanup_after, encryption_type, encryption_state, next_segment_vid, \
                   bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
                   bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context, \
-                  bucket_incarnation_generation) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                  bucket_incarnation_generation, allocation_issuer_node, allocation_issuer_lifetime) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     session.session_id,
                     session.bucket,
@@ -199,6 +244,8 @@ impl PgStore {
                     lease_deadline,
                     target_context,
                     session.bucket_incarnation_generation as i64,
+                    allocation_issuer.node_id.as_u32(),
+                    allocation_issuer.lifetime.as_slice(),
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -231,10 +278,13 @@ impl PgStore {
                             &command.session.key,
                             &command.session.session_id,
                         )?;
-                        if generation != command.payload_generation {
+                        if generation != command.payload_generation
+                            || store.load_stream_allocation_issuer(&command.session.session_id)?
+                                != command.allocation_issuer
+                        {
                             return Err(MetadataError::InvariantViolation {
                                 context: "create stream upload command generation mismatch",
-                                reason: "session reservation differs from the creation command".into(),
+                                reason: "session reservation or allocation issuer differs from the creation command".into(),
                             });
                         }
                         Ok(())
@@ -274,6 +324,7 @@ impl PgStore {
                             command.initial_next_segment_vid,
                             command.cleanup_after,
                             bucket_write_reservation,
+                            &command.allocation_issuer,
                         )
                     }
                     Err(error) => Err(error),

@@ -5271,34 +5271,6 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
     let bucket = crate::tests::bucket_name("remote-stream-append-rpc");
     let key = crate::tests::object_key("key");
     let session_id = crate::tests::stream_session_id("rsappend");
-    {
-        let remote =
-            SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &[0], ec_shape)
-                .unwrap();
-        let remote_pg = remote.get_pg(0).unwrap();
-        crate::PgMetadataStore::create_stream_upload(
-            &*remote_pg,
-            &crate::CreateStreamUploadReq {
-                session_id: session_id.clone(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-                target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::tests::metadata_only_test_encryption(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            crate::PgMetadataStore::reserve_object_generation(
-                &*remote_pg,
-                &bucket,
-                &key,
-                &session_id,
-            )
-            .unwrap(),
-            GenerationId::new(1).unwrap()
-        );
-        remote_pg.refresh_metadata_command_state_digest().unwrap();
-    }
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
@@ -5321,6 +5293,33 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
+    {
+        let remote = server.test_storage_node();
+        let remote_pg = remote.get_pg(0).unwrap();
+        remote_pg
+            .test_create_stream_upload_on_node(
+                &crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::tests::metadata_only_test_encryption(),
+                },
+                node_id,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::reserve_object_generation(
+                &*remote_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            GenerationId::new(1).unwrap()
+        );
+        remote_pg.refresh_metadata_command_state_digest().unwrap();
+    }
     let _server_guard = spawn_storage_node_server(server);
 
     let mut map = LocalClusterMap::open_with_configs(

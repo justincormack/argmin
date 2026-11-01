@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 9;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 10;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -311,6 +311,8 @@ CREATE TABLE stream_uploads (
     encryption_type INTEGER NOT NULL CHECK (encryption_type IN (1, 2)),
     encryption_state BLOB NOT NULL,
     next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
+    allocation_issuer_node INTEGER NOT NULL CHECK (allocation_issuer_node BETWEEN 0 AND 4294967295),
+    allocation_issuer_lifetime BLOB NOT NULL CHECK (length(allocation_issuer_lifetime) = 16),
     bucket_write_reservation_id TEXT,
     bucket_write_owner_token TEXT,
     bucket_write_cluster_epoch INTEGER,
@@ -815,8 +817,8 @@ CREATE TABLE metadata_command_replica_state (
     applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 \
         CHECK (applied_log_hash_encoding_version = 1),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
-    state_digest_encoding_version INTEGER NOT NULL DEFAULT 8 \
-        CHECK (state_digest_encoding_version = 8),
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 9 \
+        CHECK (state_digest_encoding_version = 9),
     state_digest      INTEGER NOT NULL DEFAULT 0
 ) STRICT";
 
@@ -1308,6 +1310,10 @@ mod tests {
             version: 9,
             catalogue: include_str!("schema_manifests/pg_schema_v9.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 10,
+            catalogue: include_str!("schema_manifests/pg_schema_v10.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1432,7 +1438,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1561,7 +1567,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

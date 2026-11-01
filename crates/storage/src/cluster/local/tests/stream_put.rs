@@ -2757,7 +2757,9 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
         .unwrap()
         .bucket_write_reservation
         .expect("stream session should carry initial bucket write proof");
+    let allocation_issuer = object_pg().test_stream_allocation_issuer(&session_id);
     let original_command = crate::metadata_command::CreateStreamUploadCommand {
+        allocation_issuer,
         payload_generation: crate::PgMetadataStore::get_object_generation_reservation(
             &*object_pg(),
             &bucket,

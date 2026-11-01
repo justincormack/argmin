@@ -848,6 +848,7 @@ impl UnixStorageNodeClient {
             || create.initial_next_segment_vid != GenerationId::MIN
             || create.cleanup_after != request.cleanup_after
             || create.bucket_write_reservation != *request.bucket_write_reservation
+            || create.allocation_issuer.node_id != self.node_id
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,

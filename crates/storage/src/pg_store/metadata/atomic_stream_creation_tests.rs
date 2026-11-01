@@ -62,7 +62,7 @@ fn fixture(store: &PgStore, part: bool) -> CreateStreamUploadCommand {
     };
     let generation = store.next_generation_id(&bucket, &key).unwrap();
     store.refresh_metadata_command_state_digest().unwrap();
-    CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+    CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
         CreateStreamUploadReq {
             session_id: crate::tests::stream_session_id("atomic-create"),
             bucket,
@@ -74,6 +74,7 @@ fn fixture(store: &PgStore, part: bool) -> CreateStreamUploadCommand {
         10,
         Some(100),
         proof,
+        store.stream_allocation_issuer(crate::NodeId::new(0)).unwrap(),
     )
 }
 
@@ -118,6 +119,12 @@ fn assert_absent(store: &PgStore, create: &CreateStreamUploadCommand) {
 }
 
 fn assert_present(store: &PgStore, create: &CreateStreamUploadCommand) {
+    assert_eq!(
+        store
+            .load_stream_allocation_issuer(&create.session.session_id)
+            .unwrap(),
+        create.allocation_issuer
+    );
     let session = store.get_stream_upload(&create.session.session_id).unwrap();
     assert_eq!(StreamUploadCommandRecord::from(&session), create.session);
     assert_eq!(session.next_segment_vid, create.initial_next_segment_vid);
@@ -145,6 +152,79 @@ fn assert_present(store: &PgStore, create: &CreateStreamUploadCommand) {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn decoded_stream_creation_reissue_rejects_crossed_issuer_without_mutation() {
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        store
+            .apply_metadata_command_and_record(0, &envelope(&create, 1))
+            .unwrap();
+        let before = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let reject_crossed = |store: &PgStore| {
+            for cross_node in [false, true] {
+                let mut crossed = create.clone();
+                if cross_node {
+                    crossed.allocation_issuer.node_id = crate::NodeId::new(1);
+                } else {
+                    crossed.allocation_issuer.lifetime[0] ^= 1;
+                }
+                let command = envelope(&crossed, 2);
+                let decoded = decode_metadata_command_envelope(
+                    &command.command_bytes(),
+                    &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+                )
+                .unwrap();
+                assert_eq!(command, decoded);
+                let changes = store.conn.total_changes();
+                let error = store
+                    .apply_metadata_command_and_record(0, &decoded)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation { context: "create stream upload command generation mismatch", ref reason }) if reason.contains("allocation issuer")),
+                    "{error:?}"
+                );
+                assert_eq!(
+                    store.conn.total_changes(),
+                    changes,
+                    "rollback must not mask attempted mutation"
+                );
+                assert_present(store, &create);
+                assert_eq!(
+                    store
+                        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                        .unwrap(),
+                    before
+                );
+            }
+        };
+        reject_crossed(&store);
+        drop(store);
+        let reopened = PgStore::open(dir.path(), 1).unwrap();
+        reject_crossed(&reopened);
+        // Exact command convergence remains valid even though the issuing
+        // runtime is gone; only fresh allocation needs the live issuer.
+        reopened
+            .apply_metadata_command_and_record(0, &envelope(&create, 2))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .load_stream_allocation_issuer(&create.session.session_id)
+                .unwrap(),
+            create.allocation_issuer
+        );
+    }
 }
 
 #[test]

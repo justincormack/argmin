@@ -1404,11 +1404,30 @@ fn runtime_map_current_state_digest_v3_is_stable() {
     let control_snapshot = canonical_snapshot_with_node();
     let runtime_map = rpc::runtime_map_test_snapshot_with_active_route();
 
+    // Preserve the previous composite vector independently of the current
+    // canonical-state marker. The runtime-map digest grammar remains v3.
+    let mut historical_routes = runtime_map.pg_routes().to_vec();
+    historical_routes[0]
+        .active_metadata_proof
+        .as_mut()
+        .unwrap()
+        .state_digest = CanonicalStateDigest {
+        encoding_version: 8,
+        value: 4,
+    };
+
     assert_eq!(
-        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        runtime_map_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
         [
             122, 23, 230, 153, 140, 165, 1, 61, 132, 101, 90, 83, 106, 114, 177, 144, 107, 128, 61,
             211, 179, 111, 196, 63, 160, 2, 97, 96, 185, 134, 124, 80,
+        ]
+    );
+    assert_eq!(
+        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        [
+            16, 51, 80, 191, 215, 133, 78, 47, 217, 12, 168, 148, 191, 10, 254, 105, 72, 11, 171,
+            178, 210, 141, 38, 176, 63, 19, 149, 150, 66, 164, 107, 118,
         ]
     );
 }
@@ -1829,6 +1848,14 @@ fn canonical_control_plane_state_v31_representative_aggregate_remains_rejected_e
 
 #[test]
 fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
+    let historical = crate::tests::frozen_hex_fixture(include_str!(
+        "testdata/state_v32_canonical_v8_aggregate.hex"
+    ));
+    assert_eq!(
+        hex_encode(&checksum::sha256::digest(&historical)),
+        "f6fa4a69526df67b1793a3b72500b5cde92e8b227a0eeb4fb7098eb3946971ed",
+        "immutable canonical-state-v8 composite"
+    );
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2366,7 +2393,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         ),
         (
             11_041,
-            "f6fa4a69526df67b1793a3b72500b5cde92e8b227a0eeb4fb7098eb3946971ed".to_owned()
+            "f30c3ec49cb64e56ee46b1f69b8db14bc1130941f6ca92f735e76c35b95a049c".to_owned()
         )
     );
 }

@@ -10113,14 +10113,15 @@ mod proof_format_baseline_tests {
         let mut bytes = Vec::new();
         write_pg_metadata_proof(&mut bytes, proof);
 
-        assert_eq!(
-            bytes,
-            [
+        let historical_v8 = [
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13,
                 0x14, 0x15, 0x16, 0x17, 0x18, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
                 0x27, 0x28,
-            ]
-        );
+            ];
+        let mut current_v9 = historical_v8;
+        current_v9[17] = 9;
+        assert_eq!(bytes, current_v9);
+        assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v8)).is_err());
         let mut reader = PayloadReader::new(&bytes);
         assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);
         assert_eq!(reader.remaining_len(), 0);

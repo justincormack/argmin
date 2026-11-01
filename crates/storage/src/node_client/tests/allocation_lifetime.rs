@@ -187,6 +187,35 @@ fn allocation_lifetime_matrix(remote: bool) {
         assert!(route
             .matching_stream_upload_exists(&request, Some(create))
             .unwrap());
+        for cross_node in [false, true] {
+            let mut crossed = create.clone();
+            if cross_node {
+                crossed.allocation_issuer.node_id = NodeId::new(config.node_id.as_u32() + 1);
+            } else {
+                crossed.allocation_issuer.lifetime[0] ^= 1;
+            }
+            let before = observe();
+            let error = route
+                .matching_stream_upload_exists(&request, Some(&crossed))
+                .unwrap_err();
+            assert!(
+                if remote {
+                    matches!(
+                        &error,
+                        ObjectPgActionError::Store(StoreError::StorageRpc {
+                            failure: StorageRpcErrorCode::Internal,
+                            ..
+                        })
+                    )
+                } else {
+                    matches!(&error, ObjectPgActionError::Metadata(MetadataError::InvariantViolation {
+                    context: "create stream upload generation mismatch", reason,
+                }) if reason.contains("allocation issuer"))
+                },
+                "{error:?}"
+            );
+            assert_eq!(observe(), before);
+        }
         assert_eq!(
             generation_route
                 .object_generation_reservation(&request.session_id)
@@ -244,14 +273,108 @@ fn allocation_lifetime_matrix(remote: bool) {
                 .unwrap();
             assert_ne!(pg.test_allocation_lifetime_identity().unwrap(), original);
         }
-        // This is liveness gating, not yet persisted issuer/session binding.
-        // Fresh successful replacement must restore the current allocator path.
-        let (_, segment) = append().unwrap();
+        // A new live lifetime must not adopt the previous issuer's allocator,
+        // including when a Unix frame reconstructs the local route afresh.
+        assert_lifetime_unavailable(append().unwrap_err(), remote);
+        assert_eq!(observe(), applied, "replacement adopted an old stream");
+        let reopened_route = client
+            .open_stream_upload_session_metadata_route(
+                config.cluster_epoch,
+                pg_id,
+                &bucket,
+                &key,
+                &request.session_id,
+            )
+            .unwrap();
+        assert_lifetime_unavailable(
+            reopened_route
+                .prepare_segment_append_with_expected_append_state(
+                    &PrepareStreamUploadSegmentAppendReq {
+                        session_id: request.session_id.clone(),
+                        segment_index: 0,
+                        size: 1,
+                        segment_crc64: 0,
+                        payload_crc64: 0,
+                    },
+                    Some(&expected),
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                    placement,
+                )
+                .unwrap_err(),
+            remote,
+        );
+        assert_eq!(observe(), applied);
+
+        let mut fresh_request = request.clone();
+        fresh_request.session_id = crate::tests::stream_session_id("fresh-stream");
+        let mut fresh_proof = proof.clone();
+        fresh_proof.reservation_id = "fresh-stream-proof".into();
+        let fresh_command = route
+            .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                effect_fence: AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                placement,
+                request: &fresh_request,
+                cleanup_after: Some(10_000),
+                precondition: if part {
+                    CreateStreamUploadPrecondition::UploadPart {
+                        expected_upload: &upload,
+                    }
+                } else {
+                    CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {}
+                },
+                bucket_write_reservation: &fresh_proof,
+            })
+            .unwrap();
+        let (fresh_session, fresh_generation) = {
+            let pg = node.get_pg(0).unwrap();
+            pg.apply_metadata_command_and_record(config.node_id.as_u32(), &fresh_command)
+                .unwrap();
+            (
+                pg.get_stream_upload(&fresh_request.session_id).unwrap(),
+                pg.get_object_generation_reservation(&bucket, &key, &fresh_request.session_id)
+                    .unwrap(),
+            )
+        };
+        let fresh_expected = if part {
+            crate::ExpectedStreamAppendState::UploadPart {
+                session: fresh_session,
+                upload: Box::new(upload.clone()),
+                part_generation_id: fresh_generation,
+            }
+        } else {
+            crate::ExpectedStreamAppendState::PutObject {
+                session: fresh_session,
+                generation_id: fresh_generation,
+            }
+        };
+        let fresh_route = client
+            .open_stream_upload_session_metadata_route(
+                config.cluster_epoch,
+                pg_id,
+                &bucket,
+                &key,
+                &fresh_request.session_id,
+            )
+            .unwrap();
+        let (_, segment) = fresh_route
+            .prepare_segment_append_with_expected_append_state(
+                &PrepareStreamUploadSegmentAppendReq {
+                    session_id: fresh_request.session_id.clone(),
+                    segment_index: 0,
+                    size: 1,
+                    segment_crc64: 0,
+                    payload_crc64: 0,
+                },
+                Some(&fresh_expected),
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                placement,
+            )
+            .unwrap();
         assert_eq!(segment.segment_vid, GenerationId::MIN);
         assert_eq!(
-            append_route.load_session().unwrap().next_segment_vid.get(),
+            fresh_route.load_session().unwrap().next_segment_vid.get(),
             2
         );
-        assert!(append_route.load_segments().unwrap().is_empty());
+        assert!(fresh_route.load_segments().unwrap().is_empty());
     }
 }

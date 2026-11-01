@@ -31,9 +31,10 @@ selects materialized-window confirmation rather than indefinitely retaining an
 introducing-command receipt, and pins the existing compaction/import behavior.
 The [local lifetime implementation](#pg-allocation-lifetime-hooks--2026-10-30)
 now tracks fresh PG-open and transfer-replacement lifetimes without persistent
-writes. Fresh Direct PUT/stream builders and append preparation now reject retired
-lifetimes; matching a persisted issuer to that identity and physical write/cleanup
-exclusion remain open.
+writes. Fresh Direct PUT/stream builders and append preparation reject retired
+lifetimes. The subsequent [durable stream issuer binding](#durable-stream-allocation-issuer--2026-11-01)
+also prevents a replacement lifetime from allocating for an old stream. Physical
+write/cleanup exclusion and retained owner/window state remain open.
 The subsequent [storage-node route-publication hook](#storage-node-route-publication-lifetimes--2026-10-30)
 handles issuer replacement on installed storage-node route changes. Embedded
 cluster publication is covered by the subsequent embedded-lifetime slice;
@@ -4507,3 +4508,64 @@ slow, six skipped) in 273.313s. Strict all-target/all-feature Clippy, the storag
 boundary checker, formatting and `git diff --check` passed. The new control
 fixture initially used inaccessible helper names; those were corrected before
 the successful focused and full runs.
+
+## Durable Stream Allocation Issuer — 2026-11-01
+
+Stream creation now captures the actual primary node and its live 128-bit
+process-local PG lifetime under primary serialization. The creation command
+persists that issuer alongside the generation reservation and session in the
+existing apply transaction. It is included in canonical state and checkpoint
+transfer; replicas preserve the original primary's identity, not their own.
+This adds no ordinary-path write transaction or fsync.
+
+Fresh segment preparation and fresh append-command construction compare the
+stored issuer with the actual node's current lifetime under the same PG lock
+used for allocator/command-ID mutation. The deadline check follows the issuer
+lookup before allocation. A retired, replaced, reopened, or foreign
+lifetime cannot adopt an old session's local cursor. Failures use the existing
+allocation-lifetime-unavailable route error. A new session created under the
+replacement lifetime can allocate normally. There is deliberately no automatic
+continuation of the old session: disjoint replicated-window reissuance remains
+deferred.
+
+Already-issued creation and append commands still apply/replay after replacement,
+and exact creation matching remains available without live issuer authority.
+An existing session must match both the durable generation and issuer before a
+creation command can be treated as idempotent. Replica apply does not compare
+against a local process nonce. Finalization and retained cleanup are unchanged.
+The issuer record is evidence of allocation provenance, not a live capability,
+lease, physical-write grant, or permission to reclaim payload.
+
+Owner-local PUT/UploadPart matrices cover embedded and installed Unix paths:
+retirement, successful lifetime replacement, new route construction, rejection
+without allocator/log/checkpoint changes, and positive allocation for a fresh
+session. Append tests preserve convergence of an already-built command while
+rejecting fresh command building under the replacement lifetime. Decoded,
+checksummed creation reissues independently cross node and lifetime; they leave
+the exact session, generation, log and checkpoint unchanged, both before and
+after reopen. Additional canaries pin durable issuer preservation across reopen,
+malformed checkpoint issuer rejection before import, and a faulty Unix builder
+response whose only changed field is the issuing node.
+
+The format vector advances together: PG schema 10, metadata command 13,
+canonical state 9, checkpoint 7, and storage RPC 33. The untagged expected-command
+RPC carrier gains 20 bytes, including its cap. Independently tagged control-plane
+and authentication containers retain their outer versions and append new nested
+fixtures. Prior exact command, RPC, checkpoint, and proof evidence remains;
+aggregate-only predecessor specimens were captured from `b445ca14` as literal
+bytes rather than rebuilt using today's registry. See the
+[format ledger](../guides/storage-format-ledger.md#stream-allocation-issuer-version-vector--2026-11-01).
+
+Retained owner/window records, cutoff confirmation, physical write/cleanup
+exclusion, proof-release obligations, and successor-primary reconciliation are
+still outstanding. All six original cleanup regressions remain open. This slice
+closes fresh stream allocator adoption only; it does not claim those cleanup
+safety properties.
+
+Validation: all 3,689 storage tests passed (six skipped). The final full Nextest
+run passed all 9,180 tests (one slow, six skipped) in 259.702s. Strict
+all-target/all-feature Clippy, the storage boundary checker, formatting and
+`git diff --check` passed. Intermediate runs exposed stale versioned fixtures,
+including CLI/admin proof inputs; those were corrected with predecessor evidence
+preserved and explicit retired-proof rejection checks. The final run includes the
+deadline check moved after the issuer lookup, before allocation.

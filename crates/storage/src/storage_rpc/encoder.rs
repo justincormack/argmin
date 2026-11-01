@@ -715,6 +715,8 @@ fn put_create_stream_upload_command(out: &mut Vec<u8>, command: &CreateStreamUpl
     put_u64(out, command.initial_next_segment_vid.get());
     put_optional_u64(out, command.cleanup_after);
     put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    put_u32(out, command.allocation_issuer.node_id.as_u32());
+    out.extend_from_slice(&command.allocation_issuer.lifetime);
 }
 
 fn put_stream_upload_command_record(

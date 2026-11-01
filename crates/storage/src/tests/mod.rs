@@ -17,6 +17,20 @@ mod metadata_tests;
 mod property_test_support;
 mod shard_tests;
 
+/// Read immutable format evidence, never regenerate it from current structures.
+pub(super) fn frozen_hex_fixture(input: &str) -> Vec<u8> {
+    let hex = input
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<String>();
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty(), "incomplete frozen hex byte");
+    pairs
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
 pub(super) fn bucket_name(name: impl Into<String>) -> BucketName {
     BucketName::try_from(name.into()).expect("storage tests must use valid bucket names")
 }

@@ -819,7 +819,7 @@ fn object_generation_reservation_rehydrates_durable_pending_slot_after_reopen() 
 }
 
 #[test]
-fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
+fn stream_segment_vid_allocation_rejects_reopened_issuer_without_changing_cursor() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -880,10 +880,12 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
             },
         )
         .unwrap_err();
-    assert!(
-        matches!(second, crate::ObjectPgActionError::InvalidRequest { reason }
-        if reason.contains("unconsumed local slot"))
-    );
+    assert!(matches!(
+        second,
+        crate::ObjectPgActionError::Store(crate::StoreError::PgAllocationLifetimeUnavailable {
+            pg_id: 2
+        })
+    ));
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
         .unwrap()
@@ -892,7 +894,7 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
 }
 
 #[test]
-fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
+fn stream_segment_vid_allocation_rejects_an_independent_runtime_without_changing_cursor() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -951,10 +953,12 @@ fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
         .unwrap_err();
 
     assert_eq!(first.segment_vid, crate::GenerationId::MIN);
-    assert!(
-        matches!(second, crate::ObjectPgActionError::InvalidRequest { reason }
-        if reason.contains("unconsumed local slot"))
-    );
+    assert!(matches!(
+        second,
+        crate::ObjectPgActionError::Store(crate::StoreError::PgAllocationLifetimeUnavailable {
+            pg_id: 2
+        })
+    ));
     for map in [&first_map, &second_map] {
         let primary = map
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))

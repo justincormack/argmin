@@ -5558,17 +5558,7 @@ impl PgMetadataStore for PgStore {
             req.bucket.as_str(),
             req.key.as_str()
         );
-        let session = StreamUploadCommandRecord {
-            session_id: req.session_id.clone(),
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            target: req.target.clone(),
-            state: StreamUploadState::InProgress,
-            created_at: PgStore::now_millis(),
-            bucket_incarnation_generation: 1,
-            encryption: req.encryption.clone(),
-        };
-        self.create_stream_upload_explicit(&session, GenerationId::MIN, None, None)
+        self.test_create_stream_upload_on_node(req, crate::NodeId::new(0))
     }
 
     fn get_stream_upload(

@@ -221,6 +221,9 @@ pub enum MetadataCommandCheckpointValidationError {
         table_name: String,
         row_index: usize,
     },
+    InvalidStreamAllocationIssuerRow {
+        row_index: usize,
+    },
     TableDigestMismatch {
         table_name: String,
         expected_digest: u64,
@@ -423,7 +426,25 @@ impl MetadataCommandCheckpoint {
     ) -> Result<(), MetadataCommandCheckpointValidationError> {
         Self::verify_bucket_tag_row(table, row_index, values)?;
         Self::verify_acl_grants_row(table, columns, row_index, values)?;
-        Self::verify_object_encryption_row(table, columns, row_index, values)
+        Self::verify_object_encryption_row(table, columns, row_index, values)?;
+        if table.name == "stream_uploads" {
+            let value = |name| {
+                columns
+                    .iter()
+                    .position(|column| *column == name)
+                    .and_then(|index| values.get(index))
+            };
+            if !matches!(value("allocation_issuer_node"), Some(MetadataCheckpointValue::Integer(node)) if u32::try_from(*node).is_ok())
+                || !matches!(value("allocation_issuer_lifetime"), Some(MetadataCheckpointValue::Blob(bytes)) if bytes.len() == 16)
+            {
+                return Err(
+                    MetadataCommandCheckpointValidationError::InvalidStreamAllocationIssuerRow {
+                        row_index,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     fn verify_object_encryption_row(
@@ -969,6 +990,8 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "bucket_incarnation_generation",
             "encryption_type",
             "encryption_state",
+            "allocation_issuer_node",
+            "allocation_issuer_lifetime",
         ],
         order_columns: &["session_id"],
         filter: MetadataDigestFilter::AllRows,
@@ -1019,6 +1042,8 @@ pub(super) const STREAM_UPLOAD_CHECKPOINT_COLUMNS: &[&str] = &[
     "encryption_type",
     "encryption_state",
     "next_segment_vid",
+    "allocation_issuer_node",
+    "allocation_issuer_lifetime",
     "bucket_write_reservation_id",
     "bucket_write_owner_token",
     "bucket_write_cluster_epoch",
@@ -7690,19 +7715,40 @@ mod canonical_format_baseline_tests {
         bytes
     }
 
+    fn frozen_checkpoint_v7() -> Vec<u8> {
+        let bytes = crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/checkpoint_v7_canonical_v9_pg_v10_sse_s3_v5.hex"
+        ));
+        assert_eq!(bytes.len(), 7816);
+        assert_eq!(
+            checksum::sha256::digest(&bytes),
+            [
+                31, 41, 25, 7, 14, 222, 83, 42, 32, 109, 105, 159, 113, 94, 20, 186, 130, 235, 239,
+                105, 75, 162, 56, 147, 105, 187, 28, 167, 7, 56, 234, 50
+            ]
+        );
+        bytes
+    }
+
     #[test]
-    fn frozen_checkpoint_v6_decodes_and_verifies_independently_of_current_builders() {
+    fn frozen_checkpoint_v6_is_rejected_independently_of_current_builders() {
+        let bytes = frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5();
+        assert!(matches!(decode_metadata_command_checkpoint_payload(&bytes), Err(crate::storage_rpc::StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion { actual: 6 })));
+    }
+
+    #[test]
+    fn frozen_checkpoint_v7_decodes_and_verifies_independently_of_current_builders() {
         // Start from the literal predecessor candidate, not a checkpoint built
         // with today's table registry. On a format advance keep these bytes and
         // convert this acceptance test to exact version-rejection evidence.
-        let bytes = frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5();
+        let bytes = frozen_checkpoint_v7();
         let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
         checkpoint.verify().unwrap();
         assert_eq!(checkpoint.cluster_epoch, ClusterEpoch::INITIAL);
         assert_eq!(checkpoint.pg_id, PgId::new(1));
         assert_eq!(checkpoint.applied_log_index, 0);
-        assert_eq!(checkpoint.state_digest.value(), 4_699_376_559_631_902_336);
-        assert_eq!(checkpoint.checkpoint_crc64, 2_653_891_692_263_939_273);
+        assert_eq!(checkpoint.state_digest.value(), 8173911510360791434);
+        assert_eq!(checkpoint.checkpoint_crc64, 11001258576210703682);
         assert_eq!(
             checkpoint
                 .table_blocks
@@ -7721,8 +7767,8 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn frozen_checkpoint_v6_installs_and_reopens_with_exact_materialized_state() {
-        let bytes = frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5();
+    fn frozen_checkpoint_v7_installs_and_reopens_with_exact_materialized_state() {
+        let bytes = frozen_checkpoint_v7();
         let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -7857,7 +7903,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn canonical_metadata_state_v8_digests_are_stable() {
+    fn canonical_metadata_state_v8_and_v9_digests_are_stable() {
         let table = &METADATA_DIGEST_TABLES[0];
         assert_eq!(table.name, "bucket_subresources");
         let values = vec![
@@ -7880,9 +7926,18 @@ mod canonical_format_baseline_tests {
 
         let mut state_hasher = checksum::crc64::Hasher::new();
         PgStore::digest_canonical_pg_state_header(&mut state_hasher);
+        let mut v8_hasher = checksum::crc64::Hasher::new();
+        digest_len_prefixed_bytes(&mut v8_hasher, METADATA_CANONICAL_PG_STATE_DOMAIN);
+        digest_u8(&mut v8_hasher, 8);
+        digest_u64(&mut v8_hasher, METADATA_DIGEST_TABLES.len() as u64);
         for (index, table) in METADATA_DIGEST_TABLES.iter().enumerate() {
             PgStore::digest_metadata_table_digest_entry(
                 &mut state_hasher,
+                table,
+                0x1000_0000_0000_0000_u64 + index as u64,
+            );
+            PgStore::digest_metadata_table_digest_entry(
+                &mut v8_hasher,
                 table,
                 0x1000_0000_0000_0000_u64 + index as u64,
             );
@@ -7890,17 +7945,18 @@ mod canonical_format_baseline_tests {
         let state_digest = state_hasher.finalize();
 
         assert_eq!(
-            (row_digest, table_digest, state_digest),
+            (row_digest, table_digest, v8_hasher.finalize()),
             (
                 0x8e12_8dbf_237c_be5e,
                 0x64a9_e3d9_b3ad_266d,
                 5_623_325_047_351_608_253,
             )
         );
+        assert_eq!(state_digest, 617112351248260004);
     }
 
     #[test]
-    fn current_encryption_and_checksum_tags_match_frozen_canonical_v8_checkpoint_v6_composite() {
+    fn current_encryption_and_checksum_tags_match_frozen_canonical_v9_checkpoint_v7_composite() {
         // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
         // plaintext encryption tag. This tuple is rejection evidence only and must never be
         // regenerated from current structs.
@@ -7976,8 +8032,8 @@ mod canonical_format_baseline_tests {
                 213, 1, 21, 38, 129, 107, 15, 86, 244, 163, 226, 196, 22, 61,
             ],
         );
-        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 8);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 6);
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 9);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 7);
 
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -8055,7 +8111,7 @@ mod canonical_format_baseline_tests {
         let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
         assert_eq!(
             encoded,
-            frozen_checkpoint_v6_canonical_v8_pg_v9_sse_s3_v5(),
+            frozen_checkpoint_v7(),
             "append a new version-vector specimen; never rewrite the old checkpoint"
         );
         let encoded_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded);
@@ -8065,7 +8121,7 @@ mod canonical_format_baseline_tests {
             encoded.len(),
             <[u8; 32]>::try_from(encoded_sha256.bytes()).unwrap(),
         );
-        assert_eq!(
+        assert_ne!(
             current_evidence,
             (
                 4_699_376_559_631_902_336,
@@ -8075,6 +8131,18 @@ mod canonical_format_baseline_tests {
                     236, 211, 171, 181, 222, 159, 50, 70, 64, 206, 214, 63, 71, 219, 235, 252, 166,
                     54, 65, 229, 183, 46, 116, 163, 117, 199, 158, 41, 81, 47, 126, 218,
                 ],
+            )
+        );
+        assert_eq!(
+            current_evidence,
+            (
+                8173911510360791434,
+                11001258576210703682,
+                7816,
+                [
+                    31, 41, 25, 7, 14, 222, 83, 42, 32, 109, 105, 159, 113, 94, 20, 186, 130, 235,
+                    239, 105, 75, 162, 56, 147, 105, 187, 28, 167, 7, 56, 234, 50
+                ]
             )
         );
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V2_EVIDENCE);
@@ -8095,41 +8163,9 @@ mod canonical_format_baseline_tests {
             HISTORICAL_CHECKPOINT_V6_SSE_S3_V4_EVIDENCE
         );
 
-        let mut checkpoint_v2 = checkpoint.clone();
-        for (table, block) in METADATA_DIGEST_TABLES
-            .iter()
-            .zip(&mut checkpoint_v2.table_blocks)
-        {
-            let canonical_indexes = table
-                .columns
-                .iter()
-                .map(|column| {
-                    block
-                        .columns
-                        .iter()
-                        .position(|candidate| candidate == column)
-                        .expect("v5 checkpoint must contain every v2 canonical column")
-                })
-                .collect::<Vec<_>>();
-            for row in &mut block.rows {
-                row.values = canonical_indexes
-                    .iter()
-                    .map(|index| row.values[*index].clone())
-                    .collect();
-            }
-            block.columns = table
-                .columns
-                .iter()
-                .map(|column| (*column).to_owned())
-                .collect();
-        }
-        PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint_v2);
-        PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
-            &mut checkpoint_v2,
-            2,
-        );
-        let mut encoded_v2 = encode_metadata_command_checkpoint_payload(&checkpoint_v2).unwrap();
-        encoded_v2[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        let encoded_v2 = crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/checkpoint_v2_derived_canonical_v8_pg_v9_sse_s3_v5.hex"
+        ));
         let encoded_v2_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded_v2);
         const HISTORICAL_DERIVED_V2_SSE_C_V3_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
             0x17e6_53d3_559e_e4a4,
@@ -8177,8 +8213,8 @@ mod canonical_format_baseline_tests {
             ],
         );
         let derived_v2_evidence = (
-            checkpoint_v2.state_digest.value(),
-            checkpoint_v2.checkpoint_crc64,
+            4_699_376_559_631_902_336_u64,
+            11_795_839_173_412_898_809_u64,
             encoded_v2.len(),
             <[u8; 32]>::try_from(encoded_v2_sha256.bytes()).unwrap(),
         );

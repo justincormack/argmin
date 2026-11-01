@@ -5787,12 +5787,12 @@ mod tests {
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            8,
+            9,
             active_proof.test_state_digest(),
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            8,
+            9,
             active_proof.test_state_digest(),
         )
         .unwrap();
@@ -6121,12 +6121,12 @@ mod tests {
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            8,
+            9,
             active_proof.test_state_digest(),
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            8,
+            9,
             active_proof.test_state_digest(),
         )
         .unwrap();
@@ -6164,20 +6164,25 @@ mod tests {
     #[test]
     fn metadata_transfer_admin_args_parse_source_and_imported_proofs() {
         let args = [
-            "7", "12", "13", "20", "1", "30", "8", "40", "20", "1", "31", "8", "40",
+            "7", "12", "13", "20", "1", "30", "9", "40", "20", "1", "31", "9", "40",
             "2", "3",
-        ]
-        .into_iter()
-        .map(OsString::from);
+        ];
 
         let (pg_id, install) =
-            parse_control_plane_pg_acting_set_with_metadata_transfer_args(args).unwrap();
+            parse_control_plane_pg_acting_set_with_metadata_transfer_args(args.into_iter().map(OsString::from)).unwrap();
 
         assert_eq!(pg_id, 7);
         assert_eq!(
             format!("{install:?}"),
             "ControlPlanePgMetadataTransferInstall(<opaque>)"
         );
+        for index in [6, 11] {
+            let mut retired = args;
+            retired[index] = "8";
+            assert!(parse_control_plane_pg_acting_set_with_metadata_transfer_args(
+                retired.into_iter().map(OsString::from),
+            ).is_none());
+        }
     }
 
     #[cfg(feature = "test-live-metadata-transfer-failpoints")]

@@ -437,8 +437,15 @@ impl LocalStreamUploadSessionMetadataRoute<'_> {
             &segment_okh,
             session.next_segment_vid,
         )?;
+        if pg.load_stream_allocation_issuer(&request.session_id)?
+            != pg.stream_allocation_issuer(self.client.node_id)?
+        {
+            return Err(StoreError::PgAllocationLifetimeUnavailable {
+                pg_id: self.pg_id.get(),
+            }
+            .into());
+        }
         effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
-        pg.require_live_allocation_lifetime()?;
         let segment_vid = allocate_stream_segment_for_preparation(&pg, request)?;
         let segment_record = StreamUploadSegmentRecord {
             session_id: request.session_id.clone(),
@@ -4083,7 +4090,14 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             placement_generation,
             segment,
         )?;
-        pg.require_live_allocation_lifetime()?;
+        if pg.load_stream_allocation_issuer(&self.session_id)?
+            != pg.stream_allocation_issuer(self.client.node_id)?
+        {
+            return Err(StoreError::PgAllocationLifetimeUnavailable {
+                pg_id: self.pg_id.get(),
+            }
+            .into());
+        }
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let id = self.client.next_metadata_command_id_from_locked_pg(
             self.pg_id.pg_id(),
@@ -5514,10 +5528,13 @@ impl LocalStorageNodeClient {
                     &create.key,
                     &create.session_id,
                 )?;
-                if Some(generation) != expected_command.map(|command| command.payload_generation) {
+                if Some(generation) != expected_command.map(|command| command.payload_generation)
+                    || Some(pg.load_stream_allocation_issuer(&create.session_id)?)
+                        != expected_command.map(|command| command.allocation_issuer.clone())
+                {
                     return Err(MetadataError::InvariantViolation {
                         context: "create stream upload generation mismatch",
-                        reason: "session reservation differs from the creation command".into(),
+                        reason: "session reservation or allocation issuer differs from the creation command".into(),
                     }
                     .into());
                 }
@@ -5665,12 +5682,13 @@ impl LocalStorageNodeClient {
         Ok(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
                     request.request.clone(),
                     payload_generation,
                     crate::clock::current_time_millis(),
                     request.cleanup_after,
                     request.bucket_write_reservation.clone(),
+                    pg.stream_allocation_issuer(self.node_id)?,
                 ),
             )),
         ))
