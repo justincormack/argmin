@@ -589,6 +589,16 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_reject_shard_ack_insertion(&self) {
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_ack_insert BEFORE INSERT ON shards \
+             BEGIN SELECT RAISE(ABORT, 'ack insertion boundary sentinel'); END;",
+            )
+            .unwrap();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_with_before_shard_ack_effect_hook<T>(
         hook: impl FnOnce(bool) + 'static,
         action: impl FnOnce() -> T,

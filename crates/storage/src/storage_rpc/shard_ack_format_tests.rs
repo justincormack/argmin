@@ -1,7 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pre-delegation evidence for the shared record/validate acknowledgement batch.
+//! Current delegated record/unchanged validate payloads and frozen v33 evidence.
 //! These are wire specimens, not payload-bearing object fixtures.
 
 use super::*;
@@ -11,6 +11,7 @@ const REQUEST_ID: u64 = 0x0102_0304_0506_0708;
 
 enum Specimen {
     Request(StorageRpcShardAckBatchRequest),
+    Record(StorageRpcShardAckRecordRequest),
     Response {
         result: Result<Vec<u8>, StorageRpcErrorResponse>,
         reusable: bool,
@@ -21,6 +22,7 @@ impl Specimen {
     fn payload(&self) -> Vec<u8> {
         match self {
             Self::Request(request) => encode_shard_ack_batch_request(request).unwrap(),
+            Self::Record(request) => encode_shard_ack_record_request(request).unwrap(),
             Self::Response { result, reusable } => {
                 let mut bytes = match result {
                     Ok(payload) => encode_storage_rpc_success_response(payload),
@@ -34,6 +36,9 @@ impl Specimen {
 
     fn assert_payload(&self, payload: &[u8]) {
         match self {
+            Self::Record(request) => {
+                assert_eq!(decode_shard_ack_record_request(payload).unwrap(), *request)
+            }
             Self::Request(request) => {
                 assert_eq!(decode_shard_ack_batch_request(payload).unwrap(), *request)
             }
@@ -76,6 +81,31 @@ fn specimens() -> BTreeMap<String, (StorageRpcMessageKind, Specimen)> {
         ("validate", StorageRpcMessageKind::ShardAckValidate),
     ] {
         for count in [1, 2] {
+            if kind == StorageRpcMessageKind::ShardAckRecord {
+                for bounded in [false, true] {
+                    let effect_deadline =
+                        bounded.then_some(StorageRpcAdmittedRouteEffectDeadline {
+                            authority_valid_until_ms: 5_000,
+                            portable_wall_valid_until_ms: 3_000,
+                        });
+                    assert!(cases
+                        .insert(
+                            format!(
+                                "{name}-request-{count}-{}",
+                                if bounded { "bounded" } else { "unbounded" }
+                            ),
+                            (
+                                kind,
+                                Specimen::Record(StorageRpcShardAckRecordRequest {
+                                    batch: request(count),
+                                    effect_deadline
+                                })
+                            )
+                        )
+                        .is_none());
+                }
+                continue;
+            }
             assert!(cases
                 .insert(
                     format!("{name}-request-{count}"),
@@ -114,9 +144,9 @@ fn specimens() -> BTreeMap<String, (StorageRpcMessageKind, Specimen)> {
     cases
 }
 
-fn frozen() -> BTreeMap<String, Vec<u8>> {
+fn frozen_text(text: &str) -> BTreeMap<String, Vec<u8>> {
     let mut cases = BTreeMap::new();
-    for line in include_str!("testdata/shard_ack_rpc_v33.hex").lines() {
+    for line in text.lines() {
         if line.starts_with('#') {
             continue;
         }
@@ -135,14 +165,42 @@ fn frozen() -> BTreeMap<String, Vec<u8>> {
     cases
 }
 
+fn frozen() -> BTreeMap<String, Vec<u8>> {
+    frozen_text(include_str!("testdata/shard_ack_rpc_v34.hex"))
+}
+
 #[test]
-fn shard_ack_v33_writer_and_reader_match_frozen_frames() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 33);
+fn retired_shard_ack_v33_frames_are_rejected_unchanged() {
+    let frozen = frozen_text(include_str!("testdata/shard_ack_rpc_v33.hex"));
+    assert_eq!(frozen.len(), 16);
+    for (name, bytes) in frozen {
+        assert!(
+            matches!(
+                decode_storage_rpc_frame(&bytes),
+                Err(StorageRpcFrameError::UnsupportedVersion(33))
+            ),
+            "{name}"
+        );
+        assert!(
+            matches!(
+                read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(bytes)),
+                Err(StorageRpcStreamError::Frame(
+                    StorageRpcFrameError::UnsupportedVersion(33)
+                ))
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn shard_ack_v34_writer_and_reader_match_frozen_frames() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
     assert_eq!(StorageRpcMessageKind::ShardAckRecord as u16, 12);
     assert_eq!(StorageRpcMessageKind::ShardAckValidate as u16, 13);
     let frozen = frozen();
     let specimens = specimens();
-    assert_eq!(frozen.len(), 16);
+    assert_eq!(frozen.len(), 18);
     assert_eq!(
         frozen.keys().collect::<Vec<_>>(),
         specimens.keys().collect::<Vec<_>>()
@@ -160,7 +218,7 @@ fn shard_ack_v33_writer_and_reader_match_frozen_frames() {
         specimen.assert_payload(&frame.payload);
         // The literal input, rather than this test's encoder output, is also
         // read through the production bounded stream reader for requests.
-        if matches!(specimen, Specimen::Request(_)) {
+        if matches!(specimen, Specimen::Request(_) | Specimen::Record(_)) {
             let admitted =
                 read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(bytes)).unwrap();
             specimen.assert_payload(&admitted.payload);
@@ -169,12 +227,13 @@ fn shard_ack_v33_writer_and_reader_match_frozen_frames() {
 }
 
 #[test]
-fn shard_ack_v33_payloads_reject_truncation_trailing_data_and_invalid_counts() {
+fn shard_ack_v34_payloads_reject_truncation_trailing_data_and_invalid_counts() {
     for (name, (kind, specimen)) in specimens() {
         let frame = decode_storage_rpc_frame(&frozen()[&name]).unwrap();
         for end in 0..frame.payload.len() {
             let prefix = &frame.payload[..end];
             let rejected = match specimen {
+                Specimen::Record(_) => decode_shard_ack_record_request(prefix).is_err(),
                 Specimen::Request(_) => decode_shard_ack_batch_request(prefix).is_err(),
                 Specimen::Response { .. } => decode_storage_rpc_response_payload(prefix).is_err(),
             };
@@ -183,11 +242,12 @@ fn shard_ack_v33_payloads_reject_truncation_trailing_data_and_invalid_counts() {
         let mut trailing = frame.payload.clone();
         trailing.push(0);
         let rejected = match specimen {
+            Specimen::Record(_) => decode_shard_ack_record_request(&trailing).is_err(),
             Specimen::Request(_) => decode_shard_ack_batch_request(&trailing).is_err(),
             Specimen::Response { .. } => decode_storage_rpc_response_payload(&trailing).is_err(),
         };
         assert!(rejected, "{name}: accepted trailing byte");
-        for version in [32, 34] {
+        for version in [33, 35] {
             let bytes = encode_storage_rpc_frame_with_version_for_test(
                 REQUEST_ID,
                 kind,
@@ -203,13 +263,28 @@ fn shard_ack_v33_payloads_reject_truncation_trailing_data_and_invalid_counts() {
                 "{name}"
             );
         }
-        if matches!(specimen, Specimen::Request(_)) {
+        if matches!(specimen, Specimen::Request(_) | Specimen::Record(_)) {
             for count in [0_u32, 4097] {
                 let mut invalid = frame.payload.clone();
-                invalid[16..20].copy_from_slice(&count.to_le_bytes());
+                let prefix = match &specimen {
+                    Specimen::Record(record) => {
+                        if record.effect_deadline.is_some() {
+                            17
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 0,
+                };
+                invalid[prefix + 16..prefix + 20].copy_from_slice(&count.to_le_bytes());
+                let result = if kind == StorageRpcMessageKind::ShardAckRecord {
+                    decode_shard_ack_record_request(&invalid).map(|record| record.batch)
+                } else {
+                    decode_shard_ack_batch_request(&invalid)
+                };
                 assert!(
                     matches!(
-                        decode_shard_ack_batch_request(&invalid),
+                        result,
                         Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(_))
                             | Err(StorageRpcPayloadError::PayloadTooLarge { .. })
                     ),
@@ -221,7 +296,33 @@ fn shard_ack_v33_payloads_reject_truncation_trailing_data_and_invalid_counts() {
 }
 
 #[test]
-fn shard_ack_v33_batch_admits_exact_cap_and_rejects_one_extra_byte() {
+fn shard_ack_record_rejects_malformed_deadlines() {
+    let mut request = StorageRpcShardAckRecordRequest {
+        batch: request(1),
+        effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: 5_000,
+            portable_wall_valid_until_ms: 3_000,
+        }),
+    };
+    let bytes = encode_shard_ack_record_request(&request).unwrap();
+    let mut invalid = bytes.clone();
+    invalid[0] = 2;
+    assert!(decode_shard_ack_record_request(&invalid).is_err());
+    for cutoff in [5_000_u64, 6_000] {
+        request
+            .effect_deadline
+            .as_mut()
+            .unwrap()
+            .portable_wall_valid_until_ms = cutoff;
+        assert!(encode_shard_ack_record_request(&request).is_err());
+        let mut invalid = bytes.clone();
+        invalid[9..17].copy_from_slice(&cutoff.to_le_bytes());
+        assert!(decode_shard_ack_record_request(&invalid).is_err());
+    }
+}
+
+#[test]
+fn shard_ack_v34_batch_admits_exact_cap_and_rejects_one_extra_byte() {
     assert_eq!(STORAGE_RPC_MAX_SHARD_ACK_ITEMS, 4096);
     assert_eq!(STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN, 184_340);
     let request = request(4096);
@@ -231,12 +332,32 @@ fn shard_ack_v33_batch_admits_exact_cap_and_rejects_one_extra_byte() {
         StorageRpcMessageKind::ShardAckRecord,
         StorageRpcMessageKind::ShardAckValidate,
     ] {
+        let (payload, limit) = if kind == StorageRpcMessageKind::ShardAckRecord {
+            (
+                encode_shard_ack_record_request(&StorageRpcShardAckRecordRequest {
+                    batch: request.clone(),
+                    effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                        authority_valid_until_ms: 5_000,
+                        portable_wall_valid_until_ms: 3_000,
+                    }),
+                })
+                .unwrap(),
+                184_357,
+            )
+        } else {
+            (payload.clone(), 184_340)
+        };
+        assert_eq!(payload.len(), limit);
         let bytes = encode_storage_rpc_frame(REQUEST_ID, kind, &payload).unwrap();
         let frame = read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(bytes)).unwrap();
-        assert_eq!(
-            decode_shard_ack_batch_request(&frame.payload).unwrap(),
-            request
-        );
+        let decoded = if kind == StorageRpcMessageKind::ShardAckRecord {
+            decode_shard_ack_record_request(&frame.payload)
+                .unwrap()
+                .batch
+        } else {
+            decode_shard_ack_batch_request(&frame.payload).unwrap()
+        };
+        assert_eq!(decoded, request);
         let mut oversized = payload.clone();
         oversized.push(0);
         let bytes = encode_storage_rpc_frame(REQUEST_ID, kind, &oversized).unwrap();
@@ -244,11 +365,11 @@ fn shard_ack_v33_batch_admits_exact_cap_and_rejects_one_extra_byte() {
             read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(bytes)),
             Err(StorageRpcStreamError::Frame(
                 StorageRpcFrameError::PayloadTooLarge {
-                    len: 184_341,
-                    limit: 184_340
+                    len,
+                    limit: actual_limit
                 }
             ))
-        ));
+            if len == limit + 1 && actual_limit == limit));
     }
     for count in [0, 4097] {
         assert!(encode_shard_ack_batch_request(&self::request(count)).is_err());

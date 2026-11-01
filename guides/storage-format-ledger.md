@@ -20,6 +20,31 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Shard Acknowledgement Deadline Delegation — 2026-11-01
+
+Storage RPC advances **33 → 34**. `ShardAckRecord` (12) now prefixes the batch
+with an optional delegated effect deadline: one option tag, then two u64 values
+when present (authority wall deadline and conservative portable wall cutoff).
+There is no serialized monotonic instant or remaining duration. The receiver
+binds the cutoff to its own monotonic clock and intersects it with its captured
+route fence. `ShardAckValidate` (13) retains its payload grammar unchanged.
+Record's maximum request grows from 184,340 to **184,357 bytes**; validation
+keeps the original cap. No PG schema, command, canonical-state, checkpoint or
+authentication-binding grammar advances.
+
+The append-only 18-frame `shard_ack_rpc_v34.hex` corpus covers bounded/unbounded
+record requests, unchanged validation requests and both response dispositions.
+Its file SHA-256 is
+`02840b756475ecd4b8b75d9d1ba6c6cf3ab3fb59fadce5f0b4de4851a170760e`.
+The original 16-frame v33 corpus below remains byte-for-byte unchanged and is
+rejected through both frame decoders. The 37-case
+`stream_creation_rpc_v34_command_v13_sse_s3_v5.hex` composite has file SHA-256
+`0e442b668f5709c98a9ed617b219731f36d75acbedcbb35e828c2b22e010a54a`;
+its v33 predecessor also remains explicit rejection evidence. Generic frame,
+SSE/checksum composite and authentication-v2 request/response specimens append
+v34 evidence without replacing their v33 bytes. Unchanged payload-only goldens
+remain unchanged.
+
 ## Stream Allocation Issuer Version Vector — 2026-11-01
 
 Stream creation now persists the allocating node and its 128-bit process-local PG
@@ -191,7 +216,7 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Metadata checkpoint payload | `storage` | private `ARGMCPKT` plus big-endian `u16` checkpoint encoding 7 | Recorded: v7 carries schema-10 stream issuer fields and canonical-state v9. A literal current v7/state-v9/schema-v10/SSE-S3-v5 specimen independently decodes, verifies, installs, and reopens. The complete v6/state-v8/schema-v9/SSE-S3-v5 bytes and earlier evidence remain immutable; retired/newer versions and malformed issuer rows are rejected before import. |
 | Canonical metadata state digest | `storage` | private domain `argmin.metadata.pg-state` and opaque fixed-width `CanonicalStateDigest` carrier version 9 | Recorded: v9 includes both durable stream issuer fields. Prior v8 composites remain immutable; current independently versioned outer carriers append state-v9 evidence without changing their grammar versions. Replica state and every exported proof carry version and value; runtime configuration, control-plane state/commands/RPC, checkpoint, and storage-RPC readers reject noncurrent carriers. |
 | Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v5`; every present PG read route contains both proof-carrier versions and values | Recorded for the coordinated carrier slice: exact v5 text, versions 4/6, incomplete/noncurrent carrier rejection, and restart/publication coverage are owner-local |
-| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 33 | Recorded: v33 adds mandatory issuer fields to the untagged expected stream-creation command carrier. The request cap includes the additional 20 bytes. All 37 creation specimens and authentication-v2 composites are appended at v33; immutable v32 and earlier specimens remain rejection evidence. |
+| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 34 | Recorded: v34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
 | Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Recorded: exact request/response bytes cover absent and present transcript tags, a fixed production-derived transcript digest seals its domain/length/input grammar, typed framing/version failures are distinct owner-locally, and authenticator-valid versions 0/3 are rejected before server dispatch or mutation |
 | Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Recorded: exact v1 bytes, owner-typed framing/version failures, allocation-ordering evidence, and valid signed inner envelopes in server-facing versions 0/2 fixtures prove rejection before authentication, dispatch, or mutation |
 | Control-plane logical state | `storage` | canonical text with leading `version=32` | Recorded: owner-typed missing/unsupported-version classification and an 11,041-byte representative aggregate sealing unavailable-node observations, proof-bound singleton unavailable-PG transitions, historical-route proof-floor/provenance, destination-route evidence, PG-local metadata log epochs, topology, leases, transfers, prior-primary state, route references, and pending-command branches. Immutable v28 through v31 aggregates remain rejection-only evidence; versions 28/29/30/31/33 are rejected through both single-authority open and replicated snapshot installation without mutation or publication. |

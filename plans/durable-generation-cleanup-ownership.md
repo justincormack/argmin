@@ -114,6 +114,10 @@ The [atomic stream cleanup correction](#atomic-stream-creation-and-abort-cleanup
 removes obsolete standalone generation-release commands from creation failure,
 abandonment and post-abort maintenance. Failed creation now preserves independent
 reservations; real Direct PUT cleanup derivatives retain their recovery coverage.
+The [fresh acknowledgement delegation slice](#fresh-acknowledgement-deadline-delegation--2026-11-01)
+carries captured request deadlines to embedded/Unix/TLS acknowledgement insertion,
+while preserving accepted-command convergence. File publication and acknowledgement
+fences still do not implement retained owners or physical cleanup exclusion.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5097,3 +5101,57 @@ Validation: all 26 focused acknowledgement tests passed. The full Nextest suite
 passed all 9,227 tests (one slow, six skipped) in 271.513s. Strict
 all-target/all-feature Clippy, the storage boundary checker, formatting and
 `git diff --check` passed.
+
+## Fresh Acknowledgement Deadline Delegation — 2026-11-01
+
+Fresh Direct PUT and stream append now pass their immutable effect fence through
+the required fenced `ShardAckRoute` method into the existing acknowledgement
+transaction. Embedded clients preserve the captured monotonic cutoff; Unix/TLS
+clients transport only the existing absolute conservative wall-clock upper
+bound. The receiving process rebinds it locally and intersects it with its own
+captured route authority, including when the client sends no deadline. The
+per-row check remains after lookup and immediately before insertion/exact retry.
+Accepted COMMIT completion is not reclassified as a fresh effect.
+
+The matching-pending Direct PUT branch instead restores acknowledgements bound
+to the accepted command's exact single-segment identity and integrity witness.
+It does not inherit the originating frontend's expired deadline. Repair,
+backfill and copied-shard maintenance retain their separate registration path.
+This distinction is explicit in the call graph rather than an optional argument
+whose absence silently turns a fresh call into convergence. Installed recovery
+still requires the receiving node's route authority.
+
+Storage RPC advances 33 → 34, with a separate record-request codec and 17 bytes
+of maximum additional payload. Validation keeps its existing batch grammar and
+cap. The v33 acknowledgement and stream-creation specimens remain immutable
+rejection evidence; new v34 frames and authentication composites are appended.
+See the format ledger for identities and hashes. No durable format, transaction
+or fsync is added by this delegation slice.
+
+Owner-local caller regressions expire authority after acknowledgement lookup,
+before insertion, while the raw static route remains usable. An insertion
+sentinel prevents later cleanup from hiding a missing fence. Separate matching
+command coverage requires convergence after the original request expires.
+Installed Unix and authenticated TLS matrices exercise the production fenced
+client conversion with different frontend/storage monotonic origins, both
+deadline orderings, an absent client bound, occupied exact retries, preserved
+files/unrelated rows and fresh retries after same-epoch renewal. Codec tests pin
+bounded/unbounded frames, malformed deadlines/counts, exact-cap admission and
+one-byte-over rejection.
+
+Retained owner/window integration, pre-install orphan custody and physical
+grant/exclusion are still outstanding. Deadline delegation is not a substitute
+for preventing a write already accepted before cutoff from racing cleanup.
+All six original cleanup regressions remain open.
+
+All 78 focused tests passed. Removing the delegated fence from fresh registration
+made both caller-level expiry tests hit the insertion sentinel and fail; the
+fence was restored before the full run. The initial full run exposed two stale
+version-rejection matrices that still classified the now-current v34 as future;
+both now explicitly reject v33 and v35, including authenticated/unauthenticated
+installed-server non-mutation coverage.
+
+Validation: the corrected full Nextest run passed all 9,235 tests (one slow,
+six skipped) in 259.427s. Strict all-target/all-feature Clippy, the storage
+boundary checker, formatting and `git diff --check` passed. The flagged Raft
+heartbeat write-amplification test completed successfully in 101.779s.

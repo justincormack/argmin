@@ -20,6 +20,12 @@ mod shard_ack_deadline_tests;
 #[path = "pending_slot_deadline_tests.rs"]
 mod pending_slot_deadline_tests;
 
+fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::StorageRpcShardAckBatchRequest) -> Vec<u8> {
+    crate::storage_rpc::encode_shard_ack_record_request(&crate::storage_rpc::StorageRpcShardAckRecordRequest {
+        batch: batch.clone(), effect_deadline: None,
+    }).unwrap()
+}
+
     use super::*;
     use crate::control_plane_auth::{
         ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
@@ -5651,7 +5657,7 @@ mod pending_slot_deadline_tests;
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());

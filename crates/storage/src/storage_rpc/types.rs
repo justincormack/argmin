@@ -2848,6 +2848,12 @@ pub(crate) struct StorageRpcShardAckBatchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardAckRecordRequest {
+    pub(crate) batch: StorageRpcShardAckBatchRequest,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardAckItemRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,

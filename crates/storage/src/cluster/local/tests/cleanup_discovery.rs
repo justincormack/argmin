@@ -288,7 +288,10 @@ fn inspect_surviving_replica(target: Target, stop: StopAfter) {
             .unwrap();
             expected_second.shard_integrity = Some(witness.durable_record());
             cluster
-                .register_validated_payload_shard_acks(&witness)
+                .register_fresh_payload_shard_acks(
+                    &witness,
+                    AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+                )
                 .unwrap();
         }
         if stop == StopAfter::Append {

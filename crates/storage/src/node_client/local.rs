@@ -890,6 +890,16 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
 }
 
 impl ShardAckRoute for LocalShardAckRoute {
+    fn register_shard_acks_with_effect_fence(
+        &self,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        effect_fence.require_valid_for(self.cluster_epoch)?;
+        let pg = self.storage_node.get_pg(self.data_pg_id.get())?;
+        pg.register_written_shards_batch_exact_with_effect_fence(shard_batch, effect_fence)
+    }
+
     fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(self.data_pg_id.get())?;
         pg.register_written_shards_batch_exact(shard_batch)

@@ -261,7 +261,32 @@ impl UnixStorageNodeClient {
         data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
-        let payload = self.encode_shard_ack_batch(data_pg_id, shard_batch)?;
+        self.register_written_shard_acks_with_effect_fence(
+            data_pg_id,
+            shard_batch,
+            AdmittedRouteEffectFence::unbounded(self.cluster_epoch),
+        )
+    }
+
+    fn register_written_shard_acks_with_effect_fence(
+        &self,
+        data_pg_id: DataPgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        effect_fence.require_valid_for(self.cluster_epoch)?;
+        let request = StorageRpcShardAckRecordRequest {
+            batch: self.shard_ack_batch_request(data_pg_id, shard_batch),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload = encode_shard_ack_record_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode shard ack record request", error.to_string())
+        })?;
         self.rpc_request(StorageRpcMessageKind::ShardAckRecord, payload)
             .map(|_| ())
     }
@@ -1027,7 +1052,18 @@ impl UnixStorageNodeClient {
         data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<Vec<u8>, StoreError> {
-        let request = StorageRpcShardAckBatchRequest {
+        encode_shard_ack_batch_request(&self.shard_ack_batch_request(data_pg_id, shard_batch))
+            .map_err(|error| {
+                self.rpc_payload_error("encode shard ack batch request", error.to_string())
+            })
+    }
+
+    fn shard_ack_batch_request(
+        &self,
+        data_pg_id: DataPgId,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> StorageRpcShardAckBatchRequest {
+        StorageRpcShardAckBatchRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id: data_pg_id.pg_id(),
@@ -1038,10 +1074,7 @@ impl UnixStorageNodeClient {
                     ack: *ack,
                 })
                 .collect(),
-        };
-        encode_shard_ack_batch_request(&request).map_err(|error| {
-            self.rpc_payload_error("encode shard ack batch request", error.to_string())
-        })
+        }
     }
 
     fn encode_shard_ack_item(&self, data_pg_id: DataPgId, key: &ShardKey) -> Vec<u8> {
@@ -1275,6 +1308,18 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 }
 
 impl ShardAckRoute for UnixShardAckRoute<'_> {
+    fn register_shard_acks_with_effect_fence(
+        &self,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        self.client.register_written_shard_acks_with_effect_fence(
+            self.data_pg_id,
+            shard_batch,
+            effect_fence,
+        )
+    }
+
     fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError> {
         UnixStorageNodeClient::register_written_shard_acks(
             self.client,

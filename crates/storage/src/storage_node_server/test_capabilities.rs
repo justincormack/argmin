@@ -5214,7 +5214,7 @@
                 &mut client,
                 request_id,
                 StorageRpcMessageKind::ShardAckRecord,
-                encode_shard_ack_batch_request(&request).unwrap(),
+                encode_unbounded_shard_ack_record_request(&request),
             );
             decode_storage_rpc_response_payload(&response.payload)
                 .unwrap()
@@ -5244,7 +5244,7 @@
             &mut client,
             4,
             StorageRpcMessageKind::ShardAckRecord,
-            encode_shard_ack_batch_request(&mismatch).unwrap(),
+            encode_unbounded_shard_ack_record_request(&mismatch),
         );
         drop(client);
         join.join().unwrap();
@@ -5298,7 +5298,7 @@
             &mut client,
             1,
             StorageRpcMessageKind::ShardAckRecord,
-            encode_shard_ack_batch_request(&record).unwrap(),
+            encode_unbounded_shard_ack_record_request(&record),
         );
         decode_storage_rpc_response_payload(&record_response.payload)
             .unwrap()
@@ -5404,7 +5404,7 @@
         let requests = [
             (
                 StorageRpcMessageKind::ShardAckRecord,
-                encode_shard_ack_batch_request(&record).unwrap(),
+                encode_unbounded_shard_ack_record_request(&record),
             ),
             (
                 StorageRpcMessageKind::ShardAckValidate,

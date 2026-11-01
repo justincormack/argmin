@@ -5213,7 +5213,7 @@ impl StorageCluster {
                     #[cfg(test)]
                     self.maybe_run_before_direct_put_payload_ack_registration_hook()?;
                     if let Err(error) =
-                        self.register_validated_payload_shard_acks(&integrity_witness)
+                        self.register_fresh_payload_shard_acks(&integrity_witness, effect_fence)
                     {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
@@ -5670,7 +5670,7 @@ impl StorageCluster {
                 #[cfg(test)]
                 self.maybe_run_before_direct_put_payload_ack_registration_hook()?;
                 if let Err(error) =
-                    self.register_validated_payload_shard_acks(&integrity_witness)
+                    self.register_matching_direct_put_payload_shard_acks(&command, &integrity_witness)
                 {
                     if new_pending_command {
                         let release_result =
@@ -7669,7 +7669,9 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
             }
-            if let Err(error) = self.register_validated_payload_shard_acks(&integrity_witness) {
+            if let Err(error) =
+                self.register_fresh_payload_shard_acks(&integrity_witness, route.effect_fence)
+            {
                 cleanup_stream_append_payload!();
                 return Err(error);
             }
@@ -7852,15 +7854,53 @@ impl StorageCluster {
         }
     }
 
-    fn register_validated_payload_shard_acks(
+    fn register_fresh_payload_shard_acks(
         &self,
         witness: &SegmentShardIntegrityWitness,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), ObjectPgActionError> {
         let data_pg_id = self.validated_data_pg(PgId::new(witness.data_pg_id()))?;
         let shard_batch = witness.registration_batch();
         self.metadata_pg_primary_shard_ack_route(data_pg_id)?
-            .register_shard_acks(&shard_batch)?;
+            .register_shard_acks_with_effect_fence(&shard_batch, effect_fence)?;
         Ok(())
+    }
+
+    fn register_matching_direct_put_payload_shard_acks(
+        &self,
+        command: &MetadataCommandEnvelope,
+        witness: &SegmentShardIntegrityWitness,
+    ) -> Result<(), ObjectPgActionError> {
+        // The caller reached an exact matching pending command, not a fresh
+        // build. Bind restored acknowledgements to its accepted payload rather
+        // than allowing an optional request fence to select convergence.
+        let batch = witness.registration_batch();
+        let matches = match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                match commit.segments.as_slice() {
+                    [segment] => {
+                        segment.data_pg_id == witness.data_pg_id()
+                            && segment.shard_integrity.as_ref() == Some(&witness.durable_record())
+                            && batch.iter().enumerate().all(|(index, (key, _))| {
+                                **key == ShardKey::new(
+                                    &segment.segment_okh,
+                                    segment.segment_vid.get(),
+                                    index as u8,
+                                )
+                            })
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "restore acknowledgements for matching direct PUT command",
+            }
+            .into());
+        }
+        self.register_maintenance_payload_shard_acks(witness.data_pg_id(), &batch)
     }
 
     fn register_maintenance_payload_shard_acks(

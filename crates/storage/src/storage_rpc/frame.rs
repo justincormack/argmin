@@ -263,7 +263,8 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardAckLoad
         | StorageRpcMessageKind::ShardAckHistoricalLoad
         | StorageRpcMessageKind::ShardAckDelete => STORAGE_RPC_MAX_SHARD_ACK_ITEM_PAYLOAD_LEN,
-        StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
+        StorageRpcMessageKind::ShardAckRecord => STORAGE_RPC_MAX_SHARD_ACK_RECORD_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardAckValidate => {
             STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ShardScavengerListFiles => {

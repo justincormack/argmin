@@ -1430,6 +1430,14 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 }
 
 pub(crate) trait ShardAckRoute: Send {
+    /// Fresh request mutation; implementations must validate at the durable effect.
+    fn register_shard_acks_with_effect_fence(
+        &self,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError>;
+
+    /// Independently authorized convergence/maintenance, not fresh request work.
     fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError>;
 
     fn validate_shard_ack(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError>;

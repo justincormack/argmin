@@ -141,12 +141,12 @@ use crate::storage_rpc::{
     decode_read_handle_acquire_request, decode_read_handle_release_request,
     decode_scavenger_list_files_request, decode_scavenger_observation_key_request,
     decode_scavenger_observation_record_request, decode_shard_ack_batch_request,
-    decode_shard_ack_item_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_scavenger_reference_match_request,
-    decode_shard_scavenger_reference_page_request, decode_shard_write_request,
-    decode_stream_part_commit_command_build_request, decode_stream_part_finalize_snapshot_request,
-    decode_stream_put_commit_command_build_request, decode_stream_put_finalize_snapshot_request,
-    decode_stream_segment_append_prepare_request,
+    decode_shard_ack_item_request, decode_shard_ack_record_request, decode_shard_delete_request,
+    decode_shard_read_range_request, decode_shard_read_request,
+    decode_shard_scavenger_reference_match_request, decode_shard_scavenger_reference_page_request,
+    decode_shard_write_request, decode_stream_part_commit_command_build_request,
+    decode_stream_part_finalize_snapshot_request, decode_stream_put_commit_command_build_request,
+    decode_stream_put_finalize_snapshot_request, decode_stream_segment_append_prepare_request,
     decode_stream_upload_bucket_write_reservation_update_request,
     decode_stream_upload_match_request, decode_stream_upload_session_request,
     decode_stream_uploads_list_request, decode_stream_uploads_pg_list_request,
@@ -327,15 +327,15 @@ use crate::storage_rpc::{
     StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
     StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
-    StorageRpcShardDeleteRequest, StorageRpcShardLocation, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardScavengerReferenceMatchRequest,
-    StorageRpcShardScavengerReferencePageRequest, StorageRpcShardWriteRequest,
-    StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
-    StorageRpcStreamPartFinalizeSnapshotOutcome, StorageRpcStreamPartFinalizeSnapshotRequest,
-    StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
-    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
-    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
-    StorageRpcStreamSegmentAppendPrepareResponse,
+    StorageRpcShardAckRecordRequest, StorageRpcShardDeleteRequest, StorageRpcShardLocation,
+    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+    StorageRpcShardScavengerReferenceMatchRequest, StorageRpcShardScavengerReferencePageRequest,
+    StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotOutcome,
+    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPartFinalizeSnapshotResponse,
+    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
+    StorageRpcStreamPutFinalizeSnapshotResponse, StorageRpcStreamSegmentAppendPrepareOutcome,
+    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamSegmentAppendPrepareResponse,
     StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
@@ -1920,7 +1920,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::ShardAckRecord => {
-                match decode_shard_ack_batch_request(&frame.payload) {
+                match decode_shard_ack_record_request(&frame.payload) {
                     Ok(request) => self.shard_ack_record_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -6636,8 +6636,11 @@ impl StorageNodeConnectionHandler {
     fn shard_ack_record_response(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
-        request: StorageRpcShardAckBatchRequest,
+        request: StorageRpcShardAckRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let effect_fence =
+            admitted_route_effect_fence(request.batch.cluster_epoch, request.effect_deadline);
+        let request = request.batch;
         let route = match self.active_primary_data_route(
             route_permit,
             request.node_id,
@@ -6648,7 +6651,8 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let response = match route.record_shard_acks(&request.items) {
+        let response = match route.record_shard_acks_with_effect_fence(&request.items, effect_fence)
+        {
             Ok(()) => encode_storage_rpc_success_response(&[]),
             Err(StorageNodeDataRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)?

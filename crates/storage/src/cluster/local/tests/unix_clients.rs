@@ -2665,6 +2665,15 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 }
 
 impl ShardAckRoute for RecordingShardAckRoute<'_> {
+    fn register_shard_acks_with_effect_fence(
+        &self,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
+        self.register_shard_acks(shard_batch)
+    }
+
     fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError> {
         let mut records = self
             .client

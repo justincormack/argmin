@@ -3718,15 +3718,27 @@ impl StorageNodeActivePrimaryDataRoute<'_> {
             .map_err(StorageNodeDataRouteError::Store)
     }
 
+    #[cfg(test)]
     fn record_shard_acks(
         &self,
         items: &[StorageRpcShardAckItem],
+    ) -> Result<(), StorageNodeDataRouteError> {
+        self.record_shard_acks_with_effect_fence(
+            items,
+            AdmittedRouteEffectFence::unbounded(self.fence.cluster_epoch),
+        )
+    }
+
+    fn record_shard_acks_with_effect_fence(
+        &self,
+        items: &[StorageRpcShardAckItem],
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), StorageNodeDataRouteError> {
         self.require_valid_now()
             .map_err(StorageNodeDataRouteError::Route)?;
         let effect_fence = self
             .fence
-            .intersect_effect_fence(AdmittedRouteEffectFence::unbounded(self.fence.cluster_epoch))
+            .intersect_effect_fence(effect_fence)
             .map_err(StorageNodeDataRouteError::Store)?;
         let shard_batch: Vec<(&ShardKey, WriteAck)> = items
             .iter()

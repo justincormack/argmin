@@ -361,6 +361,35 @@ pub(crate) fn encode_shard_ack_batch_request(
     Ok(out)
 }
 
+pub(crate) fn encode_shard_ack_record_request(
+    request: &StorageRpcShardAckRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidShardAckBatchRequest(
+            "shard ack record deadline must be conservative",
+        ));
+    }
+    let mut out = Vec::new();
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
+    out.extend_from_slice(&encode_shard_ack_batch_request(&request.batch)?);
+    Ok(out)
+}
+
+pub(crate) fn decode_shard_ack_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardAckRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let effect_deadline = decoder.read_admitted_route_effect_deadline("shard ack record deadline")?;
+    let batch = decode_shard_ack_batch_request(&bytes[decoder.cursor..])?;
+    Ok(StorageRpcShardAckRecordRequest {
+        batch,
+        effect_deadline,
+    })
+}
+
 pub(crate) fn decode_shard_ack_batch_request(
     bytes: &[u8],
 ) -> Result<StorageRpcShardAckBatchRequest, StorageRpcPayloadError> {

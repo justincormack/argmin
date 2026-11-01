@@ -59,7 +59,7 @@
             &mut client,
             1,
             StorageRpcMessageKind::ShardAckRecord,
-            encode_shard_ack_batch_request(&batch).unwrap(),
+            encode_unbounded_shard_ack_record_request(&batch),
         );
         let record_error = decode_storage_rpc_response_payload(&record_response.payload)
             .unwrap()
