@@ -4704,3 +4704,48 @@ regressions remain open.
 Validation: all 49 focused tests passed. The full Nextest suite passed all 9,190
 tests (one slow, six skipped) in 262.307s. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and `git diff --check` passed.
+
+## Transactional Bucket Reservation Fence — 2026-11-01
+
+The companion reservation audit found two gaps before owner/window integration:
+the embedded client checked the captured deadline before SQLite's implicit INSERT
+transaction, and the installed bucket route did not intersect the delegated fence
+with the receiving node's captured route deadline. A wait followed by same-epoch
+renewal could therefore authorize a new reservation after either original cutoff.
+
+Acquisition now enters or joins `BEGIN IMMEDIATE`, prepares the statement, checks
+the effect fence immediately before INSERT, and reads back the exact reservation
+within that transaction. The receiving-node route intersects its own immutable
+fence with the client fence before passing it to the local operation. Expiry keeps
+the existing embedded and Unix route-error mapping. The trusted raw store API
+shares the transaction implementation with its existing unbounded authority; this
+does not claim to eliminate every raw store mutation interface.
+
+The explicit transaction replaces the INSERT's implicit transaction rather than
+adding a successful-path commit. A trace canary requires exactly BEGIN IMMEDIATE,
+INSERT, SELECT and COMMIT. Separate canaries cover INSERT failure, COMMIT failure,
+retry, exact idempotence and rollback of an enclosing transaction. There are no
+schema, wire-format or canonical encoding changes.
+
+Owner-local, embedded and installed Unix tests expire authority after SQLite write
+admission, at 4,500 ms between the effective 4,000 ms cutoff and raw 5,000 ms
+authority timestamp. Installed cases renew the raw same-epoch route and cover
+client-first expiry, server-first expiry and absent delegated deadlines. Complete
+checkpoint, pending-slot and reservation observations remain exact, including an
+independent canary reservation; fresh admission and its exact retry succeed. The
+owner-local test additionally checks SQLite's total change count, so INSERT then
+rollback cannot masquerade as rejection before mutation.
+
+Moving validation before the hook deliberately made all three expiry regressions
+create the target reservation and fail. Independently removing receiving-node
+intersection made the Unix test fail on the server-first case after its
+client-first case passed. Both mutations were restored. An initial fixture error
+was the Unix scoped client lacking installed PG topology; correcting that setup
+made all 12 focused tests pass.
+
+This closes an existing reservation effect gap, not the retained owner/window or
+physical exclusion protocol. All six original cleanup regressions remain open.
+
+Validation: all 12 focused tests passed. The full Nextest suite passed all 9,196
+tests (one slow, six skipped) in 263.804s. Strict all-target/all-feature Clippy,
+the storage boundary checker, formatting and `git diff --check` passed.

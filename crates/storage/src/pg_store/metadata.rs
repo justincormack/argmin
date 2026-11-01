@@ -7,6 +7,9 @@ use crate::metadata_command::DeleteFinalizedBucketCommand;
 #[path = "metadata/segment_vid_window.rs"]
 mod segment_vid_window;
 
+#[path = "metadata/bucket_reservation_acquire.rs"]
+mod bucket_reservation_acquire;
+
 include!("metadata/support.rs");
 include!("metadata/command_apply.rs");
 include!("metadata/command_mutations.rs");

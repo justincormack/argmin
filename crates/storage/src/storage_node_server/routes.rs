@@ -432,6 +432,11 @@ impl StorageNodeActiveBucketRoute<'_> {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
+        let effect_fence = self
+            .fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
         if acquire.name != self.bucket {
             return Err(StorageNodeBucketRouteError::Route(
                 StorageRpcErrorResponse {

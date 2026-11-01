@@ -2078,9 +2078,13 @@ impl LocalStorageNodeClient {
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         effect_fence.require_valid_for(acquire.cluster_epoch)?;
-        Ok(PgMetadataStore::acquire_durable_bucket_write_reservation(
-            &*pg, acquire,
-        )?)
+        pg.acquire_durable_bucket_write_reservation_with_effect_fence(acquire, effect_fence)
+            .map_err(|error| match error {
+                MetadataError::RouteEffectRejected { source } => {
+                    BucketSnapshotLoadError::Store(source)
+                }
+                error => BucketSnapshotLoadError::Metadata(error),
+            })
     }
 
     fn validate_bucket_write_reservation_proof(

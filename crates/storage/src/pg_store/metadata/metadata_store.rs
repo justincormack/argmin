@@ -218,77 +218,8 @@ impl PgMetadataStore for PgStore {
         &self,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, MetadataError> {
-        let created_at = i64::try_from(acquire.created_at).map_err(|source| MetadataError::Db {
-            context: "acquire durable bucket write reservation created_at",
-            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-        })?;
-        let lease_deadline =
-            i64::try_from(acquire.lease_deadline).map_err(|source| MetadataError::Db {
-                context: "acquire durable bucket write reservation lease_deadline",
-                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-            })?;
-        let inserted = self
-            .conn
-            .execute(
-                "INSERT INTO bucket_write_reservations \
-             (bucket_name, reservation_id, owner_token, cluster_epoch, bucket_execution_generation, \
-              bucket_incarnation_generation, operation_kind, created_at, lease_deadline, target_context) \
-             SELECT name, ?1, ?2, ?3, bucket_execution_generation, bucket_incarnation_generation, ?4, ?5, ?6, ?7 \
-             FROM buckets \
-             WHERE name = ?8 AND state = ?9 \
-               AND NOT EXISTS (\
-                   SELECT 1 FROM bucket_write_drains \
-                   WHERE bucket_name = buckets.name AND state = ?10\
-               ) \
-             ON CONFLICT(bucket_name, reservation_id) DO NOTHING",
-                params![
-                    acquire.reservation_id,
-                    acquire.owner_token,
-                    acquire.cluster_epoch.get(),
-                    acquire.operation_kind,
-                    created_at,
-                    lease_deadline,
-                    acquire.target_context,
-                    acquire.name.as_str(),
-                    BucketState::Active as u8,
-                    BucketWriteDrainState::Draining as u8,
-                ],
-            )
-            .map_err(|source| MetadataError::Db {
-                context: "acquire durable bucket write reservation",
-                source: source.into(),
-            })?;
-
-        if inserted == 0 {
-            if let Some(existing) =
-                self.durable_bucket_write_reservation(acquire.name, acquire.reservation_id)?
-            {
-                if existing.owner_token == acquire.owner_token
-                    && existing.cluster_epoch == acquire.cluster_epoch
-                    && existing.operation_kind == acquire.operation_kind
-                    && existing.created_at == created_at as u64
-                    && existing.lease_deadline == lease_deadline as u64
-                    && existing.target_context.as_deref() == acquire.target_context
-                {
-                    return Ok(existing);
-                }
-                return Err(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: acquire.reservation_id.to_string(),
-                });
-            }
-            let info = self.head_bucket_raw(acquire.name)?;
-            if info.state == BucketState::Active
-                && self.durable_bucket_write_drain(acquire.name)?.is_some()
-            {
-                return Err(MetadataError::BucketWriteDraining);
-            }
-            return Err(bucket_not_found(acquire.name.as_str()));
-        }
-
-        self.durable_bucket_write_reservation(acquire.name, acquire.reservation_id)?
-            .ok_or_else(|| MetadataError::BucketWriteReservationNotFound {
-                reservation_id: acquire.reservation_id.to_string(),
-            })
+        let fence = AdmittedRouteEffectFence::unbounded(acquire.cluster_epoch);
+        self.acquire_durable_bucket_write_reservation_with_effect_fence(acquire, fence)
     }
 
     fn durable_bucket_write_reservation(

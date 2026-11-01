@@ -7,6 +7,8 @@ mod allocation_lifetime_tests;
 mod payload_participant_tests;
 #[path = "stream_creation_deadline_tests.rs"]
 mod stream_creation_deadline_tests;
+#[path = "bucket_reservation_deadline_tests.rs"]
+mod bucket_reservation_deadline_tests;
 
     use super::*;
     use crate::control_plane_auth::{
