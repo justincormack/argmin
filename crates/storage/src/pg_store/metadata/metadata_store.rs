@@ -445,60 +445,15 @@ impl PgMetadataStore for PgStore {
         created_at: u64,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, MetadataError> {
-        let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
-            context: "begin durable bucket write drain created_at",
-            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-        })?;
-        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
-            context: "begin durable bucket write drain lease_deadline",
-            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
-        })?;
-        let inserted = self
-            .conn
-            .execute(
-                "INSERT INTO bucket_write_drains \
-                 (bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
-                  state, created_at, lease_deadline) \
-                 SELECT name, ?1, ?2, ?3, bucket_execution_generation, ?4, ?5, ?6 \
-                 FROM buckets \
-                 WHERE name = ?7 AND state = ?8 \
-                 ON CONFLICT(bucket_name) DO NOTHING",
-                params![
-                    drain_id,
-                    owner_token,
-                    cluster_epoch.get(),
-                    BucketWriteDrainState::Draining as u8,
-                    created_at,
-                    lease_deadline,
-                    name.as_str(),
-                    BucketState::Active as u8,
-                ],
-            )
-            .map_err(|source| MetadataError::Db {
-                context: "begin durable bucket write drain",
-                source: source.into(),
-            })?;
-        if inserted == 0 {
-            if let Some(existing) = self.durable_bucket_write_drain(name)? {
-                if existing.drain_id == drain_id
-                    && existing.owner_token == owner_token
-                    && existing.cluster_epoch == cluster_epoch
-                    && existing.created_at == created_at as u64
-                    && existing.lease_deadline == lease_deadline as u64
-                {
-                    return Ok(existing);
-                }
-                return Err(MetadataError::BucketWriteDrainConflict {
-                    drain_id: drain_id.to_string(),
-                });
-            }
-            return Err(bucket_not_found(name.as_str()));
-        }
-        self.durable_bucket_write_drain(name)?.ok_or_else(|| {
-            MetadataError::BucketWriteDrainNotFound {
-                drain_id: drain_id.to_string(),
-            }
-        })
+        self.begin_durable_bucket_write_drain_with_effect_fence(
+            name,
+            drain_id,
+            owner_token,
+            cluster_epoch,
+            created_at,
+            lease_deadline,
+            AdmittedRouteEffectFence::unbounded(cluster_epoch),
+        )
     }
 
     fn durable_bucket_write_drain(

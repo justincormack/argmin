@@ -10,6 +10,9 @@ mod segment_vid_window;
 #[path = "metadata/bucket_reservation_acquire.rs"]
 mod bucket_reservation_acquire;
 
+#[path = "metadata/bucket_drain_begin.rs"]
+mod bucket_drain_begin;
+
 #[path = "metadata/reservation_heartbeat.rs"]
 mod reservation_heartbeat;
 #[cfg(test)]

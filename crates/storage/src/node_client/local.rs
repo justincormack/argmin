@@ -2165,15 +2165,20 @@ impl LocalStorageNodeClient {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         effect_fence.require_valid_for(cluster_epoch)?;
-        self.begin_durable_bucket_write_drain(
-            pg_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.begin_durable_bucket_write_drain_with_effect_fence(
             bucket,
             drain_id,
             owner_token,
             cluster_epoch,
             created_at,
             lease_deadline,
+            effect_fence,
         )
+        .map_err(|error| match error {
+            MetadataError::RouteEffectRejected { source } => BucketSnapshotLoadError::Store(source),
+            error => BucketSnapshotLoadError::Metadata(error),
+        })
     }
 
     fn clear_expired_durable_bucket_write_drain(

@@ -4879,3 +4879,51 @@ Validation: all ten final focused tests passed, including the unchanged
 route-expiry regression. The final full Nextest suite passed all 9,210 tests
 (one slow, six skipped) in 260.576s. Strict all-target/all-feature Clippy,
 the storage boundary checker, formatting and `git diff --check` passed.
+
+### Transactional Bucket-Delete Drain Acquisition Fence
+
+The adjacent drain-acquisition audit confirmed that the fenced client checked
+authority before taking the bucket PG lock, then delegated to an unfenced
+implicit SQLite INSERT transaction. The installed handler checked its captured
+route before dispatch but did not carry that bound into insertion. A lock wait
+or delayed RPC could therefore install a fresh drain after captured authority
+expired while the raw same-epoch map remained valid.
+
+The fenced path now carries the immutable effect fence into the store. It
+acquires or joins BEGIN IMMEDIATE, prepares the INSERT, then checks the fence
+immediately before mutation. Exact retry/conflict readback remains under the
+same write serialization. The receiving handler preserves early route/epoch
+validation and intersects its captured route bound with delegated authority.
+Trusted raw callers retain their unbounded entry point; this change does not
+make recovery/adoption depend on expired request authority.
+
+No schema, wire format, command or successful-path commit/fsync is added. The
+explicit transaction replaces the previous implicit insertion transaction.
+Existing bucket-state and exact drain-identity semantics are unchanged. Store
+tests pin one BEGIN/INSERT/SELECT/COMMIT sequence, joining without committing
+an outer transaction, rollback on insertion/commit failure, and successful retry.
+
+Expiry canaries run after SQLite admission and statement preparation, and
+compare the full checkpoint plus SQLite total_changes to exclude an
+insert-then-rollback false positive. Vacant and occupied target drains preserve
+an independent drain and reservation. Fresh acquisition, exact retry and a
+conflicting contender provide positive/negative controls. Embedded and installed
+Unix matrices renew the raw route inside the hook and advance time past the
+effective cutoff but before its authority timestamp. Client-first, server-first
+and absent-client cases reject without changing drain/reservation/checkpoint
+state; freshly admitted acquisition and exact retry succeed.
+
+This is another acceptance-boundary prerequisite, not an implementation of
+durable generation cleanup ownership. Introduction-cutoff persistence, retained
+owner/window records, replacement-primary settlement and physical exclusion
+remain outstanding; all six original cleanup regressions remain open.
+
+Moving the final effect check before the interleaving hook made all three
+expiry tests accept a drain and fail. Independently omitting the receiving-node
+intersection made the Unix server-first case accept a drain after the client-first
+case passed. Both mutations were restored before full validation.
+
+Validation: all 22 focused tests passed after refreshing the raw fixture's
+metadata digest before checkpoint export. The full Nextest suite passed all
+9,215 tests (one slow, six skipped) in 266.929s. Strict all-target/all-feature
+Clippy, the storage boundary checker, formatting and `git diff --check` passed.

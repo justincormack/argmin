@@ -539,6 +539,10 @@ impl StorageNodeActiveBucketRoute<'_> {
                 },
             ));
         }
+        let effect_fence = self.fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
         let local_client = LocalStorageNodeClient::new(
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),

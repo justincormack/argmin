@@ -9,6 +9,9 @@ mod payload_participant_tests;
 mod stream_creation_deadline_tests;
 #[path = "bucket_reservation_deadline_tests.rs"]
 mod bucket_reservation_deadline_tests;
+
+#[path = "bucket_drain_deadline_tests.rs"]
+mod bucket_drain_deadline_tests;
 #[path = "pending_slot_deadline_tests.rs"]
 mod pending_slot_deadline_tests;
 
