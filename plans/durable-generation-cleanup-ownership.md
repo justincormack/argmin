@@ -155,6 +155,10 @@ The [installed Unix file-exclusion evidence](#installed-unix-file-exclusion-evid
 also pins the file participant through real client/server dispatch, including
 expiry while waiting behind retained deletion. These local effect boundaries
 are prerequisites, not the outstanding durable owner/window implementation.
+The [generation-release ownership correction](#generation-release-ownership-at-apply--2026-11-02)
+now prevents standalone release commands from detaching a live stream's
+reservation. Abandoned stream finalization leaves that resource with the session
+for atomic stream cleanup; Direct PUT retains its standalone release derivative.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5752,3 +5756,121 @@ completed in 115.365s and 88.144s respectively. Another session's full suite was
 running in a separate worktree during the latter part of validation and was left
 untouched. Strict all-target/all-feature Clippy, storage boundary checks,
 formatting and `git diff --check` passed.
+
+## Generation-release Ownership At Apply — 2026-11-02
+
+The owner-integration audit found an asymmetry in existing generation commands.
+Standalone `ReserveObjectGeneration` already rejected a live stream's ID, but
+`ReleaseObjectGeneration` unconditionally deleted the matching reservation. A
+correctly checksummed decoded release could therefore detach a PUT or UploadPart
+session from its generation. The new regression reproduced success and applied
+log advancement before the correction; this was not merely a missing assertion.
+
+Reserve and release now share a stream-ownership check inside the existing
+apply/log transaction. Any existing session, including a terminal-state session,
+prevents a standalone generation mutation; only authoritative session absence
+allows the operation to proceed. Lookup/decoding failures propagate. Atomic
+stream terminal/abort application still uses its direct reservation deletion in
+the same transaction as session removal. No new lock, transaction, schema, wire
+encoding, durability barrier or fsync is introduced; standalone release adds a
+local session lookup.
+
+The shared `CommitDirectPutObject` envelope also represents streamed PUT
+finalization. Its cleanup classification now uses the canonical reservation
+operation: only Direct PUT selects a standalone release, both in normal
+abandonment cleanup and in authorized recovery-derivative construction. The
+classification is closed: only canonical Direct PUT commit and PUT stream
+creation are valid. Replica apply and already-applied staging cleanup reject
+every other operation kind, including when a matching standalone generation
+reservation exists and no stream session does. Abandonment uses that same
+fallible classification before fanout, durable tombstone recording, terminal
+slot removal, reservation release or physical cleanup. An invalid class is an
+error, not the valid stream case with no standalone derivative. It leaves the
+pending command discoverable with its existing effects unchanged; it cannot
+authorize even a same-payload recovery reissue. This classification is not
+authority; the apply guard independently rejects a release
+targeting a durable stream even if a malformed predecessor claims the Direct PUT
+kind. An abandoned stream terminal command leaves generation ownership with the
+session for existing abort/expiry cleanup. It does not promise that the client
+can continue, reconstruct a lost bucket reservation, or strengthen session
+durability. For valid commands, existing bucket-proof release timing and physical
+cleanup behavior are unchanged.
+
+Coverage:
+
+- PUT and UploadPart receive decoded releases with their exact bucket/key/ID.
+  Rejection must precede SQL changes and preserve the complete session,
+  reservation, allocator, canonical checkpoint and applied log. Persisting the
+  rejected envelope in a pending slot and reopening twice must not turn it into
+  successful release: slot, digest, replica state and log remain unchanged.
+- A three-replica matrix builds real Direct PUT and streamed PUT terminal
+  commands, records authoritative unstarted abandonment, and runs both the normal
+  drain and authorized-recovery entry point. Direct PUT must still publish its
+  release derivative and clear its reservation; streamed PUT must clear the
+  abandoned slot without a standalone release or reservation detachment. The
+  latter's ordinary abort then removes session and generation on every replica.
+  This exercises recovery execution, not a new control-plane authorization test.
+- Decoded commits with unknown, empty, metadata-update or UploadPart operation
+  kinds must fail before SQL mutation or log advancement despite an exact
+  generation reservation and no session. After persisting their pending slots
+  and reopening, abandonment acceptance, tombstone recording and slot removal
+  must all reject without SQL changes; canonical digest, replica state, slot and
+  reservation remain intact. Recovery derivation and replay cleanup also reject. An otherwise
+  identical canonical Direct PUT succeeds. The three-replica normal/recovery
+  matrix includes a decoded metadata-update proof kind: abandonment fanout,
+  drain and both terminal cleanup helpers must reject, preserving every PG's
+  replica/log state (including its persisted canonical digest), bucket and
+  generation reservations, the pending slot, every shard's exact bytes and durable
+  acknowledgement. This replaces the incorrect earlier assertion that accepted
+  abandonment while leaving an orphan reservation.
+- The existing stale encryption-authority test now uses an explicit storage-owned
+  malformed-state fixture to remove only the reservation. It still pins stale
+  generation rejection, rather than weakening it to a missing-session test or
+  relying on the now-forbidden production release path.
+
+This is an existing owner-kind correction. Durable owner/window rows, finite
+physical grants and post-session cleanup discovery remain unimplemented; all six
+original cleanup regressions remain open.
+
+Validation: the decoded-release regression first reproduced successful mutation
+before the guard was added. All three focused ownership/authority tests passed
+afterward. Before the operation-class review, a full Nextest run passed all
+9,272 tests (one slow, six skipped) in 254.673s; the flagged Raft heartbeat
+write-amplification test completed
+in 98.258s. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed. Two needless closure borrows in the
+concurrently landed Direct PUT retry change were removed to satisfy Clippy;
+retry semantics are unchanged. An earlier build was interrupted by a toolchain
+update before tests ran; validation resumed after the toolchain was restored.
+
+The operation-class review added the closed classification and decoded invalid-
+operation/abandonment cases above. Its first full run passed 9,272 tests and failed
+`storage_node_server_preserves_stale_delete_marker_target_conflict` during setup:
+the replacement Direct PUT used the placeholder `storage-node-rpc-test` proof
+operation. That setup now uses the canonical Direct PUT operation; its stale
+delete-marker response assertion is unchanged.
+
+After that fixture correction, its focused regression passed and a full
+Nextest run passed all 9,273 tests (one slow, six skipped) in 239.832s. The Raft
+heartbeat write-amplification test completed in 112.993s. Strict all-target/
+all-feature Clippy, boundary checks, formatting and `git diff --check` passed on
+that intermediate tree. The subsequent abandonment review identified that
+mapping an unknown class to no follow-up still permitted destructive terminal
+cleanup. The fallible pre-effect checks and preservation regressions above
+address that gap; final validation is recorded below.
+
+The abandonment revision's first full run passed 9,272 tests and failed
+`direct_put_fanout_rejects_live_crossed_reservation_subjects`: its old assertion
+expected drain to consume the malformed operation. It now requires the exact
+classification error, preserved pending slot and bucket/generation reservations,
+unchanged replica state and no tombstone. Its independent crossed-key fanout
+assertion remains unchanged. The focused observation fixtures also use state
+digests/replica state rather than checkpoint export, which intentionally rejects
+pending commands, and register the real staged shard acknowledgements before
+pending installation so preservation assertions have positive evidence.
+
+Final abandonment validation: all four focused regressions passed. The full
+Nextest run passed all 9,273 tests (two slow, six skipped) in 238.664s. The Raft
+heartbeat write-amplification test completed in 111.846s and the oversized
+version-listing test in 60.005s. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and `git diff --check` passed on the corrected tree.

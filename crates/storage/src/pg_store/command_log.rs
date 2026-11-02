@@ -4214,6 +4214,7 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
+        command.payload().validate_terminal_generation_owner()?;
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -5888,6 +5889,7 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
+        command.payload().validate_terminal_generation_owner()?;
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -6156,6 +6158,7 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandRecordResult, StoreError> {
+        command.payload().validate_terminal_generation_owner()?;
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,

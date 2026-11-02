@@ -2286,6 +2286,7 @@
             source
                 .payload()
                 .abandoned_recovery_follow_up()
+                .expect("valid terminal operation")
                 .expect("Direct PUT requires generation cleanup"),
         );
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -3683,8 +3684,12 @@
             )),
         );
         pg.apply_metadata_command_and_record(7, &reserve).unwrap();
-        let bucket_write_reservation =
-            test_bucket_write_reservation_proof(bucket.clone(), &key);
+        let bucket_write_reservation = BucketWriteReservationProof {
+            operation_kind:
+                crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                    .into(),
+            ..test_bucket_write_reservation_proof(bucket.clone(), &key)
+        };
         let provisional_encryption = crate::tests::metadata_only_test_encryption();
         let object_subject = crate::ObjectEncryptionSubject::standard_object(
             bucket_write_reservation.bucket_incarnation_generation,

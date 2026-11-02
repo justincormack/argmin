@@ -1058,23 +1058,39 @@ impl MetadataCommandPayload {
         }
     }
 
-    pub(crate) fn abandoned_recovery_follow_up(&self) -> Option<Self> {
+    pub(crate) fn validate_terminal_generation_owner(&self) -> Result<(), crate::StoreError> {
+        if let Self::CommitDirectPutObject(commit) = self {
+            commit.generation_owner()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abandoned_recovery_follow_up(&self) -> Result<Option<Self>, crate::StoreError> {
         let release = match self {
-            Self::CommitDirectPutObject(commit) => ReleaseObjectGenerationCommand::new(
-                commit.object.bucket.clone(),
-                commit.object.key.clone(),
-                commit.generation_reservation_id.clone(),
-            ),
-            // Stream creation reserves its generation in the same transaction
-            // as the session. Safe abandonment applied neither; it must not
-            // release an independently owned reservation with the same ID.
-            _ => return None,
+            Self::CommitDirectPutObject(commit)
+                if commit.generation_owner()? == PutObjectGenerationOwner::Standalone =>
+            {
+                ReleaseObjectGenerationCommand::new(
+                    commit.object.bucket.clone(),
+                    commit.object.key.clone(),
+                    commit.generation_reservation_id.clone(),
+                )
+            }
+            // Stream creation reserves its generation atomically with the
+            // session. Abandoning its terminal command must leave that ownership
+            // intact for ordinary stream abort/expiry cleanup, not detach the
+            // generation via the Direct PUT derivative. Abandoning creation
+            // applied neither resource and likewise cannot release another owner.
+            _ => return Ok(None),
         };
-        Some(Self::ReleaseObjectGeneration(release))
+        Ok(Some(Self::ReleaseObjectGeneration(release)))
     }
 
     pub(crate) fn is_authorized_recovery_derivative_of(&self, source: &Self) -> bool {
-        self == source || source.abandoned_recovery_follow_up().as_ref() == Some(self)
+        match source.abandoned_recovery_follow_up() {
+            Ok(follow_up) => self == source || follow_up.as_ref() == Some(self),
+            Err(_) => false,
+        }
     }
 }
 
@@ -1495,7 +1511,27 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutObjectGenerationOwner {
+    Standalone,
+    Stream,
+}
+
 impl CommitDirectPutObjectCommand {
+    pub(crate) fn generation_owner(&self) -> Result<PutObjectGenerationOwner, crate::StoreError> {
+        match self.bucket_write_reservation.operation_kind.as_str() {
+            PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND => {
+                Ok(PutObjectGenerationOwner::Standalone)
+            }
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND => {
+                Ok(PutObjectGenerationOwner::Stream)
+            }
+            _ => Err(crate::StoreError::RouteCapabilitySubjectMismatch {
+                operation: "put-object-terminal-generation-owner",
+            }),
+        }
+    }
+
     pub(crate) fn matches_stream_session(
         &self,
         bucket: &BucketName,

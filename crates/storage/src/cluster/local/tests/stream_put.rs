@@ -142,9 +142,18 @@ fn stream_segment_encryption_authority_binds_route_generation_and_geometry() {
     let stale = issuer_route
         .authorize_stream_segment(&session_id, 0, plaintext.len() as u64)
         .unwrap();
-    cluster
-        .release_object_generation_reservation(&bucket, &key, &session_id)
-        .unwrap();
+    // Owner-local malformed-state fixture: production standalone release now
+    // rejects a live stream owner. Remove only the reservation to retain this
+    // test's stale-generation (rather than missing-session) canary.
+    for node in map
+        .metadata_pg_acting_nodes(cluster.operation_epoch(), PgId::new(0))
+        .unwrap()
+    {
+        let pg = node.storage_node().get_pg(0).unwrap();
+        pg.delete_object_generation_reservation(&bucket, &key, &session_id)
+            .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
     let error = issuer_route
         .append_authorized_stream_segment(stale, encrypted.payload_crc64, &encrypted.storage_bytes)
         .unwrap_err();

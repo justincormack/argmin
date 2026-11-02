@@ -554,7 +554,7 @@ Current production pending-command publishers:
 | `reserve_put_object_generation_with_route_validation` | `ReserveObjectGeneration` | `AllocatorCleanup` | Revalidate admitted PutObject authority before each allocation attempt and carry its immutable effect fence to pending-slot insertion. Drain competing PG slot before and during command-id allocation, reread the allocator before final command-id allocation, then allocate/reuse through the reservation owner. If the generation becomes stale before publish, exact `ObjectGenerationReservationConflict` is retried without releasing a non-matching reservation. |
 | `reserve_next_object_version` | `ReserveObjectVersion` | `AllocatorCleanup` | Drain competing PG slot before and during command-id allocation, then allocate/reuse through the version reservation owner. |
 | `release_object_generation_reservation_command_required` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Required cleanup must retry through slot contention, including command-id contention, until terminal or fail without losing the cleanup intent. |
-| `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned reservation; drain competing PG slot before and during command-id allocation and retry. |
+| `release_object_generation_reservation` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Release an already-owned standalone Direct PUT reservation; stream-owned generations require their atomic terminal/abort command. Drain competing PG slots before and during command-id allocation and retry. |
 | `commit_direct_put_object_from_payload_shards_with_route_validation` | `CommitDirectPutObject` | `SnapshotSensitive` | Revalidate the admitted PutObject route while rebuilding the commit from fresh object preconditions and stale-payload snapshots after pending-install contention or pre-publish command-id contention. Carry the immutable effect fence to version reservation and final pending-slot insertion. The commit command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
 | `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | The actual object-PG primary builds the command under its PG lock, validating the session/target, segment witness, live allocation lifetime and captured effect fence. Build-time and pending-install contention return through the existing one-contender retry loop without deleting referenced staged payload; replica apply independently validates the same durable session/segment invariants. |
@@ -1006,7 +1006,22 @@ independent reservation with the same ID must survive failed creation cleanup.
 Stream abort removes the generation with the session in its apply transaction;
 scavenging and bucket deletion must not publish an additional generation release.
 Direct PUT terminal abandonment still has its separate generation-release
-obligation. Builders reject a pre-existing reservation under the requested session
+obligation. Although streamed PUT uses the same `CommitDirectPutObject` payload,
+its canonical stream-create proof does not authorize that standalone derivative;
+normal and authorized-recovery cleanup leave its generation with the session for
+atomic abort/expiry cleanup. These are the only two accepted terminal operation
+classes; replica apply and replay cleanup reject unrelated or unknown proof
+operations before mutation, even with an otherwise matching reservation.
+Abandonment also rejects unknown classes before recording a tombstone, releasing
+reservations, removing the pending slot or deleting payload. Invalid classification
+is not the valid stream no-derivative case: leave the pending command and all its
+effects intact for diagnosis, rather than orphaning its generation reservation.
+Central application of standalone reserve/release
+commands rejects any existing stream owner under the same reservation ID. This
+checks durable ownership even when a decoded command supplies matching subjects
+or a predecessor claims the Direct PUT proof kind.
+
+Builders reject a pre-existing reservation under the requested session
 ID. Apply independently requires reservation absence inside the creation
 transaction whenever the session is absent, including for decoded recovery
 commands. Only an existing exact session may use the idempotent branch, which

@@ -1361,17 +1361,62 @@ fn direct_put_fanout_rejects_live_crossed_reservation_subjects() {
 
     let command = command_with_proof(operation_proof);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
-    cluster
+    let states = node_ids.map(|node_id| {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+    });
+    let error = cluster
         .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
-        .unwrap();
-    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
-    for node_id in node_ids {
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(crate::StoreError::RouteCapabilitySubjectMismatch {
+                operation: "put-object-terminal-generation-owner"
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
+        Some(&command)
+    );
+    assert_eq!(
+        crate::PgMetadataStore::durable_bucket_write_reservation(
+            &*primary.storage_node().get_pg(pg_id.get()).unwrap(),
+            &bucket,
+            &operation_reservation.record.reservation_id,
+        )
+        .unwrap()
+        .as_ref(),
+        Some(&operation_reservation.record),
+    );
+    for (node_id, before) in node_ids.into_iter().zip(states) {
         let pg = map
             .node(node_id)
             .unwrap()
             .storage_node()
             .get_pg(pg_id.get())
             .unwrap();
+        assert_eq!(pg.metadata_command_replica_state().unwrap(), before);
+        assert!(!pg
+            .metadata_command_abandoned(node_id.as_u32(), &command)
+            .unwrap());
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id
+            )
+            .unwrap(),
+            generation_id
+        );
         assert!(matches!(
             crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
             Err(crate::MetadataError::ObjectNotFound)

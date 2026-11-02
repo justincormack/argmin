@@ -2670,14 +2670,14 @@ impl StorageCluster {
                 })?;
                 return match completion {
                     PendingObjectMetadataCommandCompletion::Applied => {
-                        self.after_object_metadata_command_abandoned_payload_cleanup(predecessor);
+                        self.after_object_metadata_command_abandoned_payload_cleanup(predecessor)?;
                         Ok(PendingMetadataCommandOutcome::Abandoned)
                     }
                     PendingObjectMetadataCommandCompletion::PublishedPendingRecovery
                     | PendingObjectMetadataCommandCompletion::TerminalCleanupPending {
                         applied: true,
                     } => {
-                        self.after_object_metadata_command_abandoned_payload_cleanup(predecessor);
+                        self.after_object_metadata_command_abandoned_payload_cleanup(predecessor)?;
                         Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
                             applied: false,
                         })
@@ -2900,6 +2900,8 @@ impl StorageCluster {
         let mut command = command.clone();
         let mut apply_progress = request_ops::MetadataCommandApplyProgress::Abortable;
         loop {
+            command.payload().validate_terminal_generation_owner()
+                .map_err(ObjectPgActionError::Store)?;
             if let Err(error) =
                 work_budget.check("object metadata pending command apply budget exhausted")
             {
@@ -3476,6 +3478,8 @@ impl StorageCluster {
         work_budget: &mut RequestWorkBudget,
         cleanup_context: ObjectPendingCommandCleanupContext<'_>,
     ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, ObjectPgActionError> {
+        let follow_up_payload = command.payload().abandoned_recovery_follow_up()
+            .map_err(ObjectPgActionError::Store)?;
         let ObjectPendingCommandCleanupContext {
             execution_route,
             recovery_guard,
@@ -3497,7 +3501,7 @@ impl StorageCluster {
         ) = (
             execution_route.mode,
             execution_route.recovery_authorized_source,
-            command.payload().abandoned_recovery_follow_up(),
+            follow_up_payload,
         ) {
             let Some(follow_up) = self
                 .reissue_pending_metadata_command_with_route_mode_and_recovery_guard_until(
@@ -3538,12 +3542,12 @@ impl StorageCluster {
                 },
             )? {
                 PendingObjectMetadataCommandCompletion::Applied => {
-                    self.after_object_metadata_command_abandoned_payload_cleanup(command);
+                    self.after_object_metadata_command_abandoned_payload_cleanup(command)?;
                     return Ok(request_ops::PendingMetadataCommandTerminalCleanup::Removed);
                 }
                 PendingObjectMetadataCommandCompletion::PublishedPendingRecovery
                 | PendingObjectMetadataCommandCompletion::TerminalCleanupPending { .. } => {
-                    self.after_object_metadata_command_abandoned_payload_cleanup(command);
+                    self.after_object_metadata_command_abandoned_payload_cleanup(command)?;
                     return Ok(request_ops::PendingMetadataCommandTerminalCleanup::Deferred);
                 }
                 PendingObjectMetadataCommandCompletion::Abandoned
@@ -3579,7 +3583,9 @@ impl StorageCluster {
     fn after_object_metadata_command_abandoned_payload_cleanup(
         &self,
         command: &MetadataCommandEnvelope,
-    ) {
+    ) -> Result<(), ObjectPgActionError> {
+        command.payload().validate_terminal_generation_owner()
+            .map_err(ObjectPgActionError::Store)?;
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
                 for segment in &commit.segments {
@@ -3591,6 +3597,7 @@ impl StorageCluster {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn after_object_metadata_command_abandoned(
@@ -3599,7 +3606,8 @@ impl StorageCluster {
         reservation_authority: &StorageCluster,
     ) -> Result<(), ObjectPgActionError> {
         match command.payload() {
-            MetadataCommandPayload::CommitDirectPutObject(commit) => {
+            MetadataCommandPayload::CommitDirectPutObject(commit) if commit.generation_owner()
+                .map_err(ObjectPgActionError::Store)? == crate::metadata_command::PutObjectGenerationOwner::Standalone => {
                 let release_result = reservation_authority
                     .release_object_generation_reservation_command_required(
                         command.id().pg_id(),
@@ -3607,11 +3615,12 @@ impl StorageCluster {
                         &commit.object.key,
                         &commit.generation_reservation_id,
                     );
-                self.after_object_metadata_command_abandoned_payload_cleanup(command);
+                self.after_object_metadata_command_abandoned_payload_cleanup(command)?;
                 release_result?;
             }
-            MetadataCommandPayload::AppendStreamSegment(_) => {
-                self.after_object_metadata_command_abandoned_payload_cleanup(command);
+            MetadataCommandPayload::CommitDirectPutObject(_)
+            | MetadataCommandPayload::AppendStreamSegment(_) => {
+                self.after_object_metadata_command_abandoned_payload_cleanup(command)?;
             }
             _ => {}
         }
@@ -5285,7 +5294,7 @@ impl StorageCluster {
                                 Ok(()) => {}
                                 Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
                                     if late_conflict_command.as_ref().is_some_and(
-                                        &contender_requires_direct_put_recovery_wait,
+                                        contender_requires_direct_put_recovery_wait,
                                     ) =>
                                 {
                                     // This request relinquished recovery for the exact contender.
@@ -5772,7 +5781,7 @@ impl StorageCluster {
                                     ObjectPgActionError::MetadataCommandRecoveryTransferred
                                 )
                                 && drained_contender.as_deref().is_some_and(
-                                    &contender_requires_direct_put_recovery_wait,
+                                    contender_requires_direct_put_recovery_wait,
                                 )
                             {
                                 wait_for_direct_put_contender_recovery!(

@@ -4434,6 +4434,7 @@ fn assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
         source
             .payload()
             .abandoned_recovery_follow_up()
+            .expect("valid terminal operation")
             .expect("abandoned Direct PUT requires generation cleanup"),
     );
     let MetadataCommandRecoveryAdmission::Leader(owner) = map

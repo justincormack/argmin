@@ -2377,6 +2377,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_direct_put_generation() {
         source
             .payload()
             .abandoned_recovery_follow_up()
+            .expect("valid terminal operation")
             .expect("Direct PUT requires generation cleanup"),
     );
     let pending = crate::control_plane::PendingMetadataCommandObservation::new(

@@ -671,6 +671,287 @@ fn decoded_direct_put_reservation_cannot_adopt_a_stream_generation() {
 }
 
 #[test]
+fn decoded_generation_release_cannot_detach_a_stream_reservation() {
+    for part in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let create = fixture(&store, part);
+        store
+            .apply_metadata_command_and_record(0, &envelope(&create, 1))
+            .unwrap();
+        let session = store.get_stream_upload(&create.session.session_id).unwrap();
+        let reservation = store
+            .get_object_generation_reservation_by_id(&create.session.session_id)
+            .unwrap();
+        let before = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let crossed = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::ReleaseObjectGeneration(
+                crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                    create.session.bucket.clone(),
+                    create.session.key.clone(),
+                    create.session.session_id.clone(),
+                ),
+            ),
+        );
+        let decoded = decode_metadata_command_envelope(
+            &crossed.command_bytes(),
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+        .unwrap();
+        assert_eq!(decoded, crossed);
+        let reject = |store: &PgStore, command: &MetadataCommandEnvelope| {
+            let changes = store.conn.total_changes();
+            let error = store
+                .apply_metadata_command_and_record(0, command)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                        context: "release object generation command stream-owned reservation",
+                        ..
+                    })
+                ),
+                "part={part}: {error:?}"
+            );
+            assert_eq!(store.conn.total_changes(), changes);
+            assert_eq!(
+                store.get_stream_upload(&create.session.session_id).unwrap(),
+                session
+            );
+            assert_eq!(
+                store
+                    .get_object_generation_reservation_by_id(&create.session.session_id)
+                    .unwrap(),
+                reservation
+            );
+            assert_present(store, &create);
+            assert_eq!(
+                store
+                    .metadata_command_replica_state()
+                    .unwrap()
+                    .applied_log_index,
+                1
+            );
+            assert_eq!(
+                store
+                    .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                1
+            );
+        };
+        reject(&store, &decoded);
+        assert_eq!(
+            store
+                .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                .unwrap(),
+            before
+        );
+        // A restart reads the same correctly checksummed command from the durable
+        // pending slot. Recovery must not turn a foreground rejection into release.
+        store
+            .try_insert_pending_metadata_command_slot(0, &decoded, Some(decoded.bucket_name()))
+            .unwrap();
+        let slot = store.pending_metadata_command_slot_any_epoch(0).unwrap();
+        let digest = store.metadata_state_digest().unwrap();
+        let state = store.metadata_command_replica_state().unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let reopened = PgStore::open(dir.path(), 1).unwrap();
+            let recovered = reopened
+                .pending_metadata_command_envelope_any_epoch(0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered, decoded);
+            reject(&reopened, &recovered);
+            assert_eq!(
+                reopened.pending_metadata_command_slot_any_epoch(0).unwrap(),
+                slot
+            );
+            assert_eq!(reopened.metadata_state_digest().unwrap(), digest);
+            assert_eq!(reopened.metadata_command_replica_state().unwrap(), state);
+        }
+    }
+}
+
+#[test]
+fn decoded_put_commit_rejects_unrelated_reservation_operations_without_mutation() {
+    use crate::metadata_command::{
+        PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+        UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+    };
+
+    for operation in [
+        "",
+        "unknown-operation",
+        PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+        UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+        PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+    ] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 1).unwrap();
+        let bucket = trusted_bucket_name("commit-operation");
+        let key = trusted_object_key("object");
+        let reservation_id = crate::tests::stream_session_id("commit-operation");
+        let generation = store
+            .reserve_object_generation(&bucket, &key, &reservation_id)
+            .unwrap();
+        assert_eq!(generation, GenerationId::MIN);
+        // Deliberately no stream session: the old negative classification treated
+        // every non-stream operation as a valid standalone reservation here.
+        let template = direct_put_terminal_cleanup_command(&bucket, &key, &reservation_id);
+        let mut payload = template.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = &mut payload else {
+            unreachable!();
+        };
+        commit.bucket_write_reservation.operation_kind = operation.into();
+        let envelope = MetadataCommandEnvelope::new(template.id(), payload);
+        let decoded = decode_metadata_command_envelope(
+            &envelope.command_bytes(),
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+        .unwrap();
+        assert_eq!(decoded, envelope);
+        store.refresh_metadata_command_state_digest().unwrap();
+        let before = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        let changes = store.conn.total_changes();
+        let result = store.apply_metadata_command_and_record(0, &decoded);
+        let release = MetadataCommandPayload::ReleaseObjectGeneration(
+            crate::metadata_command::ReleaseObjectGenerationCommand::new(
+                bucket.clone(),
+                key.clone(),
+                reservation_id.clone(),
+            ),
+        );
+        if operation == PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND {
+            result.unwrap();
+            assert_eq!(
+                decoded.payload().abandoned_recovery_follow_up().unwrap(),
+                Some(release.clone())
+            );
+            assert!(release.is_authorized_recovery_derivative_of(decoded.payload()));
+            assert_eq!(
+                store
+                    .get_object_version(&bucket, &key, VersionId::Null)
+                    .unwrap()
+                    .into_live()
+                    .unwrap()
+                    .generation_id,
+                generation
+            );
+            assert!(matches!(
+                store.get_object_generation_reservation(&bucket, &key, &reservation_id),
+                Err(MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+            continue;
+        }
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                    context: "commit direct put command reservation operation",
+                    ..
+                })
+            ),
+            "{operation:?}: {error:?}"
+        );
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(
+            store
+                .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                .unwrap(),
+            before
+        );
+        assert!(matches!(
+            store.get_object_version(&bucket, &key, VersionId::Null),
+            Err(MetadataError::ObjectNotFound)
+        ));
+        assert_eq!(
+            store
+                .get_object_generation_reservation(&bucket, &key, &reservation_id)
+                .unwrap(),
+            generation
+        );
+        // Reject before tombstone recording or pending-slot removal, preserving
+        // discovery of the rejected command and its independent reservation.
+        store
+            .try_insert_pending_metadata_command_slot(0, &decoded, Some(&bucket))
+            .unwrap();
+        let slot = store.pending_metadata_command_slot_any_epoch(0).unwrap();
+        let digest = store.metadata_state_digest().unwrap();
+        let replica = store.metadata_command_replica_state().unwrap();
+        drop(store);
+        let reopened = PgStore::open(dir.path(), 1).unwrap();
+        let changes = reopened.conn.total_changes();
+        for result in [
+            reopened
+                .metadata_command_abandon_acceptance(0, &decoded)
+                .map(|_| ()),
+            reopened
+                .record_metadata_command_abandoned(0, &decoded)
+                .map(|_| ()),
+            reopened
+                .remove_pending_metadata_command_slot(0, &decoded)
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "put-object-terminal-generation-owner"
+                    })
+                ),
+                "{operation:?}: {result:?}"
+            );
+        }
+        assert_eq!(reopened.conn.total_changes(), changes);
+        assert!(!reopened.metadata_command_abandoned(0, &decoded).unwrap());
+        assert_eq!(
+            reopened.pending_metadata_command_slot_any_epoch(0).unwrap(),
+            slot
+        );
+        assert_eq!(reopened.metadata_state_digest().unwrap(), digest);
+        assert_eq!(reopened.metadata_command_replica_state().unwrap(), replica);
+        assert!(decoded.payload().abandoned_recovery_follow_up().is_err());
+        assert!(!release.is_authorized_recovery_derivative_of(decoded.payload()));
+        assert!(!decoded
+            .payload()
+            .is_authorized_recovery_derivative_of(decoded.payload()));
+        assert_eq!(
+            reopened
+                .get_object_generation_reservation(&bucket, &key, &reservation_id)
+                .unwrap(),
+            generation
+        );
+        let changes = reopened.conn.total_changes();
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = decoded.payload() else {
+            unreachable!();
+        };
+        assert!(matches!(
+            reopened.cleanup_direct_put_terminal_staging(commit),
+            Err(MetadataError::InvariantViolation {
+                context: "commit direct put command reservation operation",
+                ..
+            })
+        ));
+        assert_eq!(reopened.conn.total_changes(), changes);
+    }
+}
+
+#[test]
 fn atomic_stream_creation_does_not_authorize_a_generation_release_derivative() {
     for part in [false, true] {
         let dir = test_util::tempdir();
@@ -684,7 +965,11 @@ fn atomic_stream_creation_does_not_authorize_a_generation_release_derivative() {
                 create.session.session_id.clone(),
             ),
         );
-        assert!(source.payload().abandoned_recovery_follow_up().is_none());
+        assert!(source
+            .payload()
+            .abandoned_recovery_follow_up()
+            .unwrap()
+            .is_none());
         assert!(!release.is_authorized_recovery_derivative_of(source.payload()));
         assert!(
             source

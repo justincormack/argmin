@@ -10853,6 +10853,7 @@ fn abandoned_cleanup_derivative_handoff_retains_predecessor_and_root_outcome() {
         source
             .payload()
             .abandoned_recovery_follow_up()
+            .expect("valid terminal operation")
             .expect("abandoned Direct PUT requires generation cleanup"),
     );
     map.node(NodeId::new(1))
@@ -11014,6 +11015,7 @@ fn abandoned_direct_put_cleanup_derivative_reissues_and_converges() {
         command
             .payload()
             .abandoned_recovery_follow_up()
+            .expect("valid terminal operation")
             .expect("Direct PUT has a certified reservation-release derivative"),
     );
     let omitted_predecessor_error = cluster

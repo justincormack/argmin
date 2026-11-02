@@ -904,17 +904,10 @@ impl PgStore {
         // owns its reservation atomically with the session; an identical row is
         // not evidence that this different command may adopt it. Keep the check
         // in the apply transaction, including for decoded/recovered commands.
-        match self.get_stream_upload(&command.reservation_id) {
-            Ok(_) => {
-                return Err(MetadataError::InvariantViolation {
-                    context: "reserve object generation command stream-owned reservation",
-                    reason: "a standalone reservation cannot adopt a stream session's generation"
-                        .into(),
-                });
-            }
-            Err(MetadataError::StreamSessionNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        self.require_standalone_generation_owner(
+            &command.reservation_id,
+            "reserve object generation command stream-owned reservation",
+        )?;
         self.reserve_object_generation_explicit(
             &command.bucket,
             &command.key,
@@ -924,10 +917,36 @@ impl PgStore {
         )
     }
 
+    fn require_standalone_generation_owner(
+        &self,
+        reservation_id: &SessionId,
+        context: &'static str,
+    ) -> Result<(), MetadataError> {
+        match self.get_stream_upload(reservation_id) {
+            Ok(_) => {
+                return Err(MetadataError::InvariantViolation {
+                    context,
+                    reason: "standalone generation commands cannot mutate a stream-owned reservation"
+                        .into(),
+                });
+            }
+            Err(MetadataError::StreamSessionNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
     fn apply_release_object_generation_command(
         &self,
         command: &ReleaseObjectGenerationCommand,
     ) -> Result<(), MetadataError> {
+        // Stream terminal/abort apply releases this resource in the same
+        // transaction as the session. A decoded standalone release must not
+        // detach it, even when the complete reservation subject matches.
+        self.require_standalone_generation_owner(
+            &command.reservation_id,
+            "release object generation command stream-owned reservation",
+        )?;
         self.delete_object_generation_reservation_direct(
             &command.bucket,
             &command.key,
@@ -1024,12 +1043,27 @@ impl PgStore {
         )
     }
 
+    fn direct_put_requires_stream_session(
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<bool, MetadataError> {
+        use crate::metadata_command::PutObjectGenerationOwner;
+
+        match command.generation_owner() {
+            Ok(PutObjectGenerationOwner::Standalone) => Ok(false),
+            Ok(PutObjectGenerationOwner::Stream) => Ok(true),
+            Err(_) => Err(MetadataError::InvariantViolation {
+                context: "commit direct put command reservation operation",
+                reason: "only Direct PUT commit or PUT stream creation may own the generation"
+                    .into(),
+            }),
+        }
+    }
+
     fn validate_direct_put_stream_session_proof(
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
-        let requires_stream_session = command.bucket_write_reservation.operation_kind
-            == crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND;
+        let requires_stream_session = Self::direct_put_requires_stream_session(command)?;
         match self.get_stream_upload(&command.generation_reservation_id) {
             Ok(session)
                 if requires_stream_session
@@ -1099,6 +1133,9 @@ impl PgStore {
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
+        // Replay cleanup may bypass ordinary apply after the exact log entry is
+        // already recorded. It must not accept an unknown operation either.
+        Self::direct_put_requires_stream_session(command)?;
         self.with_immediate_txn(
             "cleanup already-applied direct put command (begin txn)",
             "cleanup already-applied direct put command (commit txn)",

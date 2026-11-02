@@ -2095,6 +2095,7 @@ mod reclaim_trace;
 mod shard_scavenger;
 mod stream_commands;
 mod stream_put;
+mod stream_release_ownership;
 mod trace;
 mod unix_clients;
 

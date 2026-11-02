@@ -4396,6 +4396,7 @@ fn test_metadata_command_recovery_chain(
         source
             .payload()
             .abandoned_recovery_follow_up()
+            .expect("valid terminal operation")
             .expect("Direct PUT requires generation cleanup"),
     );
     let unrelated = test_metadata_command(pg_id, 4);

@@ -1966,6 +1966,15 @@ impl super::StorageCluster {
         execution_route: MetadataCommandExecutionRoute<'_>,
         deadline: Instant,
     ) -> Result<(), MetadataCommandApplyFailure> {
+        command
+            .payload()
+            .validate_terminal_generation_owner()
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
+                source: source.into(),
+            })?;
         execution_route
             .require_command(command.id().pg_id(), command)
             .map_err(|source| MetadataCommandApplyFailure {
