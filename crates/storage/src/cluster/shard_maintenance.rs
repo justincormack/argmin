@@ -4346,6 +4346,27 @@ impl StorageCluster {
         generation_id: GenerationId,
         shard_keys: impl IntoIterator<Item = ShardKey>,
     ) {
+        let _ = self.try_delete_payload_shard_keys_at_epoch(
+            operation_epoch,
+            data_pg_id,
+            ec,
+            okh,
+            generation_id,
+            shard_keys,
+        );
+    }
+
+    // Attempt every participant, but never turn a partial cleanup into a
+    // completion acknowledgement. All effects are idempotent for retry.
+    fn try_delete_payload_shard_keys_at_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: u32,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) -> Result<(), StoreError> {
         let shard_keys: Vec<ShardKey> = shard_keys.into_iter().collect();
         let data_pg = match self.validated_data_pg(PgId::new(data_pg_id)) {
             Ok(data_pg) => data_pg,
@@ -4354,7 +4375,7 @@ impl StorageCluster {
                     "validate placed payload cleanup data PG",
                     &error,
                 );
-                return;
+                return Err(error);
             }
         };
         let cleanup = match self.local_map.open_retained_payload_cleanup(
@@ -4371,16 +4392,19 @@ impl StorageCluster {
                     "validate retained payload cleanup scope",
                     &error,
                 );
-                return;
+                return Err(error);
             }
         };
+        let mut first_error = None;
         for entry in cleanup.entries() {
             if let Err(error) = self.maybe_run_before_placed_payload_shard_delete_hook(entry.key()) {
                 self.emit_best_effort_payload_cleanup_error("delete placed payload shard", &error);
+                first_error.get_or_insert(error);
                 continue;
             }
             if let Err(error) = entry.delete_file() {
                 self.emit_best_effort_payload_cleanup_error("delete placed payload shard", &error);
+                first_error.get_or_insert(error);
             }
         }
         for entry in cleanup.entries() {
@@ -4388,12 +4412,15 @@ impl StorageCluster {
                 self.maybe_run_before_metadata_primary_payload_ack_delete_hook(entry.key())
             {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+                first_error.get_or_insert(error);
                 continue;
             }
             if let Err(error) = entry.delete_acknowledgement() {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+                first_error.get_or_insert(error);
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn delete_placed_payload_shard_keys(

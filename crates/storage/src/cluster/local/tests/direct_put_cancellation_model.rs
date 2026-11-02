@@ -169,9 +169,21 @@ fn replay(state: &State) -> Result<(), String> {
                 let payload = payloads[other].take().unwrap();
                 match cancellation {
                     Cancellation::Drop => drop(payload),
-                    Cancellation::Discard => routes[other]
-                        .discard_direct_object_payload(payload)
-                        .map_err(diagnostic)?,
+                    Cancellation::Discard => {
+                        let result = routes[other].discard_direct_object_payload(payload);
+                        if awaiting_recovery {
+                            let error = result
+                                .err()
+                                .ok_or("discard hid failed reservation release")?;
+                            equal(
+                                error.diagnostic_cause_label(),
+                                "metadata_command_awaiting_authorized_recovery",
+                                "discard reports blocked release",
+                            )?;
+                        } else {
+                            result.map_err(diagnostic)?;
+                        }
+                    }
                 }
                 ownership[other] = if awaiting_recovery {
                     Ownership::CancelledPendingRelease

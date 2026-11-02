@@ -6033,3 +6033,77 @@ Nextest run passed all 9,281 tests (one slow, six skipped) in 252.108s; the Raft
 heartbeat write-amplification test completed in 112.206s. Strict all-target/
 all-feature Clippy, storage boundary checks, formatting and `git diff --check`
 passed. The six original cleanup regressions remain ignored and unresolved.
+
+## Direct PUT Request-Local Cleanup Completion — 2026-11-02
+
+The next boundary review found that `DirectPutPayloadWrite::cleanup_on_owner`
+discarded both physical-deletion and generation-release failures. Explicit
+`discard_direct_object_payload` consequently returned success even when cleanup
+had not completed. It could also release the generation after a file or
+acknowledgement deletion failed.
+
+The shared retained-subset deletion now attempts every file and acknowledgement
+but returns its first error. Existing best-effort callers retain their behaviour;
+payload-handle cleanup uses the result and releases its generation only after all
+physical participants acknowledge deletion. A release failure is returned too.
+Neither a successful file deletion nor an empty acknowledgement table alone is
+completion evidence.
+
+`DirectPutPayloadWrite::into_cleanup` consumes publication authority and returns
+the opaque, non-cloneable `DirectPutPayloadCleanup`. Its `finish(&mut self)` can
+retry the exact owner-bound cleanup after either physical or release failures.
+There is no operation to recover a publishable payload from this handle. Success
+disarms it, so repeated completion and Drop perform no further effects. The
+existing consuming discard convenience makes one attempt, reports its failure,
+and keeps no retry custody; Drop of an armed write/cleanup handle remains a
+best-effort attempt. This does not add a retry loop holding admission indefinitely.
+
+The physical-failure regression starts from real encrypted shard writes and
+registers their exact acknowledgement batch, representing pre-terminal staging.
+Independent file/acknowledgement faults prove that other participants are still
+attempted, the failed effect remains, and every replica retains the generation
+reservation. After fault removal, the same cleanup handle removes the remaining
+state and publishes exactly one generation release. Effect counters pin no work
+on repeated successful finish or Drop, and exactly one physical attempt when
+consuming discard returns a failure. The recovery regression retains a cleanup
+handle while another request's detached pending command blocks release, then
+retries after the production maintenance pass recovers that command. Both request
+orderings preserve the accepted object's payload and release only the cancelled
+request's generation. Existing cancellation traces now require the exact blocked-
+release diagnostic rather than treating discard as successful.
+
+This is **request-local completion and retry custody**, not durable ownership.
+Losing the frontend handle after a failed physical cleanup can still strand a
+reservation; no durable retry record is introduced here. The six original
+regressions still require owner/window integration and finite physical authority.
+The new recovery test explicitly retries a retained handle and does not replace
+the ignored test requiring maintenance to discover lost cleanup by itself. Other
+pre-terminal best-effort command cleanup paths also remain for the coordinated
+owner protocol; this slice does not claim all generation releases are now gated
+by physical completion. No new fsync, schema, wire format or dependency is added.
+
+Review correction: consuming discard initially returned the crossed-route
+`InvalidRequest` before checking owner-side cleanup's result. It now gives the
+cleanup error precedence, still disarming before returning so Drop cannot hide
+a second attempt. Successful cleanup of a crossed subject continues to return
+the route mismatch. New regressions cover crossed keys/buckets with independent
+file and acknowledgement failures, plus a crossed-key generation release blocked
+by an unrelated detached recovery flight. They assert the exact cleanup diagnostic,
+one file/acknowledgement attempt per shard, and retained generation ownership.
+Both new tests failed before the correction with `invalid_request` instead of
+`store_io_failure` or `metadata_command_awaiting_authorized_recovery`.
+
+Validation: 260 focused Direct PUT/cleanup/reclaim/retained-route tests passed.
+The first physical-failure canary used the wrong expected diagnostic label
+(`store_io`); it was corrected to the existing `store_io_failure` classification.
+The pre-review full Nextest run passed all 9,283 tests (one slow, six skipped) in
+239.531s. The Raft heartbeat write-amplification test passed in 109.037s.
+Strict all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed. The six original ignored regressions remain open.
+
+Re-review validation: all nine focused discard/cleanup/retained-route tests
+passed after reproducing both crossed-route failures. The full Nextest run
+passed all 9,285 tests (two slow, six skipped) in 238.647s. The Raft heartbeat
+write-amplification test passed in 110.994s and the oversized version-listing
+test in 60.508s. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed.

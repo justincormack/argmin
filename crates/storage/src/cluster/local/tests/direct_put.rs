@@ -19,6 +19,9 @@ mod allocator_install;
 #[path = "direct_put_scope.rs"]
 mod scope;
 
+#[path = "direct_put_cleanup_retry.rs"]
+mod cleanup_retry;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,

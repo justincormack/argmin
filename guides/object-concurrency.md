@@ -112,6 +112,20 @@ prefix must not be deleted before discovering a malformed later member. This
 subject check does not establish reference absence, expiry, cross-node atomicity
 or durable retry ownership; those remain separate cleanup obligations.
 
+A Direct PUT payload handle can be consumed into `DirectPutPayloadCleanup` to
+give up publication permanently while retaining request-local retry custody.
+`finish()` attempts every captured file and acknowledgement, preserves the first
+error, and releases the generation reservation only after all physical deletions
+acknowledge success. A failed generation release also leaves the handle armed.
+Successful completion disarms it; repeated `finish()` and Drop then do no work.
+The consuming `discard_direct_object_payload` convenience performs one attempt
+and returns failures, but retains no retry handle. Owner-side cleanup failures
+take precedence over a crossed-route mismatch; a mismatch is returned only when
+cleanup succeeds. Drop is still best effort.
+Neither API provides crash-safe discovery or fences late delegated writes. The
+durable owner/window work remains necessary, including when a failed cleanup
+leaves a reservation but the frontend loses its handle.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

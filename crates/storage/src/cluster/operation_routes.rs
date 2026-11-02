@@ -1045,7 +1045,31 @@ impl ActiveObjectMetadataMutationRoute<'_> {
     }
 }
 
-impl DirectPutPayloadWrite<'_> {
+/// Request-local retry custody for a discarded Direct PUT payload. Converting
+/// the write handle to this type permanently removes its publication interface.
+/// This is not a durable cleanup handoff: dropping it makes one best-effort
+/// attempt, and process loss still requires the durable-owner protocol.
+#[must_use = "call finish to observe cleanup completion"]
+pub struct DirectPutPayloadCleanup<'admission> {
+    payload: DirectPutPayloadWrite<'admission>,
+}
+
+impl DirectPutPayloadCleanup<'_> {
+    /// Retry file/acknowledgement deletion, then release the generation. Errors
+    /// leave this handle armed; success makes subsequent calls no-ops.
+    pub fn finish(&mut self) -> Result<(), crate::DirectPutFailure> {
+        self.payload
+            .cleanup_on_owner()
+            .map_err(crate::DirectPutFailure::from_object_pg_action)
+    }
+}
+
+impl<'admission> DirectPutPayloadWrite<'admission> {
+    /// Give up publication and retain request-local custody for cleanup retries.
+    pub fn into_cleanup(self) -> DirectPutPayloadCleanup<'admission> {
+        DirectPutPayloadCleanup { payload: self }
+    }
+
     fn issued_by(&self, admission: &StorageClusterRouteAdmission) -> bool {
         std::ptr::eq(self.owner, admission)
     }
@@ -1054,25 +1078,27 @@ impl DirectPutPayloadWrite<'_> {
         self.armed.set(false);
     }
 
-    fn cleanup_on_owner(&self) {
-        if !self.armed.replace(false) {
-            return;
+    fn cleanup_on_owner(&self) -> Result<(), ObjectPgActionError> {
+        if !self.armed.get() {
+            return Ok(());
         }
         self.owner
             .cluster
-            .delete_direct_put_segment_payload_shards_at_epoch(
+            .try_delete_payload_shard_keys_at_epoch(
                 self.placement_cluster_epoch,
                 self.written.data_pg_id,
                 self.written.ec,
                 &self.segment_okh,
                 self.segment_vid,
-                &self.written.written_shards,
-            );
-        let _ = self.owner.cluster.release_object_generation_reservation(
+                self.written.written_shards.iter().map(|written| written.key.clone()),
+            )?;
+        self.owner.cluster.release_object_generation_reservation(
             &self.bucket,
             &self.key,
             &self.generation_reservation_id,
-        );
+        )?;
+        self.disarm();
+        Ok(())
     }
 }
 
@@ -1105,7 +1131,7 @@ impl Drop for DirectPutGenerationReservation<'_> {
 
 impl Drop for DirectPutPayloadWrite<'_> {
     fn drop(&mut self) {
-        self.cleanup_on_owner();
+        let _ = self.cleanup_on_owner();
     }
 }
 
@@ -2397,7 +2423,14 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         let subject_matches = payload.issued_by(self.admission)
             && payload.bucket == self.bucket
             && payload.key == self.key;
-        payload.cleanup_on_owner();
+        let result = payload.cleanup_on_owner();
+        // This consuming convenience operation attempts cleanup exactly once.
+        // A caller needing retry custody must use into_cleanup instead. Do not
+        // hide a second RPC attempt in Drop after returning an error.
+        payload.disarm();
+        // Owner-side cleanup failure takes precedence: a subject mismatch must
+        // not mask incomplete physical deletion or generation release.
+        result.map_err(crate::DirectPutFailure::from_object_pg_action)?;
         if !subject_matches {
             return Err(crate::DirectPutFailure::from_object_pg_action(
                 ObjectPgActionError::InvalidRequest {

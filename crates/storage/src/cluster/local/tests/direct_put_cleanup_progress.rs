@@ -1,8 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Discovery regression: production cleanup must supply its own progress.
-//! No test-scheduled reservation release, background threads, or sleeps.
+//! Lost-handle discovery regressions require production cleanup to supply its
+//! own progress, without test-scheduled release, background threads or sleeps.
+//! The separate retained-handle control explicitly retries request-local cleanup;
+//! it does not satisfy the lost-handle discovery requirement.
 
 use super::*;
 
@@ -10,6 +12,7 @@ use super::*;
 enum Cancellation {
     Drop,
     Discard,
+    RetainedCleanup,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -152,12 +155,39 @@ fn cancellation_progress(
     ownership[owner] = Ownership::Pending;
     fixture.observe(ownership, &identities, Some(&command))?;
 
-    let cancel = |payload| -> Result<(), String> {
+    let mut retained_cleanup = None;
+    let cancel = |payload| -> Result<_, String> {
+        let mut cleanup_to_retry = None;
         match cancellation {
             Cancellation::Drop => drop(payload),
-            Cancellation::Discard => routes[other]
-                .discard_direct_object_payload(payload)
-                .map_err(diagnostic)?,
+            Cancellation::Discard => {
+                let result = routes[other].discard_direct_object_payload(payload);
+                if matches!(when, CancelWhen::BeforeRecovery) {
+                    let error = result
+                        .err()
+                        .ok_or("discard hid failed reservation release")?;
+                    equal(
+                        error.diagnostic_cause_label(),
+                        "metadata_command_awaiting_authorized_recovery",
+                        "discard reports blocked release",
+                    )?;
+                } else {
+                    result.map_err(diagnostic)?;
+                }
+            }
+            Cancellation::RetainedCleanup => {
+                let mut cleanup = payload.into_cleanup();
+                let error = cleanup
+                    .finish()
+                    .err()
+                    .ok_or("cleanup hid blocked release")?;
+                equal(
+                    error.diagnostic_cause_label(),
+                    "metadata_command_awaiting_authorized_recovery",
+                    "retained cleanup reports blocked release",
+                )?;
+                cleanup_to_retry = Some(cleanup);
+            }
         }
         // The production bucket-write wrapper releases caller authority after
         // its action returns, even if best-effort payload-handle cleanup failed.
@@ -165,10 +195,10 @@ fn cancellation_progress(
             .cluster
             .release_bucket_write_reservation_proof(&prepared[other].bucket_write_reservation)
             .map_err(diagnostic)?;
-        Ok(())
+        Ok(cleanup_to_retry)
     };
     if matches!(when, CancelWhen::BeforeRecovery) {
-        cancel(payloads[other].take().unwrap())?;
+        retained_cleanup = cancel(payloads[other].take().unwrap())?;
         ownership[other] = Ownership::CancelledPendingRelease;
         fixture.observe(ownership, &identities, Some(&command))?;
     }
@@ -183,7 +213,7 @@ fn cancellation_progress(
     ownership[owner] = Ownership::Visible;
     if matches!(when, CancelWhen::AfterRecovery) {
         fixture.observe(ownership, &identities, None)?;
-        cancel(payloads[other].take().unwrap())?;
+        retained_cleanup = cancel(payloads[other].take().unwrap())?;
     }
     for round in 0..3 {
         equal(
@@ -191,6 +221,18 @@ fn cancellation_progress(
             0,
             &format!("healthy maintenance round {round} has no pending commands"),
         )?;
+    }
+    if let Some(mut cleanup) = retained_cleanup {
+        cleanup.finish().map_err(diagnostic)?;
+        cleanup.finish().map_err(diagnostic)?;
+        drop(cleanup);
+        assert_single_generation_release(
+            &fixture.map,
+            0,
+            &fixture.bucket,
+            &fixture.key,
+            &fixture.reservations[other],
+        );
     }
     equal(
         runtime.test_metadata_command_recovery_flight_count(),
@@ -202,6 +244,97 @@ fn cancellation_progress(
     // expectation. Do not repair the state with a manual release here.
     ownership[other] = Ownership::Released;
     fixture.observe(ownership, &identities, None)
+}
+
+#[test]
+fn direct_put_cleanup_handle_retries_generation_release_after_recovery() {
+    for owner in 0..2 {
+        cancellation_progress(
+            owner,
+            Cancellation::RetainedCleanup,
+            CancelWhen::BeforeRecovery,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn crossed_route_discard_reports_blocked_generation_release_without_drop_retry() {
+    let fixture = Fixture::new();
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_put_object_route(&fixture.bucket, &fixture.key)
+        .unwrap();
+    let mut payloads = Vec::new();
+    let mut identities = [None, None];
+    for (actor, identity) in identities.iter_mut().enumerate() {
+        let generation = route
+            .test_reserve_generation_with_id(&fixture.reservations[actor])
+            .unwrap();
+        let prepared = fixture.prepared(actor, generation.generation_id());
+        let encrypted = &fixture.encrypted[actor];
+        let encryption_reservation = generation
+            .bind_encryption(&encrypted.encryption)
+            .bind_standard_segment(encrypted.logical_size)
+            .bind_committed_encryption(&prepared.encryption)
+            .unwrap();
+        let payload = route
+            .write_direct_object_segment_payload(encryption_reservation, &encrypted.storage_bytes)
+            .unwrap();
+        fixture.record_payload_integrity(actor, &payload).unwrap();
+        *identity = Some(direct_payload_test_identity(&payload));
+        payloads.push(payload);
+    }
+    let cancelled = payloads.pop().unwrap();
+    let command = fixture
+        .leave_pending_after_inspection_failure(0, &route, payloads.pop().unwrap())
+        .unwrap();
+    let runtime = fixture.map.runtime_state();
+    let MetadataCommandRecoveryAdmission::Leader(guard) =
+        runtime.join_metadata_command_recovery(PgId::new(0), &command)
+    else {
+        panic!("fixture must acquire recovery leadership");
+    };
+    guard.relinquish_for_authorized_recovery();
+    let crossed_key = crate::tests::object_key("crossed-discard-key");
+    let crossed_route = admission
+        .active_put_object_route(&fixture.bucket, &crossed_key)
+        .unwrap();
+    let file_calls = Arc::new(AtomicUsize::new(0));
+    let ack_calls = Arc::new(AtomicUsize::new(0));
+    let file_observer = Arc::clone(&file_calls);
+    let ack_observer = Arc::clone(&ack_calls);
+    let _file_hook = fixture
+        .cluster
+        .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |_| {
+            file_observer.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let _ack_hook = fixture
+        .cluster
+        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(move |_| {
+            ack_observer.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let ec = cancelled.written.ec;
+    let error = crossed_route
+        .discard_direct_object_payload(cancelled)
+        .unwrap_err();
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "metadata_command_awaiting_authorized_recovery"
+    );
+    assert_eq!(file_calls.load(Ordering::SeqCst), usize::from(ec.k + ec.m));
+    assert_eq!(ack_calls.load(Ordering::SeqCst), usize::from(ec.k + ec.m));
+    fixture
+        .observe(
+            [Ownership::Pending, Ownership::CancelledPendingRelease],
+            &identities,
+            Some(&command),
+        )
+        .unwrap();
 }
 
 fn assert_progress(when: CancelWhen) {
