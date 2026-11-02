@@ -5083,17 +5083,20 @@ impl StorageCluster {
         // repeatedly publish allocator commands that obstruct each other's commits.
         // Snapshots, authorization, and route authority are still revalidated below.
         let mut reserved_version_id = None;
+        // Fresh preparation has already registered its validated witness and
+        // carries the evaluated snapshot required for installation. An observed
+        // pending command instead restores acknowledgements under command-owned
+        // authority; restoration failure must not run caller-owned cleanup.
+        enum DirectPutPreparation<'attempt> {
+            Fresh(SnapshotSensitiveEvaluatedAttempt<'attempt>),
+            MatchingPending,
+        }
         let (command, new_pending_command) = 'direct_put_metadata: loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
             );
-            let (
-                mut command,
-                new_pending_command,
-                payload_acks_registered,
-                mut evaluated_attempt,
-            ) = loop {
+            let (mut command, mut preparation) = loop {
                 require_direct_put_route_before_command_ownership!();
                 check_direct_put_work_before_command_ownership!(
                     "direct PUT metadata pending retry budget exhausted"
@@ -5364,7 +5367,7 @@ impl StorageCluster {
                             );
                         }
                     };
-                    break (command, true, true, Some(evaluated_attempt));
+                    break (command, DirectPutPreparation::Fresh(evaluated_attempt));
                 };
 
                 let matching_direct_put = match command.payload() {
@@ -5572,7 +5575,7 @@ impl StorageCluster {
                     continue;
                 }
                 if is_matching_direct_put {
-                    break (command, false, false, None);
+                    break (command, DirectPutPreparation::MatchingPending);
                 }
                 if is_same_object_direct_put {
                     match self
@@ -5659,33 +5662,12 @@ impl StorageCluster {
                 );
             };
 
-            if !payload_acks_registered {
-                let Some(stored_segment_size) = req.encryption.segment_stored_size(req.size) else {
-                    if new_pending_command {
-                        let release_result =
-                            self.release_metadata_command_bucket_write_reservation(&command);
-                        self.release_object_generation_reservation_best_effort(
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                    }
-                    return Err(ObjectPgActionError::Store(
-                        StoreError::PayloadShardSetMismatch {
-                            reason: "direct PUT segment has invalid stored codec geometry"
-                                .to_string(),
-                        },
-                    ));
-                };
-                let integrity_witness = match Self::build_payload_shard_integrity_witness(
+            if matches!(preparation, DirectPutPreparation::MatchingPending) {
+                let stored_segment_size = req.encryption.segment_stored_size(req.size)
+                    .ok_or_else(|| ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                        reason: "direct PUT segment has invalid stored codec geometry".to_string(),
+                    }))?;
+                let integrity_witness = Self::build_payload_shard_integrity_witness(
                     req.data_pg_id,
                     req.ec,
                     &req.segment_okh,
@@ -5693,54 +5675,10 @@ impl StorageCluster {
                     stored_segment_size,
                     req.segment_crc64,
                     &shard_batch,
-                ) {
-                    Ok(witness) => witness,
-                    Err(error) => {
-                        if new_pending_command {
-                            let release_result =
-                                self.release_metadata_command_bucket_write_reservation(&command);
-                            self.release_object_generation_reservation_best_effort(
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
-                            release_result
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                        }
-                        return Err(error);
-                    }
-                };
+                )?;
                 #[cfg(test)]
                 self.maybe_run_before_direct_put_payload_ack_registration_hook()?;
-                if let Err(error) =
-                    self.register_matching_direct_put_payload_shard_acks(&command, &integrity_witness)
-                {
-                    if new_pending_command {
-                        let release_result =
-                            self.release_metadata_command_bucket_write_reservation(&command);
-                        self.release_object_generation_reservation_best_effort(
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                    }
-                    return Err(error);
-                }
+                self.register_matching_direct_put_payload_shard_acks(&command, &integrity_witness)?;
             }
             if let Err(error) = self.validate_registered_payload_shard_acks(
                 req.data_pg_id,
@@ -5749,26 +5687,12 @@ impl StorageCluster {
                 req.segment_vid,
                 &shard_batch,
             ) {
-                if new_pending_command {
-                    let release_result =
-                        self.release_metadata_command_bucket_write_reservation(&command);
-                    self.release_object_generation_reservation_best_effort(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
-                    release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                if matches!(preparation, DirectPutPreparation::Fresh(_)) {
+                    cleanup_direct_put_attempt_before_command_ownership!();
                 }
                 return Err(error);
             }
-            if new_pending_command {
+            if let DirectPutPreparation::Fresh(evaluated_attempt) = &mut preparation {
                 check_direct_put_work_before_command_ownership!(
                     "direct PUT command install retry budget exhausted"
                 );
@@ -5785,9 +5709,7 @@ impl StorageCluster {
                             Some(effect_fence),
                             &mut work_budget,
                             &mut install_may_have_applied,
-                            evaluated_attempt.as_mut().expect(
-                                "new direct PUT command requires an evaluated snapshot attempt",
-                            ),
+                            evaluated_attempt,
                         ) {
                         Ok(install) => break install,
                         Err(failure) => {
@@ -5918,7 +5840,7 @@ impl StorageCluster {
                     break (command, false);
                 }
             }
-            break (command, new_pending_command);
+            break (command, matches!(preparation, DirectPutPreparation::Fresh(_)));
         };
 
         let mut command = command;

@@ -10,26 +10,46 @@ enum Fault {
     Acknowledgement,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RejectionStage {
+    Condition,
+    ProjectedCondition,
+    RegisteredPayload,
+}
+
 #[test]
 fn admitted_direct_put_rejection_cleans_once_without_drop_release() {
-    check_rejected_commit(Fault::None, false);
+    check_rejected_commit(Fault::None, RejectionStage::Condition);
 }
 
 #[test]
 fn admitted_direct_put_rejection_preserves_generation_after_physical_cleanup_failure() {
     for fault in [Fault::File, Fault::Acknowledgement] {
-        check_rejected_commit(fault, false);
+        check_rejected_commit(fault, RejectionStage::Condition);
     }
 }
 
 #[test]
 fn admitted_direct_put_projected_rejection_cleans_payload_before_budgeted_generation_release() {
     for fault in [Fault::None, Fault::File, Fault::Acknowledgement] {
-        check_rejected_commit(fault, true);
+        check_rejected_commit(fault, RejectionStage::ProjectedCondition);
     }
 }
 
-fn check_rejected_commit(fault: Fault, with_contender: bool) {
+#[test]
+fn fresh_direct_put_ack_validation_failure_uses_prepublication_cleanup() {
+    for fault in [Fault::None, Fault::File, Fault::Acknowledgement] {
+        check_rejected_commit(fault, RejectionStage::RegisteredPayload);
+    }
+}
+
+fn check_rejected_commit(fault: Fault, stage: RejectionStage) {
+    let with_contender = stage == RejectionStage::ProjectedCondition;
+    let failed_cleanup_index = if stage == RejectionStage::RegisteredPayload {
+        1
+    } else {
+        0
+    };
     let fixture = Fixture::new();
     let handle =
         crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
@@ -52,10 +72,12 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
         .unwrap();
     let identity = direct_payload_test_identity(&payload);
     let shards = payload.written.written_shards.clone();
-    fixture
-        .cluster
-        .test_register_payload_shard_acks(identity.data_pg_id, &shards)
-        .unwrap();
+    if stage != RejectionStage::RegisteredPayload {
+        fixture
+            .cluster
+            .test_register_payload_shard_acks(identity.data_pg_id, &shards)
+            .unwrap();
+    }
     assert_direct_payload_shards_exist(&fixture.cluster, identity);
     let ack_node = fixture
         .map
@@ -66,12 +88,40 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
         .unwrap()
         .storage_node();
     for shard in &shards {
-        ack_node
+        let ack = ack_node
             .get_pg(identity.data_pg_id)
             .unwrap()
-            .validate_written_shard_ack(&shard.key, shard.ack)
-            .unwrap();
+            .validate_written_shard_ack(&shard.key, shard.ack);
+        if stage == RejectionStage::RegisteredPayload {
+            assert!(matches!(ack, Err(StoreError::NotFound)), "{ack:?}");
+        } else {
+            ack.unwrap();
+        }
     }
+    if stage == RejectionStage::RegisteredPayload {
+        // Keep the valid write acknowledgements, but lose a physical file before
+        // commit. Witness construction and registration succeed; the later
+        // registered-payload read must reject it before pending installation.
+        let path = fixture
+            .cluster
+            .test_payload_shard_file_path(
+                identity.data_pg_id,
+                identity.ec,
+                &identity.segment_okh,
+                identity.segment_vid,
+                0,
+            )
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+    let registrations = Arc::new(AtomicUsize::new(0));
+    let observed_registrations = Arc::clone(&registrations);
+    let _registration_hook = fixture
+        .cluster
+        .test_install_before_direct_put_payload_ack_registration_hook(Arc::new(move || {
+            observed_registrations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
     let contender = if with_contender {
         let generation = route
             .test_reserve_generation_with_id(&fixture.reservations[1])
@@ -103,7 +153,7 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
         .cluster
         .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |key| {
             file_observer.fetch_add(1, Ordering::SeqCst);
-            if fault == Fault::File && key.shard_index().get() == 0 {
+            if fault == Fault::File && key.shard_index().get() == failed_cleanup_index {
                 return Err(StoreError::Io {
                     context: "prepublication cleanup file fault",
                     source: std::io::Error::other("injected"),
@@ -115,7 +165,7 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
         .cluster
         .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(move |key| {
             ack_observer.fetch_add(1, Ordering::SeqCst);
-            if fault == Fault::Acknowledgement && key.shard_index().get() == 0 {
+            if fault == Fault::Acknowledgement && key.shard_index().get() == failed_cleanup_index {
                 return Err(StoreError::Io {
                     context: "prepublication cleanup acknowledgement fault",
                     source: std::io::Error::other("injected"),
@@ -125,13 +175,31 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
         }));
     let result = route.commit_direct_object(payload, &prepared, |snapshot| {
         assert_eq!(snapshot.existing_etag.is_some(), with_contender);
-        Err::<(), _>("condition rejected")
+        if stage == RejectionStage::RegisteredPayload {
+            Ok(())
+        } else {
+            Err("condition rejected")
+        }
     });
-    if fault == Fault::None {
-        assert!(
-            matches!(result, Ok(Err("condition rejected"))),
-            "{result:?}"
+    if stage == RejectionStage::RegisteredPayload {
+        assert_eq!(
+            registrations.load(Ordering::SeqCst),
+            1,
+            "the fresh path must reach acknowledgement registration"
         );
+    }
+    if fault == Fault::None {
+        if stage == RejectionStage::RegisteredPayload {
+            assert_eq!(
+                result.unwrap_err().diagnostic_cause_label(),
+                "store_not_found"
+            );
+        } else {
+            assert!(
+                matches!(result, Ok(Err("condition rejected"))),
+                "{result:?}"
+            );
+        }
         assert_single_generation_release(
             &fixture.map,
             0,
@@ -179,13 +247,13 @@ fn check_rejected_commit(fault: Fault, with_contender: bool) {
                     index
                 )
                 .unwrap(),
-            fault == Fault::File && index == 0
+            fault == Fault::File && index == failed_cleanup_index
         );
         let ack = ack_node
             .get_pg(identity.data_pg_id)
             .unwrap()
             .validate_written_shard_ack(&shard.key, shard.ack);
-        if fault == Fault::Acknowledgement && index == 0 {
+        if fault == Fault::Acknowledgement && index == failed_cleanup_index {
             ack.unwrap();
         } else {
             assert!(matches!(ack, Err(StoreError::NotFound)), "{ack:?}");

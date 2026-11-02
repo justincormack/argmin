@@ -6161,3 +6161,45 @@ contract. The full Nextest run passed all 9,288 tests (two slow, six skipped) in
 239.068s. The Raft heartbeat write-amplification and oversized version-listing
 tests passed in 110.984s and 61.561s respectively. Strict all-target/all-feature
 Clippy, storage boundary checks, formatting and `git diff --check` passed.
+
+## Direct PUT Preparation Ownership — 2026-11-02
+
+Direct PUT command preparation now has two explicit states: fresh preparation,
+which carries the evaluated snapshot required for pending installation, and an
+exact matching pending command, which restores acknowledgements under existing
+command ownership. This replaces the independent fresh-command and registered-ack
+booleans plus optional snapshot proof. Fresh-only cleanup branches inside the
+pending-only restoration path were unreachable and are removed. The later
+new-command/apply-mode distinction remains; this is not a rewrite of accepted
+publication or recovery.
+
+Fresh registered-payload validation previously released the generation before
+best-effort physical cleanup and left the admitted handle armed. It now uses the
+common pre-publication completion path: attempt every captured file/acknowledgement,
+propagate cleanup failure, release the generation only after physical completion,
+and disarm after success. Matching-pending restoration and validation errors do
+not use this caller-owned cleanup.
+
+The fresh-path regression starts with real encrypted shards and no registered
+acknowledgements, removes one file, and proves acknowledgement registration is
+reached before the physical validation rejection. Independent cleanup faults on a
+different shard cover file failure and acknowledgement failure. Successful cleanup
+requires one physical pass and one generation release, while failure requires the
+exact remaining effect and retained generation on every replica. The pending-path
+regression removes the exact acknowledgement batch from a matching installed
+command. An injected restoration error preserves that command, its payload and
+generation without caller cleanup; the success case restores the batch and checks
+visible publication and readback. A panic canary forbids fresh snapshot evaluation
+in either pending case.
+
+No new durability barrier, schema, wire format or dependency is introduced.
+Accepted-command abandonment/post-apply cleanup and crash-safe discovery remain
+outside this request-local slice. The durable owner/window integration, finite
+physical-write authority and all six original ignored regressions remain open.
+
+Validation: all 162 focused Direct PUT tests passed. The full Nextest run passed
+all 9,290 tests (one slow, six skipped) in 244.286s. The Raft heartbeat
+write-amplification test passed in 114.584s. Strict all-target/all-feature Clippy,
+storage boundary checks, formatting and `git diff --check` passed. An initial
+focused build caught a missing error-type import in the new test module; that
+test-only compilation error was corrected before these successful runs.

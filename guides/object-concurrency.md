@@ -138,6 +138,14 @@ existing best-effort Drop attempt; this is not a durable handoff. Accepted-comma
 abandonment and post-apply cleanup have separate ownership rules and are not
 covered by this pre-publication completion claim.
 
+Direct PUT preparation distinguishes a fresh command carrying its evaluated
+snapshot from an exact matching pending command. Only fresh preparation installs
+a command; failure of its post-registration payload validation uses the same
+caller-owned cleanup described above. Matching-pending preparation instead restores
+acknowledgements under the pending command's authority. Restoration or validation
+failure must preserve command-owned payload and generation reservations for recovery,
+not invoke caller cleanup or re-arm the consumed payload handle.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock
