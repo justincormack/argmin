@@ -178,6 +178,20 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_direct_put_pending_cleanup_retry_hook(
+        &self,
+        hook: DirectPutPendingCleanupRetryTestHook,
+    ) -> DirectPutPendingCleanupRetryTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = DIRECT_PUT_PENDING_CLEANUP_RETRY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        DirectPutPendingCleanupRetryTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_pending_object_metadata_command_recovery_transferred_hook(
         &self,
         hook: PendingObjectMetadataCommandRecoveryTransferredTestHook,

@@ -5596,6 +5596,12 @@ impl StorageCluster {
                         continue;
                     }
                     if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
+                        #[cfg(test)]
+                        request_ops::maybe_run_direct_put_pending_cleanup_retry_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                            &mut work_budget,
+                        )?;
                         retry_direct_put_pending_drain_error!(
                             error,
                             "direct PUT unrelated pending drain retry budget exhausted"

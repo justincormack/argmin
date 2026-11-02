@@ -746,6 +746,15 @@ type PendingObjectMetadataCommandDrainAttemptTestHook =
     >;
 
 #[cfg(test)]
+type DirectPutPendingCleanupRetryTestHook =
+    Arc<
+        dyn Fn(&MetadataCommandEnvelope, &mut super::RequestWorkBudget)
+                -> Result<(), ObjectPgActionError>
+            + Send
+            + Sync,
+    >;
+
+#[cfg(test)]
 type PendingObjectMetadataCommandRecoveryTransferredTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
 
@@ -973,6 +982,11 @@ static PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static DIRECT_PUT_PENDING_CLEANUP_RETRY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutPendingCleanupRetryTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static PENDING_OBJECT_METADATA_COMMAND_RECOVERY_TRANSFERRED_HOOKS: OnceLock<
     Mutex<HashMap<usize, PendingObjectMetadataCommandRecoveryTransferredTestHook>>,
 > = OnceLock::new();
@@ -1193,6 +1207,11 @@ pub(crate) struct DirectPutPendingInstallUncertaintyTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct PendingObjectMetadataCommandDrainAttemptTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutPendingCleanupRetryTestHookGuard {
     scope_id: usize,
 }
 
@@ -1494,6 +1513,18 @@ impl Drop for DirectPutPendingInstallUncertaintyTestHookGuard {
 impl Drop for PendingObjectMetadataCommandDrainAttemptTestHookGuard {
     fn drop(&mut self) {
         let hooks = PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutPendingCleanupRetryTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_PENDING_CLEANUP_RETRY_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -2118,6 +2149,24 @@ pub(super) fn maybe_run_pending_object_metadata_command_drain_attempt_hook(
     work_budget: &mut super::RequestWorkBudget,
 ) -> Result<(), ObjectPgActionError> {
     let hook = PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    match hook {
+        Some(hook) => hook(command, work_budget),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_direct_put_pending_cleanup_retry_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) -> Result<(), ObjectPgActionError> {
+    let hook = DIRECT_PUT_PENDING_CLEANUP_RETRY_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())

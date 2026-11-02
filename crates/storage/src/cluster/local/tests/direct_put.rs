@@ -5724,6 +5724,500 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
 }
 
 #[test]
+fn direct_put_version_reservation_churn_recovers_without_duplicate_versions() {
+    check_direct_put_version_reservation_churn(false);
+}
+
+#[test]
+fn direct_put_version_reservation_churn_expires_without_publication() {
+    check_direct_put_version_reservation_churn(true);
+}
+
+fn check_direct_put_version_reservation_churn(expire_snapshot: bool) {
+    let _serial = lock_metadata_command_apply_hook_test();
+    const CONFLICTS: usize = 3;
+    for initial_state in ["absent", "live", "delete-marker"] {
+        let tmp = test_util::tempdir();
+        let map = Arc::new(
+            LocalClusterMap::open(
+                tmp.path(),
+                &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+                &[0],
+                EcShape { k: 2, m: 1 },
+            )
+            .unwrap(),
+        );
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+        let bucket = crate::BucketName::try_from("version-reservation-churn".to_string()).unwrap();
+        let key = crate::ObjectKey::try_from(initial_state.to_string()).unwrap();
+        let contender_key = crate::ObjectKey::try_from("other-key".to_string()).unwrap();
+        let pg_id = PgId::new(0);
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        let prepare = |index: u8| {
+            let payload = b"version reservation churn payload";
+            let reservation_id = crate::tests::stream_session_id(format!("churn-{index}"));
+            let generation_id = cluster
+                .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                .unwrap();
+            let segment_okh = [index; 16];
+            let written = write_encrypted_direct_put_segment_payload_shards(
+                &cluster,
+                &bucket,
+                &key,
+                generation_id,
+                0,
+                &segment_okh,
+                payload,
+            )
+            .unwrap();
+            let mut request = direct_put_commit_req(
+                &cluster,
+                DirectPutCommitReqFixture {
+                    bucket: &bucket,
+                    key: &key,
+                    reservation_id,
+                    generation_id,
+                    payload,
+                    segment_okh,
+                    written: &written,
+                },
+            );
+            request.versioning = crate::BucketVersioningState::Enabled;
+            (request, written)
+        };
+        if initial_state != "absent" {
+            let (request, written) = prepare(1);
+            cluster
+                .commit_direct_put_object_from_payload_shards(
+                    &request,
+                    &written.written_shards,
+                    |_| Ok::<(), ()>(()),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        if initial_state == "delete-marker" {
+            cluster
+                .insert_current_delete_marker_if(
+                    &bucket,
+                    &key,
+                    crate::BucketVersioningState::Enabled,
+                    crate::OwnerIdentity::from_principal("owner"),
+                    |_| Ok::<(), ()>(()),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        let baseline = cluster
+            .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
+            .unwrap()
+            .versions;
+        let (request, written) = prepare(2);
+
+        // Model a competing writer installing its allocator command after this
+        // PUT reserved a version, but before it can construct its commit. The
+        // real PUT path must drain the command and repeat snapshot evaluation.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_hook = Arc::clone(&builds);
+        let hook_map = Arc::clone(&map);
+        let hook_bucket = bucket.clone();
+        let injected = Arc::new(Mutex::new(Vec::new()));
+        let injected_for_hook = Arc::clone(&injected);
+        let command_hook =
+            cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                let round = builds_for_hook.fetch_add(1, Ordering::SeqCst);
+                if round < CONFLICTS {
+                    assert!(
+                        pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket).is_none()
+                    );
+                    let command = MetadataCommandEnvelope::new(
+                        MetadataCommandId::new(
+                            ClusterEpoch::INITIAL,
+                            pg_id,
+                            hook_map.test_next_metadata_command_log_index(pg_id),
+                        ),
+                        MetadataCommandPayload::ReserveObjectVersion(
+                            crate::metadata_command::ReserveObjectVersionCommand::new(
+                                hook_bucket.clone(),
+                                contender_key.clone(),
+                                crate::VersionId::from_u64(round as u64 + 1),
+                            ),
+                        ),
+                    );
+                    force_insert_pending_metadata_command_for_test(
+                        &hook_map,
+                        pg_id,
+                        &hook_bucket,
+                        &command,
+                    );
+                    injected_for_hook.lock().unwrap().push(command);
+                }
+                Ok(())
+            }));
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let snapshots_for_hook = Arc::clone(&snapshots);
+        let snapshot_hook =
+            cluster.test_install_after_direct_put_snapshot_loaded_hook(Arc::new(move || {
+                let round = snapshots_for_hook.fetch_add(1, Ordering::SeqCst);
+                // Expire only after all injected allocator conflicts have drained;
+                // this exercises the observed snapshot_reinspection_conflict exit.
+                expire_snapshot && round == CONFLICTS
+            }));
+        let actions = AtomicUsize::new(0);
+        let result = cluster.commit_direct_put_object_from_payload_shards(
+            &request,
+            &written.written_shards,
+            |_| {
+                actions.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        );
+        drop(snapshot_hook);
+        drop(command_hook);
+        assert_eq!(snapshots.load(Ordering::SeqCst), CONFLICTS + 1);
+        assert_eq!(injected.lock().unwrap().len(), CONFLICTS);
+        let versions = cluster
+            .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
+            .unwrap()
+            .versions;
+        if expire_snapshot {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                crate::ObjectPgActionError::SnapshotReinspectionConflict
+            ));
+            assert_eq!(
+                crate::DirectPutFailure::from_object_pg_action(error).kind(),
+                crate::DirectPutFailureKind::SnapshotReinspectionConflict
+            );
+            assert_eq!(builds.load(Ordering::SeqCst), CONFLICTS);
+            assert_eq!(actions.load(Ordering::SeqCst), CONFLICTS);
+            assert_eq!(
+                versions, baseline,
+                "failed PUT changed {initial_state} history"
+            );
+            assert_direct_payload_staging_cleaned(
+                &map,
+                &cluster,
+                &bucket,
+                &key,
+                &request.generation_reservation_id,
+                DirectPayloadTestIdentity {
+                    data_pg_id: written.data_pg_id,
+                    ec: written.ec,
+                    segment_okh: request.segment_okh,
+                    segment_vid: request.generation_id,
+                },
+            );
+        } else {
+            let outcome = result.unwrap().unwrap();
+            assert_eq!(builds.load(Ordering::SeqCst), CONFLICTS + 1);
+            assert_eq!(actions.load(Ordering::SeqCst), CONFLICTS + 1);
+            assert_eq!(versions.len(), baseline.len() + 1);
+            let committed = versions
+                .iter()
+                .find(|stored| stored.version_id() == outcome.version_id && stored.key() == &key)
+                .unwrap();
+            assert_eq!(
+                committed.as_live().unwrap().generation_id,
+                request.generation_id
+            );
+            for original in &baseline {
+                let mut retained = cluster
+                    .test_get_object_version(&bucket, &key, original.version_id())
+                    .unwrap();
+                if initial_state == "live" {
+                    let crate::StoredObject::Live(live) = &mut retained else {
+                        panic!("lost live version")
+                    };
+                    assert!(live.became_noncurrent_at.is_some());
+                    live.became_noncurrent_at = original.became_noncurrent_at();
+                }
+                assert_eq!(retained, *original);
+            }
+        }
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        assert_clean_metadata_command_stream(&map, &[0]);
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+}
+
+#[test]
+fn published_direct_put_cleanup_allows_two_other_keys_after_recovery() {
+    check_published_direct_put_cleanup_with_two_contenders(false);
+}
+
+#[test]
+fn published_direct_put_cleanup_expires_two_other_keys_without_publication() {
+    check_published_direct_put_cleanup_with_two_contenders(true);
+}
+
+fn check_published_direct_put_cleanup_with_two_contenders(expire_wait: bool) {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::BucketName::try_from("three-put-cleanup".to_string()).unwrap();
+    let keys = ["absent", "live", "delete-marker"]
+        .map(|key| crate::ObjectKey::try_from(key.to_string()).unwrap());
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let prepare = |key: &crate::ObjectKey, index: u8, payload: &[u8]| {
+        let reservation_id = crate::tests::stream_session_id(format!("three-put-{index}"));
+        let generation_id = cluster
+            .reserve_put_object_generation(&bucket, key, &reservation_id)
+            .unwrap();
+        let segment_okh = [index; 16];
+        let written = write_encrypted_direct_put_segment_payload_shards(
+            &cluster,
+            &bucket,
+            key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+        let mut request = direct_put_commit_req(
+            &cluster,
+            DirectPutCommitReqFixture {
+                bucket: &bucket,
+                key,
+                reservation_id,
+                generation_id,
+                payload,
+                segment_okh,
+                written: &written,
+            },
+        );
+        request.versioning = crate::BucketVersioningState::Enabled;
+        (request, written)
+    };
+    for (index, key) in [1_u8, 2].into_iter().zip(&keys[1..]) {
+        let (request, written) = prepare(key, index, b"original destination");
+        cluster
+            .commit_direct_put_object_from_payload_shards(&request, &written.written_shards, |_| {
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+    }
+    cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &keys[2],
+            crate::BucketVersioningState::Enabled,
+            crate::OwnerIdentity::from_principal("owner"),
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let baseline = cluster
+        .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
+        .unwrap()
+        .versions;
+    assert_eq!(baseline.len(), 3);
+
+    // All payloads and write proofs exist before terminal cleanup is held up. This
+    // isolates concurrent commit/recovery from authorization and body timing.
+    let attempts: Vec<_> = [3_u8, 4, 5]
+        .into_iter()
+        .zip(&keys)
+        .map(|(index, key)| prepare(key, index, b"replacement destination"))
+        .collect();
+    let winner_key = keys[0].clone();
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            matches!(command.payload(), MetadataCommandPayload::CommitDirectPutObject(commit)
+                if commit.object.key == winner_key)
+        }),
+    );
+    let (winner_request, winner_written) = &attempts[0];
+    let winner = cluster
+        .commit_direct_put_object_from_payload_shards(
+            winner_request,
+            &winner_written.written_shards,
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let pg_id = PgId::new(0);
+    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("successful PUT must retain the injected terminal cleanup");
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &keys[0], winner.version_id)
+            .unwrap()
+            .as_live()
+            .unwrap()
+            .generation_id,
+        winner_request.generation_id,
+    );
+
+    let wait_calls = Arc::new(AtomicUsize::new(0));
+    let wait_calls_for_hook = Arc::clone(&wait_calls);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let entered_tx_for_hook = entered_tx.clone();
+    let (release_tx, release_rx): (Vec<_>, Vec<_>) =
+        (0..2).map(|_| std::sync::mpsc::channel::<()>()).unzip();
+    let release_rx: Vec<_> = release_rx.into_iter().map(Mutex::new).collect();
+    let pending_id = pending.id();
+    let wait_hook = cluster.test_install_direct_put_pending_cleanup_retry_hook(Arc::new(
+        move |command, budget| {
+            if command.id() == pending_id {
+                let index = wait_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                assert!(index < 2, "each contender should wait on the winner once");
+                entered_tx_for_hook.send(Ok(())).unwrap();
+                // Dropping the senders also releases these gates on unwinding.
+                let _ = release_rx[index].lock().unwrap().recv();
+                if expire_wait {
+                    budget.expire_for_test();
+                } else {
+                    // Time spent at the test gate is not request work.
+                    budget.reset_for_test(crate::cluster::DIRECT_PUT_METADATA_RETRY_BUDGET);
+                }
+            }
+            Ok(())
+        },
+    ));
+    let mut cleanup_hook = Some(cleanup_hook);
+    thread::scope(|scope| {
+        let workers: Vec<_> = attempts[1..]
+            .iter()
+            .map(|(request, written)| {
+                let cluster = &cluster;
+                let entered_tx = entered_tx.clone();
+                scope.spawn(move || {
+                    let result = cluster.commit_direct_put_object_from_payload_shards(
+                        request,
+                        &written.written_shards,
+                        |_| Ok::<(), ()>(()),
+                    );
+                    let detail = match &result {
+                        Err(crate::ObjectPgActionError::Store(
+                            StoreError::MetadataCommandContention { context },
+                        )) => *context,
+                        _ => "no contention context",
+                    };
+                    let _ =
+                        entered_tx.send(Err(format!("contender finished: {result:?}: {detail}")));
+                    result
+                })
+            })
+            .collect();
+        // Declare the gate inside the scope so unwinding releases workers
+        // before thread::scope joins them.
+        let release_tx = release_tx;
+        // A worker panic cannot disconnect this channel while the hook retains
+        // a sender. Bound failure detection so unwinding drops both gates.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("contender did not reach the cleanup retry hook")
+            .expect("contender returned before both cleanup retries");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("contender did not reach the cleanup retry hook")
+            .expect("contender returned before both cleanup retries");
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(pending.clone())
+        );
+        if !expire_wait {
+            drop(cleanup_hook.take());
+            assert_eq!(
+                cluster
+                    .drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id, &pending, &cluster,
+                    )
+                    .unwrap(),
+                PendingMetadataCommandOutcome::Applied
+            );
+        }
+        drop(release_tx);
+        for worker in workers {
+            let result = worker.join().unwrap();
+            if expire_wait {
+                let error = result.expect_err("contender must exhaust its cleanup retry");
+                assert_eq!(
+                    crate::DirectPutFailure::from_object_pg_action(error).kind(),
+                    crate::DirectPutFailureKind::MetadataCommandContention
+                );
+            } else {
+                result
+                    .expect("contender must resume after recovery")
+                    .unwrap();
+            }
+        }
+    });
+    drop(wait_hook);
+    if expire_wait {
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(pending.clone())
+        );
+        drop(cleanup_hook.take());
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &pending, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+    }
+    let versions = cluster
+        .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
+        .unwrap()
+        .versions;
+    let contender_versions: Vec<_> = versions
+        .iter()
+        .filter(|stored| stored.key() != &keys[0])
+        .cloned()
+        .collect();
+    if expire_wait {
+        assert_eq!(
+            contender_versions, baseline,
+            "failed PUTs changed version history"
+        );
+    } else {
+        assert_eq!(contender_versions.len(), baseline.len() + 2);
+        for original in &baseline {
+            let mut recovered = cluster
+                .test_get_object_version(&bucket, original.key(), original.version_id())
+                .unwrap();
+            if original.key() == &keys[1] {
+                let crate::StoredObject::Live(live) = &mut recovered else {
+                    panic!("original live version must remain live");
+                };
+                assert!(live.became_noncurrent_at.is_some());
+                // Successful replacement changes only the old current version's
+                // noncurrent timestamp; its content and identity stay intact.
+                live.became_noncurrent_at = original.became_noncurrent_at();
+            }
+            assert_eq!(recovered, *original);
+        }
+        for (request, _) in &attempts[1..] {
+            assert!(contender_versions
+                .iter()
+                .any(|stored| stored
+                    .as_live()
+                    .is_some_and(|live| live.generation_id == request.generation_id
+                        && live.key == request.key)));
+        }
+    }
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn direct_put_terminal_cleanup_handoff_projects_same_object_and_waits_for_unrelated() {
     struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
 
