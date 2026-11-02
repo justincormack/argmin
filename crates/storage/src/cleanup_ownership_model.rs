@@ -18,6 +18,7 @@
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
 mod confirmation;
+mod ephemeral_attempt;
 mod fanout;
 mod introduction;
 mod issuer;
@@ -86,6 +87,8 @@ struct State {
     cleanup: Cleanup,
     command: Command,
     owner_record: bool,
+    // Abstract resource owned by cleanup (e.g. the generation reservation),
+    // not evidence that a primary-local bucket liveness row remains visible.
     reservation: bool,
     file: bool,
     ack: bool,

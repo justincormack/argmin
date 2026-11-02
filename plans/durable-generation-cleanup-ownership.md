@@ -138,6 +138,10 @@ The [bucket-side replacement evidence](#bucket-side-discovery-and-checkpoint-rep
 shows why primary-local acquisition rows cannot be the sole evidence for
 cleanup ownership. Their loss can invalidate an attempt; preserving those rows
 or session continuity is not itself an implementation requirement.
+The [ephemeral-attempt model](#ephemeral-attempt-cleanup-model--2026-11-02)
+now checks cleanup after loss of attempt coordination, without restoring the
+session, while preserving accepted publication. It assumes the durable owner
+already exists; introducing that owner/window remains production work.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5464,3 +5468,56 @@ all-target/all-feature Clippy, storage boundary checks, formatting and
 The subsequent scope correction is documentation-only and leaves this store
 behavior and the evidence tests unchanged. It withdraws reservation/session
 preservation as an independent goal, not any of the physical cleanup obligations.
+
+## Ephemeral-attempt Cleanup Model — 2026-11-02
+
+[`ephemeral_attempt.rs`](../crates/storage/src/cleanup_ownership_model/ephemeral_attempt.rs)
+reuses the original physical-cleanup transitions under the finite-cutoff protocol.
+It separates loss of primary-local attempt coordination from cleanup ownership.
+The failed attempt cannot dispatch new writes, consume a response receipt, or
+install a fresh terminal command. Already-sent requests can still arrive, admitted
+IO can finish, and an accepted terminal command can converge. No transition
+restores the attempt; a still-running frontend does not change those rules.
+
+The bounded state space contains one attempt/physical location, two exact write
+deliveries, one coordination-loss event, one data-node restart and one failed
+resource release. Exhaustion visits **4,547 states and 12,260 transitions**, checks
+the inherited payload/owner safety invariants, and requires nine reachability
+witnesses: cleanup without restored liveness; cleanup after loss before dispatch,
+during transport, during admitted IO, and after staging; cleanup through release
+failure/restart; accepted publication convergence; preservation of already
+published data; and admission of an already-sent request after attempt failure.
+Loss is recorded only before cleanup starts, so completed cleanup followed by
+coordination loss cannot satisfy these witnesses.
+
+Four independent safety mutations must produce counterexamples: forgetting the
+owner, treating coordination absence as physical-authority expiry, ignoring
+in-flight exclusion, and discarding accepted publication. A fifth mutation gates
+cleanup on the lost attempt's liveness: the bounded graph still exhausts, but
+the required cleanup witness disappears while publication convergence remains
+reachable. This is a reachability check, **not a fairness or eventual-progress
+proof**.
+
+Ordered canaries additionally pin both sides of the physical boundary. A delayed
+write is admitted after the attempt fails, holds exclusion across cutoff and
+file/ack persistence, then permits cleanup; a second delayed delivery is rejected
+after cleanup and restart. A separate staged-versus-pending comparison permits
+cleanup of the failed unpublished attempt but requires the accepted command to
+converge without deleting its payload.
+
+**Limits and next integration:** this model starts with a durable owner/window
+already introduced. It does not prove first-write owner creation, replica
+settlement, replacement-primary activation, checkpoint transfer, wire fencing,
+or the separate file/ack participant protocol. Its abstract retained reservation
+is a cleanup-owned resource, not evidence that the primary-local bucket row
+survives. Durable MPU records, committed parts and fresh client retries are
+outside this model. It adds no production behavior, schema, wire format, fsync
+or reservation-preservation requirement. The next implementation remains the
+coordinated owner/window introduction and finite physical-write authority using
+existing durability barriers. All six original cleanup regressions remain open.
+
+Validation: all four focused tests passed. The full Nextest run passed all
+9,249 tests (one slow, six skipped) in 236.677s; the flagged
+`raft_production_shaped_heartbeat_write_amplification_gate` completed successfully
+in 112.136s. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed.
