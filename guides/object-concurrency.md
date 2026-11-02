@@ -67,6 +67,34 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
 
 ## Required Coordinator APIs
 
+### Local shard-file mutation exclusion
+
+Each opened PG owns a process-local, per-`ShardKey` file-mutation registry shared
+by `PgStore` and `SharedStorageNode`'s unlocked file facade. Publishers take
+shared access; deletion takes exclusive access. Hold access through final-name
+publication/unlink, its directory sync and file `WriteAck` production. Multiple
+matching publishers retain the hard-link path's existing concurrency semantics;
+unrelated keys and separate PGs use independent locks. Entries are removed when
+the last active/waiting operation exits, including errors and unwinding.
+
+The registry mutex only protects lock lookup/removal; never hold it across IO.
+Low-level locked-store callers take the PG mutex **before** the file guard.
+Unlocked file paths must not acquire a PG mutex while holding the file guard,
+and no network request may run under either lock. Captured effect fences are
+checked inside the guarded file operation, so waiting cannot turn an expired
+request into a new publication.
+
+This guard serializes local file effects, not allocation or cleanup authority.
+It does not revoke a delayed request, establish a durable owner, or protect
+payload after the file operation returns. Separate acknowledgement-row mutation
+remains under its owning PG's SQL/lock boundary; file acknowledgement production
+is not a cross-node acknowledgement-persistence lease. The durable-cleanup plan
+must still establish finite write authority, reference protection and closure
+at both physical participants before retiring an owner. Waiting for an admitted
+filesystem operation is not a promise of progress when that IO is stalled.
+
+### Coordinator helpers
+
 For object read/write/copy paths, use these helpers instead of open-coded lock
 orchestration:
 

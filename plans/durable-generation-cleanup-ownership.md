@@ -145,6 +145,9 @@ already exists; introducing that owner/window remains production work.
 The [durable unlink prerequisite](#durable-shard-unlink-before-owner-retirement--2026-11-02)
 now makes shard-file deletion acknowledge its directory barrier, including
 idempotent retries. It does not implement write exclusion or owner retirement.
+The [local file exclusion slice](#local-shard-file-publicationdeletion-exclusion--2026-11-02)
+now serializes in-flight file publication with deletion in each opened PG. It
+does not revoke delayed requests or replace the durable owner/window protocol.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5570,3 +5573,69 @@ Validation: all five focused tests passed. Full Nextest passed all 9,254 tests
 Strict all-target/all-feature Clippy, storage boundary checks, formatting and
 `git diff --check` passed. These checks do not exercise power-loss recovery or
 close the six ignored cleanup regressions.
+
+## Local Shard-file Publication/Deletion Exclusion — 2026-11-02
+
+The physical-effect handoff needs an exclusion guard which survives for the
+duration of filesystem work, independently of the client attempt. This slice
+implements the file participant's local serialization, without claiming that a
+missing session or a completed unlink authorizes future cleanup.
+
+[`shard_file_mutations.rs`](../crates/storage/src/pg_store/shard_file_mutations.rs)
+provides a private per-opened-PG registry keyed by the full physical `ShardKey`.
+`PgStore` and the node's unlocked file facade share its exact `Arc`; route-map
+views do not mint independent file locks. The raw/fenced rename and hard-link
+writers hold shared access through temporary-file work, final publication,
+directory sync and file-acknowledgement production. File-only and combined
+row/file deletion hold exclusive access through their durable unlink boundary.
+The combined store writer also retains the guard through its existing local
+ack-row insertion. Distributed ack registration remains a separate participant,
+not covered by the file guard after the file request has returned.
+
+The registry mutex is released before waiting or IO. Different keys and PGs
+remain independent, and matching publishers may overlap. Active/waiting users
+retain the same lock; the last user removes its entry while holding the registry
+mutex, avoiding both split locks and an ever-growing idle-key inventory. Error
+and unwind paths release access. Poison can be recovered because the lock owns
+exclusion only, not mutable state whose integrity depends on a panicked action.
+
+Lock order is PG mutex (when already required by a low-level store operation),
+then the per-file guard. Unlocked node file operations do not acquire a PG mutex
+or make network calls while holding it. Existing captured effect checks execute
+inside the guard, including after a wait. Registry lifetime follows the opened
+PG runtime, not a frontend session. This does not establish cross-process
+exclusion for unsupported simultaneous runtimes over the same store.
+
+### Evidence and remaining obligations
+
+Four new owner-local tests cover:
+
+- A writer paused before publication and after directory sync. A deleter's
+  actual failed `try_write` proves contention; merely starting a thread is not
+  the canary. The matrix covers locked-store and raw/fenced node rename/link
+  writers with file-only or locked-store deletion, excluding the store/store
+  case already serialized by its PG mutex. Different-key/same-PG and
+  same-key/different-PG operations still complete while the target is held.
+- Both fenced node writers waiting behind deletion, with the captured effective
+  deadline expiring during contention but before the raw authority timestamp.
+  They fail without publishing a file or leaving a temporary file; a later valid
+  operation provides the positive canary.
+- Concurrent same-key publishers and removal of their registry entry only after
+  the last participant exits.
+- Returned errors and panics in either operation, followed by successful reuse
+  and an empty idle registry.
+
+No schema, command, RPC, dependency or fsync is added. Cost is a short registry
+lookup/removal and per-key read/write lock per physical operation; no performance
+improvement is claimed. An admitted IO can still delay a deleter until it ends.
+The guard does **not** stop a not-yet-admitted request with still-valid authority
+from publishing after cleanup. Durable owners/windows, settled confirmation,
+finite authority, independent ack closure and reference-aware retirement remain
+required. All six original cleanup regressions remain open; their semantics
+have not been weakened to treat local serialization as durable revocation.
+
+Validation: all nine focused exclusion/deletion tests passed. Full Nextest
+passed all 9,258 tests (two slow, six skipped) in 255.187s. The flagged Raft
+write-amplification and oversized version-list tests completed in 110.354s and
+69.606s respectively. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed.

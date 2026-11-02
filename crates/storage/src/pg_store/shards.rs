@@ -31,6 +31,8 @@ type ShardPublicationHook = Box<dyn FnOnce()>;
 thread_local! {
     static BEFORE_SHARD_PUBLICATION: std::cell::RefCell<Option<ShardPublicationHook>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_SHARD_PUBLICATION: std::cell::RefCell<Option<ShardPublicationHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -38,6 +40,28 @@ fn run_before_shard_publication_hook() {
     if let Some(hook) = BEFORE_SHARD_PUBLICATION.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
+}
+
+#[cfg(test)]
+fn run_after_shard_publication_hook() {
+    if let Some(hook) = AFTER_SHARD_PUBLICATION.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn with_after_shard_publication_hook<T>(
+    hook: impl FnOnce() + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<ShardPublicationHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AFTER_SHARD_PUBLICATION.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(AFTER_SHARD_PUBLICATION.with(|slot| slot.replace(Some(Box::new(hook)))));
+    action()
 }
 
 /// fsync a directory to ensure namespace changes are durable.
@@ -93,6 +117,12 @@ where
 }
 
 impl PgStore {
+    pub(in crate::node_runtime) fn shard_file_mutations(
+        &self,
+    ) -> std::sync::Arc<super::ShardFileMutations> {
+        std::sync::Arc::clone(&self.shard_file_mutations)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_delete_shard_row(&self, key: &ShardKey) -> Result<(), StoreError> {
         let changed = self
@@ -197,6 +227,18 @@ impl PgStore {
     }
 
     fn delete_shard_with_sync<S>(&self, key: &ShardKey, sync: S) -> Result<(), StoreError>
+    where
+        S: FnOnce(&Path, &fs::File) -> std::io::Result<()>,
+    {
+        self.shard_file_mutations
+            .delete(key, || self.delete_shard_exclusively_with_sync(key, sync))
+    }
+
+    fn delete_shard_exclusively_with_sync<S>(
+        &self,
+        key: &ShardKey,
+        sync: S,
+    ) -> Result<(), StoreError>
     where
         S: FnOnce(&Path, &fs::File) -> std::io::Result<()>,
     {
@@ -327,7 +369,7 @@ impl PgStore {
             let _ = fs::remove_file(&tmp_path);
         })?;
         // Acceptance precedes rename; once accepted, durability may finish
-        // after the cutoff. Future owner/window exclusion must span that tail.
+        // after the cutoff. The caller's file-mutation guard spans that tail.
         fs::rename(&tmp_path, &shard_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             StoreError::Io {
@@ -344,6 +386,8 @@ impl PgStore {
             })?;
         }
 
+        #[cfg(test)]
+        run_after_shard_publication_hook();
         Ok(WriteAck {
             crc64: crc,
             stored_size,
@@ -470,6 +514,8 @@ impl PgStore {
                             source: e,
                         })?;
                     }
+                    #[cfg(test)]
+                    run_after_shard_publication_hook();
                     return Ok(expected);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -489,6 +535,8 @@ impl PgStore {
                                         source: e,
                                     })?;
                                 }
+                                #[cfg(test)]
+                                run_after_shard_publication_hook();
                                 return Ok(actual);
                             }
                             return Err(StoreError::ShardAckMismatch {
@@ -936,9 +984,11 @@ impl ShardStore for PgStore {
             key,
             data.len()
         );
-        let ack = Self::write_shard_file_durable(&self.tmp_dir, &self.shards_dir, key, data)?;
-        self.register_written_shard(key, ack)?;
-        Ok(ack)
+        self.shard_file_mutations.publish(key, || {
+            let ack = Self::write_shard_file_durable(&self.tmp_dir, &self.shards_dir, key, data)?;
+            self.register_written_shard(key, ack)?;
+            Ok(ack)
+        })
     }
 
     fn read_shard(&self, key: &ShardKey) -> Result<ShardData, StoreError> {

@@ -150,6 +150,8 @@ mod rows;
 mod scavenger;
 #[path = "pg_store/schema.rs"]
 mod schema;
+#[path = "pg_store/shard_file_mutations.rs"]
+mod shard_file_mutations;
 #[path = "pg_store/shards.rs"]
 mod shards;
 #[path = "pg_store/sql_types.rs"]
@@ -158,6 +160,7 @@ mod sql_types;
 use schema::{init_pg_schema, require_current_pg_schema};
 
 pub(in crate::node_runtime) use allocation_lifetime::ReplacementLifetime as PgAllocationReplacement;
+pub(in crate::node_runtime) use shard_file_mutations::ShardFileMutations;
 
 #[cfg(test)]
 pub(crate) use crate::control_plane::METADATA_CANONICAL_STATE_ENCODING_VERSION;
@@ -726,6 +729,7 @@ pub struct PgStore {
     tmp_dir: PathBuf,
     conn: Connection,
     allocation_lifetime: allocation_lifetime::PgAllocationLifetime,
+    shard_file_mutations: std::sync::Arc<ShardFileMutations>,
     clean_metadata_digest_revision: AtomicU64,
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
@@ -955,6 +959,7 @@ pub(crate) fn inspect_pg_shard_inventory(
         tmp_dir: pg_dir.join("tmp"),
         conn,
         allocation_lifetime: allocation_lifetime::PgAllocationLifetime::retired(),
+        shard_file_mutations: Default::default(),
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1271,6 +1276,7 @@ impl PgStore {
             tmp_dir,
             conn,
             allocation_lifetime: allocation_lifetime::PgAllocationLifetime::new()?,
+            shard_file_mutations: Default::default(),
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),

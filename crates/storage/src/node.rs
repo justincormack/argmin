@@ -98,6 +98,7 @@ mod stream_ops;
 struct PgDataPaths {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
+    shard_file_mutations: Arc<crate::node_runtime::pg_store::ShardFileMutations>,
 }
 
 fn bounded_pg_startup_map<T, E, F>(
@@ -954,6 +955,7 @@ impl SharedStorageNode {
                 let paths = PgDataPaths {
                     shards_dir: pg_dir.join("shards"),
                     tmp_dir: pg_dir.join("tmp"),
+                    shard_file_mutations: store.shard_file_mutations(),
                 };
                 Ok::<_, StoreError>((store, paths))
             },
@@ -1906,7 +1908,9 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
+        paths.shard_file_mutations.publish(key, || {
+            PgStore::write_shard_file_durable(&paths.tmp_dir, &paths.shards_dir, key, data)
+        })
     }
 
     #[cfg(test)]
@@ -1928,7 +1932,14 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::write_shard_file_durable_if_absent(&paths.tmp_dir, &paths.shards_dir, key, data)
+        paths.shard_file_mutations.publish(key, || {
+            PgStore::write_shard_file_durable_if_absent(
+                &paths.tmp_dir,
+                &paths.shards_dir,
+                key,
+                data,
+            )
+        })
     }
 
     pub(crate) fn write_shard_file_with_effect_fence(
@@ -1950,13 +1961,15 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::write_shard_file_durable_with_effect_fence(
-            &paths.tmp_dir,
-            &paths.shards_dir,
-            key,
-            data,
-            effect_fence,
-        )
+        paths.shard_file_mutations.publish(key, || {
+            PgStore::write_shard_file_durable_with_effect_fence(
+                &paths.tmp_dir,
+                &paths.shards_dir,
+                key,
+                data,
+                effect_fence,
+            )
+        })
     }
 
     pub(crate) fn write_shard_file_if_absent_with_effect_fence(
@@ -1978,13 +1991,15 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::write_shard_file_durable_if_absent_with_effect_fence(
-            &paths.tmp_dir,
-            &paths.shards_dir,
-            key,
-            data,
-            effect_fence,
-        )
+        paths.shard_file_mutations.publish(key, || {
+            PgStore::write_shard_file_durable_if_absent_with_effect_fence(
+                &paths.tmp_dir,
+                &paths.shards_dir,
+                key,
+                data,
+                effect_fence,
+            )
+        })
     }
 
     /// Read a shard file directly without taking the per-PG mutex.
@@ -2202,7 +2217,9 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        PgStore::delete_shard_file_durable(&paths.shards_dir, key)
+        paths.shard_file_mutations.delete(key, || {
+            PgStore::delete_shard_file_durable(&paths.shards_dir, key)
+        })
     }
 
     /// List local shard files for scavenger audit without taking the per-PG
