@@ -7,6 +7,14 @@
 > shared write/cleanup exclusion contract and enable all six ignored
 > regressions; see [`plans/README.md`](README.md#active-plan-inventory).
 
+**Current scope decision — 2026-11-02:** client write attempts are ephemeral and
+may fail on primary loss; clients retry PUT or individual multipart parts.
+Persist **cleanup responsibility and accepted publication**, not a promise to
+resume the client session. Do not replicate or preserve bucket reservations
+merely to keep attempts alive. The
+[selected scope below](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02)
+supersedes earlier recommendations that treat reservation survival as a goal.
+
 Status: production regression evidence, bounded design modelling, and a concrete
 [contract proposal for review](#proposed-production-contract--2026-10-29).
 The subsequent [minimum-contract and transaction review](#minimum-contract-and-transaction-review--2026-10-29)
@@ -119,13 +127,99 @@ carries captured request deadlines to embedded/Unix/TLS acknowledgement insertio
 while preserving accepted-command convergence. File publication and acknowledgement
 fences still do not implement retained owners or physical cleanup exclusion.
 The [reservation lifecycle evidence gate](#reservation-lifecycle-evidence-before-introduction-custody--2026-11-01)
-pins the existing wire records before the coordinated introduction-cutoff and
-custody change. It adds no ownership fields or new mutation authority.
+pins the existing wire records for any justified future format changes. The
+remaining integration concerns durable cleanup ownership and finite physical
+write authority, not preservation of these reservation records. The evidence
+slice adds no ownership fields or new mutation authority.
 The [exact record-release correction](#exact-bucket-reservation-record-release--2026-11-01)
 closes an existing compare-and-delete identity gap before retained obligations
 reuse that boundary. It does not implement owner-aware orphan retirement.
+The [bucket-side replacement evidence](#bucket-side-discovery-and-checkpoint-replacement--2026-11-02)
+shows why primary-local acquisition rows cannot be the sole evidence for
+cleanup ownership. Their loss can invalidate an attempt; preserving those rows
+or session continuity is not itself an implementation requirement.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
+
+## Selected Scope: Ephemeral Attempts, Durable Cleanup — 2026-11-02
+
+The objective is reliable cleanup, **not stronger client-session durability**.
+A Direct PUT or streamed PUT may fail when its primary/reservation disappears.
+An UploadPart or UploadPartCopy attempt may likewise fail and be retried. Do not
+automatically reconstruct their reservations or resume their allocation authority
+on another primary. This leaves the existing S3 multipart contract unchanged:
+the MPU record/upload ID and already committed parts remain durable, allowing the
+client to retry an individual part and later complete the upload.
+
+Separate three responsibilities:
+
+| State | Required behavior after request or primary failure |
+| --- | --- |
+| Client attempt / liveness reservation | May become invalid. Return the existing appropriate request failure and let the client retry; continued upload execution is not a goal. |
+| Issued physical-write authority and cleanup owner | Retain exact, bounded responsibility for every file/ack that can still be produced, independent of session/reservation survival. An abandoned attempt remains discoverable and cleanable without a returning client. |
+| Accepted or ambiguously published command / committed data | Preserve existing exact-command recovery and ownership rules. Request failure is not permission to abandon irrevocable publication or delete its payload. Completed objects and multipart parts are not ephemeral attempts. |
+
+### Minimum safety contract
+
+1. Before authorizing physical shard writes or acknowledgement insertion, establish
+   the durable owner and bounded window through the existing introducing-command
+   transaction/publication boundaries. An in-memory token, a client connection,
+   or a primary-local bucket reservation alone is insufficient cleanup ownership.
+2. Session loss, expiry, cancellation and frontend death may stop the attempt.
+   They must not erase its issued-window coverage, generation/resource release
+   obligations, or exact pending/publication evidence. Retaining that cleanup
+   state must not imply that the request is still live or can resume.
+3. Fence or outwait all previously authorized physical effects before deletion,
+   including delayed transport and writes already admitted locally. Retain local
+   exclusion through file/ack persistence. A missing bucket reservation can be
+   a reason to fail the request, but is not by itself proof that no late write or
+   accepted publication can exist.
+4. Resolve accepted/uncertain publication through the existing recovery protocol,
+   independently of client liveness. Preserve referenced payload, and clean only
+   the exact unreferenced attempt/window after the required settlement/exclusion
+   checks. Do not reintroduce a renewable request lease as a prerequisite for
+   converging an already irrevocable command.
+5. Make abandoned cleanup eligible after finite authority bounds without requiring
+   the client to return. Durable owners are bounded cleanup obligations, not
+   immortal sessions. Retry unavailable cleanup conservatively without holding
+   frontend admission or a global publication gate indefinitely.
+6. Reuse existing reserve/create/append/terminal transactions and durability
+   barriers. Do not add bucket-side replication or an extra ordinary-path fsync
+   solely to preserve client-session continuity. Any additional retained metadata
+   must justify which cleanup obligation would otherwise be lost.
+
+### Consequences for the earlier handoff proposals
+
+The earlier pre-install cutoff/inspection models remain useful evidence about
+delayed installation, uncertain acceptance and safe exact release. They are not
+a requirement to preserve every acquisition row across failover. Before any
+physical authority is issued, and with authoritative evidence that no introducing
+command was accepted, there is no payload obligation to retain; an invalidated
+request can fail. Any still-existing local reservation needs bounded retirement,
+not reconstruction on a successor merely to preserve the attempt. Unknown
+installation is not this case: inspect/recover the authoritative object-PG
+pending/materialized state rather than infer absence from a replacement's empty
+bucket table.
+
+The bucket-side checkpoint characterization below therefore does **not** impose
+a new choice between durable local session anchors and replicated reservations.
+Keep bucket coordination primary-local unless a concrete cleanup/recovery
+invariant demonstrates a need to change it. The next integration review should
+trace durable cleanup ownership from the first authorized physical effect
+through command recovery, terminal publication or cleanup, and identify only
+the metadata needed to prevent gaps in that chain. The earlier mandatory
+cutoff/discovery-field placement and anchor recommendations are candidates to
+re-evaluate against this narrower contract, not prerequisites in their own right.
+
+Acceptance coverage must permit request failure while independently proving:
+no shard/ack authority before durable ownership; no lost owner when a session or
+bucket reservation disappears; late writes cannot resurrect cleaned payload;
+accepted publication converges safely; cleanup works without the client; and
+completed MPU parts survive a failed part attempt and remain usable by retry/
+completion. Include primary loss before introduction, during uncertain install,
+during staging and after publication. Do not make an old attempt's successful
+continuation the positive canary. All six original cleanup regressions remain
+required; none is waived by allowing request failure.
 
 ## Lost Direct-PUT Reservation Cleanup
 
@@ -3502,6 +3596,11 @@ not mint another window merely because the caller did not receive a reply.
 
 ### Resource ownership is not just proof presence
 
+These lifetimes describe normal-path ownership and exact release responsibility,
+not a requirement to keep a client attempt alive through failure. Apply the
+[ephemeral-attempt scope decision](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02)
+when deciding which cleanup state must survive replacement.
+
 The owner records an exact release obligation, not permission to release every
 proof that occurs in an introducing command. In
 [`metadata_operations.rs`](../crates/storage/src/cluster/metadata_operations.rs),
@@ -4065,6 +4164,13 @@ Clippy, the storage boundary checker, formatting and `git diff --check` passed.
 
 ## Pre-Install Orphan Retirement Contract — 2026-10-31
 
+**Scope correction — 2026-11-02:** this section records the earlier candidate
+and its bounded model. Its safe-installation/inspection obligations remain
+relevant, but preserving acquisition rows and mandating cutoff/discovery fields
+on those rows are not selected requirements merely for session continuity.
+Re-evaluate that placement under the
+[current cleanup-only contract](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02).
+
 ### Existing boundaries and the missing distinction
 
 The source audit distinguishes three operations which must not be conflated:
@@ -4092,7 +4198,7 @@ effect fence immediately before a write does not bound the write's completion
 time: a transaction can finish after the cutoff. Inspection must also serialize
 against that in-flight installation.
 
-### Selected integration contract
+### Earlier pre-install integration candidate
 
 1. Persist an immutable **introduction acceptance cutoff** with the exact bucket
    reservation in its existing acquisition transaction. It is distinct from the
@@ -4144,13 +4250,14 @@ this slice does not implement or prove their composition. Retain the required
 bucket/object historical routes throughout the unresolved handoff. Do not infer
 historical absence from an unavailable or pruned route.
 
-This uses the existing acquisition, pending insertion and owner-materialization
-transactions, plus exceptional read-only inspection and the existing exact
-release transaction. It proposes no additional ordinary-path fsync. Persisted
-cutoff/discovery fields, owner proof obligations, command/wire/state version
-advances, owner-aware bucket draining and frontend handoff must be implemented
-together. The current frontend scope's release policy is not changed by this
-model, and no proof-only command change is safe to land independently.
+That earlier candidate would use the existing acquisition, pending insertion
+and owner-materialization transactions, plus exceptional read-only inspection
+and the existing exact release transaction, without an additional ordinary-path
+fsync. Its proposed persisted cutoff/discovery fields and coordinated format
+changes are not prerequisites under the subsequent cleanup-only scope decision.
+Any selected ownership change must still coordinate exact resource obligations,
+safe bucket draining and frontend handoff. This model does not change the current
+frontend release policy or make a proof-only command change safe on its own.
 
 ### Bounded evidence and remaining implementation tests
 
@@ -4767,8 +4874,9 @@ installation: fenced embedded clients checked authority under the PG mutex, then
 called unfenced store methods which acquired SQLite write serialization and
 prepared/validated the insertion later. Installed generic and bucket-control RPCs
 also checked the receiving route early without carrying that bound into the
-transaction. These gaps must close before the immutable introduction-cutoff and
-closed-and-absent inspection protocol can rely on pending installation.
+transaction. Closing these gaps enforces captured authority at pending
+installation, which the cleanup-owner handoff must respect; it does not require
+a new introduction-cutoff field on ephemeral bucket reservations.
 
 All five fenced client entry points now pass the captured fence through to the
 store: generic, generic-until, classified-generic-until, bucket-control and
@@ -4810,8 +4918,8 @@ unavailable with a pending slot, so post-install observations use replica state
 and exact pending/reservation records rather than treating export failure as
 evidence of equality.
 
-This implements the existing captured-route acceptance boundary only. Persisting
-the introduction cutoff, retained owner/window state, replacement-primary
+This implements the existing captured-route acceptance boundary only. Durable
+cleanup-owner/window state, finite physical-write authority, replacement-primary
 settlement and physical exclusion remain outstanding. All six original cleanup
 regressions remain open.
 
@@ -4864,9 +4972,9 @@ independent reservation. A two-hop Unix canary renews an epoch-1 proof through a
 epoch-2 route and verifies both durable records.
 
 This closes heartbeat's existing captured-route effect boundary only. It does
-not implement retained owner/window renewal, introduction-cutoff persistence,
-replacement-primary settlement, or physical write exclusion. All six original
-cleanup regressions remain open. The adjacent bucket-delete drain acquisition
+not implement durable cleanup-owner/window state, finite physical-write
+authority, replacement-primary settlement, or physical write exclusion. All six
+original cleanup regressions remain open. The adjacent bucket-delete drain acquisition
 still needs its own transactional effect-boundary audit; this slice does not
 claim to cover that separate operation.
 
@@ -4924,9 +5032,9 @@ and absent-client cases reject without changing drain/reservation/checkpoint
 state; freshly admitted acquisition and exact retry succeed.
 
 This is another acceptance-boundary prerequisite, not an implementation of
-durable generation cleanup ownership. Introduction-cutoff persistence, retained
-owner/window records, replacement-primary settlement and physical exclusion
-remain outstanding; all six original cleanup regressions remain open.
+durable generation cleanup ownership. Durable cleanup-owner/window records,
+finite physical-write authority, replacement-primary settlement and physical
+exclusion remain outstanding; all six original cleanup regressions remain open.
 
 Moving the final effect check before the interleaving hook made all three
 expiry tests accept a drain and fail. Independently omitting the receiving-node
@@ -5164,13 +5272,20 @@ heartbeat write-amplification test completed successfully in 101.779s.
 
 ## Reservation Lifecycle Evidence Before Introduction Custody — 2026-11-01
 
-The next durable integration must include the pre-install handoff, not merely
-owner/window rows: the bucket reservation needs its immutable introduction
-acceptance cutoff and exact discovery subject; object-PG pending installation,
-retained owner materialization and frontend release policy must agree about
-custody. A renewable lease deadline or a request-only effect fence is not that
-durable cutoff. The coordinated-state and successor-primary requirements above
-remain in force.
+The subsequent
+[scope decision](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02)
+narrows the proposed integration below: the frozen corpus is still valid evidence,
+but does not mandate new fields or preservation of ephemeral reservations.
+
+The proposal at the time of this evidence slice placed an immutable introduction
+acceptance cutoff and discovery subject on the bucket reservation. **That field
+placement and reservation-preservation prerequisite are superseded.** The current
+requirement is durable cleanup ownership before physical writes are authorized,
+with finite write authority and no gap between pending-command recovery,
+materialized cleanup ownership and frontend release. These guarantees must
+survive attempt failure; the bucket reservation and client session need not.
+Any additional acquisition fields must be justified by a concrete cleanup or
+accepted-publication invariant, not by this corpus or the superseded proposal.
 
 The predecessor audit found round-trip reservation codec tests and some
 heartbeat cap coverage, but no immutable lifecycle wire corpus. Under the
@@ -5200,10 +5315,11 @@ operation-subject boundary. The format ledger records the corpus identity.
 
 No production behavior, durable schema, command/RPC version, transaction or fsync
 changes. There are still no retained owner/window rows or physical exclusion
-grants, and all six original cleanup regressions remain open. After this evidence
-lands, the next state change must follow the coordinated implementation sequence
-above, including exact release obligations, pending/materialized custody,
-route-history retention and checkpoint/canonical-state membership.
+grants, and all six original cleanup regressions remain open. The next state
+change must implement the selected cleanup-only contract: exact release
+obligations, pending/materialized cleanup ownership, and the route-history and
+checkpoint/canonical-state coverage needed by that ownership. This is not a
+requirement to preserve or replicate ephemeral bucket coordination records.
 
 Validation: all six focused tests passed. The full Nextest run passed all 9,239
 tests (two slow, six skipped) in 248.896s. Strict all-target/all-feature Clippy,
@@ -5255,9 +5371,11 @@ the serving node's files.
 This is a correction to an existing resource-release boundary, not the durable
 custody integration. The current bucket-side coordination rows are primary-local,
 outside command canonical state; they must not be mistaken for replicated owner
-evidence merely because they survive local restart. The coordinated owner/window,
-introduction-cutoff, successor-prefix, retention and frontend-handoff requirements
-remain open, as do all six original cleanup regressions.
+evidence merely because they survive local restart. Durable cleanup-owner/window
+state, finite physical-write authority, successor-prefix settlement and the
+retention/frontend handoff needed by cleanup and accepted publication remain
+open, as do all six original cleanup regressions. Reservation persistence is not
+an independent prerequisite.
 
 Validation: all five focused tests passed, and the full Nextest run passed all
 9,242 tests (two slow, six skipped) in 270.048s. The flagged Raft heartbeat
@@ -5266,3 +5384,83 @@ write-amplification and oversized version-list pagination tests completed in
 after naming the test-only mutation tuple type; boundary checks, formatting and
 `git diff --check` passed. All five focused tests passed again after that
 type-alias-only lint cleanup.
+
+## Bucket-side Discovery and Checkpoint Replacement — 2026-11-02
+
+The introduction-custody integration must distinguish two kinds of durable
+reservation. `object_generation_reservations` belongs to replicated command
+state; `bucket_write_reservations` is primary-local coordination, deliberately
+excluded from `METADATA_DIGEST_TABLES` and checkpoint blocks. Its schema also
+has `ON DELETE CASCADE` from `buckets`. A local restart preserves the acquisition
+row, but checkpoint installation clears/reinserts buckets and therefore removes
+that row even when the imported bucket has the identical incarnation.
+
+This limits the earlier proposal to use acquisition rows as durable discovery
+anchors; it does not establish a need to preserve client sessions. Retaining
+historical route metadata cannot recover a coordination row already removed
+from the underlying store. Nor may an empty successor's idempotent proof release
+be treated as confirmation that the original primary released its reservation.
+The selected response is the
+[cleanup-only scope above](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02):
+allow attempt failure, but do not lose cleanup or accepted-publication evidence.
+
+### Production-store evidence
+
+[`bucket_reservation_transfer_evidence_tests.rs`](../crates/storage/src/pg_store/metadata/bucket_reservation_transfer_evidence_tests.rs)
+uses production command apply, acquisition, checkpoint export/import, release,
+rollback and reopen primitives. It keeps the reservation lease live throughout.
+The replicated bucket incarnation, generation reservation, complete checkpoint
+blocks, table digests and state digest provide independent preservation canaries.
+
+- Local reopen preserves the exact bucket reservation. Checkpoint export is
+  unchanged by its acquisition, and import into another store preserves the
+  replicated canaries but not the bucket reservation. Idempotent proof release
+  on that empty candidate leaves the original primary's exact row untouched;
+  release on the actual source removes it without changing replicated state.
+- Replacing the original store with an otherwise identical checkpoint at the
+  next epoch removes the local reservation; reopen does not recover it. The
+  bucket incarnation and replicated generation state remain exact.
+- A temporary insertion trigger fails only after the local coordination table
+  has become empty. Failed checkpoint replacement rolls back both the cascade
+  and command-state replacement: the original reservation, prefix and canonical
+  state survive, including after reopen.
+
+These are **current-behavior characterization tests**, not acceptance tests for
+the proposed cleanup protocol. The successful-import absence assertions may
+remain correct under the chosen ephemeral-attempt semantics. What must be added
+is coverage that cleanup and accepted-publication obligations survive independently
+of those rows, not an assertion that every bucket reservation survives. The tests
+do not activate a control-plane-authorized successor, issue physical grants, or
+prove end-to-end replacement safety. No production behavior or format changes here.
+
+### Interpretation after the scope decision
+
+Do not add the mutable coordination tables to the replica digest as a shortcut:
+their acquisition, heartbeat and release currently mutate only the primary.
+Doing so would create replica disagreement rather than replicated discovery.
+
+The earlier comparison between a separately retained pre-install anchor and
+replicated acquisition evidence is **not a blocking session-availability
+decision**. Neither is selected simply to prevent an in-flight PUT or part from
+failing. The implementation question is instead whether the existing introducing
+transactions can establish all cleanup ownership before physical authorization,
+and whether their pending/recovery/retained state preserves it through failure.
+Only a demonstrated gap in that responsibility chain justifies another anchor
+or replication boundary. Do not promote a cleanup hint into fresh write authority.
+
+Loss of bucket coordination may invalidate a request; it must not be the sole
+authorization to delete staged payload, retire its owner, or abandon accepted
+publication. Preserve the settled-prefix, finite physical-window, exact
+resource-release and exclusion requirements for that purpose, without requiring
+old client sessions to continue. All six original cleanup regressions remain open.
+
+Validation: all three focused tests passed. The final full Nextest run, including
+the strengthened rollback sentinel, passed all 9,245 tests (two slow, six skipped)
+in 237.672s. The flagged Raft heartbeat write-amplification and oversized
+version-list tests completed in 113.126s and 63.744s respectively. Strict
+all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed.
+
+The subsequent scope correction is documentation-only and leaves this store
+behavior and the evidence tests unchanged. It withdraws reservation/session
+preservation as an independent goal, not any of the physical cleanup obligations.

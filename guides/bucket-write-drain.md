@@ -44,6 +44,19 @@ replicate them through the bucket command stream or add a separate
 primary-owned coordination integrity record; until then, they must not be
 treated as part of acting-set metadata agreement.
 
+Local restart durability does not imply transfer durability. These coordination
+rows are absent from command checkpoint blocks, and their bucket foreign keys
+cascade when checkpoint installation clears and reinserts bucket rows. An empty
+imported coordination table is therefore not evidence that the former primary
+had no reservations, nor proof that a release on that former owner succeeded.
+An in-flight PUT or part attempt may fail and be retried when this coordination
+is lost; session continuity is not a durability guarantee. The pending
+[cleanup-only contract](../plans/durable-generation-cleanup-ownership.md#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02)
+must retain cleanup ownership and accepted-publication evidence independently
+before authorizing physical writes. Reservation absence alone is not permission
+to delete payload or abandon accepted commands. Preserving or replicating these
+coordination rows merely to keep a client attempt alive is not a selected goal.
+
 Each reservation must include at least:
 
 - bucket name
