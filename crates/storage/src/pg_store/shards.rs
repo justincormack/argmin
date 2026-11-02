@@ -572,6 +572,14 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(in crate::node_runtime) fn test_with_after_shard_publication_hook<T>(
+        hook: impl FnOnce() + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        with_after_shard_publication_hook(hook, action)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_with_before_shard_publication_hook<T>(
         hook: impl FnOnce() + 'static,
         action: impl FnOnce() -> T,

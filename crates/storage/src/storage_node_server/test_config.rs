@@ -19,6 +19,8 @@ mod shard_publication_deadline_tests;
 mod shard_ack_deadline_tests;
 #[path = "shard_ack_cleanup_tests.rs"]
 mod shard_ack_cleanup_tests;
+#[path = "shard_file_cleanup_tests.rs"]
+mod shard_file_cleanup_tests;
 #[path = "pending_slot_deadline_tests.rs"]
 mod pending_slot_deadline_tests;
 

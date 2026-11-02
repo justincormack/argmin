@@ -14,6 +14,46 @@ use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use crate::ShardKey;
 
 #[cfg(test)]
+pub(in crate::node_runtime) mod test_hook {
+    use crate::ShardKey;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::node_runtime) enum Point {
+        PublishWaiting,
+        DeleteWaiting,
+        DeleteAcquired,
+    }
+
+    type Hook = Box<dyn FnMut(Point, &ShardKey)>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run(point: Point, key: &ShardKey) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(point, key);
+            }
+        });
+    }
+
+    pub(in crate::node_runtime) fn with_hook<T>(
+        hook: impl FnMut(Point, &ShardKey) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Hook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
+    }
+}
+
+#[cfg(test)]
 type DeleteWaitHook = Box<dyn FnOnce(&ShardKey) + Send>;
 
 #[derive(Default)]
@@ -58,6 +98,7 @@ impl ShardFileMutations {
             Err(TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 {
+                    test_hook::run(test_hook::Point::PublishWaiting, key);
                     let hook = self.before_publish_wait.lock().unwrap().take();
                     if let Some(hook) = hook {
                         hook(key);
@@ -81,6 +122,7 @@ impl ShardFileMutations {
             Err(TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 {
+                    test_hook::run(test_hook::Point::DeleteWaiting, key);
                     let hook = self.before_delete_wait.lock().unwrap().take();
                     if let Some(hook) = hook {
                         hook(key);
@@ -92,6 +134,8 @@ impl ShardFileMutations {
                     .unwrap_or_else(|error| error.into_inner())
             }
         };
+        #[cfg(test)]
+        test_hook::run(test_hook::Point::DeleteAcquired, key);
         action()
     }
 }

@@ -151,6 +151,10 @@ does not revoke delayed requests or replace the durable owner/window protocol.
 The [acknowledgement exclusion evidence](#acknowledgement-transaction-and-cleanup-exclusion--2026-11-02)
 pins the companion PG-mutex boundary through embedded and installed Unix paths.
 It requires no additional production lock or durability barrier.
+The [installed Unix file-exclusion evidence](#installed-unix-file-exclusion-evidence--2026-11-02)
+also pins the file participant through real client/server dispatch, including
+expiry while waiting behind retained deletion. These local effect boundaries
+are prerequisites, not the outstanding durable owner/window implementation.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5703,3 +5707,48 @@ Validation: all five focused tests passed. Full Nextest passed all 9,263 tests
 completed in 97.173s.
 Strict all-target/all-feature Clippy, storage boundary checks, formatting and
 `git diff --check` passed.
+
+## Installed Unix File Exclusion Evidence — 2026-11-02
+
+[`shard_file_cleanup_tests.rs`](../crates/storage/src/storage_node_server/shard_file_cleanup_tests.rs)
+extends the embedded file-lock evidence to the installed Unix client, codec,
+receiving route and retained-cleanup paths. Two deterministic tests cover:
+
+- A fresh shard write paused both before hard-link publication and after its
+  directory sync, while still holding shared file access. Retained deletion's
+  actual failed `try_write` proves contention. Once exclusive access is acquired,
+  the test checks exact file bytes immediately before the real unlink. The write
+  returns the matching size/CRC acknowledgement; deletion completes only after
+  publication releases access. Another key in the same PG remains writable.
+  Reopening only after the original runtime is dropped preserves target absence,
+  the independent file/ack row, and an empty temporary directory.
+- Retained deletion holds exclusive file access while a valid fenced Unix write
+  reaches a failed `try_read`. The receiving thread then crosses the effective
+  deadline but remains before the raw authority timestamp; its receiving route
+  remains live. After deletion releases access, the writer must return
+  `StaleShardLocation`, without reaching the temporary-file publication sentinel
+  or recreating the file. Independent acknowledgement rows remain unchanged:
+  file deletion does not stand in for acknowledgement cleanup. A subsequent
+  valid fenced request succeeds as an effect-boundary positive canary only.
+
+The scheduling hooks are owner-local `cfg(test)` callbacks scoped to the actual
+server worker; they do not change production acquisitions or expose a downstream
+test API. Each request has one joined server acceptor, and the schedules use
+channels rather than sleeps. These tests prove syscall ordering and observable
+state after reopen, not simulated power-loss behavior. Existing publication
+deadline tests separately cover same-epoch renewal and receiver-first expiry.
+
+No production behavior, schema, RPC, transaction, fsync or dependency changes.
+In particular, this does not authorize cleanup from session absence or revoke a
+still-valid delayed request. Durable owner/window introduction, settled-prefix
+confirmation, finite physical grants, reference protection and independent
+participant completion remain outstanding. All six original cleanup regressions
+remain open.
+
+Validation: both new focused Unix tests passed. The full Nextest run, including
+the added pre-publication sentinel, passed all 9,269 tests (three slow, six
+skipped) in 345.220s. The Raft write-amplification and retry-budget model tests
+completed in 115.365s and 88.144s respectively. Another session's full suite was
+running in a separate worktree during the latter part of validation and was left
+untouched. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed.

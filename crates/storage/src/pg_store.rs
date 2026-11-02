@@ -160,6 +160,8 @@ mod sql_types;
 use schema::{init_pg_schema, require_current_pg_schema};
 
 pub(in crate::node_runtime) use allocation_lifetime::ReplacementLifetime as PgAllocationReplacement;
+#[cfg(test)]
+pub(in crate::node_runtime) use shard_file_mutations::test_hook as shard_file_mutation_test_hook;
 pub(in crate::node_runtime) use shard_file_mutations::ShardFileMutations;
 
 #[cfg(test)]
