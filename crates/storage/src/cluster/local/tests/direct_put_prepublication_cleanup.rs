@@ -1,0 +1,213 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    None,
+    File,
+    Acknowledgement,
+}
+
+#[test]
+fn admitted_direct_put_rejection_cleans_once_without_drop_release() {
+    check_rejected_commit(Fault::None, false);
+}
+
+#[test]
+fn admitted_direct_put_rejection_preserves_generation_after_physical_cleanup_failure() {
+    for fault in [Fault::File, Fault::Acknowledgement] {
+        check_rejected_commit(fault, false);
+    }
+}
+
+#[test]
+fn admitted_direct_put_projected_rejection_cleans_payload_before_budgeted_generation_release() {
+    for fault in [Fault::None, Fault::File, Fault::Acknowledgement] {
+        check_rejected_commit(fault, true);
+    }
+}
+
+fn check_rejected_commit(fault: Fault, with_contender: bool) {
+    let fixture = Fixture::new();
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_put_object_route(&fixture.bucket, &fixture.key)
+        .unwrap();
+    let generation = route
+        .test_reserve_generation_with_id(&fixture.reservations[0])
+        .unwrap();
+    let prepared = fixture.prepared(0, generation.generation_id());
+    let encrypted = &fixture.encrypted[0];
+    let encryption_reservation = generation
+        .bind_encryption(&encrypted.encryption)
+        .bind_standard_segment(encrypted.logical_size)
+        .bind_committed_encryption(&prepared.encryption)
+        .unwrap();
+    let payload = route
+        .write_direct_object_segment_payload(encryption_reservation, &encrypted.storage_bytes)
+        .unwrap();
+    let identity = direct_payload_test_identity(&payload);
+    let shards = payload.written.written_shards.clone();
+    fixture
+        .cluster
+        .test_register_payload_shard_acks(identity.data_pg_id, &shards)
+        .unwrap();
+    assert_direct_payload_shards_exist(&fixture.cluster, identity);
+    let ack_node = fixture
+        .map
+        .metadata_pg_primary_node(
+            fixture.cluster.operation_epoch(),
+            PgId::new(identity.data_pg_id),
+        )
+        .unwrap()
+        .storage_node();
+    for shard in &shards {
+        ack_node
+            .get_pg(identity.data_pg_id)
+            .unwrap()
+            .validate_written_shard_ack(&shard.key, shard.ack)
+            .unwrap();
+    }
+    let contender = if with_contender {
+        let generation = route
+            .test_reserve_generation_with_id(&fixture.reservations[1])
+            .unwrap();
+        let prepared = fixture.prepared(1, generation.generation_id());
+        let encrypted = &fixture.encrypted[1];
+        let reservation = generation
+            .bind_encryption(&encrypted.encryption)
+            .bind_standard_segment(encrypted.logical_size)
+            .bind_committed_encryption(&prepared.encryption)
+            .unwrap();
+        let payload = route
+            .write_direct_object_segment_payload(reservation, &encrypted.storage_bytes)
+            .unwrap();
+        fixture.record_payload_integrity(1, &payload).unwrap();
+        let identity = direct_payload_test_identity(&payload);
+        fixture
+            .leave_pending_with_prepared_after_inspection_failure(1, &route, payload, &prepared)
+            .unwrap();
+        Some(identity)
+    } else {
+        None
+    };
+    let file_calls = Arc::new(AtomicUsize::new(0));
+    let ack_calls = Arc::new(AtomicUsize::new(0));
+    let file_observer = Arc::clone(&file_calls);
+    let ack_observer = Arc::clone(&ack_calls);
+    let _file_hook = fixture
+        .cluster
+        .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |key| {
+            file_observer.fetch_add(1, Ordering::SeqCst);
+            if fault == Fault::File && key.shard_index().get() == 0 {
+                return Err(StoreError::Io {
+                    context: "prepublication cleanup file fault",
+                    source: std::io::Error::other("injected"),
+                });
+            }
+            Ok(())
+        }));
+    let _ack_hook = fixture
+        .cluster
+        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(move |key| {
+            ack_observer.fetch_add(1, Ordering::SeqCst);
+            if fault == Fault::Acknowledgement && key.shard_index().get() == 0 {
+                return Err(StoreError::Io {
+                    context: "prepublication cleanup acknowledgement fault",
+                    source: std::io::Error::other("injected"),
+                });
+            }
+            Ok(())
+        }));
+    let result = route.commit_direct_object(payload, &prepared, |snapshot| {
+        assert_eq!(snapshot.existing_etag.is_some(), with_contender);
+        Err::<(), _>("condition rejected")
+    });
+    if fault == Fault::None {
+        assert!(
+            matches!(result, Ok(Err("condition rejected"))),
+            "{result:?}"
+        );
+        assert_single_generation_release(
+            &fixture.map,
+            0,
+            &fixture.bucket,
+            &fixture.key,
+            &fixture.reservations[0],
+        );
+        assert_eq!(file_calls.load(Ordering::SeqCst), shards.len());
+        assert_eq!(ack_calls.load(Ordering::SeqCst), shards.len());
+        assert_direct_payload_staging_cleaned(
+            &fixture.map,
+            &fixture.cluster,
+            &fixture.bucket,
+            &fixture.key,
+            &fixture.reservations[0],
+            identity,
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert_eq!(error.diagnostic_cause_label(), "store_io_failure");
+        for node in fixture.map.nodes.values() {
+            let pg = node.storage_node().get_pg(0).unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &fixture.bucket,
+                    &fixture.key,
+                    &fixture.reservations[0]
+                )
+                .unwrap(),
+                identity.segment_vid
+            );
+        }
+    }
+    for shard in &shards {
+        let index = shard.key.shard_index().get();
+        assert_eq!(
+            fixture
+                .cluster
+                .test_payload_shard_file_exists(
+                    identity.data_pg_id,
+                    identity.ec,
+                    &identity.segment_okh,
+                    identity.segment_vid,
+                    index
+                )
+                .unwrap(),
+            fault == Fault::File && index == 0
+        );
+        let ack = ack_node
+            .get_pg(identity.data_pg_id)
+            .unwrap()
+            .validate_written_shard_ack(&shard.key, shard.ack);
+        if fault == Fault::Acknowledgement && index == 0 {
+            ack.unwrap();
+        } else {
+            assert!(matches!(ack, Err(StoreError::NotFound)), "{ack:?}");
+        }
+    }
+    assert_bucket_write_reservations_released(&fixture.map, &fixture.bucket);
+    assert!(
+        pending_metadata_command_for_test(&fixture.map, PgId::new(0), &fixture.bucket).is_none()
+    );
+    for node in fixture.map.nodes.values() {
+        let pg = node.storage_node().get_pg(0).unwrap();
+        let object = crate::PgMetadataStore::get_object_meta(&*pg, &fixture.bucket, &fixture.key);
+        if let Some(contender) = contender {
+            assert_eq!(
+                object.unwrap().as_live().unwrap().generation_id,
+                contender.segment_vid
+            );
+        } else {
+            assert!(matches!(object, Err(crate::MetadataError::ObjectNotFound)));
+        }
+    }
+    if let Some(contender) = contender {
+        assert_direct_payload_shards_exist(&fixture.cluster, contender);
+    }
+}

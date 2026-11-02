@@ -6107,3 +6107,57 @@ passed all 9,285 tests (two slow, six skipped) in 238.647s. The Raft heartbeat
 write-amplification test passed in 110.994s and the oversized version-listing
 test in 60.508s. Strict all-target/all-feature Clippy, storage boundary checks,
 formatting and `git diff --check` passed.
+
+## Direct PUT Pre-publication Cancellation Completion — 2026-11-02
+
+The admitted payload-handle correction did not cover the commit workflow's
+separate common caller-owned cleanup. That path released the generation before
+best-effort file/acknowledgement deletion, ignored failures, and left the admitted
+payload armed even after successful cleanup. New production-capability regressions
+reproduced both behaviours: an injected physical cleanup error returned only the
+conditional rejection, and successful rejection published two generation-release
+commands because Drop repeated the completed cleanup. The existing single-release
+canary used the raw storage-unit adapter and therefore had no payload Drop.
+
+Common pre-publication cleanup now uses the retained-subset completion result,
+deletes files and acknowledgements before releasing the generation, and propagates
+both physical and release failures. Successful cleanup disarms the request handle.
+The same-object semantic-projection branch performs physical deletion before its
+existing budgeted release and records that deletion so common cleanup repeats
+neither physical effects nor the already-published release. Existing budgeted
+release/recovery behaviour is otherwise retained; this adds no retry loop,
+transaction, fsync, dependency or format version.
+
+The tests use admitted payload handles with real encrypted shards and their exact
+acknowledgements. Ordinary rejection and rejection after recovering a same-object
+contender independently cover successful cleanup, file failure and acknowledgement
+failure. They assert one release and one physical pass after success, retained
+generation reservations on every replica after persistent physical failure, exact
+remaining files/rows, no candidate publication, and preservation of the contender's
+published generation and shard files. Conditional rejection remains the result
+when cleanup succeeds; physical failure instead reports `store_io_failure`.
+
+The focused run also exposed an intentional diagnostic change in
+`direct_put_transferred_contender_exits_without_retrying_drain`: cancellation now
+reports `MetadataCommandAwaitingAuthorizedRecovery` from its blocked generation
+release, rather than swallowing that error and returning the earlier transfer
+notification. The test retains its exactly-one-drain and public
+`MetadataCommandContention` assertions and now pins the retained generation on
+every replica. The unrelated pending command remains unchanged.
+
+This slice covers the common pre-publication cancellation path and the projected
+loser's budgeted release, not every cleanup branch in the terminal workflow.
+Accepted-command, safe-abandonment, post-apply and malformed-payload disjoint
+cleanup remain separately governed. A failed pre-publication cleanup leaves the
+admitted handle armed for its existing best-effort Drop attempt; successful
+cleanup suppresses that attempt. Loss of the handle can still strand cleanup.
+The retained owner/window protocol, finite physical authority and all six original
+ignored regressions remain outstanding. No session-survival requirement is added.
+
+Validation: both initial admitted-rejection regressions failed before the fix
+(hidden physical failure and two generation releases instead of one). All 160
+focused Direct PUT tests passed on the corrected implementation and diagnostic
+contract. The full Nextest run passed all 9,288 tests (two slow, six skipped) in
+239.068s. The Raft heartbeat write-amplification and oversized version-listing
+tests passed in 110.984s and 61.561s respectively. Strict all-target/all-feature
+Clippy, storage boundary checks, formatting and `git diff --check` passed.

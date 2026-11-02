@@ -126,6 +126,18 @@ Neither API provides crash-safe discovery or fences late delegated writes. The
 durable owner/window work remains necessary, including when a failed cleanup
 leaves a reservation but the frontend loses its handle.
 
+The Direct PUT commit loop's common **caller-owned, pre-publication** cleanup
+also deletes the captured payload subset before releasing its generation. It
+reports either failure instead of treating best-effort cleanup as complete.
+After successful cleanup, it disarms the admitted payload handle so Drop does
+not repeat deletion or publish another generation-release command. When a
+same-object contender has published, delete the losing request's staging before
+its existing budgeted generation-release path, and reuse that successful deletion
+when finishing common cleanup. Failed cleanup leaves the payload armed for its
+existing best-effort Drop attempt; this is not a durable handoff. Accepted-command,
+abandonment and post-apply cleanup have separate ownership rules and are not
+covered by this pre-publication completion claim.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

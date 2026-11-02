@@ -3,7 +3,8 @@
 
 //! Bounded ownership schedules over real admitted PUT handles and shard files.
 //! A matching pending command is installed through production preparation/store
-//! APIs; the only injected fault is a failed subsequent abandonment inspection.
+//! APIs; the bounded schedules inject a failed subsequent abandonment inspection.
+//! Focused child regressions additionally exercise cleanup-effect failures.
 
 use super::*;
 use crate::bounded_explorer::{explore, Checks};
@@ -14,6 +15,9 @@ mod cancellation_model;
 
 #[path = "direct_put_cleanup_progress.rs"]
 mod cleanup_progress;
+
+#[path = "direct_put_prepublication_cleanup.rs"]
+mod prepublication_cleanup;
 
 const DATA: [&[u8]; 2] = [b"owner A staged body", b"owner B different staged body"];
 const REQUIRED: [&str; 6] = [

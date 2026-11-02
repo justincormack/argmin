@@ -4755,6 +4755,7 @@ impl StorageCluster {
         }
         let mut payload_ownership = DirectPutPayloadOwnership::Caller;
         let mut generation_reservation_released = false;
+        let mut caller_payload_deleted = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
             () => {{
                 if !bucket_write_proof_command_owned {
@@ -4765,26 +4766,40 @@ impl StorageCluster {
                 }
             }};
         }
+        macro_rules! delete_caller_payload_before_generation_release {
+            () => {{
+                if matches!(payload_ownership, DirectPutPayloadOwnership::Caller)
+                    && !caller_payload_deleted
+                {
+                    self.try_delete_payload_shard_keys_at_epoch(
+                        effective_bucket_write_reservation.cluster_epoch,
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards.iter().map(|written| written.key.clone()),
+                    )
+                } else {
+                    Ok(())
+                }
+            }};
+        }
         macro_rules! cleanup_direct_put_attempt_before_command_ownership {
             () => {{
                 let release_result = release_caller_bucket_write_proof_if_unowned!();
                 match payload_ownership {
                     DirectPutPayloadOwnership::Caller => {
+                        delete_caller_payload_before_generation_release!()?;
                         if !generation_reservation_released {
-                            self.release_object_generation_reservation_best_effort(
+                            self.release_object_generation_reservation(
                                 &req.bucket,
                                 &req.key,
                                 &req.generation_reservation_id,
-                            );
+                            )?;
                         }
-                        self.delete_direct_put_segment_payload_shards_at_epoch(
-                            effective_bucket_write_reservation.cluster_epoch,
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
+                        // The workflow completed caller-owned cleanup. Do not
+                        // let the admitted payload's Drop publish it again.
+                        disarm_payload_cleanup();
                     }
                     DirectPutPayloadOwnership::DurableCommand => {}
                 }
@@ -5147,6 +5162,15 @@ impl StorageCluster {
                         }
                         Err(error) => {
                             if same_object_publication_observed {
+                                if let Err(cleanup_error) = delete_caller_payload_before_generation_release!() {
+                                    // Still relinquish the bucket proof, but
+                                    // retain the generation while physical
+                                    // cleanup is incomplete. Its failure takes
+                                    // precedence over the projected condition.
+                                    let _ = release_caller_bucket_write_proof_if_unowned!();
+                                    return Err(cleanup_error.into());
+                                }
+                                caller_payload_deleted = true;
                                 if let Err(cleanup_error) = self
                                     .release_object_generation_reservation_after_same_object_projection(
                                         &req.bucket,
@@ -5159,8 +5183,9 @@ impl StorageCluster {
                                     return Err(cleanup_error);
                                 }
                                 // The budgeted release already published cleanup for this
-                                // exact attempt. Common cleanup still owns its bucket proof
-                                // and shards, but must not publish another release command.
+                                // exact attempt after deleting its shards. Common
+                                // cleanup still owns its bucket proof, but must
+                                // repeat neither the deletes nor the release.
                                 generation_reservation_released = true;
                             }
                             cleanup_direct_put_attempt_before_command_ownership!();

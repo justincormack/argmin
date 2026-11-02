@@ -1797,10 +1797,16 @@ fn direct_put_transferred_contender_exits_without_retrying_drain() {
         "transferred contender took {:?} to leave the request path",
         started.elapsed()
     );
-    assert!(matches!(
-        &error,
-        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
-    ));
+    // The contender transferred to recovery. Cancellation now reports that its
+    // generation release is blocked, rather than hiding that cleanup failure
+    // behind the earlier transfer notification. It must not re-drain the flight.
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+        ),
+        "{error:?}"
+    );
     assert!(install_ran.load(Ordering::SeqCst));
     assert_eq!(drain_attempts.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -1812,6 +1818,20 @@ fn direct_put_transferred_contender_exits_without_retrying_drain() {
         Some(contender),
         "the unrelated converging command must remain available to recovery"
     );
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(pg_id.get()).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &commit_req.generation_reservation_id,
+            )
+            .unwrap(),
+            generation_id,
+            "blocked cleanup must retain its generation on every replica",
+        );
+    }
     assert_bucket_write_reservations_released(&map, &bucket);
     for shard_index in 0..written.ec.k + written.ec.m {
         assert!(!cluster
