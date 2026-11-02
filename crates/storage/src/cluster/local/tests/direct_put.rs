@@ -5725,15 +5725,27 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
 
 #[test]
 fn direct_put_version_reservation_churn_recovers_without_duplicate_versions() {
-    check_direct_put_version_reservation_churn(false);
+    check_direct_put_version_reservation_churn(VersionReservationChurnFinish::Commit);
 }
 
 #[test]
 fn direct_put_version_reservation_churn_expires_without_publication() {
-    check_direct_put_version_reservation_churn(true);
+    check_direct_put_version_reservation_churn(VersionReservationChurnFinish::Expire);
 }
 
-fn check_direct_put_version_reservation_churn(expire_snapshot: bool) {
+#[test]
+fn direct_put_version_reservation_churn_revalidates_action_before_publication() {
+    check_direct_put_version_reservation_churn(VersionReservationChurnFinish::Reject);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VersionReservationChurnFinish {
+    Commit,
+    Expire,
+    Reject,
+}
+
+fn check_direct_put_version_reservation_churn(finish: VersionReservationChurnFinish) {
     let _serial = lock_metadata_command_apply_hook_test();
     const CONFLICTS: usize = 3;
     for initial_state in ["absent", "live", "delete-marker"] {
@@ -5817,6 +5829,12 @@ fn check_direct_put_version_reservation_churn(expire_snapshot: bool) {
             .unwrap()
             .versions;
         let (request, written) = prepare(2);
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let allocations_for_hook = Arc::clone(&allocations);
+        let allocation_hook =
+            cluster.test_install_before_object_version_command_id_hook(Arc::new(move || {
+                allocations_for_hook.fetch_add(1, Ordering::SeqCst);
+            }));
 
         // Model a competing writer installing its allocator command after this
         // PUT reserved a version, but before it can construct its commit. The
@@ -5865,37 +5883,56 @@ fn check_direct_put_version_reservation_churn(expire_snapshot: bool) {
                 let round = snapshots_for_hook.fetch_add(1, Ordering::SeqCst);
                 // Expire only after all injected allocator conflicts have drained;
                 // this exercises the observed snapshot_reinspection_conflict exit.
-                expire_snapshot && round == CONFLICTS
+                finish == VersionReservationChurnFinish::Expire && round == CONFLICTS
             }));
         let actions = AtomicUsize::new(0);
         let result = cluster.commit_direct_put_object_from_payload_shards(
             &request,
             &written.written_shards,
             |_| {
-                actions.fetch_add(1, Ordering::SeqCst);
-                Ok::<(), ()>(())
+                let round = actions.fetch_add(1, Ordering::SeqCst);
+                if finish == VersionReservationChurnFinish::Reject && round == CONFLICTS {
+                    Err("revalidated action rejected PUT")
+                } else {
+                    Ok(())
+                }
             },
         );
         drop(snapshot_hook);
         drop(command_hook);
+        drop(allocation_hook);
+        assert_eq!(
+            allocations.load(Ordering::SeqCst),
+            1,
+            "commit contention must reuse the attempt's reserved version"
+        );
         assert_eq!(snapshots.load(Ordering::SeqCst), CONFLICTS + 1);
         assert_eq!(injected.lock().unwrap().len(), CONFLICTS);
         let versions = cluster
             .list_object_versions_for_bucket(&bucket, None, None, None, None, 100)
             .unwrap()
             .versions;
-        if expire_snapshot {
-            let error = result.unwrap_err();
-            assert!(matches!(
-                error,
-                crate::ObjectPgActionError::SnapshotReinspectionConflict
-            ));
-            assert_eq!(
-                crate::DirectPutFailure::from_object_pg_action(error).kind(),
-                crate::DirectPutFailureKind::SnapshotReinspectionConflict
-            );
-            assert_eq!(builds.load(Ordering::SeqCst), CONFLICTS);
-            assert_eq!(actions.load(Ordering::SeqCst), CONFLICTS);
+        if finish != VersionReservationChurnFinish::Commit {
+            if finish == VersionReservationChurnFinish::Expire {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    crate::ObjectPgActionError::SnapshotReinspectionConflict
+                ));
+                assert_eq!(
+                    crate::DirectPutFailure::from_object_pg_action(error).kind(),
+                    crate::DirectPutFailureKind::SnapshotReinspectionConflict
+                );
+                assert_eq!(builds.load(Ordering::SeqCst), CONFLICTS);
+                assert_eq!(actions.load(Ordering::SeqCst), CONFLICTS);
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err(),
+                    "revalidated action rejected PUT"
+                );
+                assert_eq!(builds.load(Ordering::SeqCst), CONFLICTS);
+                assert_eq!(actions.load(Ordering::SeqCst), CONFLICTS + 1);
+            }
             assert_eq!(
                 versions, baseline,
                 "failed PUT changed {initial_state} history"

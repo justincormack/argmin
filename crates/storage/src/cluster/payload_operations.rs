@@ -5054,6 +5054,11 @@ impl StorageCluster {
                         if release.bucket == req.bucket && release.key == req.key
                 )
             };
+        // A successful allocation belongs to this live attempt, not its snapshot.
+        // Retain it across pre-publication retries so competing PUTs do not
+        // repeatedly publish allocator commands that obstruct each other's commits.
+        // Snapshots, authorization, and route authority are still revalidated below.
+        let mut reserved_version_id = None;
         let (command, new_pending_command) = 'direct_put_metadata: loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -5155,7 +5160,9 @@ impl StorageCluster {
                     }
                     let evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
 
-                    let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
+                    let version_id = if let Some(version_id) = reserved_version_id {
+                        version_id
+                    } else if req.versioning == crate::BucketVersioningState::Enabled {
                         match self.reserve_next_object_version_for_completion_with_effect_fence(
                             pg_id,
                             &req.bucket,
@@ -5163,7 +5170,10 @@ impl StorageCluster {
                             effect_fence,
                             &mut require_valid_route,
                         ) {
-                            Ok(version_id) => version_id,
+                            Ok(version_id) => {
+                                reserved_version_id = Some(version_id);
+                                version_id
+                            }
                             Err(error) => {
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
