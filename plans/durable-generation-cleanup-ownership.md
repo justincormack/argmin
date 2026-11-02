@@ -159,6 +159,10 @@ The [generation-release ownership correction](#generation-release-ownership-at-a
 now prevents standalone release commands from detaching a live stream's
 reservation. Abandoned stream finalization leaves that resource with the session
 for atomic stream cleanup; Direct PUT retains its standalone release derivative.
+The [introduction-to-physical-handoff model](#introduction-to-physical-handoff-model--2026-11-02)
+now composes introduction settlement with separate file/ack admission and loss of
+attempt coordination. This is bounded candidate evidence, not production grants
+or retained owner/window integration; the six regressions remain open.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5874,3 +5878,95 @@ Nextest run passed all 9,273 tests (two slow, six skipped) in 238.664s. The Raft
 heartbeat write-amplification test completed in 111.846s and the oversized
 version-listing test in 60.005s. Strict all-target/all-feature Clippy, storage
 boundary checks, formatting and `git diff --check` passed on the corrected tree.
+
+## Introduction-to-physical-handoff Model — 2026-11-02
+
+[`physical_handoff.rs`](../crates/storage/src/cleanup_ownership_model/introduction/physical_handoff.rs)
+connects two previously separate model boundaries: introduction assumed a live
+proof, while the ephemeral-attempt model started with an already durable owner.
+The new composition calls the introduction model's actual transition function
+for pending installation, witness-first replica application, inspection,
+compaction, restart, release and retirement. It adds independently losable
+attempt coordination and separate file/ack transport, confirmation, admission
+and persistence steps. It is **abstract model evidence**, not a test of installed
+physical grants or a claim that production cleanup now satisfies the protocol.
+
+The parent's `own_proof` means unresolved cleanup custody in this composition,
+not survival of a primary-local bucket reservation row. Losing `coordination`
+may fail the attempt; it neither erases an accepted introduction nor recreates a
+lost reservation. Resolving custody after loss represents authoritative
+release/absence confirmation. The model does not implement the cross-PG lookup
+that must supply that confirmation.
+
+The bounded graph contains one introduction, three metadata replicas, one file
+delivery and one independently admitted acknowledgement, one coordination loss,
+one metadata restart, and one immutable cutoff. Replica application remains
+separate; complete-prefix inspection and log compaction are macro-steps through
+the parent transitions. This deliberately uses the settled all-replica prefix
+abstraction, not a model of primary/witness certificate issuance. Positive
+installation replies are omitted; lost/unknown replies remain in the graph.
+Coordination loss is bounded to before physical cleanup, so a cleanup-first,
+loss-afterward trace cannot satisfy the independent-cleanup witnesses.
+Terminal acceptance is a separate step from atomic publication: after attempt
+loss only previously accepted terminal work can publish. There is no transition
+that restores client liveness.
+
+Required behavior:
+
+- A pending slot or witness-only owner cannot confirm physical work. Recovery
+  settles introduction and clears the slot before confirmation, including after
+  coordination loss and a subsequent metadata restart. Compaction cannot erase
+  the materialized owner needed to confirm a delayed request.
+- Loss before introduction acceptance can fail without creating an owner;
+  started introduction must converge rather than become abandoned. This model
+  rejects fresh installation once coordination is lost; it does not prove the
+  separate production cross-PG validation/installation race.
+- A previously confirmed request may be admitted before cutoff even after
+  cancellation. Cleanup waits until cutoff and both admitted effect guards have
+  drained. A file or acknowledgement admitted before cutoff may finish after it;
+  a request still waiting for admission must be rejected afterward.
+- Cancellation permits physical cleanup, followed by resource release/absence
+  confirmation and owner retirement. Release failure and metadata restart must
+  not require restoring client coordination. Accepted publication instead
+  preserves its payload and retained owner; later object deletion is outside
+  this graph.
+
+Eight independent safety mutations check premature pending/witness confirmation,
+owner loss with coordination, abandonment of started introduction, early owner
+retirement, cleanup at coordination loss, and omission of either file or ack
+exclusion. A ninth mutation requires live coordination to reacquire recovery:
+its safe graph must exhaust but lose the witness-first, loss-then-restart
+convergence witness. This is a reachability canary, not a fairness guarantee.
+The positive graph exhausts **31,130 states and 77,972 transitions**, with eight
+required reachability witnesses; reaching the 500,000-state resource limit is a
+failure, not successful validation.
+
+Ordered tests additionally require the exact sequences, rather than allowing
+history flags in an unrelated order: witness application → coordination loss →
+restart → recovery → settlement → delayed confirmation; acknowledgement admission
+→ cutoff → persistence → cleanup → failed release → restart → retirement;
+confirmation → cleanup/retirement → delayed admission rejection; and terminal
+acceptance → loss/restart → publication, contrasted with unaccepted staged data
+being cleaned. No path restores the lost attempt.
+
+**Remaining integration:** real route certificates, inter-host clocks and RPC
+rebinding, data-node restart, multiple windows, durable owner/window schemas,
+primary replacement activation, checkpoint transfer and fresh-client multipart
+retries are not established by this graph. The next production work is still
+the coordinated owner/window and finite physical-authority integration using
+existing transactions. This slice adds no production behavior, format changes,
+durability barriers or session-preservation requirement. All six original
+cleanup regressions remain open.
+
+Validation: the first focused run exposed an incorrectly ordered reachability
+monitor: a restart before coordination loss could satisfy the purported
+loss-then-restart witness even with recovery gated on live coordination. The
+monitor now records that order explicitly; release-failure/restart and
+admission/cutoff/persistence witnesses likewise record their required order.
+Self-review also excluded coordination loss after physical cleanup, preventing
+cleanup-first traces from satisfying the independent-cleanup witness.
+All six new tests passed on the final tree. The full Nextest run passed all
+9,279 tests (two slow, six skipped) in 323.713s. The Raft heartbeat
+write-amplification and oversized version-listing tests completed successfully
+in 155.084s and 99.739s respectively. Strict all-target/all-feature Clippy,
+storage boundary checks, formatting and `git diff --check` passed.

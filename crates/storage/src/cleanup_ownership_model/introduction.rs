@@ -17,6 +17,8 @@
 
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
 
+mod physical_handoff;
+
 const PRIMARY: usize = 0;
 const WITNESS: usize = 1;
 const TRAILING: usize = 2;
