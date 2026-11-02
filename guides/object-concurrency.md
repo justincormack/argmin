@@ -154,6 +154,14 @@ the payload-mismatch diagnostic; successful cleanup still returns the mismatch.
 Do not re-arm Drop on failure: it cannot distinguish this mixed ownership. This
 consuming error path does not provide retry custody or durable cleanup discovery.
 
+After authoritative abandonment, Direct PUT's foreground terminal/reinspection
+exits also complete retained file/acknowledgement cleanup before their standalone
+generation release. Physical or release failures take precedence over the original
+terminal diagnostic. This is not permission to clean accepted or ambiguous commands:
+their publication/recovery ownership remains unchanged. Nor does it supply durable
+cleanup discovery after the abandoned slot has gone, or change generation cleanup
+that may already have been performed by a recovery derivative.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

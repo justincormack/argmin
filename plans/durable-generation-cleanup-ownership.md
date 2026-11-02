@@ -6246,3 +6246,46 @@ The Raft heartbeat write-amplification and oversized version-listing tests passe
 in 117.350s and 61.053s respectively. Strict all-target/all-feature Clippy, storage
 boundary checks, formatting and `git diff --check` passed. The updated deliberate
 mutation patch also passed a dry-run application check.
+
+## Foreground Abandoned Direct PUT Cleanup — 2026-11-02
+
+The foreground Direct PUT workflow still had separate cleanup after definitive
+abandonment. Its reinspection exits best-effort released the generation before
+deleting files/acknowledgements and then returned only the earlier conflict or
+conditional result. Explicit terminal-abandonment exits reported release errors
+but likewise released before best-effort physical cleanup.
+
+These foreground exits now share one cleanup sequence: use the request's captured
+placement epoch and exact shard subset, attempt all physical participants, return
+physical failure if any, then perform the fallible standalone generation release.
+Only successful cleanup returns the original request diagnostic. The generic
+payload handle remains disarmed after command ownership; no hidden Drop retry is
+introduced. The now test-only best-effort Direct PUT helper is gated accordingly,
+and the unused best-effort generation-release wrapper is removed.
+
+The regression exhausts the request budget immediately after pending installation
+and before apply, forcing authoritative unstarted abandonment. It covers both an
+already-exhausted reinspection budget and a reinspection that returns a conditional
+rejection. Independent file and acknowledgement faults must return
+`store_io_failure`, preserve the standalone generation on every replica, leave the
+exact failed effect, and never publish the object. Successful cleanup requires one
+physical pass and one generation release. Captured-envelope assertions verify the
+abandoned record on every replica, while the pending slot and bucket reservation
+are gone. The pre-fix test returned `snapshot_reinspection_conflict` instead of the
+injected physical failure.
+
+This is a foreground completion/error-ordering correction, not durable ownership.
+An abandoned slot is already removed on this path, so losing the remaining live
+request still requires the planned durable owner for cleanup discovery. Historical
+recovery can already have released the generation through its authorized derivative;
+this slice neither reverses nor changes that protocol. It does not claim every
+abandonment path globally retains a generation until physical deletion, and does
+not change accepted/ambiguous publication, add retries/fsyncs, or strengthen client
+session durability. Durable owner/window integration and all six original ignored
+regressions remain open.
+
+Validation: the new regression first reproduced the hidden physical failure;
+all 164 focused Direct PUT tests passed after correction. The full Nextest run
+passed all 9,292 tests (one slow, six skipped) in 243.704s. The Raft heartbeat
+write-amplification test completed in 112.057s. Strict all-target/all-feature
+Clippy, storage boundary checks, formatting and `git diff --check` passed.

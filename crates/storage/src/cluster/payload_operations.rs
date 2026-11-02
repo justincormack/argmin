@@ -4439,15 +4439,6 @@ impl StorageCluster {
         }
     }
 
-    fn release_object_generation_reservation_best_effort(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-    ) {
-        let _ = self.release_object_generation_reservation(bucket, key, reservation_id);
-    }
-
     fn release_object_generation_reservation_after_same_object_projection(
         &self,
         bucket: &BucketName,
@@ -4889,6 +4880,28 @@ impl StorageCluster {
                 return Err(error);
             }
         };
+        // Only after authoritative abandonment: pending/ambiguous publication
+        // still owns these bytes and must never enter this foreground cleanup.
+        // The abandonment path has settled the bucket proof. Complete physical
+        // cleanup before this path releases the standalone generation, and do
+        // not hide either failure behind the request's terminal diagnostic.
+        macro_rules! cleanup_abandoned_direct_put_attempt {
+            () => {{
+                self.delete_direct_put_segment_payload_shards_at_epoch(
+                    effective_bucket_write_reservation.cluster_epoch,
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                )?;
+                self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                )?;
+            }};
+        }
         macro_rules! finish_direct_put_after_safe_abandonment {
             () => {{
                 #[cfg(test)]
@@ -4901,18 +4914,7 @@ impl StorageCluster {
                     .check("direct PUT snapshot reinspection budget exhausted")
                     .is_err()
                 {
-                    self.release_object_generation_reservation_best_effort(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
+                    cleanup_abandoned_direct_put_attempt!();
                     return Err(ObjectPgActionError::SnapshotReinspectionConflict);
                 }
                 let snapshot = match direct_put_metadata_route
@@ -4923,18 +4925,7 @@ impl StorageCluster {
                     ) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        self.release_object_generation_reservation_best_effort(
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
+                        cleanup_abandoned_direct_put_attempt!();
                         if error.is_operation_deadline_exhaustion() {
                             return Err(ObjectPgActionError::SnapshotReinspectionConflict);
                         }
@@ -4949,33 +4940,11 @@ impl StorageCluster {
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
                 if Instant::now() >= reinspection_deadline {
-                    self.release_object_generation_reservation_best_effort(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    );
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
+                    cleanup_abandoned_direct_put_attempt!();
                     return Err(ObjectPgActionError::SnapshotReinspectionConflict);
                 }
                 let action_result = action(snapshot.auth_snapshot);
-                self.release_object_generation_reservation_best_effort(
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
+                cleanup_abandoned_direct_put_attempt!();
                 match action_result {
                     Err(error) => return Ok(Err(error)),
                     Ok(()) => return Err(ObjectPgActionError::SnapshotReinspectionConflict),
@@ -4997,18 +4966,7 @@ impl StorageCluster {
                         finish_direct_put_after_safe_abandonment!();
                     }
                     request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
-                        self.release_object_generation_reservation(
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        )?;
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
+                        cleanup_abandoned_direct_put_attempt!();
                         return Err(error);
                     }
                 }
@@ -5787,18 +5745,7 @@ impl StorageCluster {
                                                     cleanup_direct_put_attempt_before_command_ownership!();
                                                     return Err(error);
                                                 }
-                                                self.release_object_generation_reservation(
-                                                    &req.bucket,
-                                                    &req.key,
-                                                    &req.generation_reservation_id,
-                                                )?;
-                                                self.delete_direct_put_segment_payload_shards(
-                                                    req.data_pg_id,
-                                                    req.ec,
-                                                    &req.segment_okh,
-                                                    req.segment_vid,
-                                                    written_shards,
-                                                );
+                                                cleanup_abandoned_direct_put_attempt!();
                                                 return Err(error);
                                             }
                                         }
@@ -6221,18 +6168,7 @@ impl StorageCluster {
                 }
                 request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
                     recovery_guard.record_outcome(PendingMetadataCommandOutcome::Abandoned);
-                    self.release_object_generation_reservation(
-                        &req.bucket,
-                        &req.key,
-                        &req.generation_reservation_id,
-                    )?;
-                    self.delete_direct_put_segment_payload_shards(
-                        req.data_pg_id,
-                        req.ec,
-                        &req.segment_okh,
-                        req.segment_vid,
-                        written_shards,
-                    );
+                    cleanup_abandoned_direct_put_attempt!();
                     return Err(error);
                 }
             }
@@ -6595,6 +6531,7 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn delete_direct_put_segment_payload_shards(
         &self,
         data_pg_id: u32,

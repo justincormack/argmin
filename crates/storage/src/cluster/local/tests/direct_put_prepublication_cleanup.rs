@@ -15,6 +15,8 @@ enum RejectionStage {
     Condition,
     ProjectedCondition,
     RegisteredPayload,
+    AbandonedBudget,
+    AbandonedCondition,
 }
 
 #[test]
@@ -43,8 +45,24 @@ fn fresh_direct_put_ack_validation_failure_uses_prepublication_cleanup() {
     }
 }
 
+#[test]
+fn abandoned_direct_put_reports_cleanup_failure_before_reinspection_result() {
+    for stage in [
+        RejectionStage::AbandonedBudget,
+        RejectionStage::AbandonedCondition,
+    ] {
+        for fault in [Fault::None, Fault::File, Fault::Acknowledgement] {
+            check_rejected_commit(fault, stage);
+        }
+    }
+}
+
 fn check_rejected_commit(fault: Fault, stage: RejectionStage) {
     let with_contender = stage == RejectionStage::ProjectedCondition;
+    let abandon = matches!(
+        stage,
+        RejectionStage::AbandonedBudget | RejectionStage::AbandonedCondition
+    );
     let failed_cleanup_index = if stage == RejectionStage::RegisteredPayload {
         1
     } else {
@@ -173,14 +191,45 @@ fn check_rejected_commit(fault: Fault, stage: RejectionStage) {
             }
             Ok(())
         }));
+    let installed = Arc::new(AtomicUsize::new(0));
+    let observed_installed = Arc::clone(&installed);
+    let installed_command = Arc::new(Mutex::new(None));
+    let observed_command = Arc::clone(&installed_command);
+    let _installed_hook = abandon.then(|| {
+        fixture
+            .cluster
+            .test_install_direct_put_pending_installed_hook(Arc::new(move |command| {
+                observed_installed.fetch_add(1, Ordering::SeqCst);
+                *observed_command.lock().unwrap() = Some(command.clone());
+                true // Exhaust the work budget after installation, before any apply.
+            }))
+    });
+    let _reinspection_hook = (stage == RejectionStage::AbandonedCondition).then(|| {
+        fixture
+            .cluster
+            .test_install_snapshot_reinspection_hook(Arc::new(|| Duration::from_secs(5)))
+    });
+    let action_calls = AtomicUsize::new(0);
     let result = route.commit_direct_object(payload, &prepared, |snapshot| {
         assert_eq!(snapshot.existing_etag.is_some(), with_contender);
-        if stage == RejectionStage::RegisteredPayload {
+        let first_action = action_calls.fetch_add(1, Ordering::SeqCst) == 0;
+        if stage == RejectionStage::RegisteredPayload || (abandon && first_action) {
             Ok(())
         } else {
             Err("condition rejected")
         }
     });
+    if abandon {
+        assert_eq!(installed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            if stage == RejectionStage::AbandonedCondition {
+                2
+            } else {
+                1
+            }
+        );
+    }
     if stage == RejectionStage::RegisteredPayload {
         assert_eq!(
             registrations.load(Ordering::SeqCst),
@@ -193,6 +242,11 @@ fn check_rejected_commit(fault: Fault, stage: RejectionStage) {
             assert_eq!(
                 result.unwrap_err().diagnostic_cause_label(),
                 "store_not_found"
+            );
+        } else if stage == RejectionStage::AbandonedBudget {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                crate::DirectPutFailureKind::SnapshotReinspectionConflict
             );
         } else {
             assert!(
@@ -265,6 +319,14 @@ fn check_rejected_commit(fault: Fault, stage: RejectionStage) {
     );
     for node in fixture.map.nodes.values() {
         let pg = node.storage_node().get_pg(0).unwrap();
+        if abandon {
+            assert!(pg
+                .metadata_command_abandoned(
+                    node.node_id().as_u32(),
+                    installed_command.lock().unwrap().as_ref().unwrap(),
+                )
+                .unwrap());
+        }
         let object = crate::PgMetadataStore::get_object_meta(&*pg, &fixture.bucket, &fixture.key);
         if let Some(contender) = contender {
             assert_eq!(
