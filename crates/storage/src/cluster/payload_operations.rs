@@ -5401,7 +5401,9 @@ impl StorageCluster {
                         // responsibility away from the RAII guard before returning: its generic
                         // cleanup would release command-owned state. Disjoint caller staging can
                         // be removed; overlapping keys may be the command's live recovery input
-                        // and must remain untouched.
+                        // and must remain untouched. Report incomplete disjoint
+                        // cleanup before the mismatch, without rearming Drop or
+                        // releasing the pending command's reservation.
                         disarm_payload_cleanup();
                         let caller_owned_shards =
                             Self::direct_put_written_shards_not_owned_by_command(
@@ -5417,7 +5419,7 @@ impl StorageCluster {
                                 &req.segment_okh,
                                 req.segment_vid,
                                 &caller_owned_shards,
-                            );
+                            )?;
                         }
                         return Err(conflicting_pending_object_metadata_command(
                             "pending direct PUT command payload differs from request",
@@ -6618,15 +6620,15 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         written_shards: &[WrittenShardAck],
-    ) {
-        self.delete_payload_shard_keys_best_effort_at_epoch(
+    ) -> Result<(), StoreError> {
+        self.try_delete_payload_shard_keys_at_epoch(
             operation_epoch,
             data_pg_id,
             ec,
             segment_okh,
             segment_vid,
             written_shards.iter().map(|written| written.key.clone()),
-        );
+        )
     }
 
     #[cfg(test)]

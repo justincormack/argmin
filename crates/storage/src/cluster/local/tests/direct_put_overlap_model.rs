@@ -9,6 +9,9 @@ use super::*;
 use crate::bounded_explorer::{explore, Checks};
 use std::cell::RefCell;
 
+#[path = "direct_put_overlap_cleanup.rs"]
+mod cleanup;
+
 const DATA: &[u8] = b"pending command payload must remain recoverable";
 const CALLER_EC: EcShape = EcShape { k: 2, m: 2 };
 const COMMAND_EC: EcShape = EcShape { k: 2, m: 1 };
@@ -348,21 +351,13 @@ impl Fixture {
     }
 }
 
-fn replay(state: &State) -> Result<(), String> {
-    if state.trace.is_empty() {
-        return Ok(());
-    }
-    let mut fixture = Fixture::new();
-    let handle =
-        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
-    let admission = handle.admit_current_route().map_err(diagnostic)?;
-    let route = admission
-        .active_put_object_route(&fixture.bucket, &fixture.key)
-        .map_err(diagnostic)?;
+fn reserve_shared_generation<'a>(
+    fixture: &mut Fixture,
+    route: &crate::ActivePutObjectRoute<'a>,
+) -> Result<crate::DirectPutGenerationReservation<'a>, String> {
     // EC shape can change placement ordering. Select a deterministic fixture
     // with a genuine shared prefix, not merely equal keys on different nodes.
     // This bounded setup search is outside the explored operation schedule.
-    let mut selected = None;
     for candidate in 0..128 {
         let reservation = crate::tests::stream_session_id(format!("overlap-{candidate}"));
         let generation_reservation = route
@@ -384,13 +379,25 @@ fn replay(state: &State) -> Result<(), String> {
         }
         if shared_prefix {
             fixture.reservation = reservation;
-            selected = Some(generation_reservation);
-            break;
+            return Ok(generation_reservation);
         }
         drop(generation_reservation);
     }
-    let mut generation_reservation =
-        Some(selected.ok_or("no shared-prefix placement in 128 deterministic candidates")?);
+    Err("no shared-prefix placement in 128 deterministic candidates".to_string())
+}
+
+fn replay(state: &State) -> Result<(), String> {
+    if state.trace.is_empty() {
+        return Ok(());
+    }
+    let mut fixture = Fixture::new();
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
+    let admission = handle.admit_current_route().map_err(diagnostic)?;
+    let route = admission
+        .active_put_object_route(&fixture.bucket, &fixture.key)
+        .map_err(diagnostic)?;
+    let mut generation_reservation = Some(reserve_shared_generation(&mut fixture, &route)?);
     let generation = generation_reservation.as_ref().unwrap().generation_id();
     let caller_okh = crate::direct_put_segment_key_hash(&fixture.reservation, 0);
     let mut command_okh = caller_okh;

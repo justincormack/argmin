@@ -146,6 +146,14 @@ acknowledgements under the pending command's authority. Restoration or validatio
 failure must preserve command-owned payload and generation reservations for recovery,
 not invoke caller cleanup or re-arm the consumed payload handle.
 
+If a matching logical reservation has a different pending physical payload, first
+disarm generic caller cleanup, then delete only the exact caller-only shard subset.
+Overlapping command-owned files/acknowledgements and the logical reservation must
+survive. Attempt every caller-only participant and report cleanup failure before
+the payload-mismatch diagnostic; successful cleanup still returns the mismatch.
+Do not re-arm Drop on failure: it cannot distinguish this mixed ownership. This
+consuming error path does not provide retry custody or durable cleanup discovery.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

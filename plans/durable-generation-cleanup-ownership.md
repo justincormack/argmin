@@ -6203,3 +6203,46 @@ write-amplification test passed in 114.584s. Strict all-target/all-feature Clipp
 storage boundary checks, formatting and `git diff --check` passed. An initial
 focused build caught a missing error-type import in the new test module; that
 test-only compilation error was corrected before these successful runs.
+
+## Mismatched Pending Direct PUT Cleanup Errors — 2026-11-02
+
+A retry can match a pending command's logical reservation while supplying a
+different physical payload. That rejection already disarmed generic payload Drop
+and selected only caller-only shard keys, preserving command-owned overlap and
+generation ownership. However, it ignored physical cleanup failure and returned
+only the metadata-command contention diagnostic. The caller could not distinguish
+successful rejection cleanup from leftover files or acknowledgement rows.
+
+The retained explicit-subset helper now returns its completion result to this
+branch. Cleanup attempts every caller-only file and acknowledgement; its error
+takes precedence over the payload mismatch. Success retains the existing mismatch
+result. Both paths leave Drop disarmed and preserve the pending command's logical
+reservation. No retry loop, generation release, durability barrier or format change
+is added. The deliberate command-owned-deletion mutation fixture explicitly
+discards this result so it continues to exercise its intended unsafe behavior.
+
+The new regression reuses the overlap model's actual shared-location selection
+and encrypted EC payloads. Partial overlap and wholly disjoint layouts each cover
+independent file/acknowledgement failures. A deletion-key inventory proves exactly
+one attempt at every caller-only participant and none at shared command keys,
+including absence of a hidden Drop retry. Assertions pin remaining files/rows,
+the exact pending envelope, generation reservations on all replicas, preserved
+command acknowledgements and ciphertext reconstruction. After removing the fault,
+an explicit storage-owned retry of that subset completes cleanup and authorized
+recovery publishes the original command without payload loss. The existing bounded
+model continues to cover successful mismatch cleanup and repeated rejection.
+
+The new test failed against the previous implementation with
+`store_metadata_command_contention` instead of `store_io_failure` on its injected
+partial-overlap file failure. This fixes error reporting, **not durable retry
+ownership**: the test retains explicit owner-local subset evidence; the consuming
+request error still supplies no cleanup handle or durable record. The retained
+owner/window integration and six original ignored regressions remain outstanding.
+
+Validation: the pre-fix regression reproduced the hidden cleanup failure. All
+163 focused Direct PUT tests then passed, including the bounded overlap model.
+The full Nextest run passed all 9,291 tests (two slow, six skipped) in 245.338s.
+The Raft heartbeat write-amplification and oversized version-listing tests passed
+in 117.350s and 61.053s respectively. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and `git diff --check` passed. The updated deliberate
+mutation patch also passed a dry-run application check.
