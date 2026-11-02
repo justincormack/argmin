@@ -93,6 +93,16 @@ must still establish finite write authority, reference protection and closure
 at both physical participants before retiring an owner. Waiting for an admitted
 filesystem operation is not a promise of progress when that IO is stalled.
 
+Acknowledgement insertion and deletion already share the acknowledgement PG's
+mutex. Exact batch registration holds it across `BEGIN IMMEDIATE`, per-row
+captured-fence checks and commit/rollback; retained acknowledgement deletion
+acquires the same mutex. Do not add a second acknowledgement lock merely to
+mirror the unlocked file path. A delayed fresh batch must still revalidate its
+captured fence after acquiring the PG, before any insertion. Conversely, a
+deletion must wait for an admitted batch's transaction to finish. These are local
+serialization guarantees, not permission to clean while future delegated
+effects remain possible.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

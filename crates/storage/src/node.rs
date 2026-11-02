@@ -92,6 +92,9 @@ mod multipart_ops;
 mod object_metadata_ops;
 #[path = "node/object_read_ops.rs"]
 mod object_read_ops;
+#[cfg(test)]
+#[path = "node/pg_lock_test_hook.rs"]
+pub(super) mod pg_lock_test_hook;
 #[path = "node/stream_ops.rs"]
 mod stream_ops;
 
@@ -1682,7 +1685,14 @@ impl SharedStorageNode {
             .stores
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+        #[cfg(test)]
+        {
+            Ok(pg_lock_test_hook::lock_pg(mutex, pg_id))
+        }
+        #[cfg(not(test))]
+        {
+            Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+        }
     }
 
     pub(crate) fn get_pg_until(

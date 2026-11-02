@@ -148,6 +148,9 @@ idempotent retries. It does not implement write exclusion or owner retirement.
 The [local file exclusion slice](#local-shard-file-publicationdeletion-exclusion--2026-11-02)
 now serializes in-flight file publication with deletion in each opened PG. It
 does not revoke delayed requests or replace the durable owner/window protocol.
+The [acknowledgement exclusion evidence](#acknowledgement-transaction-and-cleanup-exclusion--2026-11-02)
+pins the companion PG-mutex boundary through embedded and installed Unix paths.
+It requires no additional production lock or durability barrier.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5639,3 +5642,64 @@ passed all 9,258 tests (two slow, six skipped) in 255.187s. The flagged Raft
 write-amplification and oversized version-list tests completed in 110.354s and
 69.606s respectively. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and `git diff --check` passed.
+
+## Acknowledgement Transaction And Cleanup Exclusion — 2026-11-02
+
+The companion acknowledgement participant does not need a copy of the new
+per-file lock. Unlike unlocked file IO, `LocalShardAckRoute` and the installed
+server's active-primary data route hold the acknowledgement PG mutex throughout
+`register_written_shards_batch_exact_with_effect_fence`, including the immediate
+transaction, row checks, insertions and commit/rollback. Retained acknowledgement
+deletion locks that same PG before deleting its exact row. The existing immutable
+effect fence is rechecked inside the transaction, after any PG/SQLite wait.
+
+Four tests in
+[`shard_ack_cleanup_tests.rs`](../crates/storage/src/storage_node_server/shard_ack_cleanup_tests.rs)
+exercise both orderings through embedded routes and a bound Unix server:
+
+- Pause an admitted two-row batch inside its transaction, then invoke retained
+  deletion. An actual `try_lock` failure at the deletion's PG acquisition pins
+  contention. After the writer releases the PG, inspect both exact batch rows
+  and an independent canary immediately before deletion: cleanup cannot pass
+  merely because the target was never inserted. Close the original runtime
+  before reopening, then verify the target row is absent, the other rows survive,
+  and the separate shard files remain unchanged.
+- Delete an existing row while holding the PG, then deliver a fresh batch with
+  a still-valid captured deadline. At its actual lock contention, advance only
+  the executing thread's clock past the effective cutoff but before its raw
+  authority timestamp. After the PG is released, require the exact expiry error
+  (embedded `RouteMapExpired`, Unix `StaleShardLocation`), no resurrected target
+  or inserted sibling, and unchanged independent row/files. A new valid-authority
+  batch succeeds as a positive effect-boundary canary, not as permission for an
+  abandoned production attempt to resume.
+
+Both routes are constructed before the race. The one-shot owner-local hook runs
+only after observed contention, with an optional inspection while holding the
+acquired PG; signalling thread start or blocking during route construction cannot
+satisfy it. The hook is `cfg(test)` only and is not exposed through downstream
+test support. The Unix cases exercise the real client, codec, server admission,
+portable deadline binding and SQL path; they are not raw response-validator calls.
+The receiving route is independently live throughout these tests; same-epoch
+renewal and TLS clock-origin coverage remain in the earlier deadline regressions.
+
+The lock probe returns an already acquired guard directly, including a poisoned
+guard. Only `WouldBlock` invokes the scheduling hook and blocking acquisition;
+there is no unlock/relock gap on the fast path. A separate regression supplies
+real successful and poisoned `try_lock` results and makes the blocking step
+panic if called. It also checks continued ownership and that the contention hook
+remains unused. This pins the probe semantics independently of the four forced
+contention schedules.
+
+This is current-behavior evidence, not a production synchronization change. No
+additional acknowledgement lock, transaction, fsync, format or dependency is
+introduced. The PG mutex does not revoke a valid delayed request after cleanup;
+durable owner/window coverage, finite delegated authority and cutoff-aware
+eligibility must still prevent that schedule. Nor does this slice implement
+ack-closure RPCs, cross-participant physical cleanup, or replacement-primary
+settlement. All six original cleanup regressions remain open.
+
+Validation: all five focused tests passed. Full Nextest passed all 9,263 tests
+(one slow, six skipped) in 261.098s. The flagged Raft write-amplification test
+completed in 97.173s.
+Strict all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed.
