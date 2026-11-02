@@ -548,6 +548,209 @@ fn placed_segment_deleter_rejects_crossed_segment_keys() {
 }
 
 #[test]
+fn retained_payload_cleanup_rejects_crossed_batch_before_file_or_ack_mutation() {
+    let _serial = lock_payload_cleanup_hook_test();
+    let tmp = test_util::tempdir();
+    let nodes = [0, 1, 2].map(NodeId::new);
+    let ec = EcShape { k: 1, m: 1 };
+    let pg = DataPgId::new_for_test(PgId::new(0));
+    let hash = [0x91; 16];
+    let vid = GenerationId::MIN;
+    let mut map = LocalClusterMap::open(tmp.path(), &nodes, &[0], ec).unwrap();
+    let locations = map
+        .place_payload_shards(
+            ClusterEpoch::INITIAL,
+            pg,
+            ec,
+            &crate::cluster::segment_payload_placement_key(&hash, vid),
+        )
+        .unwrap();
+    let primary = nodes
+        .into_iter()
+        .find(|id| locations.iter().all(|l| l.node_id() != *id))
+        .unwrap();
+    set_route_primary(&mut map, pg.get(), primary);
+    let map = Arc::new(map);
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let own_key = ShardKey::new(&hash, vid.get(), 0);
+    let unselected_key = ShardKey::new(&hash, vid.get(), 1);
+    let foreign_key = ShardKey::new(&[0x92; 16], vid.get(), 0);
+    let bytes = b"physical cleanup subject fixture";
+    let own_ack = cluster
+        .write_payload_shard(locations[0], &own_key, bytes)
+        .unwrap();
+    let unselected_ack = cluster
+        .write_payload_shard(locations[1], &unselected_key, bytes)
+        .unwrap();
+    let foreign_locations = cluster
+        .segment_payload_shard_locations(pg.get(), ec, &[0x92; 16], vid)
+        .unwrap();
+    let foreign_ack = cluster
+        .write_payload_shard(foreign_locations[0], &foreign_key, bytes)
+        .unwrap();
+    cluster
+        .test_register_payload_shard_acks(
+            pg.get(),
+            &[
+                WrittenShardAck {
+                    key: own_key.clone(),
+                    ack: own_ack,
+                },
+                WrittenShardAck {
+                    key: foreign_key.clone(),
+                    ack: foreign_ack,
+                },
+                WrittenShardAck {
+                    key: unselected_key.clone(),
+                    ack: unselected_ack,
+                },
+            ],
+        )
+        .unwrap();
+    let ack_node = map.node(primary).unwrap().storage_node();
+    let check_acks = || {
+        for (key, ack) in [
+            (&own_key, own_ack),
+            (&foreign_key, foreign_ack),
+            (&unselected_key, unselected_ack),
+        ] {
+            ack_node
+                .get_pg(pg.get())
+                .unwrap()
+                .validate_written_shard_ack(key, ack)
+                .unwrap();
+        }
+    };
+    check_acks();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let file_effects = effects.clone();
+    let ack_effects = effects.clone();
+    let file_hook =
+        cluster.test_install_before_placed_payload_shard_delete_hook(Arc::new(move |_| {
+            file_effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    let ack_hook =
+        cluster.test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(move |_| {
+            ack_effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+    for (invalid_key, expected_reason) in [
+        (
+            foreign_key.clone(),
+            "shard key does not match placed segment identity at shard index 0",
+        ),
+        (
+            ShardKey::new(&hash, 2, 0),
+            "shard key does not match placed segment identity at shard index 0",
+        ),
+        (
+            ShardKey::new(&hash, vid.get(), ec.k + ec.m),
+            "shard index 2 is outside the placed segment's 2 locations",
+        ),
+        (
+            own_key.clone(),
+            "payload cleanup subset repeats a shard index",
+        ),
+    ] {
+        let keys = vec![own_key.clone(), invalid_key];
+        let error = map
+            .open_retained_payload_cleanup(ClusterEpoch::INITIAL, pg, ec, &hash, vid, keys.clone())
+            .err()
+            .expect("crossed/duplicate cleanup batch must be rejected");
+        let error = match error {
+            StoreError::ShardStore { source, .. } => *source,
+            other => other,
+        };
+        assert!(
+            matches!(&error, StoreError::PayloadShardSetMismatch { reason } if reason == expected_reason),
+            "{error:?}"
+        );
+        cluster.delete_payload_shard_keys_best_effort_at_epoch(
+            ClusterEpoch::INITIAL,
+            pg.get(),
+            ec,
+            &hash,
+            vid,
+            keys,
+        );
+        ack_node
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(&foreign_key, foreign_ack)
+            .expect("a crossed cleanup key must not delete the unrelated acknowledgement");
+        ack_node
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(&own_key, own_ack)
+            .expect("validate the entire batch before deleting even its valid prefix");
+        check_acks();
+        for (location, key) in [
+            (locations[0], &own_key),
+            (foreign_locations[0], &foreign_key),
+            (locations[1], &unselected_key),
+        ] {
+            assert_eq!(
+                map.node(location.node_id())
+                    .unwrap()
+                    .storage_node()
+                    .read_shard_file(pg.get(), key)
+                    .unwrap(),
+                bytes
+            );
+        }
+    }
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        0,
+        "invalid batches must not reach either effect hook"
+    );
+    drop((file_hook, ack_hook));
+    for _ in 0..2 {
+        cluster.delete_payload_shard_keys_best_effort_at_epoch(
+            ClusterEpoch::INITIAL,
+            pg.get(),
+            ec,
+            &hash,
+            vid,
+            [own_key.clone()],
+        );
+        assert!(matches!(
+            ack_node
+                .get_pg(pg.get())
+                .unwrap()
+                .validate_written_shard_ack(&own_key, own_ack),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            map.node(locations[0].node_id())
+                .unwrap()
+                .storage_node()
+                .read_shard_file(pg.get(), &own_key),
+            Err(StoreError::NotFound)
+        ));
+        for (location, key, ack) in [
+            (locations[1], &unselected_key, unselected_ack),
+            (foreign_locations[0], &foreign_key, foreign_ack),
+        ] {
+            assert_eq!(
+                map.node(location.node_id())
+                    .unwrap()
+                    .storage_node()
+                    .read_shard_file(pg.get(), key)
+                    .unwrap(),
+                bytes
+            );
+            ack_node
+                .get_pg(pg.get())
+                .unwrap()
+                .validate_written_shard_ack(key, ack)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
 fn payload_placement_keeps_file_owners_distinct_from_acknowledgement_primary() {
     let tmp = test_util::tempdir();
     let acting = [4, 2, 3].map(NodeId::new);

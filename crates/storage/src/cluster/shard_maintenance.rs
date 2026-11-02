@@ -4357,19 +4357,43 @@ impl StorageCluster {
                 return;
             }
         };
-        self.delete_placed_payload_shard_keys_best_effort_at_epoch(
+        let cleanup = match self.local_map.open_retained_payload_cleanup(
             operation_epoch,
             data_pg,
             ec,
             okh,
             generation_id,
-            &shard_keys,
-        );
-        self.delete_metadata_primary_payload_shard_keys_best_effort_at_epoch(
-            operation_epoch,
-            data_pg_id,
-            &shard_keys,
-        );
+            shard_keys,
+        ) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                self.emit_best_effort_payload_cleanup_error(
+                    "validate retained payload cleanup scope",
+                    &error,
+                );
+                return;
+            }
+        };
+        for entry in cleanup.entries() {
+            if let Err(error) = self.maybe_run_before_placed_payload_shard_delete_hook(entry.key()) {
+                self.emit_best_effort_payload_cleanup_error("delete placed payload shard", &error);
+                continue;
+            }
+            if let Err(error) = entry.delete_file() {
+                self.emit_best_effort_payload_cleanup_error("delete placed payload shard", &error);
+            }
+        }
+        for entry in cleanup.entries() {
+            if let Err(error) =
+                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(entry.key())
+            {
+                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+                continue;
+            }
+            if let Err(error) = entry.delete_acknowledgement() {
+                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
+            }
+        }
     }
 
     fn delete_placed_payload_shard_keys(
@@ -4401,53 +4425,6 @@ impl StorageCluster {
         Ok(())
     }
 
-    fn delete_placed_payload_shard_keys_best_effort_at_epoch(
-        &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        ec: EcShape,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        shard_keys: &[ShardKey],
-    ) {
-        let deleter = match self
-            .local_map
-            .open_retained_placed_segment_shard_deleter(
-                operation_epoch,
-                data_pg_id,
-                ec,
-                okh,
-                generation_id,
-            )
-        {
-            Ok(deleter) => deleter,
-            Err(error) => {
-                self.emit_best_effort_payload_cleanup_error(
-                    "resolve retained payload placement route",
-                    &error,
-                );
-                return;
-            }
-        };
-
-        for shard_key in shard_keys {
-            if let Err(error) = self.maybe_run_before_placed_payload_shard_delete_hook(shard_key) {
-                self.emit_best_effort_payload_cleanup_error(
-                    "delete placed payload shard",
-                    &error,
-                );
-                continue;
-            }
-            if let Err(error) = deleter.delete_matching_key(shard_key) {
-                let error = shard_io_error_to_store(error);
-                self.emit_best_effort_payload_cleanup_error(
-                    "delete placed payload shard",
-                    &error,
-                );
-            }
-        }
-    }
-
     fn delete_metadata_primary_payload_shard_keys(
         &self,
         data_pg_id: u32,
@@ -4470,51 +4447,6 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
         self.delete_metadata_primary_payload_shard_keys(data_pg_id, shard_keys)
-    }
-
-    fn delete_metadata_primary_payload_shard_keys_best_effort_at_epoch(
-        &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: u32,
-        shard_keys: &[ShardKey],
-    ) {
-        let data_pg_id = match self.validated_data_pg(PgId::new(data_pg_id)) {
-            Ok(data_pg_id) => data_pg_id,
-            Err(error) => {
-                self.emit_best_effort_payload_cleanup_error(
-                    "validate payload acknowledgement cleanup data PG",
-                    &error,
-                );
-                return;
-            }
-        };
-        let shard_ack_client = match self.metadata_pg_primary_shard_ack_client_at_retained_epoch(
-            operation_epoch,
-            data_pg_id.pg_id(),
-        ) {
-            Ok(shard_ack_client) => shard_ack_client,
-            Err(error) => {
-                self.emit_best_effort_payload_cleanup_error(
-                    "resolve payload ack metadata PG primary",
-                    &error,
-                );
-                return;
-            }
-        };
-        for shard_key in shard_keys {
-            if let Err(error) =
-                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
-            {
-                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
-                continue;
-            }
-            if let Err(error) = shard_ack_client
-                .open_retained_shard_ack_route(operation_epoch, data_pg_id, shard_key)
-                .and_then(|route| route.delete_retained_shard_ack())
-            {
-                self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
-            }
-        }
     }
 
     fn placed_payload_shard_location(
@@ -4563,42 +4495,28 @@ impl StorageCluster {
                 k: segment.ec_k,
                 m: segment.ec_m,
             };
-            let deleter = self
+            let shard_keys =
+                Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
+            let cleanup = self
                 .local_map
-                .open_retained_placed_segment_shard_deleter(
+                .open_retained_payload_cleanup(
                     segment.placement_cluster_epoch,
                     data_pg_id,
                     ec,
                     &segment.segment_okh,
                     segment.segment_vid,
+                    shard_keys,
                 )
                 .map_err(ObjectPgActionError::Store)?;
-            let shard_keys =
-                Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
-            for shard_key in &shard_keys {
-                self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+            for entry in cleanup.entries() {
+                self.maybe_run_before_placed_payload_shard_delete_hook(entry.key())
                     .map_err(ObjectPgActionError::Store)?;
-                deleter
-                    .delete_matching_key(shard_key)
-                    .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
+                entry.delete_file().map_err(ObjectPgActionError::Store)?;
             }
-            let shard_ack_client = self
-                .metadata_pg_primary_shard_ack_client_at_retained_epoch(
-                    segment.placement_cluster_epoch,
-                    data_pg_id.pg_id(),
-                )
-                .map_err(ObjectPgActionError::Store)?;
-            for shard_key in &shard_keys {
-                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+            for entry in cleanup.entries() {
+                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(entry.key())
                     .map_err(ObjectPgActionError::Store)?;
-                shard_ack_client
-                    .open_retained_shard_ack_route(
-                        segment.placement_cluster_epoch,
-                        data_pg_id,
-                        shard_key,
-                    )
-                    .and_then(|route| route.delete_retained_shard_ack())
-                    .map_err(ObjectPgActionError::Store)?;
+                entry.delete_acknowledgement().map_err(ObjectPgActionError::Store)?;
             }
         }
         Ok(())

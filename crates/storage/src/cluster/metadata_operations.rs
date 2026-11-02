@@ -5827,17 +5827,6 @@ impl StorageCluster {
             .open_shard_ack_route(operation_epoch, data_pg_id)
     }
 
-    fn metadata_pg_primary_shard_ack_client_at_retained_epoch(
-        &self,
-        operation_epoch: ClusterEpoch,
-        pg_id: PgId,
-    ) -> Result<&Arc<dyn RetainedShardAckNodeClient>, StoreError> {
-        let node = self
-            .local_map
-            .metadata_pg_primary_node_for_retained_cleanup(operation_epoch, pg_id)?;
-        Ok(node.retained_shard_ack_client())
-    }
-
     #[cfg(test)]
     pub(crate) fn record_routine_metadata_command_checkpoints(
         &self,

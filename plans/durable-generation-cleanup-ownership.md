@@ -163,6 +163,10 @@ The [introduction-to-physical-handoff model](#introduction-to-physical-handoff-m
 now composes introduction settlement with separate file/ack admission and loss of
 attempt coordination. This is bounded candidate evidence, not production grants
 or retained owner/window integration; the six regressions remain open.
+The [retained cleanup subject correction](#retained-fileacknowledgement-cleanup-subject--2026-11-02)
+binds each explicit cleanup subset to both its file locations and historical
+acknowledgement primary before either effect. It fixes crossed-key acknowledgement
+deletion, not missing durable ownership or delayed-write fencing.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5970,3 +5974,62 @@ All six new tests passed on the final tree. The full Nextest run passed all
 write-amplification and oversized version-listing tests completed successfully
 in 155.084s and 99.739s respectively. Strict all-target/all-feature Clippy,
 storage boundary checks, formatting and `git diff --check` passed.
+
+## Retained File/Acknowledgement Cleanup Subject — 2026-11-02
+
+Reviewing the production boundary for the owner/window integration found an
+existing subject-binding gap. `delete_payload_shard_keys_best_effort_at_epoch`
+validated keys only in the file-deletion loop, then independently passed the
+original list to acknowledgement deletion. A wrong-hash key was rejected by the
+file deleter but still removed that unrelated key's acknowledgement. A valid
+prefix of a malformed batch could also be deleted before the mismatch appeared.
+The new embedded regression reproduced `NotFound` for the unrelated durable
+acknowledgement before the production change.
+
+`LocalRetainedPayloadCleanup` now owns the exact segment subset and captures its
+file deleter and historical acknowledgement client together. Construction checks
+every key's hash, VID and placed index, rejects duplicates, and resolves the exact
+retained metadata primary before returning any effect-bearing member. Members
+take no replacement key, PG, epoch or primary for either deletion. A caller can
+inspect a member's key for diagnostics/hooks, but cannot replace its private
+subject. The acknowledgement primary is independent of shard-index order and
+may own none of the segment's files.
+
+Both best-effort retained cleanup (Direct PUT, stream append and displaced
+payload helpers) and the error-returning retained stream-abort path use this
+scope. The separate best-effort file/ack wrappers and unused raw retained-client
+selector were removed. Invalid scope construction now performs neither effect.
+Once a valid scope exists, best-effort cleanup still attempts other members and
+the acknowledgement phase after individual IO failures; strict stream cleanup
+still returns its first effect failure. No new lock, RPC, transaction, fsync,
+dependency or durable/wire format is introduced. Existing local effect guards
+and receiver-side route checks remain in force.
+
+Coverage includes independent hash, VID, out-of-range index and duplicate-key
+negatives, with a valid key first in each rejected batch. Effect hooks must remain
+untouched, all existing file bytes and acknowledgement rows must remain intact,
+and a valid subset must delete exactly that subset on repeated cleanup. The
+same-segment unselected shard and foreign-segment canary remain readable with
+their acknowledgements. An installed-Unix test uses an unsorted acting set,
+a historical acknowledgement primary which owns no selected file, and a different
+current primary. It rejects a crossed batch without mutation, then deletes a
+valid subset idempotently using the historical route. A same-key acknowledgement
+on the current primary must survive, independently pinning historical selection.
+These are owner-local physical-file/row fixtures, not encrypted object fixtures.
+
+This scope proves **subject/participant binding only**. The caller still needs
+reference protection and cleanup eligibility. It does not provide cross-node
+atomicity, revoke late writes, retain a failed cleanup obligation or prove durable
+completion. The coordinated owner/window introduction and finite physical grants
+remain the next state integration; all six original cleanup regressions remain
+open. This correction adds no session-preservation requirement.
+
+Validation: the crossed-batch regression reproduced unrelated acknowledgement
+deletion before the fix. The expanded negative matrix initially expected an
+unwrapped mismatch; it now checks the exact `PayloadShardSetMismatch` diagnostic
+inside the placement layer's `ShardStore` wrapper, without admitting other error
+classes. All 71 focused cleanup/reclaim/abort/placement tests passed. The full
+Nextest run passed all 9,281 tests (one slow, six skipped) in 252.108s; the Raft
+heartbeat write-amplification test completed in 112.206s. Strict all-target/
+all-feature Clippy, storage boundary checks, formatting and `git diff --check`
+passed. The six original cleanup regressions remain ignored and unresolved.

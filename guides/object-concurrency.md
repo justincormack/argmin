@@ -103,6 +103,15 @@ deletion must wait for an admitted batch's transaction to finish. These are loca
 serialization guarantees, not permission to clean while future delegated
 effects remain possible.
 
+Retained cleanup of an explicit segment subset must validate the complete subset
+before either file or acknowledgement deletion. Use the shared storage-owned
+cleanup scope: each member binds its shard key, placement epoch/data PG, file
+location and independently selected historical acknowledgement primary. A file
+key mismatch must not fall through to acknowledgement deletion, and a valid
+prefix must not be deleted before discovering a malformed later member. This
+subject check does not establish reference absence, expiry, cross-node atomicity
+or durable retry ownership; those remain separate cleanup obligations.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

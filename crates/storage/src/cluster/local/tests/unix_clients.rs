@@ -12219,6 +12219,185 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
 }
 
 #[test]
+fn retained_payload_cleanup_binds_unix_files_and_historical_ack_primary() {
+    let (_serial, tmp) = unix_client_tempdir();
+    let nodes = [2, 0, 1].map(NodeId::new);
+    let ec = EcShape { k: 1, m: 1 };
+    let old_epoch = ClusterEpoch::new(7).unwrap();
+    let epoch = ClusterEpoch::new(9).unwrap();
+    let pg = DataPgId::new_for_test(PgId::new(0));
+    let hash = [0x96; 16];
+    let vid = GenerationId::new(3).unwrap();
+    let locations = place_payload_shards_for_pg_route(
+        old_epoch,
+        pg,
+        ec,
+        &crate::cluster::segment_payload_placement_key(&hash, vid),
+        &nodes,
+    )
+    .unwrap();
+    let old_primary = nodes
+        .into_iter()
+        .find(|id| locations.iter().all(|l| l.node_id() != *id))
+        .unwrap();
+    let current_primary = locations[0].node_id();
+    assert_ne!(old_primary, current_primary);
+    let route = |epoch, primary| StorageNodePgRoute {
+        pg_id: pg.get(),
+        cluster_epoch: epoch,
+        state: PgState::Active,
+        primary_node_id: primary,
+        metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
+        acting_set: nodes.to_vec(),
+    };
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        current_primary,
+        nodes,
+        &[pg.get()],
+        ec,
+        epoch,
+    )
+    .unwrap();
+    set_route_primary(&mut map, pg.get(), current_primary);
+    map.test_install_historical_pg_routes([PgRouteSnapshot::reconstructed(
+        old_epoch,
+        pg.pg_id(),
+        old_primary,
+        nodes.to_vec(),
+        PgState::Active,
+    )]);
+    private_socket_dir(&tmp.path().join("sockets"));
+    let mut remotes = std::collections::BTreeMap::new();
+    let mut servers = Vec::new();
+    let mut clients = Vec::new();
+    for node in nodes {
+        let socket = tmp.path().join(format!("sockets/{}.sock", node.as_u32()));
+        let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id: node,
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join(format!("remote-{}", node.as_u32())),
+            default_ec_shape: ec,
+            pg_ids: vec![pg.get()],
+            socket_path: socket.clone(),
+            pg_routes: vec![route(epoch, current_primary)],
+            pending_metadata_command_recoveries: vec![],
+            historical_pg_routes: vec![route(old_epoch, old_primary)],
+        })
+        .unwrap();
+        remotes.insert(node, server.test_storage_node());
+        servers.push(spawn_storage_node_server(server));
+        clients.push(LocalUnixShardNodeClientConfig::new(node, socket));
+    }
+    map.install_unix_shard_clients(clients).unwrap();
+    let map = Arc::new(map);
+    let cluster = StorageCluster::from_static_local_map(map.clone()).unwrap();
+    let keys: Vec<_> = locations
+        .iter()
+        .map(|l| ShardKey::new(&hash, vid.get(), l.shard_index().get()))
+        .collect();
+    let bytes = b"retained cleanup physical fixture";
+    let mut acks = Vec::new();
+    for (location, key) in locations.iter().zip(&keys) {
+        acks.push(
+            remotes[&location.node_id()]
+                .write_shard_file(pg.get(), key, bytes)
+                .unwrap(),
+        );
+    }
+    let old_node = &remotes[&old_primary];
+    for (key, ack) in keys.iter().zip(&acks) {
+        old_node
+            .get_pg(pg.get())
+            .unwrap()
+            .register_written_shards_batch_exact(&[(key, *ack)])
+            .unwrap();
+    }
+    // The current primary has a same-key canary: accidentally selecting it
+    // instead of the exact retained primary must be observable.
+    remotes[&current_primary]
+        .get_pg(pg.get())
+        .unwrap()
+        .register_written_shards_batch_exact(&[(&keys[0], acks[0])])
+        .unwrap();
+    let crossed = ShardKey::new(&[0x97; 16], vid.get(), 0);
+    old_node
+        .get_pg(pg.get())
+        .unwrap()
+        .register_written_shards_batch_exact(&[(&crossed, acks[0])])
+        .unwrap();
+    cluster.delete_payload_shard_keys_best_effort_at_epoch(
+        old_epoch,
+        pg.get(),
+        ec,
+        &hash,
+        vid,
+        [keys[0].clone(), crossed.clone()],
+    );
+    for (location, (key, ack)) in locations.iter().zip(keys.iter().zip(&acks)) {
+        assert_eq!(
+            remotes[&location.node_id()]
+                .read_shard_file(pg.get(), key)
+                .unwrap(),
+            bytes
+        );
+        old_node
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(key, *ack)
+            .unwrap();
+    }
+    old_node
+        .get_pg(pg.get())
+        .unwrap()
+        .validate_written_shard_ack(&crossed, acks[0])
+        .unwrap();
+    for _ in 0..2 {
+        cluster.delete_payload_shard_keys_best_effort_at_epoch(
+            old_epoch,
+            pg.get(),
+            ec,
+            &hash,
+            vid,
+            [keys[0].clone()],
+        );
+        assert!(matches!(
+            remotes[&locations[0].node_id()].read_shard_file(pg.get(), &keys[0]),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            old_node
+                .get_pg(pg.get())
+                .unwrap()
+                .validate_written_shard_ack(&keys[0], acks[0]),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            remotes[&locations[1].node_id()]
+                .read_shard_file(pg.get(), &keys[1])
+                .unwrap(),
+            bytes
+        );
+        old_node
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(&keys[1], acks[1])
+            .unwrap();
+        old_node
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(&crossed, acks[0])
+            .unwrap();
+        remotes[&current_primary]
+            .get_pg(pg.get())
+            .unwrap()
+            .validate_written_shard_ack(&keys[0], acks[0])
+            .unwrap();
+    }
+}
+
+#[test]
 fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

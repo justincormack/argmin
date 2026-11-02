@@ -72,7 +72,7 @@ use crate::node_client::{
     MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
     MetadataCommandPeeringNodeClient, MetadataCommandPendingSlotInsertError,
     MetadataReadAuthorization, ObjectListingMetadataRoute, ObjectPayloadLeaseNodeLease,
-    RetainedShardAckNodeClient, ShardAckRoute,
+    ShardAckRoute,
 };
 pub(crate) use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{

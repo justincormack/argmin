@@ -1313,7 +1313,7 @@ pub(super) struct LocalPlacedSegmentShardDeleter<'a> {
 }
 
 impl LocalPlacedSegmentShardDeleter<'_> {
-    pub(super) fn delete_matching_key(&self, key: &ShardKey) -> Result<(), ShardIoError> {
+    fn require_matching_key(&self, key: &ShardKey) -> Result<ShardLocation, ShardIoError> {
         let shard_index = usize::from(key.shard_index().get());
         let (location, expected_key) = self.subject.location_and_key(shard_index)?;
         if *key != expected_key {
@@ -1321,18 +1321,69 @@ impl LocalPlacedSegmentShardDeleter<'_> {
                 "shard key does not match placed segment identity at shard index {shard_index}"
             )));
         }
+        Ok(location)
+    }
+
+    pub(super) fn delete_matching_key(&self, key: &ShardKey) -> Result<(), ShardIoError> {
+        let location = self.require_matching_key(key)?;
         match self.route_kind {
             LocalPlacedSegmentShardDeleteRouteKind::Current => {
                 self.cluster_map.delete_payload_shard_for_current_route(
                     self.subject.operation_epoch,
                     location,
-                    &expected_key,
+                    key,
                 )
             }
             LocalPlacedSegmentShardDeleteRouteKind::Retained => self
                 .cluster_map
-                .delete_payload_shard_for_historical_cleanup(location, &expected_key),
+                .delete_payload_shard_for_historical_cleanup(location, key),
         }
+    }
+}
+
+/// One validated segment subset shared by file and acknowledgement cleanup.
+/// This binds subjects and participants, not reference/expiry authorization:
+/// callers must still establish that this payload may be cleaned. It provides
+/// neither cross-node atomic deletion nor durable retry ownership.
+pub(super) struct LocalRetainedPayloadCleanup<'map> {
+    files: LocalPlacedSegmentShardDeleter<'map>,
+    ack_client: Arc<dyn RetainedShardAckNodeClient>,
+    keys: Vec<ShardKey>,
+}
+
+impl LocalRetainedPayloadCleanup<'_> {
+    pub(super) fn entries(&self) -> impl Iterator<Item = LocalRetainedPayloadCleanupEntry<'_, '_>> {
+        self.keys
+            .iter()
+            .map(|key| LocalRetainedPayloadCleanupEntry { scope: self, key })
+    }
+}
+
+/// A member cannot supply a different key, PG, epoch or acknowledgement owner
+/// to either effect. Its representation is private to the placement owner.
+pub(super) struct LocalRetainedPayloadCleanupEntry<'scope, 'map> {
+    scope: &'scope LocalRetainedPayloadCleanup<'map>,
+    key: &'scope ShardKey,
+}
+
+impl LocalRetainedPayloadCleanupEntry<'_, '_> {
+    pub(super) fn key(&self) -> &ShardKey {
+        self.key
+    }
+
+    pub(super) fn delete_file(&self) -> Result<(), StoreError> {
+        self.scope
+            .files
+            .delete_matching_key(self.key)
+            .map_err(super::shard_io_error_to_store)
+    }
+
+    pub(super) fn delete_acknowledgement(&self) -> Result<(), StoreError> {
+        let subject = &self.scope.files.subject;
+        self.scope
+            .ack_client
+            .open_retained_shard_ack_route(subject.operation_epoch, subject.data_pg_id, self.key)?
+            .delete_retained_shard_ack()
     }
 }
 
@@ -6486,6 +6537,44 @@ impl LocalClusterMap {
                 segment_vid,
             )?,
             route_kind: LocalPlacedSegmentShardDeleteRouteKind::Retained,
+        })
+    }
+
+    /// Validate the whole subset before exposing either effect, and capture
+    /// the historical acknowledgement primary independently of file placement.
+    pub(super) fn open_retained_payload_cleanup(
+        &self,
+        placement_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        keys: Vec<ShardKey>,
+    ) -> Result<LocalRetainedPayloadCleanup<'_>, StoreError> {
+        let files = self.open_retained_placed_segment_shard_deleter(
+            placement_epoch,
+            data_pg_id,
+            ec,
+            segment_okh,
+            segment_vid,
+        )?;
+        let mut seen = BTreeSet::new();
+        for key in &keys {
+            files
+                .require_matching_key(key)
+                .map_err(super::shard_io_error_to_store)?;
+            if !seen.insert(key.shard_index()) {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "payload cleanup subset repeats a shard index".into(),
+                });
+            }
+        }
+        let primary = self
+            .metadata_pg_primary_node_for_retained_cleanup(placement_epoch, data_pg_id.pg_id())?;
+        Ok(LocalRetainedPayloadCleanup {
+            files,
+            ack_client: Arc::clone(primary.retained_shard_ack_client()),
+            keys,
         })
     }
 
