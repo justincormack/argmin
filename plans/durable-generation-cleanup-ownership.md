@@ -142,6 +142,9 @@ The [ephemeral-attempt model](#ephemeral-attempt-cleanup-model--2026-11-02)
 now checks cleanup after loss of attempt coordination, without restoring the
 session, while preserving accepted publication. It assumes the durable owner
 already exists; introducing that owner/window remains production work.
+The [durable unlink prerequisite](#durable-shard-unlink-before-owner-retirement--2026-11-02)
+now makes shard-file deletion acknowledge its directory barrier, including
+idempotent retries. It does not implement write exclusion or owner retirement.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -5521,3 +5524,49 @@ Validation: all four focused tests passed. The full Nextest run passed all
 `raft_production_shaped_heartbeat_write_amplification_gate` completed successfully
 in 112.136s. Strict all-target/all-feature Clippy, storage boundary checks,
 formatting and `git diff --check` passed.
+
+## Durable Shard Unlink Before Owner Retirement — 2026-11-02
+
+The selected cleanup contract requires durable physical deletion before retiring
+the last owner. Auditing that boundary found that both final-file deletion paths
+returned after `unlink` without confirming the directory barrier. This slice
+implements the independent DUR-3 prerequisite before adding owner retirement;
+it does not substitute for the coordinated owner/window integration.
+
+`PgStore::delete_shard_file_durable` now supplies the shared final-name protocol
+for the file-only `SharedStorageNode` path (active and retained node-client/RPC
+routes) and the combined `PgStore` row/file delete. An existing prefix is opened,
+the final name unlinked, and that directory synced before success. An absent
+prefix requires a sync of the existing shard root instead. No prefix is created
+for deletion. Missing storage or a non-directory/symlink prefix fails closed.
+The containing storage namespace remains storage-owned; this is not a protocol
+for concurrent directory replacement by another process.
+
+Already-absent names still require a barrier. Another deleter or an earlier
+attempt may have removed the name without completing its sync. A sync failure
+is may-have-applied, not a successful deletion or an old-or-new crash guarantee.
+The combined path retains its deleting row on failure and removes it only after
+confirmed sync; the file-only path leaves independent acknowledgement cleanup
+to its existing owner.
+
+Five owner-local regressions cover failed sync and retry across reopen, repeated
+absent-prefix failures, a concurrent `ENOENT` deleter while the first deleter's
+sync fails, unlink failure retaining bookkeeping, and symlink-prefix rejection.
+The callbacks assert unlink-before-sync and row-removal-after-sync directly.
+These are deterministic syscall-boundary tests, not power-loss tests. Successful
+reads before deletion and independent row/file observations prevent an absent
+or unreadable initial fixture from satisfying the cleanup assertions.
+
+Cost: one directory sync per successful final-file deletion attempt, including
+idempotent retries. No ordinary write-path sync, SQLite transaction, persistent
+format, or dependency is added. This change does not revoke pending writes:
+cleanup must still establish the finite-authority/exclusion boundary before
+calling it. Unknown-file discovery, retained ownership, replacement-primary
+confirmation and all six original cleanup regressions remain open.
+
+Validation: all five focused tests passed. Full Nextest passed all 9,254 tests
+(one slow, six skipped) in 251.190s. The flagged
+`raft_production_shaped_heartbeat_write_amplification_gate` completed in 110.445s.
+Strict all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed. These checks do not exercise power-loss recovery or
+close the six ignored cleanup regressions.

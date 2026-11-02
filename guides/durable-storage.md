@@ -368,6 +368,7 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 | Operation | Durable success requires |
 | --- | --- |
 | shard write | durable prefix reachability through a shard-root directory sync, complete bytes, file `sync_data`, atomic destination publication by rename or create-if-absent hard link, and destination prefix-directory sync; returned `WriteAck` describes those exact bytes, while any surviving temporary source name is recoverable residue |
+| final shard-file deletion | unlink and successful prefix-directory sync, including on an already-absent file; an absent prefix requires syncing the shard root instead. This confirms deletion only, not exclusion of outstanding writes or removal of independent acknowledgement rows. |
 | PG metadata mutation | successful SQLite transaction commit under the configured WAL/`synchronous=FULL` connection |
 | object or part publication | every referenced shard durably acknowledged before the replicated metadata command becomes visible |
 | single-authority command | replayable journal frame and required file/directory sync before durable command acknowledgement |
@@ -388,17 +389,6 @@ selected encrypted records instead; they enter complete witness-backed
 reconstruction when a selected physical range is unavailable or suspect.
 
 ## Known gaps and required follow-up
-
-### DUR-3: shard unlink durability classification
-
-Shard deletion currently marks/removes its SQLite row and unlinks the file
-without syncing the shard directory. This can be correct only under the
-recoverable-residue exception: after power loss an unlinked file may reappear,
-but absent authoritative metadata must keep it invisible and scavenging must
-remove it safely. That contract should be pinned with restart/scavenger tests
-and recorded next to the deletion implementation. If deletion acknowledgement
-is intended to promise immediate physical reclamation across power loss, the
-parent directory must instead be synced.
 
 ### DUR-4: mechanical inventory enforcement
 
@@ -486,6 +476,35 @@ regression pauses the winning hard-link writer before its prefix sync, lets a
 matching contender establish and acknowledge its own barrier, then injects a
 sync failure into the winner and verifies that the acknowledged shard remains
 readable after reopening the store.
+
+### DUR-3: shard unlink durability classification
+
+Final shard deletion now promises a durably removed name, rather than relying
+on scavenging resurrected names. Both `SharedStorageNode`'s file-only route
+(including active and historical RPC deletion) and `PgStore`'s combined row/file
+operation use the same helper in
+[`pg_store/shards.rs`](../crates/storage/src/pg_store/shards.rs). The helper unlinks
+the final name and syncs its prefix directory before returning success. When
+the prefix itself is absent, it syncs the existing shard root instead, without
+creating a directory. Missing PG storage and other open/unlink/sync errors fail
+closed. Prefix opens reject a symlink or non-directory leaf.
+
+Every attempt performs its own sync, including `ENOENT` retries and concurrent
+deleters. Otherwise a second deleter could acknowledge the first's unsynced
+unlink. A sync failure is **may-have-applied**: live namespace absence does not
+establish crash durability. The combined operation leaves its `Deleting` row
+until a retry confirms the barrier, then removes the row; file-only deletion
+does not remove the independently owned acknowledgement row.
+
+Owner-local tests assert ordering, failure/retry across reopen, a concurrent
+deleter whose first sync fails, absent-prefix retries, unlink failure and
+symlink-prefix rejection. Injected failures/reopen are not power-loss simulation.
+The change adds one directory barrier per successful deletion attempt, no new
+SQLite transaction or ordinary PUT fsync. It does **not** fence delayed writers,
+discover unknown files, or supply a durable cleanup owner. Those obligations
+remain in the cleanup-ownership plan; an unlink barrier alone cannot prevent a
+later authorized write from recreating the name. The separate broader scavenger
+and capacity-recovery work is not closed by this change.
 
 ### Managed storage-node root creation
 

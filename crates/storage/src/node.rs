@@ -2202,15 +2202,7 @@ impl SharedStorageNode {
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
-        let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
-        match fs::remove_file(&shard_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError::Io {
-                context: "unlink shard file",
-                source: e,
-            }),
-        }
+        PgStore::delete_shard_file_durable(&paths.shards_dir, key)
     }
 
     /// List local shard files for scavenger audit without taking the per-PG

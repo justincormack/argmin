@@ -28,16 +28,17 @@ documents.
 1. Fix [durable generation cleanup ownership](durable-generation-cleanup-ownership.md).
    Make the six ignored Direct PUT and stream late-write regressions pass by
    establishing one storage-owned write/cleanup exclusion contract.
-2. Resolve the three independent durability gaps recorded under
+2. Resolve the remaining independent durability gaps recorded under
    [known gaps and required follow-up](../guides/durable-storage.md#known-gaps-and-required-follow-up):
-   - [DUR-3](../guides/durable-storage.md#dur-3-shard-unlink-durability-classification):
-     classify and enforce shard-unlink durability.
    - [DUR-4](../guides/durable-storage.md#dur-4-mechanical-inventory-enforcement):
      mechanically enforce the persistence inventory.
    - [DUR-5](../guides/durable-storage.md#dur-5-capacity-exhaustion-safety-and-recovery-liveness):
      model ENOSPC, inode and quota exhaustion, recovery liveness, and reserved
      recovery headroom.
    These are separate planning gaps, not one capacity-exhaustion project.
+   [DUR-3](../guides/durable-storage.md#dur-3-shard-unlink-durability-classification)
+   now enforces durable unlink acknowledgement; write exclusion and durable
+   cleanup ownership remain part of item 1, not solved by that barrier.
 3. Refresh and finish the [multihost production release gate](multihost-followup-plan.md):
    outage/replacement/rejoin, historical payload backfill, failure containment,
    terminal convergence, operational diagnostics, and recovery controls.

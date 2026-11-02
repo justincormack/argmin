@@ -12,6 +12,10 @@ mod deadline_tests;
 mod ack_deadline_tests;
 
 #[cfg(test)]
+#[path = "shard_deletion_tests.rs"]
+mod deletion_tests;
+
+#[cfg(test)]
 type ShardAckEffectHook = Box<dyn FnOnce(bool)>;
 
 #[cfg(test)]
@@ -36,7 +40,7 @@ fn run_before_shard_publication_hook() {
     }
 }
 
-/// fsync a directory to ensure renames are durable.
+/// fsync a directory to ensure namespace changes are durable.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let f = fs::File::open(dir)?;
     f.sync_all()?;
@@ -124,6 +128,105 @@ impl PgStore {
         path.push(prefix);
         path.push(full);
         path
+    }
+
+    /// Confirm durable absence of a final shard name. The caller must separately
+    /// exclude writes; syncing an unlink does not revoke outstanding authority.
+    pub(crate) fn delete_shard_file_durable(
+        shards_dir: &Path,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        Self::delete_shard_file_durable_with_sync(shards_dir, key, |_, dir| dir.sync_all())
+    }
+
+    fn delete_shard_file_durable_with_sync<S>(
+        shards_dir: &Path,
+        key: &ShardKey,
+        sync: S,
+    ) -> Result<(), StoreError>
+    where
+        S: FnOnce(&Path, &fs::File) -> std::io::Result<()>,
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+        let prefix = shard_path.parent().expect("canonical shard prefix");
+        let open_directory = |path: &Path| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(path)
+        };
+        let (sync_path, directory) = match open_directory(prefix) {
+            Ok(directory) => {
+                match fs::remove_file(&shard_path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(StoreError::Io {
+                            context: "unlink shard file",
+                            source,
+                        });
+                    }
+                }
+                (prefix, directory)
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                // An unused key may never have had a prefix. Confirm its absence
+                // in the existing shard root, without creating a new directory.
+                let root = open_directory(shards_dir).map_err(|source| StoreError::Io {
+                    context: "open shard root for deletion sync",
+                    source,
+                })?;
+                (shards_dir, root)
+            }
+            Err(source) => {
+                return Err(StoreError::Io {
+                    context: "open shard prefix for deletion sync",
+                    source,
+                });
+            }
+        };
+        // ENOENT is not durability evidence: another deleter, or our previous
+        // attempt, may have unlinked the name but failed to sync. Every successful
+        // attempt establishes its own barrier, including idempotent retries.
+        sync(sync_path, &directory).map_err(|source| StoreError::Io {
+            context: "fsync shard deletion directory",
+            source,
+        })
+    }
+
+    fn delete_shard_with_sync<S>(&self, key: &ShardKey, sync: S) -> Result<(), StoreError>
+    where
+        S: FnOnce(&Path, &fs::File) -> std::io::Result<()>,
+    {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shards SET status = ?1 WHERE shard_key = ?2",
+                params![ShardStatus::Deleting as u8, key.as_bytes().as_slice()],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "mark shard deleting",
+                source: source.into(),
+            })?;
+
+        Self::delete_shard_file_durable_with_sync(&self.shards_dir, key, sync)?;
+
+        // On an unlink/sync error, leave the deleting row for a retry. A live
+        // namespace observation is not sufficient to retire durable bookkeeping.
+        if updated > 0 {
+            self.conn
+                .execute(
+                    "DELETE FROM shards WHERE shard_key = ?1",
+                    params![key.as_bytes().as_slice()],
+                )
+                .map_err(|source| StoreError::Db {
+                    context: "delete shard record",
+                    source: source.into(),
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn write_shard_file_durable(
@@ -901,45 +1004,7 @@ impl ShardStore for PgStore {
     }
 
     fn delete_shard(&self, key: &ShardKey) -> Result<(), StoreError> {
-        // Mark as deleting in SQLite.
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE shards SET status = ?1 WHERE shard_key = ?2",
-                params![ShardStatus::Deleting as u8, key.as_bytes().as_slice()],
-            )
-            .map_err(|e| StoreError::Db {
-                context: "mark shard deleting",
-                source: e.into(),
-            })?;
-
-        // Unlink the file (ignore ENOENT for idempotency).
-        let shard_path = self.shard_path(key);
-        match fs::remove_file(&shard_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(StoreError::Io {
-                    context: "unlink shard file",
-                    source: e,
-                });
-            }
-        }
-
-        // Remove the SQLite record.
-        if updated > 0 {
-            self.conn
-                .execute(
-                    "DELETE FROM shards WHERE shard_key = ?1",
-                    params![key.as_bytes().as_slice()],
-                )
-                .map_err(|e| StoreError::Db {
-                    context: "delete shard record",
-                    source: e.into(),
-                })?;
-        }
-
-        Ok(())
+        self.delete_shard_with_sync(key, |_, dir| dir.sync_all())
     }
 
     fn stat_shard(&self, key: &ShardKey) -> Result<ShardStat, StoreError> {
