@@ -1,6 +1,36 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+/// Keep failed rollback of an acknowledged prefix distinct until its owner
+/// decides whether releasing the generation is safe. `Write` does not prove
+/// absence of delayed/ambiguous writes; durable write windows remain separate.
+#[derive(Debug)]
+enum PayloadShardWriteError<E> {
+    Write(E),
+    CleanupIncomplete(E),
+}
+
+impl<E> PayloadShardWriteError<E> {
+    fn map<F>(self, map: impl FnOnce(E) -> F) -> PayloadShardWriteError<F> {
+        match self {
+            Self::Write(error) => PayloadShardWriteError::Write(map(error)),
+            Self::CleanupIncomplete(error) => PayloadShardWriteError::CleanupIncomplete(map(error)),
+        }
+    }
+
+    fn into_source(self) -> E {
+        match self {
+            Self::Write(error) | Self::CleanupIncomplete(error) => error,
+        }
+    }
+}
+
+impl<E: From<StoreError>> From<StoreError> for PayloadShardWriteError<E> {
+    fn from(error: StoreError) -> Self {
+        Self::Write(E::from(error))
+    }
+}
+
 fn object_version_allocator_command_contention(error: &ObjectPgActionError) -> bool {
     matches!(
         error,
@@ -541,6 +571,7 @@ impl StorageCluster {
             data,
             || Ok(()),
         )
+        .map_err(PayloadShardWriteError::into_source)
     }
 
     #[cfg(test)]
@@ -577,7 +608,7 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         data: &[u8],
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-    ) -> Result<DirectPutWrittenSegment, StoreError> {
+    ) -> Result<DirectPutWrittenSegment, PayloadShardWriteError<StoreError>> {
         let PutObjectMutationEffectRoute {
             bucket,
             key,
@@ -635,6 +666,7 @@ impl StorageCluster {
             &mut || Ok(()),
             &mut || Ok(()),
         )
+        .map_err(PayloadShardWriteError::into_source)
     }
 
     fn write_placed_segment_payload_shards_with_route_validation<E>(
@@ -645,7 +677,7 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         require_valid_route: &mut impl FnMut() -> Result<(), StoreError>,
         maintain_lease: &mut impl FnMut() -> Result<(), E>,
-    ) -> Result<Vec<WrittenShardAck>, E>
+    ) -> Result<Vec<WrittenShardAck>, PayloadShardWriteError<E>>
     where
         E: From<StoreError>,
     {
@@ -654,18 +686,33 @@ impl StorageCluster {
             segment_vid,
             data,
         } = write;
-        require_valid_route().map_err(E::from)?;
+        require_valid_route()?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
-            .map_err(cluster_build_error_to_store)
-            .map_err(E::from)?;
+            .map_err(cluster_build_error_to_store)?;
         self.local_map.write_erasure_coded_segment_shards_with(
             segment_okh,
             segment_vid,
             data,
             ec,
             |shard_batch| {
+                let rollback = |written: &[WrittenShardAck], error: E| {
+                    if written.is_empty() {
+                        return PayloadShardWriteError::Write(error);
+                    }
+                    match self.try_delete_payload_shard_keys_at_epoch(
+                        self.operation_epoch(),
+                        data_pg.get(),
+                        ec,
+                        segment_okh,
+                        segment_vid,
+                        written.iter().map(|written| written.key.clone()),
+                    ) {
+                        Ok(()) => PayloadShardWriteError::Write(error),
+                        Err(cleanup_error) => PayloadShardWriteError::CleanupIncomplete(E::from(cleanup_error)),
+                    }
+                };
                 let mut written_acks = Vec::with_capacity(shard_batch.len());
                 let mut written_for_cleanup: Vec<WrittenShardAck> =
                     Vec::with_capacity(shard_batch.len());
@@ -673,28 +720,10 @@ impl StorageCluster {
                     locations.iter().zip(shard_batch.iter())
                 {
                     if let Err(error) = maintain_lease() {
-                        self.delete_payload_shard_keys_best_effort(
-                            data_pg.get(),
-                            ec,
-                            segment_okh,
-                            segment_vid,
-                            written_for_cleanup
-                                .iter()
-                                .map(|written| written.key.clone()),
-                        );
-                        return Err(error);
+                        return Err(rollback(&written_for_cleanup, error));
                     }
                     if let Err(error) = require_valid_route() {
-                        self.delete_payload_shard_keys_best_effort(
-                            data_pg.get(),
-                            ec,
-                            segment_okh,
-                            segment_vid,
-                            written_for_cleanup
-                                .iter()
-                                .map(|written| written.key.clone()),
-                        );
-                        return Err(E::from(error));
+                        return Err(rollback(&written_for_cleanup, E::from(error)));
                     }
                     let write_result = effect_fence.map_or_else(
                         || self.write_payload_shard(*location, shard_key, shard_payload),
@@ -716,16 +745,7 @@ impl StorageCluster {
                             });
                         }
                         Err(error) => {
-                            self.delete_payload_shard_keys_best_effort(
-                                data_pg.get(),
-                                ec,
-                                segment_okh,
-                                segment_vid,
-                                written_for_cleanup
-                                    .iter()
-                                    .map(|written| written.key.clone()),
-                            );
-                            return Err(E::from(shard_io_error_to_store(error)));
+                            return Err(rollback(&written_for_cleanup, E::from(shard_io_error_to_store(error))));
                         }
                     }
                 }
@@ -7240,6 +7260,7 @@ impl StorageCluster {
             &mut require_valid_route,
             maintain_lease,
         )
+        .map_err(PayloadShardWriteError::into_source)
     }
 
     #[cfg(test)]

@@ -6289,3 +6289,51 @@ all 164 focused Direct PUT tests passed after correction. The full Nextest run
 passed all 9,292 tests (one slow, six skipped) in 243.704s. The Raft heartbeat
 write-amplification test completed in 112.057s. Strict all-target/all-feature
 Clippy, storage boundary checks, formatting and `git diff --check` passed.
+
+## Partial Shard-write Rollback Disposition — 2026-11-02
+
+Before Direct PUT has a completed payload handle, its generation reservation is
+still owned by a separate RAII guard. The shared shard writer previously ignored
+failure to delete its already-acknowledged prefix after a later write/route/lease
+failure. Returning the original error then dropped the generation guard and
+released the reservation even when rollback was incomplete.
+
+The internal writer now returns a typed `PayloadShardWriteError`, distinguishing
+the original write failure from incomplete acknowledged-prefix cleanup. Rollback
+uses the retained exact-subset completion result and attempts every participant;
+cleanup failure takes precedence. Direct PUT preserves the distinction through
+error mapping and disarms generation release on incomplete cleanup. Successful
+rollback still reports the original write error and permits ordinary generation
+Drop. No complete/publishable payload handle is created on either failure path.
+Streaming maps the cleanup error into its existing workflow, retaining session-
+owned generation semantics; it does not acquire Direct PUT's reservation guard.
+The remaining best-effort current-epoch wrapper is now storage-unit-test-only.
+
+The regression writes real encrypted shard zero, verifies that file exists at
+the shard-one boundary, then rejects shard one before its physical effect.
+Successful rollback and independent file/acknowledgement-contact failures check
+the exact diagnostic, one cleanup pass over the acknowledged prefix, no later
+shard writes, no published object or pending command, and generation state on
+every replica. File failure leaves the first file; acknowledgement-contact
+failure retains the generation even though the file was removed, because that
+participant could not confirm cleanup. This does not fabricate a pre-publication
+acknowledgement row. Successful rollback publishes exactly one generation release.
+The test initially failed because the original `store_not_found` hid the injected
+`store_io_failure`.
+
+Scope remains deliberately limited: the error's ordinary `Write` variant is not
+a certificate that delayed or ambiguously failed writes cannot later arrive.
+The existing rollback set is the acknowledged prefix, not all possible effects
+of an unacknowledged request. Durable owner/window integration must cover that
+transport gap and discover incomplete cleanup after the frontend disappears.
+No durable owner or retry handle, normal-path fsync, format change, or stronger
+client-session semantics is introduced here. All six original ignored regressions
+remain open.
+
+Validation: the new test reproduced the hidden rollback error before correction.
+All 277 focused Direct PUT/streaming tests passed. The full Nextest run passed
+all 9,293 tests (two slow, six skipped) in 250.044s; the Raft heartbeat and oversized
+version-listing tests passed in 120.317s and 63.383s. Strict Clippy identified an
+unnecessary clone in the new test assertion; after replacing it with a borrowed
+slice, all-target/all-feature Clippy and a final focused rerun passed. Storage
+boundary checks, formatting and `git diff --check` also passed.

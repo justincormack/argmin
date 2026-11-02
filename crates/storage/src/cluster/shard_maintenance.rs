@@ -4319,6 +4319,7 @@ impl StorageCluster {
         );
     }
 
+    #[cfg(test)]
     fn delete_payload_shard_keys_best_effort(
         &self,
         data_pg_id: u32,

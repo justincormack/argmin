@@ -2198,13 +2198,23 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 },
             ));
         }
-        let payload = self.write_direct_object_payload_for_reserved_generation(
+        let payload = match self.write_direct_object_payload_for_reserved_generation(
             &generation_reservation.reservation_id,
             generation_reservation.generation_id,
             &generation_reservation.bucket_write_reservation,
             encryption_subject,
             data,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(PayloadShardWriteError::Write(error)) => return Err(error),
+            Err(PayloadShardWriteError::CleanupIncomplete(error)) => {
+                // The guard must not release a generation whose acknowledged
+                // shard prefix still needs cleanup. No publishable handle was
+                // created; durable discovery of this obligation remains separate.
+                generation_reservation.disarm();
+                return Err(error);
+            }
+        };
         generation_reservation.disarm();
         Ok(payload)
     }
@@ -2231,7 +2241,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         bucket_write_reservation: &BucketWriteReservationProof,
         encryption_subject: SegmentEncryptionSubject,
         data: &[u8],
-    ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+    ) -> Result<DirectPutPayloadWrite<'admission>, PayloadShardWriteError<crate::DirectPutFailure>> {
         let segment_index = 0;
         let segment_okh =
             crate::direct_put_segment_key_hash(generation_reservation_id, segment_index);
@@ -2246,7 +2256,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 data,
                 || self.admission.require_valid_now_raw(),
             )
-            .map_err(crate::DirectPutFailure::from_store)?;
+            .map_err(|error| error.map(crate::DirectPutFailure::from_store))?;
         let logical_size = encryption_subject.logical_plaintext_len();
         Ok(DirectPutPayloadWrite {
             bucket_write_reservation: bucket_write_reservation.clone(),
@@ -2314,6 +2324,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             encryption_subject,
             data,
         )
+        .map_err(PayloadShardWriteError::into_source)
     }
 
     pub(super) fn commit_direct_object<E>(

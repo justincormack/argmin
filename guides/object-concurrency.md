@@ -162,6 +162,16 @@ their publication/recovery ownership remains unchanged. Nor does it supply durab
 cleanup discovery after the abandoned slot has gone, or change generation cleanup
 that may already have been performed by a recovery derivative.
 
+Before a full payload handle exists, shard writing distinguishes a write error
+from failure to roll back its acknowledged prefix. Preserve that distinction
+through Direct PUT's internal write result: incomplete rollback disarms the
+generation guard's release, retaining the reservation instead of releasing it
+on Drop. Successful rollback keeps the original write diagnostic and ordinary
+generation release. Streaming still owns its generation through the durable
+session and reports rollback failures through that workflow. This only covers
+acknowledged-prefix rollback, not cleanup discovery after frontend loss or the
+revocation of delayed/ambiguous unacknowledged writes.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

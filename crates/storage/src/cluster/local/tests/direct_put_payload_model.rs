@@ -22,6 +22,9 @@ mod prepublication_cleanup;
 #[path = "direct_put_preparation.rs"]
 mod preparation;
 
+#[path = "direct_put_partial_write_cleanup.rs"]
+mod partial_write_cleanup;
+
 const DATA: [&[u8]; 2] = [b"owner A staged body", b"owner B different staged body"];
 const REQUIRED: [&str; 6] = [
     "ordinary drop releases only its own staging",
