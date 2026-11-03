@@ -4,6 +4,9 @@
 use super::*;
 use crate::{ObjectPayloadReclaimKind, PgMetadataStore};
 
+#[path = "payload_reclaim/participant_progress.rs"]
+mod participant_progress;
+
 #[test]
 fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
     let runtime_state = LocalClusterRuntimeState::new();
@@ -1853,7 +1856,7 @@ fn payload_reclaim_in_progress_blocks_new_payload_leases() {
 }
 
 #[test]
-fn reclaim_placed_payload_delete_failure_preserves_payload_until_retry() {
+fn reclaim_placed_payload_delete_failure_preserves_failed_file_until_retry() {
     let _serial = lock_payload_cleanup_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1910,21 +1913,24 @@ fn reclaim_placed_payload_delete_failure_preserves_payload_until_retry() {
             committed.generation_id.get(),
             shard_index,
         );
-        assert!(map
+        assert!(!map
             .node(NodeId::new(0))
             .unwrap()
             .storage_node()
             .test_shard_exists(committed.written.data_pg_id, &shard_key)
             .unwrap());
-        assert!(cluster
-            .test_payload_shard_file_exists(
-                committed.written.data_pg_id,
-                committed.written.ec,
-                &committed.segment_okh,
-                committed.generation_id,
-                shard_index,
-            )
-            .unwrap());
+        assert_eq!(
+            cluster
+                .test_payload_shard_file_exists(
+                    committed.written.data_pg_id,
+                    committed.written.ec,
+                    &committed.segment_okh,
+                    committed.generation_id,
+                    shard_index,
+                )
+                .unwrap(),
+            shard_index == 0
+        );
     }
 
     drop(hook_guard);

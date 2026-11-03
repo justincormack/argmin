@@ -4459,7 +4459,7 @@ impl StorageCluster {
         }
     }
 
-    fn release_object_generation_reservation_after_same_object_projection(
+    fn release_object_generation_reservation_after_snapshot_rejection(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -4482,7 +4482,7 @@ impl StorageCluster {
                 {
                     if work_budget
                         .sleep_after_contention(
-                            "same-object direct PUT loser cleanup retry budget exhausted",
+                            "direct PUT rejected snapshot cleanup retry budget exhausted",
                         )
                         .is_ok()
                     {
@@ -4994,22 +4994,18 @@ impl StorageCluster {
         }
 
         let mut snapshot_retry_phase = SnapshotSensitiveRetryPhase::default();
-        let mut same_object_publication_observed = false;
         macro_rules! wait_for_same_object_direct_put_recovery {
             ($command:expr) => {{
-                let applied = match self
+                if let Err(error) = self
                     .wait_for_same_object_direct_put_recovery_with_work_budget(
                         pg_id,
                         $command,
                         &mut work_budget,
-                    ) {
-                    Ok(applied) => applied,
-                    Err(error) => {
-                        cleanup_direct_put_attempt_before_command_ownership!();
-                        return Err(error);
-                    }
-                };
-                same_object_publication_observed |= applied;
+                    )
+                {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(error);
+                }
                 snapshot_retry_phase.require_snapshot_reinspection();
             }};
         }
@@ -5142,33 +5138,35 @@ impl StorageCluster {
                             reject_expired_direct_put_snapshot_before_command_ownership!();
                         }
                         Err(error) => {
-                            if same_object_publication_observed {
-                                if let Err(cleanup_error) = delete_caller_payload_before_generation_release!() {
-                                    // Still relinquish the bucket proof, but
-                                    // retain the generation while physical
-                                    // cleanup is incomplete. Its failure takes
-                                    // precedence over the projected condition.
-                                    let _ = release_caller_bucket_write_proof_if_unowned!();
-                                    return Err(cleanup_error.into());
-                                }
-                                caller_payload_deleted = true;
-                                if let Err(cleanup_error) = self
-                                    .release_object_generation_reservation_after_same_object_projection(
-                                        &req.bucket,
-                                        &req.key,
-                                        &req.generation_reservation_id,
-                                        &mut work_budget,
-                                    )
-                                {
-                                    cleanup_direct_put_attempt_before_command_ownership!();
-                                    return Err(cleanup_error);
-                                }
-                                // The budgeted release already published cleanup for this
-                                // exact attempt after deleting its shards. Common
-                                // cleanup still owns its bucket proof, but must
-                                // repeat neither the deletes nor the release.
-                                generation_reservation_released = true;
+                            // The winner can publish after an empty pending-slot
+                            // observation but before this snapshot is loaded. A
+                            // rejected snapshot needs the same convergent cleanup
+                            // whether or not we first saw the winner's command.
+                            if let Err(cleanup_error) = delete_caller_payload_before_generation_release!() {
+                                // Still relinquish the bucket proof, but retain
+                                // the generation while physical cleanup is
+                                // incomplete. Its failure takes precedence over
+                                // the projected condition.
+                                let _ = release_caller_bucket_write_proof_if_unowned!();
+                                return Err(cleanup_error.into());
                             }
+                            caller_payload_deleted = true;
+                            if let Err(cleanup_error) = self
+                                .release_object_generation_reservation_after_snapshot_rejection(
+                                    &req.bucket,
+                                    &req.key,
+                                    &req.generation_reservation_id,
+                                    &mut work_budget,
+                                )
+                            {
+                                cleanup_direct_put_attempt_before_command_ownership!();
+                                return Err(cleanup_error);
+                            }
+                            // The budgeted release already published cleanup for
+                            // this exact attempt after deleting its shards. Common
+                            // cleanup still owns its bucket proof, but must repeat
+                            // neither the deletes nor the release.
+                            generation_reservation_released = true;
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));
                         }
@@ -5442,7 +5440,6 @@ impl StorageCluster {
                         // boundary. Reinspect the object even while that command retains the
                         // bucket's pending slot so conditional requests project the winner's
                         // state instead of exposing an internal recovery handoff as SlowDown.
-                        same_object_publication_observed = true;
                         snapshot_retry_phase.require_snapshot_reinspection();
                         continue;
                     }
@@ -5523,7 +5520,6 @@ impl StorageCluster {
                         Ok(outcome)
                             if is_same_object_direct_put && outcome.is_logically_applied() =>
                         {
-                            same_object_publication_observed = true;
                             snapshot_retry_phase.require_snapshot_reinspection();
                             continue;
                         }
@@ -5573,7 +5569,6 @@ impl StorageCluster {
                                 applied: true,
                             },
                         ) => {
-                            same_object_publication_observed = true;
                             snapshot_retry_phase.require_snapshot_reinspection();
                             continue;
                         }

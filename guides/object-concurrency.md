@@ -130,10 +130,16 @@ The Direct PUT commit loop's common **caller-owned, pre-publication** cleanup
 also deletes the captured payload subset before releasing its generation. It
 reports either failure instead of treating best-effort cleanup as complete.
 After successful cleanup, it disarms the admitted payload handle so Drop does
-not repeat deletion or publish another generation-release command. When a
-same-object contender has published, delete the losing request's staging before
-its existing budgeted generation-release path, and reuse that successful deletion
-when finishing common cleanup. Failed cleanup leaves the payload armed for its
+not repeat deletion or publish another generation-release command. Whenever the
+authoritative snapshot rejects the request, delete its staging before the
+budgeted generation-release path, and reuse that successful deletion when
+finishing common cleanup. Do not select this convergence behavior from whether
+the request previously observed a same-object pending command: the winner can
+publish between an empty pending-slot observation and the snapshot load. Retry
+cleanup contention/recovery handoffs within the request budget before returning
+the evaluated condition; genuine cleanup failures still take precedence, and
+budget exhaustion is not broadly remapped to a conditional conflict.
+Failed cleanup leaves the payload armed for its
 existing best-effort Drop attempt; this is not a durable handoff. Accepted-command,
 abandonment and post-apply cleanup have separate ownership rules and are not
 covered by this pre-publication completion claim.
@@ -197,6 +203,15 @@ retained retry reuses that exact abort and idempotently releases its exact proof
 and deletes any remaining effects; unrelated reservations remain untouched.
 This is not a guarantee for generic recovery, whose separate best-effort cleanup
 and pending-slot retirement still require durable owner/window integration.
+
+Durable object-payload reclaim follows the same independent-participant rule:
+attempt every file and acknowledgement in every recorded segment/part, preserving
+the first deletion error. Do not install the reclaim-root removal command after
+any deletion error. The exact durable root remains retryable and the existing
+payload-lease fence stays closed after deletion has started. Retry repeats
+idempotent deletion, including already-absent participants. This does not add
+historical placement authority or solve delayed staging writes; it preserves the
+existing reclaim route and claim protocol.
 
 ### Coordinator helpers
 

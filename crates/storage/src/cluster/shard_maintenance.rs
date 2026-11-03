@@ -4298,15 +4298,38 @@ impl StorageCluster {
         okh: &[u8; 16],
         generation_id: GenerationId,
     ) -> Result<(), ObjectPgActionError> {
+        // Validate placement before either participant can mutate. Only effect
+        // failures, not an invalid cleanup subject, permit independent progress.
+        let deleter = self
+            .local_map
+            .open_placed_segment_shard_deleter(
+                self.operation_epoch(),
+                self.validated_data_pg(PgId::new(data_pg_id))?,
+                ec,
+                okh,
+                generation_id,
+            )
+            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
-        self.delete_placed_payload_shard_keys(
-            self.validated_data_pg(PgId::new(data_pg_id))?,
-            ec,
-            okh,
-            generation_id,
-            &shard_keys,
-        )?;
-        self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys)
+        let mut first_error = None;
+        for shard_key in &shard_keys {
+            let result = self
+                .maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+                .and_then(|()| {
+                    deleter.delete_matching_key(shard_key).map_err(shard_io_error_to_store)
+                });
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        // File and acknowledgement owners are independent participants. A
+        // failed file must not prevent acknowledgement cleanup, but either
+        // failure still prevents the caller from retiring the reclaim root.
+        let ack_cleanup = self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys);
+        if let Some(error) = first_error {
+            return Err(ObjectPgActionError::Store(error));
+        }
+        ack_cleanup
     }
 
     fn delete_payload_shard_set_best_effort_at_epoch(
@@ -4433,35 +4456,6 @@ impl StorageCluster {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn delete_placed_payload_shard_keys(
-        &self,
-        data_pg_id: DataPgId,
-        ec: EcShape,
-        okh: &[u8; 16],
-        generation_id: GenerationId,
-        shard_keys: &[ShardKey],
-    ) -> Result<(), ObjectPgActionError> {
-        let deleter = self
-            .local_map
-            .open_placed_segment_shard_deleter(
-                self.operation_epoch(),
-                data_pg_id,
-                ec,
-                okh,
-                generation_id,
-            )
-            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
-
-        for shard_key in shard_keys {
-            self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
-                .map_err(ObjectPgActionError::Store)?;
-            deleter
-                .delete_matching_key(shard_key)
-                .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
-        }
-        Ok(())
-    }
-
     fn delete_metadata_primary_payload_shard_keys(
         &self,
         data_pg_id: u32,
@@ -4469,12 +4463,16 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_route = self.metadata_pg_primary_shard_ack_route(data_pg_id)?;
+        let mut first_error = None;
         for shard_key in shard_keys {
-            self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
-                .map_err(ObjectPgActionError::Store)?;
-            shard_ack_route.delete_shard_ack(shard_key)?;
+            let result = self
+                .maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+                .and_then(|()| shard_ack_route.delete_shard_ack(shard_key));
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(ObjectPgActionError::Store(error)))
     }
 
     #[cfg(test)]

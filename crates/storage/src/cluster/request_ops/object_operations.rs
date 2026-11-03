@@ -4508,31 +4508,41 @@ impl super::StorageCluster {
                 return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
             }
             reclaim_fence_started = true;
+            let mut first_delete_error = None;
             match &reclaim {
                 ObjectPayloadReclaimCommand::Segments(reclaim) => {
                     for segment in &reclaim.segments {
                         payload_delete_started = true;
-                        self.delete_payload_shard_set(
+                        if let Err(error) = self.delete_payload_shard_set(
                             segment.data_pg_id,
                             segment.ec,
                             &segment.segment_okh,
                             segment.segment_vid,
-                        )?;
+                        ) {
+                            first_delete_error.get_or_insert(error);
+                        }
                     }
                 }
                 ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                     for part in &reclaim.parts {
                         for segment in &part.segments {
                             payload_delete_started = true;
-                            self.delete_payload_shard_set(
+                            if let Err(error) = self.delete_payload_shard_set(
                                 segment.data_pg_id,
                                 segment.ec,
                                 &segment.segment_okh,
                                 segment.segment_vid,
-                            )?;
+                            ) {
+                                first_delete_error.get_or_insert(error);
+                            }
                         }
                     }
                 }
+            }
+            // Finish this pass over independent segments/parts before returning
+            // an error. Never publish root removal after partial physical cleanup.
+            if let Some(error) = first_delete_error {
+                return Err(error);
             }
             loop {
                 if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {

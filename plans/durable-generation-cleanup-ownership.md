@@ -6663,3 +6663,100 @@ The full Nextest suite passed all 9,308 tests (two slow, six skipped) in 239.724
 The Raft heartbeat write-amplification test completed in 111.703s and oversized
 version listing in 60.529s. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and `git diff --check` passed.
+
+## Durable Reclaim Participant Progress — 2026-11-03
+
+The retained-owner integration audit found the same short-circuit problem in
+the existing durable object-payload reclaim consumer: a file error skipped
+later files, all acknowledgement rows and later segments/parts. This differs
+from the corrected retained-abort path and the independent-participant model.
+
+Reclaim now attempts all file participants, then acknowledgement participants,
+for each segment, and continues through the remaining segments/parts while
+preserving the first deletion error. Any deletion error returns before building
+or installing the reclaim-root removal command. The existing failure path
+releases the attempt claim while retaining the exact durable reclaim root and
+the payload-lease fence once deletion has started. Successful retry repeats
+idempotent participant deletion before retiring the root. No route authority,
+claim/release error precedence or command-publication semantics change.
+
+The owner-local matrix creates a real encrypted two-segment streamed PUT (an
+8 MiB first segment) and a completed two-part MPU (a 5 MiB first part), deletes
+each through the ordinary object-delete path, and injects first-file, first-ack
+and combined failures. Successful pre-delete ciphertext readback pins the
+physical fixtures. Each case checks all six file and acknowledgement attempts,
+the exact residual rows/files, unchanged root and command allocator, no pending
+removal, closed payload leasing, and an untouched same-PG live-object canary.
+Retry removes the residual effects and root; a further missing-root attempt
+does not allocate another command. The existing single-segment regression now
+expects only the failed file to remain, rather than enshrining short-circuiting.
+An independent malformed-placement canary supplies an EC shape with zero data
+shards and requires rejection before either file or acknowledgement hooks,
+with positive before/after checks of real files and rows. Placement validation
+remains a prerequisite to effects, not an error to bypass for participant progress.
+
+Both new regressions first failed against the prior implementation with one
+file attempt instead of six. This slice adds no tables, formats, commands or
+ordinary successful-path fsyncs. It improves cleanup for already-durable reclaim
+roots; it does not introduce staging owners/windows, preserve failed client
+sessions, or close any of the six original ignored regressions. The coordinated
+owner/window and finite physical-write-authority integration remains open.
+
+Validation: all 214 focused cleanup/reclaim/model tests passed, followed by the
+additional invalid-placement regression. The matrix's positive canary caught an
+initial acknowledgement inspection against the default bridge node; it now
+queries the actual routed acknowledgement owner. The invalid-placement case
+uses zero data shards, not an assumption that placement forbids co-located shards.
+Strict all-target/all-feature Clippy, boundary checks, formatting and diff checks
+passed. **The full suite did not pass:** Nextest stopped after 2,162 of 9,311
+tests (2,161 passed, one failed, six skipped; 7,149 not run) in 76.643s.
+`s3-tests::conditional::test_simultaneous_if_match_puts_publish_one_complete_object`
+failed at `conditional.rs:283` in the single-segment case: the losing PUT returned
+HTTP 503 `SlowDown` instead of the asserted 409/412, request ID
+`HQG9XFZBP2XZYEQ5`. That failure was reported without rerunning or modifying the
+test; its cause has not been attributed to or excluded from this slice. The
+complete output is retained locally in `/tmp/reclaim-participant-full.log`.
+
+## Conditional Direct PUT Snapshot/Cleanup Race — 2026-11-03
+
+Investigation of the blocking full-suite failure found a gap in the previously
+added same-object winner projection. The pending-slot observation and snapshot
+load are separate operations. A winner can publish between them: the loser
+correctly observes the winner's ETag, but has not set the bookkeeping flag that
+selected budgeted generation-release cleanup. Its ordinary cleanup can therefore
+return an internal authorized-recovery handoff instead of the evaluated failed
+precondition. This does not require exhaustion of the ten-second request budget.
+
+The new owner-local regression commits real encrypted original/winner payloads,
+publishes the winner in precisely that gap, and defers its terminal slot cleanup.
+An authorized recovery worker is allowed to finish only after the losing request
+actually requests the handoff. No contention error is injected. Before the fix,
+the test failed in 0.200s with
+`direct_put_error cause_label=metadata_command_awaiting_authorized_recovery`.
+The original HTTP request had no internal trace, so this establishes a concrete
+reproduction of the leaking path, not retrospective trace attribution for
+`HQG9XFZBP2XZYEQ5`. Twenty isolated traced race attempts and five parallel
+conditional-suite diagnostic iterations had not reproduced that original failure.
+
+Every authoritative snapshot rejection now uses the existing budgeted release
+convergence path, independent of pending-slot observation history. Physical
+cleanup still precedes generation release; real cleanup failures and exhausted
+budgets are not converted into conditional errors. The regression requires the
+original failed If-Match result, one snapshot evaluation, exactly one generation
+release per replica, absent losing staging/reservations, the intact winning
+generation/payload, and an empty terminal slot after recovery. S3 response
+mapping and the strict 409/412 race assertion remain unchanged.
+
+This changes no format or durable ownership protocol and adds no healthy-path
+transaction/fsync. The original full-suite failure above remains historical
+validation evidence.
+
+Validation: all 186 focused Direct PUT/recovery/cleanup and simultaneous
+conditional-PUT tests passed in 55.837s. The full suite then passed all 9,312
+tests (one slow, six skipped) in 239.049s with retries disabled and internal S3
+tracing enabled. The previously failing If-Match race and the new deterministic
+regression both passed; no `direct_put_error` event was captured in that run.
+The slow Raft heartbeat/checkpoint test was inspected while running and completed
+successfully in 110.023s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed. The interrupted diagnostic run
+and an initial ETag type error in the new fixture are not counted as passing runs.

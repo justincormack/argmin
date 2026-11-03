@@ -22,6 +22,9 @@ mod scope;
 #[path = "direct_put_cleanup_retry.rs"]
 mod cleanup_retry;
 
+#[path = "direct_put_snapshot_cleanup.rs"]
+mod snapshot_cleanup;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,
