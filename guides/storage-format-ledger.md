@@ -20,6 +20,32 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Cleanup Command Branch Evidence Before Owner/Window Integration — 2026-11-03
+
+`metadata_command_v13_cleanup_branches.hex` supplements, without modifying, the
+existing 30-command v13/SSE-S3-v5 object corpus. Its 13 complete literal command
+specimens are 9,252 file bytes, SHA-256
+`afe02f70bd6f05dd6089d800ef2f3c44d9fe238de1e291256d01bed38c4eb75e`.
+They were captured from the unchanged v13 production writer before owner/window
+fields are introduced. No format version or production mutation changes here.
+
+The abort matrix covers absent proof, proof without target context and exact-key
+proof, crossed with empty manifests and two-segment manifests with/without shard
+integrity. The append matrix crosses PUT/UploadPart targets with absent/present
+shard integrity. The original object corpus lacked proof-present abort and
+UploadPart append specimens; its dynamic disposition test did not freeze those
+bytes independently of the current encoder. This supplement is scoped branch
+evidence, not an exhaustive corpus for all metadata command variants.
+
+Tests compare the unchanged writer and literal decoding against all named cases,
+require exact case-set equality and reject duplicate fixture names, truncation,
+trailing data, invalid proof option tags and noncurrent versions through the
+appropriate full/header readers. Decoded proof evidence also pins release
+classification and historical-route responsibility. Bucket-wide proof examples
+pin accepted codec grammar only; they do not authorize stream creation or
+physical effects. Keep this evidence immutable and rejection-only after an
+incompatible command advancement; it does not permit a compatibility reader.
+
 ## Bucket Reservation Lifecycle Evidence Before Introduction Custody — 2026-11-01
 
 `storage_rpc/testdata/bucket_reservation_rpc_v34.hex` freezes **91** complete

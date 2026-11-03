@@ -5900,6 +5900,307 @@ mod tests {
         }
     }
 
+    // These branches are changed by owner/window integration but were absent
+    // from the original 30-command literal corpus. Capture them while v13 is
+    // still the production writer, not by reconstructing v13 after a bump.
+    fn cleanup_branch_specimens() -> std::collections::BTreeMap<String, MetadataCommandEnvelope> {
+        let commands = immutable_v13_sse_s3_v5_object_command_bytes()
+            .into_iter()
+            .map(|bytes| decode_metadata_command_envelope_for_test(&bytes).unwrap())
+            .collect::<Vec<_>>();
+        let MetadataCommandPayload::AbortStreamUpload(abort) = commands[23].payload() else {
+            panic!("expected frozen abort")
+        };
+        let MetadataCommandPayload::AppendStreamSegment(append) = commands[22].payload() else {
+            panic!("expected frozen append")
+        };
+        let original = commands[19]
+            .payload()
+            .primary_bucket_write_reservation_proof()
+            .unwrap();
+        let mut specimens = std::collections::BTreeMap::new();
+        // Empty and multi-segment manifests, with each integrity option arm.
+        // Proof without target context pins accepted wire grammar only; it is
+        // not evidence that a bucket-wide proof authorizes stream creation.
+        for proof_kind in ["absent", "bucket", "key"] {
+            for manifest_kind in ["empty", "plain", "integrity"] {
+                let mut segments = Vec::new();
+                if manifest_kind != "empty" {
+                    for index in 0..2 {
+                        let ec = EcShape { k: 2, m: 1 };
+                        segments.push(StreamUploadSegmentRecord {
+                            session_id: abort.session_id.clone(),
+                            segment_index: index,
+                            size: 11,
+                            segment_crc64: 9,
+                            payload_crc64: 17,
+                            segment_okh: [u8::try_from(index + 7).unwrap(); 16],
+                            segment_vid: GenerationId::new(u64::from(index) + 1).unwrap(),
+                            data_pg_id: 2,
+                            placement_cluster_epoch: ClusterEpoch::new(7).unwrap(),
+                            ec_k: ec.k,
+                            ec_m: ec.m,
+                            shard_integrity: (manifest_kind == "integrity").then(|| {
+                                crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                                    ec, 11,
+                                )
+                                .1
+                            }),
+                        });
+                    }
+                }
+                let proof = (proof_kind != "absent").then(|| BucketWriteReservationProof {
+                    bucket: abort.bucket.clone(),
+                    reservation_id: original.reservation_id.clone(),
+                    owner_token: original.owner_token.clone(),
+                    cluster_epoch: original.cluster_epoch,
+                    bucket_execution_generation: original.bucket_execution_generation,
+                    bucket_incarnation_generation: original.bucket_incarnation_generation,
+                    operation_kind: PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.into(),
+                    created_at: original.created_at,
+                    lease_deadline: original.lease_deadline,
+                    target_context: (proof_kind == "key").then(|| abort.key.as_str().to_owned()),
+                });
+                let command = AbortStreamUploadCommand {
+                    bucket: abort.bucket.clone(),
+                    key: abort.key.clone(),
+                    session_id: abort.session_id.clone(),
+                    staged_segments: segments,
+                    stream_create_bucket_write_reservation: proof,
+                };
+                assert!(specimens
+                    .insert(
+                        format!("abort-{proof_kind}-{manifest_kind}"),
+                        MetadataCommandEnvelope::new(
+                            commands[23].id(),
+                            MetadataCommandPayload::AbortStreamUpload(Box::new(command))
+                        ),
+                    )
+                    .is_none());
+            }
+        }
+        for part in [false, true] {
+            for integrity in [false, true] {
+                let source = &append.segment;
+                let segment = StreamUploadSegmentRecord {
+                    session_id: source.session_id.clone(),
+                    segment_index: source.segment_index,
+                    size: source.size,
+                    segment_crc64: source.segment_crc64,
+                    payload_crc64: source.payload_crc64,
+                    segment_okh: source.segment_okh,
+                    segment_vid: source.segment_vid,
+                    data_pg_id: source.data_pg_id,
+                    placement_cluster_epoch: source.placement_cluster_epoch,
+                    ec_k: source.ec_k,
+                    ec_m: source.ec_m,
+                    shard_integrity: integrity.then(|| {
+                        crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                            EcShape {
+                                k: source.ec_k,
+                                m: source.ec_m,
+                            },
+                            source.size,
+                        )
+                        .1
+                    }),
+                };
+                let command = AppendStreamSegmentCommand {
+                    bucket: append.bucket.clone(),
+                    key: append.key.clone(),
+                    target: if part {
+                        StreamUploadTarget::UploadPart {
+                            upload_id: UploadId::try_from("ab".repeat(crate::UPLOAD_ID_LEN / 2))
+                                .unwrap(),
+                            part_number: 2,
+                        }
+                    } else {
+                        StreamUploadTarget::PutObject
+                    },
+                    segment,
+                };
+                assert!(specimens
+                    .insert(
+                        format!(
+                            "append-{}-{}",
+                            if part { "part" } else { "put" },
+                            if integrity { "integrity" } else { "plain" }
+                        ),
+                        MetadataCommandEnvelope::new(
+                            commands[22].id(),
+                            MetadataCommandPayload::AppendStreamSegment(Box::new(command))
+                        ),
+                    )
+                    .is_none());
+            }
+        }
+        specimens
+    }
+
+    fn immutable_v13_cleanup_branch_bytes() -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut specimens = std::collections::BTreeMap::new();
+        for line in include_str!("metadata_command_v13_cleanup_branches.hex")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let mut fields = line.split_ascii_whitespace();
+            let name = fields.next().unwrap().to_owned();
+            let checksum = u64::from_str_radix(fields.next().unwrap(), 16).unwrap();
+            let bytes = decode_fixture_hex(fields.next().unwrap());
+            assert_eq!(fields.next(), None);
+            assert_eq!(checksum::crc64::checksum(&bytes), checksum, "{name}");
+            assert!(
+                specimens.insert(name, bytes).is_none(),
+                "duplicate specimen"
+            );
+        }
+        assert_eq!(specimens.len(), 13);
+        specimens
+    }
+
+    #[test]
+    fn cleanup_branch_v13_writer_and_decoder_match_immutable_evidence() {
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 13);
+        let frozen = immutable_v13_cleanup_branch_bytes();
+        let expected = cleanup_branch_specimens();
+        assert_eq!(
+            frozen.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &frozen {
+            let command = &expected[name];
+            assert_eq!(*bytes, command.command_bytes(), "{name}");
+            let decoded = decode_metadata_command_envelope_for_test(bytes).unwrap();
+            assert_eq!(decoded, *command, "{name}");
+            assert_eq!(decoded.command_bytes(), *bytes, "{name}");
+            assert_applied_log_decoder_accepts(command);
+            for end in 0..bytes.len() {
+                assert!(
+                    decode_metadata_command_envelope_for_test(&bytes[..end]).is_err(),
+                    "{name}: truncated at {end}"
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(
+                decode_metadata_command_envelope_for_test(&trailing).is_err(),
+                "{name}: trailing data"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_branch_v13_literal_proofs_preserve_exact_release_disposition() {
+        for (name, bytes) in immutable_v13_cleanup_branch_bytes() {
+            let command = decode_metadata_command_envelope_for_test(&bytes).unwrap();
+            let payload = command.payload();
+            let disposition = payload.bucket_write_reservation_disposition();
+            match payload {
+                MetadataCommandPayload::AbortStreamUpload(abort) => {
+                    assert_eq!(
+                        abort.staged_segments.len(),
+                        if name.ends_with("empty") { 0 } else { 2 }
+                    );
+                    for segment in &abort.staged_segments {
+                        assert_eq!(
+                            segment.shard_integrity.is_some(),
+                            name.ends_with("integrity")
+                        );
+                    }
+                    if name.starts_with("abort-absent-") {
+                        assert_eq!(abort.stream_create_bucket_write_reservation, None);
+                        assert!(matches!(
+                            disposition,
+                            MetadataCommandReservationDisposition::NoCommandProof
+                        ));
+                        assert_eq!(
+                            payload
+                                .bucket_write_reservation_route_dependencies()
+                                .count(),
+                            0
+                        );
+                    } else {
+                        let proof = abort
+                            .stream_create_bucket_write_reservation
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(proof.bucket, abort.bucket);
+                        assert_eq!(
+                            proof.operation_kind,
+                            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        );
+                        assert_eq!(
+                            proof.target_context.as_deref(),
+                            name.starts_with("abort-key-").then_some(abort.key.as_str())
+                        );
+                        assert!(
+                            matches!(disposition, MetadataCommandReservationDisposition::ReleaseStreamCreationOnApply(actual) if actual == proof)
+                        );
+                        assert_eq!(
+                            payload
+                                .bucket_write_reservation_route_dependencies()
+                                .collect::<Vec<_>>(),
+                            vec![proof]
+                        );
+                    }
+                    // An unstarted abort cannot claim the live session's proof.
+                    assert_eq!(payload.primary_bucket_write_reservation_proof(), None);
+                }
+                MetadataCommandPayload::AppendStreamSegment(append) => {
+                    assert_eq!(
+                        matches!(append.target, StreamUploadTarget::UploadPart { .. }),
+                        name.starts_with("append-part-")
+                    );
+                    assert_eq!(
+                        append.segment.shard_integrity.is_some(),
+                        name.ends_with("integrity")
+                    );
+                    assert!(matches!(
+                        disposition,
+                        MetadataCommandReservationDisposition::NoCommandProof
+                    ));
+                    assert_eq!(
+                        payload
+                            .bucket_write_reservation_route_dependencies()
+                            .count(),
+                        0
+                    );
+                }
+                _ => panic!("unexpected cleanup specimen: {name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_branch_v13_noncurrent_versions_and_invalid_proof_tags_are_rejected() {
+        let frozen = immutable_v13_cleanup_branch_bytes();
+        for (name, bytes) in &frozen {
+            let offset = 4 + METADATA_COMMAND_MAGIC.len();
+            assert_eq!(&bytes[offset..offset + 2], &13_u16.to_le_bytes());
+            for version in [12_u16, 14] {
+                let mut noncurrent = bytes.clone();
+                noncurrent[offset..offset + 2].copy_from_slice(&version.to_le_bytes());
+                assert_unsupported_applied_command(&noncurrent, version);
+            }
+            if name.starts_with("abort-") {
+                let manifest = name.rsplit_once('-').unwrap().1;
+                let absent = &frozen[&format!("abort-absent-{manifest}")];
+                let proof_tag = absent.len() - 1;
+                assert_eq!(absent[proof_tag], 0);
+                assert_eq!(
+                    bytes[proof_tag],
+                    u8::from(!name.starts_with("abort-absent-"))
+                );
+                let mut malformed = bytes.clone();
+                malformed[proof_tag] = 2;
+                assert!(
+                    decode_metadata_command_envelope_for_test(&malformed).is_err(),
+                    "{name}: invalid proof tag"
+                );
+            }
+        }
+    }
+
     #[test]
     fn reservation_dispositions_keep_authorization_release_and_route_retention_distinct() {
         // Independent expectations for the immutable object-command corpus:

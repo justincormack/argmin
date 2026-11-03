@@ -7377,3 +7377,41 @@ belongs in the first coordinated state slice, not a later optional phase.
 This priority decision records the agreed sequencing; it adds no production
 behavior or format change and does not claim that the coordinated protocol has
 been implemented or fully proven.
+
+## Command Branch Evidence Before Owner/Window Integration — 2026-11-03
+
+The milestone-1 evidence gate found missing literal branches in the current
+command baseline. The existing 30-command v13 object corpus encodes stream abort
+without its optional retained creation proof and append only for PUT. The
+proof-present abort was exercised dynamically by the disposition test, which
+cannot independently pin an encoder/decoder change to those bytes.
+
+`metadata_command_v13_cleanup_branches.hex` now freezes thirteen complete commands
+from the unchanged v13 production writer: nine abort proof/manifest combinations
+and four PUT/UploadPart append/integrity combinations. It preserves absent and
+present proof, both target-context forms, empty and two-segment manifests, and
+both shard-integrity arms. Existing v13 and historical specimens are unchanged.
+The format ledger records the exact file hash and scope; this is not a claim of
+exhaustive evidence for every metadata-command variant or completion of the
+entire format-vector audit.
+
+The owner-local tests require exact named-case coverage, byte-for-byte current
+writer comparison, independent literal decode, exact release/route disposition,
+all truncations, trailing data, invalid proof tags and older/newer rejection.
+Proof-without-target examples pin wire grammar, not authorization of a stream or
+physical write. No production code, schema, command/RPC version, cleanup policy
+or durability barrier changes. The temporary capture test was removed; permanent
+tests never regenerate the immutable fixture.
+
+This is the separately committed current-writer evidence prerequisite required
+by the versioning guide before changing those command branches. Coordinated
+owner/window state remains the next production work, including completion's
+ownership handoff; all six original regressions remain ignored and unresolved.
+
+Validation before independent review: the first capture build caught an incorrect
+private-type path in the fixture constructor; it was corrected before capture.
+All five focused branch/original-corpus/disposition tests passed in 0.063s,
+followed by all 40 metadata-command tests in 0.079s. Independent source/test-design
+review approved the evidence-only slice. Full workspace Nextest passed all 9,330
+tests (two slow, six existing skips) in 248.680s. Strict all-target/all-feature
+Clippy, formatting and diff checks passed.
