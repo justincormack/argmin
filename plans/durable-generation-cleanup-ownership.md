@@ -6337,3 +6337,42 @@ version-listing tests passed in 120.317s and 63.383s. Strict Clippy identified a
 unnecessary clone in the new test assertion; after replacing it with a borrowed
 slice, all-target/all-feature Clippy and a final focused rerun passed. Storage
 boundary checks, formatting and `git diff --check` also passed.
+
+## Explicit Generation Release After Failed Shard Writing — 2026-11-02
+
+Successful acknowledged-prefix rollback previously returned the original write
+error and left generation release to the reservation guard's best-effort Drop.
+An unrelated detached pending command could block that release, hiding the
+cleanup failure behind the original shard-write diagnostic.
+
+The admitted Direct PUT write boundary now explicitly invokes the guard's
+owner-bound, fallible release after an ordinary write failure. Failed release
+takes diagnostic precedence; successful release preserves the original error.
+The guard disarms before attempting release, so returning its error cannot trigger
+a hidden second attempt on Drop. Incomplete physical rollback still skips release
+entirely, as established by the preceding slice. Ordinary unsolicited Drop remains
+best effort; successful writes still transfer ownership to the completed payload.
+
+The new regression reserves both attempts before detaching one exact pending PUT,
+writes the other attempt's first encrypted shard, and rejects its second shard.
+It checks successful one-pass prefix rollback, the blocked-release diagnostic,
+retained generation reservations on all replicas, no visible object, and the
+unmodified contender's pending command and payload. Before the correction it
+returned `store_not_found` instead of
+`metadata_command_awaiting_authorized_recovery`. A separate guard regression
+blocks explicit release, then runs production recovery before dropping the guard:
+the reservation must remain, proving Drop did not retry when release became
+possible. An explicit owner-local release is the positive control, not a claim
+of automatic maintenance discovery.
+
+This is error reporting and one-attempt cleanup discipline, not durable owner
+integration. A lost request can still leave a retained reservation with no
+discoverable cleanup obligation. It does not close the unacknowledged-write
+transport gap, add new retries/fsyncs or formats, or strengthen ephemeral client
+session semantics. All six original ignored regressions remain open.
+
+Validation: the new blocked-release test reproduced the hidden diagnostic before
+the correction. All 167 focused Direct PUT tests passed, followed by the full
+Nextest suite: 9,295 passed, one slow, six skipped, in 239.453s. The Raft heartbeat
+write-amplification test passed in 110.402s. Strict all-target/all-feature Clippy,
+storage boundary checks, formatting and `git diff --check` passed.

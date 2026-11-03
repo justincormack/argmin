@@ -3,6 +3,186 @@
 
 use super::*;
 
+fn detach_other_put(
+    fixture: &Fixture,
+    route: &crate::ActivePutObjectRoute<'_>,
+) -> (MetadataCommandEnvelope, DirectPayloadTestIdentity) {
+    let reservation = route
+        .test_reserve_generation_with_id(&fixture.reservations[0])
+        .unwrap();
+    let prepared = fixture.prepared(0, reservation.generation_id());
+    let encrypted = &fixture.encrypted[0];
+    let bound = reservation
+        .bind_encryption(&encrypted.encryption)
+        .bind_standard_segment(encrypted.logical_size)
+        .bind_committed_encryption(&prepared.encryption)
+        .unwrap();
+    let payload = route
+        .write_direct_object_segment_payload(bound, &encrypted.storage_bytes)
+        .unwrap();
+    fixture.record_payload_integrity(0, &payload).unwrap();
+    let identity = direct_payload_test_identity(&payload);
+    let command = fixture
+        .leave_pending_after_inspection_failure(0, route, payload)
+        .unwrap();
+    let runtime = fixture.map.runtime_state();
+    let MetadataCommandRecoveryAdmission::Leader(guard) =
+        runtime.join_metadata_command_recovery(PgId::new(0), &command)
+    else {
+        panic!("fixture must acquire recovery leadership");
+    };
+    guard.relinquish_for_authorized_recovery();
+    (command, identity)
+}
+
+#[test]
+fn direct_put_partial_write_reports_blocked_generation_release() {
+    let fixture = Fixture::new();
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_put_object_route(&fixture.bucket, &fixture.key)
+        .unwrap();
+    // Both reservations precede the detached command that will block release.
+    let reservation = route
+        .test_reserve_generation_with_id(&fixture.reservations[1])
+        .unwrap();
+    let generation = reservation.generation_id();
+    let segment_okh = crate::direct_put_segment_key_hash(&fixture.reservations[1], 0);
+    let data_pg_id = fixture
+        .map
+        .object_generation_segment_data_pg(&fixture.bucket, &fixture.key, generation, 0)
+        .get();
+    let ec = fixture.cluster.default_payload_ec_shape();
+    let identity = DirectPayloadTestIdentity {
+        data_pg_id,
+        ec,
+        segment_okh,
+        segment_vid: generation,
+    };
+    let (command, other_identity) = detach_other_put(&fixture, &route);
+    let first_path = fixture
+        .cluster
+        .test_payload_shard_file_path(data_pg_id, ec, &segment_okh, generation, 0)
+        .unwrap();
+    let _write_hook = fixture
+        .cluster
+        .test_install_before_placed_payload_shard_write_hook(Arc::new(move |_, key| {
+            if key.shard_index().get() == 1 {
+                assert!(!std::fs::read(&first_path).unwrap().is_empty());
+                return Err(StoreError::NotFound);
+            }
+            Ok(())
+        }));
+    let files = Arc::new(Mutex::new(Vec::new()));
+    let acks = Arc::new(Mutex::new(Vec::new()));
+    let observed_files = Arc::clone(&files);
+    let observed_acks = Arc::clone(&acks);
+    let _file_hook = fixture
+        .cluster
+        .test_install_before_placed_payload_shard_delete_hook(Arc::new(move |key| {
+            observed_files.lock().unwrap().push(key.clone());
+            Ok(())
+        }));
+    let _ack_hook = fixture
+        .cluster
+        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(move |key| {
+            observed_acks.lock().unwrap().push(key.clone());
+            Ok(())
+        }));
+    let encrypted = &fixture.encrypted[1];
+    let error = route
+        .write_direct_object_payload(
+            reservation.bind_encryption(&encrypted.encryption),
+            encrypted.logical_size,
+            &encrypted.storage_bytes,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "metadata_command_awaiting_authorized_recovery"
+    );
+    let first_key = ShardKey::new(&segment_okh, generation.get(), 0);
+    assert_eq!(
+        files.lock().unwrap().as_slice(),
+        std::slice::from_ref(&first_key)
+    );
+    assert_eq!(
+        acks.lock().unwrap().as_slice(),
+        std::slice::from_ref(&first_key)
+    );
+    fixture
+        .observe(
+            [Ownership::Pending, Ownership::CancelledPendingRelease],
+            &[Some(other_identity), Some(identity)],
+            Some(&command),
+        )
+        .unwrap();
+}
+
+#[test]
+fn direct_put_failed_explicit_generation_release_does_not_retry_on_drop() {
+    let fixture = Fixture::new();
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&fixture.cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_put_object_route(&fixture.bucket, &fixture.key)
+        .unwrap();
+    let reservation = route
+        .test_reserve_generation_with_id(&fixture.reservations[1])
+        .unwrap();
+    let generation = reservation.generation_id();
+    let (_command, _) = detach_other_put(&fixture, &route);
+    let error = reservation.release_on_owner().unwrap_err();
+    assert_eq!(
+        crate::DirectPutFailure::from_object_pg_action(error).diagnostic_cause_label(),
+        "metadata_command_awaiting_authorized_recovery"
+    );
+
+    // Make a hidden retry observable: after real recovery clears the blocker,
+    // an armed Drop would now successfully remove this reservation.
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_static_map()
+            .unwrap(),
+        1
+    );
+    drop(reservation);
+    for node in fixture.map.nodes.values() {
+        let pg = node.storage_node().get_pg(0).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &fixture.bucket,
+                &fixture.key,
+                &fixture.reservations[1],
+            )
+            .unwrap(),
+            generation
+        );
+    }
+    // Owner-local control, not automatic discovery: the surviving reservation
+    // is releasable once recovery finishes, but only by an explicit new attempt.
+    fixture
+        .cluster
+        .release_object_generation_reservation(
+            &fixture.bucket,
+            &fixture.key,
+            &fixture.reservations[1],
+        )
+        .unwrap();
+    assert_single_generation_release(
+        &fixture.map,
+        0,
+        &fixture.bucket,
+        &fixture.key,
+        &fixture.reservations[1],
+    );
+}
+
 #[test]
 fn direct_put_partial_write_cleanup_failure_preserves_generation() {
     // None is a successful rollback; the other cases independently fail a

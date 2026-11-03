@@ -166,8 +166,11 @@ Before a full payload handle exists, shard writing distinguishes a write error
 from failure to roll back its acknowledged prefix. Preserve that distinction
 through Direct PUT's internal write result: incomplete rollback disarms the
 generation guard's release, retaining the reservation instead of releasing it
-on Drop. Successful rollback keeps the original write diagnostic and ordinary
-generation release. Streaming still owns its generation through the durable
+on Drop. After successful rollback, Direct PUT explicitly attempts generation
+release: a release failure takes precedence over the original write diagnostic;
+successful release preserves that diagnostic. The guard disarms before the
+attempt, so Drop cannot silently retry a reported release failure. Unsolicited
+Drop remains best effort. Streaming still owns its generation through the durable
 session and reports rollback failures through that workflow. This only covers
 acknowledged-prefix rollback, not cleanup discovery after frontend loss or the
 revocation of delayed/ambiguous unacknowledged writes.

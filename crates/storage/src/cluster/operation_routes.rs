@@ -1111,21 +1111,23 @@ impl DirectPutGenerationReservation<'_> {
         self.armed.set(false);
     }
 
-    fn release_on_owner(&self) {
+    fn release_on_owner(&self) -> Result<(), ObjectPgActionError> {
         if !self.armed.replace(false) {
-            return;
+            return Ok(());
         }
-        let _ = self.owner.cluster.release_object_generation_reservation(
+        // Explicit failure is returned to the caller; Drop must not make a
+        // second, hidden attempt after that diagnostic has been selected.
+        self.owner.cluster.release_object_generation_reservation(
             &self.bucket,
             &self.key,
             &self.reservation_id,
-        );
+        )
     }
 }
 
 impl Drop for DirectPutGenerationReservation<'_> {
     fn drop(&mut self) {
-        self.release_on_owner();
+        let _ = self.release_on_owner();
     }
 }
 
@@ -2206,7 +2208,12 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             data,
         ) {
             Ok(payload) => payload,
-            Err(PayloadShardWriteError::Write(error)) => return Err(error),
+            Err(PayloadShardWriteError::Write(error)) => {
+                generation_reservation
+                    .release_on_owner()
+                    .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+                return Err(error);
+            }
             Err(PayloadShardWriteError::CleanupIncomplete(error)) => {
                 // The guard must not release a generation whose acknowledged
                 // shard prefix still needs cleanup. No publishable handle was
