@@ -6760,3 +6760,48 @@ The slow Raft heartbeat/checkpoint test was inspected while running and complete
 successfully in 110.023s. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and `git diff --check` passed. The interrupted diagnostic run
 and an initial ETag type error in the new fixture are not counted as passing runs.
+
+## Durable Reclaim Restart Confirmation — 2026-11-03
+
+The preceding participant-progress matrix retried within one live process.
+The next owner-local matrix crosses a real runtime close/reopen boundary after
+failed cleanup of an encrypted two-segment PUT or completed two-part MPU.
+Independent file, acknowledgement and combined failures are tested both before
+the effect and after the real scoped deletion has succeeded but its successful
+completion is withheld at the orchestration boundary: twelve cases in total.
+
+Before closing, the tests require the exact root on every metadata replica,
+the precise residual file/acknowledgement set, released attempt claims, no pending
+root-removal command and an unchanged command allocator. Post-effect failures
+are particularly important: **all physical effects can be absent while the
+unconfirmed root must remain**. A weak-reference canary proves the original map
+has been dropped before opening the same stores; no concurrent second runtime
+or process-local route clone substitutes for restart.
+
+The reopened runtime starts without a reclaim queue hint. The production durable
+scan must rediscover the exact bucket/key/generation; the worker retries only
+that discovered subject. A complete inventory requires all six file and six
+acknowledgement operations again, including already-absent participants. Only
+then may the replicated removal delete the root. A subsequent missing-root
+attempt cannot advance the command allocator. The same-PG live canary retains
+its metadata and every file/acknowledgement, with exact ciphertext readback.
+Positive checks establish the target participants before injecting failures.
+
+This is production-connected restart evidence for **existing durable reclaim
+roots**, not a power-loss test, actual socket-reply-loss test, primary replacement
+or historical-route transition. The completion-failure injection calls the real
+placed-file/metadata-ack route before returning an error; it adds no production
+hooks or alternate deletion implementation. No production code, format, table,
+ordinary-path transaction or fsync changes. The coordinated staging owner/window
+and finite physical-write-authority integration, and all six original ignored
+regressions, remain open.
+
+Validation: both initial focused tests passed. After strengthening the positive
+participant and same-PG canaries, all 68 focused reclaim/retirement-model tests
+passed in 2.117s. The full Nextest suite passed all 9,314 tests (two slow, six
+skipped), with retries disabled, in 241.114s. The Raft heartbeat/checkpoint and
+1,001-version listing tests completed in 113.431s and 60.091s respectively.
+Strict all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed. Fixture compilation first caught an incorrect
+private-type import and topology accessor; these were corrected before the
+successful runs.

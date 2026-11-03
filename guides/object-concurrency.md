@@ -213,6 +213,13 @@ idempotent deletion, including already-absent participants. This does not add
 historical placement authority or solve delayed staging writes; it preserves the
 existing reclaim route and claim protocol.
 
+Reopening a runtime discards the queue hint and all process-local completion
+observations. Rediscover retained reclaim roots from durable metadata and repeat
+every recorded file/acknowledgement deletion, even when inspection finds every
+effect already absent after an unconfirmed completion. Namespace absence does
+not replace participant confirmation. Retire the root only after the complete
+retry succeeds; an unrelated live payload on the same PG must remain unchanged.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

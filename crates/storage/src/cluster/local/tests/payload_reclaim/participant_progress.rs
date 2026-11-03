@@ -4,6 +4,9 @@
 use super::*;
 use crate::ObjectPgActionError;
 
+#[path = "participant_restart.rs"]
+mod restart;
+
 fn publish_segments(
     cluster: &StorageCluster,
     bucket: &BucketName,
