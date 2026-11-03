@@ -7065,3 +7065,44 @@ the expanded twelve-case foreground/recovery/finisher matrix also passed.
 Full workspace Nextest passed all 9,326 tests (three slow, six existing skips)
 in 272.508s. Strict all-target/all-feature Clippy, formatting and diff checks
 passed. Independent source/test-design review approved this bounded fix.
+
+## Applied Part-Replacement Cleanup Before Retirement — 2026-11-03
+
+`CommitStreamPart` had the same retry-custody gap for displaced part payload:
+its transaction replaced the part's metadata and deleted its session, then the
+pending command was removed before best-effort physical deletion. A deterministic
+fresh-finalize regression reproduced a successful replacement response despite
+an injected displaced-file deletion failure and no surviving pending retry owner.
+
+Applied part commits now delete the recorded displaced segments at the shared
+pre-removal boundary. The same result-bearing retained-placement segment helper
+serves whole-MPU abort, preserving its independent active-session cleanup even
+when a committed participant fails. Every displaced file and acknowledgement is
+attempted; any failure keeps the exact applied part command pending for retry.
+Reservation release remains independent and precedes physical cleanup. The former
+post-removal best-effort displaced-part pass is removed. No schema, encoding,
+transaction or ordinary-path fsync changes are introduced.
+
+The encrypted regression uses two displaced segments, a replacement segment and
+an unrelated completed part. Four cases independently fail file or acknowledgement
+cleanup during fresh foreground finalization and again through static recovery or
+the generic finisher. They require all six file and acknowledgement attempts,
+precise residual effects, exact pending custody, eventual successful retry with
+unchanged applied replica prefixes, the new part metadata, and intact ciphertext,
+files and acknowledgements for the replacement and unrelated completed part.
+
+This retains existing pending-envelope retry responsibility, not a new durable
+owner/window. It does not preserve custody across primary replacement/compaction,
+cover prepared writes absent from the command, or fence delayed physical writes.
+`CommitMultipartObject` completion cleanup retains its existing best-effort policy.
+All six original ignored regressions remain open. The command-stream guide now
+records the abort and part-replacement pre-removal requirements explicitly.
+
+Validation before independent review: after correcting a missing trait import in
+the fixture, the pre-fix regression failed with `failed displaced cleanup must
+retain publication custody: Ok(FinalizeStreamPartOutcome ...)`. All 14 initial
+focused tests and all 105 broader stream-command/multipart-abort/release-ownership
+tests passed after the fix. Independent source/test-design review approved the
+bounded change. Full workspace Nextest passed all 9,327 tests (one slow, six
+existing skips) in 244.200s. Strict all-target/all-feature Clippy, formatting and
+diff checks passed.

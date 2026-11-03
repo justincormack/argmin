@@ -15,6 +15,7 @@ mod reservation_disposition;
 mod append_cleanup;
 
 mod multipart_abort_cleanup;
+mod part_replacement_cleanup;
 #[path = "stream_commands/retained_abort_cleanup.rs"]
 mod retained_abort_cleanup;
 

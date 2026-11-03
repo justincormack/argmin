@@ -5068,19 +5068,34 @@ impl super::StorageCluster {
         );
     }
 
-    pub(super) fn delete_finalize_upload_part_cleanup_best_effort(
+    pub(super) fn delete_finalize_upload_part_cleanup_at_retained_epoch(
         &self,
         cleanup: &FinalizeStreamPartCleanup,
-    ) {
-        self.delete_multipart_part_segments_best_effort(&cleanup.displaced_segments);
+    ) -> Result<(), ObjectPgActionError> {
+        self.delete_multipart_part_segments_at_retained_epoch(&cleanup.displaced_segments)
     }
 
     pub(super) fn delete_abort_multipart_cleanup_at_retained_epoch(
         &self,
         cleanup: &AbortMultipartUploadCleanup,
     ) -> Result<(), ObjectPgActionError> {
+        let committed_cleanup =
+            self.delete_multipart_part_segments_at_retained_epoch(&cleanup.streaming_segments);
+        // Active sessions and committed parts are independent obligations. A
+        // failed committed participant cannot starve active-session cleanup.
+        let active_cleanup = self.delete_staged_stream_segment_payload_shards_at_retained_epoch(
+            &cleanup.stream_upload_segments,
+        );
+        committed_cleanup?;
+        active_cleanup
+    }
+
+    fn delete_multipart_part_segments_at_retained_epoch(
+        &self,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
         let mut first_error = None;
-        for segment in &cleanup.streaming_segments {
+        for segment in segments {
             let ec = EcShape { k: segment.ec_k, m: segment.ec_m };
             let keys = Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
             if let Err(error) = self.try_delete_payload_shard_keys_at_epoch(
@@ -5094,15 +5109,7 @@ impl super::StorageCluster {
                 first_error.get_or_insert(ObjectPgActionError::Store(error));
             }
         }
-        // Active sessions and committed parts are independent obligations. A
-        // failed committed participant cannot starve active-session cleanup.
-        let active_cleanup = self.delete_staged_stream_segment_payload_shards_at_retained_epoch(
-            &cleanup.stream_upload_segments,
-        );
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        active_cleanup
+        first_error.map_or(Ok(()), Err)
     }
 
     fn delete_multipart_part_segments_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {

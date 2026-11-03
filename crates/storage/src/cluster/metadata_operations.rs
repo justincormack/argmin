@@ -6325,8 +6325,8 @@ impl StorageCluster {
         }
     }
 
-    /// Keep exact applied stream/MPU aborts pending until both independent
-    /// reservation-release and physical-cleanup obligations succeed. Historical payload placement belongs to `self`,
+    /// Keep exact applied commands pending until their independent
+    /// reservation-release and required physical-cleanup obligations succeed. Historical payload placement belongs to `self`,
     /// even when reservation release uses a separate current-map authority.
     fn complete_applied_metadata_command_terminal_cleanup(
         &self,
@@ -6344,6 +6344,11 @@ impl StorageCluster {
                 .map_err(object_pg_action_error_to_bucket_snapshot_error),
             MetadataCommandPayload::AbortMultipartUpload(abort) => self
                 .delete_abort_multipart_cleanup_at_retained_epoch(&abort.cleanup)
+                .map_err(object_pg_action_error_to_bucket_snapshot_error),
+            MetadataCommandPayload::CommitStreamPart(commit) => self
+                .delete_finalize_upload_part_cleanup_at_retained_epoch(&crate::FinalizeStreamPartCleanup {
+                    displaced_segments: commit.displaced_segments.clone(),
+                })
                 .map_err(object_pg_action_error_to_bucket_snapshot_error),
             _ => Ok(()),
         };

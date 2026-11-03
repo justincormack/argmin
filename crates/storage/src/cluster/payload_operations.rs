@@ -4431,18 +4431,12 @@ impl StorageCluster {
                     );
                 }
             }
-            // Applied stream/MPU abort cleanup must succeed before slot removal;
+            // Applied abort and displaced-part cleanup must succeed before slot removal;
             // it is performed by complete_applied_metadata_command_terminal_cleanup.
             MetadataCommandPayload::CreateStreamUpload(_)
             | MetadataCommandPayload::AbortStreamUpload(_)
-            | MetadataCommandPayload::AbortMultipartUpload(_) => {}
-            MetadataCommandPayload::CommitStreamPart(commit) => {
-                self.delete_finalize_upload_part_cleanup_best_effort(
-                    &crate::FinalizeStreamPartCleanup {
-                        displaced_segments: commit.displaced_segments.clone(),
-                    },
-                );
-            }
+            | MetadataCommandPayload::AbortMultipartUpload(_)
+            | MetadataCommandPayload::CommitStreamPart(_) => {}
             MetadataCommandPayload::DeleteObjectPayloadReclaim(delete) => {
                 self.enqueue_bucket_delete_finalize(crate::BucketDeleteFinalizeRoot {
                     bucket: delete.bucket.clone(),
