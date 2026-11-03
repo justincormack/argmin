@@ -6006,8 +6006,8 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 }
 
 #[test]
-fn get_payload_reclaim_root_returns_first_pg_root() {
-    let (_dir, store) = make_pg_store();
+fn get_payload_reclaim_root_rotates_across_layouts_and_wraps() {
+    let (dir, store) = make_pg_store();
 
     store
         .put_multipart_reclaim(&MultipartReclaimRecord {
@@ -6044,6 +6044,74 @@ fn get_payload_reclaim_root_returns_first_pg_root() {
     assert_eq!(root.bucket, "a-bucket");
     assert_eq!(root.key, "k");
     assert_eq!(root.generation_id, GenerationId::new(3).unwrap());
+
+    let next = store.get_payload_reclaim_root().unwrap().unwrap();
+    assert_eq!(next.bucket, "z-bucket");
+    assert_eq!(next.key, "z");
+    assert_eq!(next.generation_id, GenerationId::new(9).unwrap());
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(root.clone())
+    );
+    // Reopening discards the hint, not either durable root.
+    drop(store);
+    let store = crate::PgStore::open(&dir.path().join("pg-0000"), 0).unwrap();
+    assert_eq!(store.get_payload_reclaim_root().unwrap(), Some(root));
+}
+
+#[test]
+fn reclaim_discovery_cursor_handles_insertions_deletions_and_empty_pg() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bucket");
+    let roots = [("a", 1), ("a", 2), ("b", 1)].map(|(key, generation)| PayloadReclaimRoot {
+        bucket: bucket.clone(),
+        key: object_key(key),
+        generation_id: GenerationId::new(generation).unwrap(),
+    });
+    let insert = |root: &PayloadReclaimRoot| {
+        store
+            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: root.bucket.clone(),
+                key: root.key.clone(),
+                generation_id: root.generation_id,
+                created_at: 1,
+                segments: Vec::new(),
+            })
+            .unwrap();
+    };
+    insert(&roots[1]);
+    insert(&roots[2]);
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(roots[1].clone())
+    );
+    insert(&roots[0]); // A new root behind the current hint is not lost.
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(roots[2].clone())
+    );
+    store
+        .delete_object_segments_reclaim(&bucket, &roots[2].key, roots[2].generation_id)
+        .unwrap();
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(roots[0].clone())
+    );
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(roots[1].clone())
+    );
+    for root in &roots[..2] {
+        store
+            .delete_object_segments_reclaim(&bucket, &root.key, root.generation_id)
+            .unwrap();
+    }
+    assert_eq!(store.get_payload_reclaim_root().unwrap(), None);
+    insert(&roots[0]);
+    assert_eq!(
+        store.get_payload_reclaim_root().unwrap(),
+        Some(roots[0].clone())
+    );
 }
 
 #[test]

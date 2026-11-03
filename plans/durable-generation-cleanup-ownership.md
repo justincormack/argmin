@@ -6805,3 +6805,49 @@ Strict all-target/all-feature Clippy, storage boundary checks, formatting and
 `git diff --check` passed. Fixture compilation first caught an incorrect
 private-type import and topology accessor; these were corrected before the
 successful runs.
+
+## Durable Reclaim Discovery Past Blocked Roots — 2026-11-03
+
+Review of discovery after restart exposed a separate progress obligation: preserving
+an unsuccessful root must not make it the only discoverable root on its PG.
+The existing PG-wide query always selected the lexicographically first row;
+the caller checked its deferred set and active payload leases only afterward.
+Another pass therefore rediscovered that same row indefinitely when it could
+not complete. The new rotation canary failed against the previous implementation
+with `left: "a-bucket", right: "z-bucket"` on its second discovery call.
+
+PG-wide discovery now retains a **process-local scheduling cursor** in the
+opened PG store. A keyset query returns the next `(bucket, key, generation)`
+across standard and multipart roots, wrapping at the end. It performs at most
+two queries and returns at most one root per call. The cursor advances before
+caller-side deferral/lease/queue-capacity checks, so those checks cannot pin
+discovery to the same first root. It is not deletion authority, a completion
+receipt or an exhaustion proof. An ignored/lost response is rediscovered after
+wraparound; reopening resets the hint. Bucket-specific draining is unchanged.
+Existing worker capacity, PG cooldown and claim serialization still apply;
+this fixes discovery starvation, not arbitrary concurrent-work scheduling.
+
+Owner-local regressions cover both reclaim layouts, ordered generations of one
+key, deletion of the cursor row, insertion behind the cursor, empty-PG recovery,
+and reset on reopen. An installed Unix regression opens a new connection and
+scoped route for every call, requiring rotation and wraparound to survive those
+ephemeral callers. A production-path encrypted-payload regression reopens the
+runtime without queue hints, keeps the first of two same-PG roots either
+explicitly deferred or leased, discovers and completes the second, verifies the
+first root and ciphertext remain intact, then releases the first deferral and
+requires its eventual cleanup and an empty final scan.
+
+No schema, wire grammar, command encoding, ordinary-write transaction or fsync
+changes. Durable owner/window records, finite physical-write authority and the
+six original ignored cleanup regressions remain open.
+
+Validation: all 66 focused reclaim/discovery tests passed in 3.076s. The full
+Nextest suite passed all 9,317 tests (one slow, six skipped), with retries
+disabled, in 240.874s. The slow Raft heartbeat/checkpoint test was inspected
+while running and passed in 109.641s. Strict all-target/all-feature Clippy,
+storage boundary checks, formatting and `git diff --check` passed. In addition
+to the expected pre-fix rotation failure, the first integration run caught a
+fixture mistake: successful payload reclaim also queues a bucket-finalization
+wake. The test now validates and consumes that live bucket's wake separately
+before checking the exact next payload root; no production retry or assertion
+was relaxed.

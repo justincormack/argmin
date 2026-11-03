@@ -220,6 +220,17 @@ effect already absent after an unconfirmed completion. Namespace absence does
 not replace participant confirmation. Retire the root only after the complete
 retry succeeds; an unrelated live payload on the same PG must remain unchanged.
 
+Durable discovery must also progress past a root that remains leased, deferred,
+or repeatedly fails cleanup. PG-wide discovery rotates in `(bucket, key,
+generation)` order using a process-local cursor, wrapping after the last root.
+Each call returns at most one root and performs at most two metadata queries.
+The cursor is only a scheduling hint: it grants no deletion authority, is not
+persisted or replicated, and resets on reopen. A lost discovery response skips
+that root only until wraparound; it cannot retire the root. Bucket-specific
+draining retains its existing first-root behavior. Workers still revalidate the
+exact root, leases and claim before effects and request another scan pass after
+any nonempty result.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

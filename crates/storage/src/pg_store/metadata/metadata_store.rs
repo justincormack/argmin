@@ -2583,28 +2583,45 @@ impl PgMetadataStore for PgStore {
     }
 
     fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
-        self.query_row_cached_optional_metadata(
-            "SELECT bucket, key, generation_id FROM (
+        let load_after = |after: Option<&PayloadReclaimRoot>| {
+            self.query_row_cached_optional_metadata(
+                "SELECT bucket, key, generation_id FROM (
                  SELECT bucket, key, generation_id FROM object_segments_reclaims
                  UNION ALL
                  SELECT bucket, key, generation_id FROM multipart_reclaims
              )
+             WHERE (bucket, key, generation_id) > (?1, ?2, ?3)
              ORDER BY bucket ASC, key ASC, generation_id ASC
              LIMIT 1",
-            [],
-            "get payload reclaim root",
-            |row| {
-                Ok(PayloadReclaimRoot {
-                    bucket: row.get(0)?,
-                    key: row.get(1)?,
-                    generation_id: Self::parse_generation_id(
-                        row.get::<_, i64>(2)?,
-                        2,
-                        "generation_id",
-                    )?,
-                })
-            },
-        )
+                params![
+                    after.map_or("", |root| root.bucket.as_str()),
+                    after.map_or("", |root| root.key.as_str()),
+                    // Cursor generations were decoded from positive SQLite i64s.
+                    after.map_or(0, |root| root.generation_id.get() as i64),
+                ],
+                "get payload reclaim root",
+                |row| {
+                    Ok(PayloadReclaimRoot {
+                        bucket: row.get(0)?,
+                        key: row.get(1)?,
+                        generation_id: Self::parse_generation_id(
+                            row.get::<_, i64>(2)?,
+                            2,
+                            "generation_id",
+                        )?,
+                    })
+                },
+            )
+        };
+        let mut cursor = self.payload_reclaim_scan_cursor.borrow_mut();
+        let mut root = load_after(cursor.as_ref())?;
+        if root.is_none() && cursor.is_some() {
+            root = load_after(None)?;
+        }
+        // Advance even if the caller cannot enqueue/process this root. Wraparound
+        // retries it later without starving unrelated roots in the same PG.
+        *cursor = root.clone();
+        Ok(root)
     }
 
     fn get_bucket_delete_finalize_roots(

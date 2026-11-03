@@ -574,7 +574,9 @@ pub(crate) trait PgMetadataStore {
     /// Return one reclaim root on this metadata PG, if any exist.
     ///
     /// Used by reclaim workers to recover durable roots when local wakeup hints
-    /// were lost across process restart.
+    /// were lost across process restart. Repeated calls rotate through roots in
+    /// subject order, wrapping at the end, even if earlier roots remain. The
+    /// process-local cursor is a scheduling hint and resets when the PG reopens.
     fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
     /// Return the active object-payload reclaim claim on this metadata PG, if any.

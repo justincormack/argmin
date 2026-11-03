@@ -733,6 +733,9 @@ pub struct PgStore {
     allocation_lifetime: allocation_lifetime::PgAllocationLifetime,
     shard_file_mutations: std::sync::Arc<ShardFileMutations>,
     clean_metadata_digest_revision: AtomicU64,
+    // Discovery hint only; never part of durable state or cleanup authority.
+    // Access is serialized by the owning PG lock, like the SQLite connection.
+    payload_reclaim_scan_cursor: std::cell::RefCell<Option<PayloadReclaimRoot>>,
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -963,6 +966,7 @@ pub(crate) fn inspect_pg_shard_inventory(
         allocation_lifetime: allocation_lifetime::PgAllocationLifetime::retired(),
         shard_file_mutations: Default::default(),
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+        payload_reclaim_scan_cursor: Default::default(),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -1280,6 +1284,7 @@ impl PgStore {
             allocation_lifetime: allocation_lifetime::PgAllocationLifetime::new()?,
             shard_file_mutations: Default::default(),
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+            payload_reclaim_scan_cursor: Default::default(),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

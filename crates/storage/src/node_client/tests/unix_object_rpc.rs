@@ -4443,6 +4443,64 @@ fn unix_bucket_payload_reclaim_root_requires_pg_primary() {
 }
 
 #[test]
+fn unix_reclaim_discovery_rotates_across_client_reconnections() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("discovery-rpc-bucket");
+    let roots = ["a", "z"].map(|key| crate::types::PayloadReclaimRoot {
+        bucket: bucket.clone(),
+        key: crate::tests::object_key(key),
+        generation_id: GenerationId::new(3).unwrap(),
+    });
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        // Metadata-only discovery fixtures; no payload is claimed or deleted.
+        for root in &roots {
+            PgMetadataStore::put_object_segments_reclaim(
+                &*pg,
+                &ObjectSegmentsReclaimRecord {
+                    bucket: root.bucket.clone(),
+                    key: root.key.clone(),
+                    generation_id: root.generation_id,
+                    created_at: 1,
+                    segments: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    // Each frame uses a new connection and a newly constructed scoped route.
+    // Neither can reset the owning PG's discovery hint.
+    for index in [0, 1, 0, 1] {
+        let server = Arc::clone(&server);
+        let serving = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        )
+        .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+        assert_eq!(
+            object_mutation_scan_route(&client, ObjectMetadataScanPgId::new_for_test(PgId::new(0)))
+                .get_payload_reclaim_root()
+                .unwrap(),
+            Some(roots[index].clone()),
+        );
+        drop(client);
+        serving.join().unwrap();
+    }
+}
+
+#[test]
 fn unix_object_payload_reclaim_root_requires_pg_primary() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);

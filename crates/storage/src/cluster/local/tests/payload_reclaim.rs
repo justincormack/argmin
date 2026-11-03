@@ -7,6 +7,9 @@ use crate::{ObjectPayloadReclaimKind, PgMetadataStore};
 #[path = "payload_reclaim/participant_progress.rs"]
 mod participant_progress;
 
+#[path = "payload_reclaim/discovery.rs"]
+mod discovery;
+
 #[test]
 fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
     let runtime_state = LocalClusterRuntimeState::new();
