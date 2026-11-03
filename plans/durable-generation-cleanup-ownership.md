@@ -17,10 +17,200 @@ supersedes earlier recommendations that treat reservation survival as a goal.
 
 **Next-work priority — 2026-11-03:** move to coordinated retained owner/window
 integration rather than continuing the sequence of adjacent cleanup patches.
-Defer standalone `CommitMultipartObject` cleanup hardening; include completion's
-selected-payload ownership transfer and retained unselected cleanup obligations
-in that integration. Its current best-effort cleanup remains unresolved. See the
-[priority decision below](#critical-path-priority-and-completion-cleanup--2026-11-03).
+Defer only a standalone `CommitMultipartObject` pending-slot-retention patch,
+not completion cleanup itself. Completion's ownership handoff, safe deletion and
+durable retry are required across the coordinated integration milestones below.
+Its current best-effort cleanup remains unresolved. See the
+[completion cleanup work breakdown](#commitmultipartobject-cleanup-hardening)
+and [priority decision](#critical-path-priority-and-completion-cleanup--2026-11-03).
+
+## Coordinated Integration Checklist — 2026-11-03
+
+This is the current execution checklist, consolidated from the contract and
+integration decisions recorded later in this document. Checkboxes are acceptance
+requirements, not completed work. The first coordinated state slice is followed
+by separate physical-authority and worker slices; it must not be mistaken for
+an implemented end-to-end cleanup protocol.
+
+### Fixed contract and first-slice boundary
+
+- Client attempts may fail on primary/lifetime loss. Preserve cleanup
+  responsibility and accepted publication, not session continuity. No bucket
+  reservation replication, successor session resumption or exceptional retry
+  windows in this first implementation.
+- Reuse reserve/create/append/terminal apply transactions. Target no additional
+  ordinary-path metadata command/fsync, no per-shard intent or durable receipt.
+- Use one physical allocation per window (`B = 1`). Retain the selected initial
+  immutable admission caps: ten seconds for Direct PUT and five minutes per
+  stream window, further restricted by request/route bounds. These are new
+  physical-authority limits, not reinterpretations of heartbeat leases.
+- The first slice installs real replicated ownership, checked allocation and
+  terminal reference transfers. It does **not** grant a new remotely usable
+  capability or authorize owner-based deletion. Do not add an unsafe scanner or
+  call the six original regressions fixed before confirmation/exclusion lands.
+
+### Milestone 1: required records and invariants
+
+- [ ] Add storage-private owner/window records, initially explicit rows. Owners
+  bind reservation/session ID, bucket incarnation, key/object PG, originating
+  epoch, target, reserved generation and allocation issuer. UploadPart also binds
+  its enclosing MPU generation independently of its part payload generation.
+- [ ] A window binds owner/revision, index/hash, checked nonempty one-slot VID
+  interval, original issuer, immutable cutoff, bounded codec/storage geometry,
+  EC shape, data-PG placement epoch, and exact file/ack participants. Capture the
+  independent acknowledgement primary, not just file placement. Maintain the
+  maximum issued horizon and replicated reserved end separately from the local
+  consumed cursor; no nullable/infinite authority or arithmetic wraparound.
+- [ ] Persist a closed owner lifecycle and exact selected-payload references.
+  References distinguish the object payload generation or upload/part generation
+  and physical keys, not merely object key, version ID or part number. A window
+  selecting payload does not discard responsibility for unselected windows.
+- [ ] Represent exact resource responsibility explicitly: no-resource, retained
+  live responsibility, or release-due evidence, without overloading `Option<Proof>`.
+  Preserve stable proof identity and its historical release route separately from
+  renewable deadlines. Permit independent unresolved creation/finalization
+  obligations for UploadPart; do not hold its creation proof for session lifetime.
+  A successful release need not gain a new command merely to erase evidence;
+  retain conservative evidence for idempotent reinspection at a later transition.
+- [ ] No owner/window/reference deletion cascades from session, reservation, MPU
+  or live-object removal. Only owner-owned child rows may cascade. Canonical
+  validation enforces subject, issuer, interval, lifecycle, reference and resource
+  relationships centrally, including decoded apply and checkpoint import.
+
+### Milestone 1: transaction and frontend custody checklist
+
+| Existing boundary | Required first-slice effect |
+| --- | --- |
+| Direct PUT `ReserveObjectGeneration` | Primary builder captures proof/placement/geometry/cutoff; apply installs owner, resource responsibility and exact first window with the reservation. Change frontend proof custody in the same slice, including ambiguous insertion; never land proof persistence with terminal-only frontend handoff. |
+| `CreateStreamUpload` | Add owner/first window to the existing atomic generation/session transaction. Persist the actual primary issuer on all replicas; preserve PUT versus UploadPart creation-proof release timing. |
+| Local preparation | Under the existing PG/allocator lock compare the persisted window and issuer with the actual live PG lifetime, recheck the captured fence and consume only its slot. Second preparation/lost response does not authorize reuse. Restart/import/new lifetime cannot allocate under an old issuer. |
+| `AppendStreamSegment` | Primary-owned construction validates selected-window membership and captures the next descriptor. Apply stores the manifest, reserves the next one-slot interval from the reserved end and retains previous windows/horizon. Exact replay/reissue preserves descriptors, cutoffs and allocation. |
+| `CommitDirectPutObject` / `CommitStreamPart` | Atomically bind selected keys to the published object/part and retain all other window/resource obligations before removing session/reservation rows. Part replacement transfers displaced ownership before deleting its old manifests. |
+| `CommitMultipartObject` | Atomically transfer selected-part references to the exact completed object generation, retain omitted-part, active-session and unused-window obligations, and preserve completion replay semantics. This is the durable handoff portion of completion cleanup hardening; deletion and retry are required in milestones 2–3 below. |
+| Abort/release/abandonment, overwrite/delete/reclaim | Retain or transfer exact ownership before existing metadata disappears. Serialize fresh installation against adoption of retiring ownership; recover accepted/uncertain commands rather than infer absence. A disposition/cutoff alone must not enable physical deletion. |
+
+- [ ] Update exact retry/reissue matching and reservation-disposition handling
+  together. An unrelated drainer cannot steal/release the introducing attempt's
+  resources. Witness-first and primary-later apply must have identical effects;
+  replica apply does not evaluate clocks or perform cross-PG availability checks.
+- [ ] Retain current abort/part-replacement pre-removal retry guarantees until an
+  independently reviewed durable handoff replaces them; do not simply remove
+  those checks when adding owner rows. Completion's owner transfer must preserve
+  selected payload even when its cleanup participants are unavailable.
+
+### CommitMultipartObject cleanup hardening
+
+Completion cleanup is required work, not a later optional feature. Only the
+standalone patch that would retain the completion command slot until deletion
+succeeds is deferred. The replacement is an end-to-end durable handoff:
+
+1. **Milestone 1 — retain the work before metadata removal.** Completion apply
+   transfers selected-part references to the exact completed object and retains
+   cleanup obligations for omitted parts, active-session segments, unused windows
+   and unresolved resource releases. Those obligations survive pending-slot
+   removal, compaction and replacement independently of the client. Do not remove
+   the current cleanup pass merely because owner rows exist, or claim that adding
+   rows alone hardens physical cleanup.
+2. **Milestone 2 — make completion's deletions safe.** Route completion cleanup
+   through the shared finite-authority, reference-protection and local-exclusion
+   contract at both files and acknowledgements. Remove or replace the current
+   unguarded best-effort path as that safe handoff becomes available; a stale
+   callback must not bypass closure or delete selected payload.
+3. **Milestone 3 — retry to confirmed physical completion.** The bounded worker
+   discovers and retries the retained completion obligations without a returning
+   client, including failed/lost replies and unavailable participants. Retirement
+   requires every exact deletion and resource release to be confirmed; restart
+   must not trust lost process-local completion evidence. Accepted object
+   publication remains protected and must not depend on cleanup availability.
+
+Acceptance must cover omitted committed parts and active sessions independently,
+file and ack failures, crash after completion apply/slot removal, compaction and
+replacement, and delayed writes. Require the selected completed object's exact
+metadata and ciphertext to remain intact. Until these stages pass, completion's
+current best-effort cleanup remains an unresolved gap even if milestone 1 lands.
+
+### Milestone 1: source and format checklist
+
+All source paths below are under `crates/storage/src/`.
+
+| Concern | Current owning locations to change together |
+| --- | --- |
+| Types/encoding/retry semantics | `metadata_command.rs`, storage-private types in `types.rs`, and `storage_rpc/{types,encoder,decoder,limits}.rs` |
+| Primary construction/allocation | `node_client/{interface,local,unix_object_rpc}.rs`, installed dispatch in `storage_node_server{.rs,/routes.rs}`, `pg_store/metadata/segment_vid_window.rs` |
+| Apply/terminal transfer | `pg_store/metadata/{command_apply,command_mutations}.rs`, affected cluster publishers/recovery, `cluster/operation_routes.rs` for Direct PUT custody |
+| SQL/canonical/checkpoint state | `pg_store/schema.rs`, `pg_store/command_log.rs`, owner-local semantic validation and fixtures |
+| Historical routes/references | Both summary and exact-reference queries in `pg_store.rs`, pending-command references, and affected scavenger/backfill reference enumeration |
+
+- [ ] At implementation start verify parent evidence for the **current** vector:
+  PG schema 10, command 13, canonical state 9, checkpoint 7, storage RPC 34.
+  Earlier plan snapshots naming schema 9/command 12/RPC 30 are historical, not
+  the next bump's baseline. Do not preassign the next numbers.
+- [ ] Follow [versioning](../guides/versioning.md) and the
+  [format ledger](../guides/storage-format-ledger.md): freeze any missing exact
+  current evidence in a separately validated parent commit before changing its
+  writer. Keep existing schema catalogues, command/RPC corpora and composite
+  checkpoint/transfer/authentication specimens immutable. Advance affected
+  grammars once per commit and append new containment-vector evidence; unchanged
+  independently versioned outer grammars need new composites, not automatic bumps.
+- [ ] Include new rows in canonical digest, checkpoint table inventory/export/
+  import and semantic validation. Pin window placement, owner recovery and exact
+  release-route history even when no file, acknowledgement or session exists.
+  Include future windows carried in pending introductions. Check RPC carrier
+  size limits and noncurrent sealed rejection before mutation/dispatch.
+
+### Milestone 1: acceptance tests and commit gate
+
+- [ ] Atomic rollback/no partial owner at reserve/create; Direct PUT loss before
+  staging retains exact release evidence; accepted/ambiguous introduction never
+  returns custody to generic frontend Drop. Authoritative pre-introduction absence
+  can fail the attempt without reconstructing a reservation.
+- [ ] One successful preparation, second-slot rejection without mutation, lost
+  preparation reply, next-window reservation and exact append replay/reissue.
+  Preserve the opaque issuer through witness-first apply, reopen and transfer;
+  reject same-node/new-lifetime allocation over embedded and installed Unix paths.
+- [ ] Terminal matrix for direct/streamed PUT, UploadPart replacement, completion,
+  stream/whole-MPU abort, overwrite/delete and reclaim: removed old metadata never
+  loses windows/release evidence; selected live/pending keys stay protected. A
+  failed part attempt preserves committed parts and their usable references.
+- [ ] Checkpoint/import after log/receipt compaction, reopen and two route
+  transitions preserve exact owners, selected references, high-water and all
+  historical participant/release routes. Invalid/crossed subject, cutoff,
+  geometry, participant or resource evidence fails without partial mutation.
+- [ ] Owner-local format fixtures, targeted integration tests, independent review,
+  strict Clippy/format/diff checks and the admitted full Nextest suite all pass.
+  Record command/transaction/fsync counts before and after; claim no physical
+  exclusion or six-regression closure from this state-only commit.
+
+### Milestones 2–4: physical authority, workers and end-to-end gate
+
+2. **Scoped settled-prefix confirmation and physical admission:** confirm exact
+   materialized windows through the current authoritative object-PG primary with
+   matching witness-prefix or certified transfer evidence. Follow the selected
+   [confirmation rule](#settled-prefix-confirmation-decision--2026-10-30),
+   not introducing-envelope retention or an extra confirmation journal. Bind
+   portable absolute cutoffs to receiver-local monotonic deadlines; never renew
+   an old window through route renewal. Both file and ack owners recheck under
+   their existing local exclusion; no data-PG/file lock spans a network call.
+   Apply this contract to completion's deletion path as well as other cleanup.
+3. **Autonomous bounded closure/cleanup/retirement:** resolve uncertain publication,
+   wait conservatively for finite authority with clock health/skew, drain admitted
+   file/ack operations, and retry every exact participant/resource obligation,
+   including the obligations retained by `CommitMultipartObject`. Preserve owners
+   across restart and unavailable targets without requiring the client or durable
+   per-participant receipts. Unavailable work cannot monopolize frontend admission
+   or starve unrelated owners/PGs.
+4. **End-to-end gate:** enable the six original regressions only when their actual
+   invariants pass, then cover delayed duplicates, lost/partial replies, restart,
+   replacement and historical routes independently for file and ack effects.
+   Require committed-object/part preservation and completion cleanup hardening,
+   and measure retained state, cleanup delay/bytes, RPC cost, 4 KiB PUT and 8 MiB
+   UploadPart before declaring completion.
+
+## Historical Progress And Supporting Decisions
+
+The sections below retain the design evolution and evidence for each landed
+slice. The execution checklist above is the consolidated current work order;
+earlier future-work statements must be read with subsequent scope decisions.
 
 Status: production regression evidence, bounded design modelling, and a concrete
 [contract proposal for review](#proposed-production-contract--2026-10-29).
@@ -7134,12 +7324,16 @@ resumption merely to preserve an attempt.
 
 ### Completion cleanup is part of integration, not the next standalone patch
 
-Defer a standalone upgrade of `CommitMultipartObject`'s best-effort omitted-part
-and active-session cleanup. Extending pending-command retention would close a
-real retry-custody gap, but would not establish custody across replacement or
+Defer only the standalone patch extending pending-command retention for
+`CommitMultipartObject`'s best-effort omitted-part and active-session cleanup,
+not completion cleanup hardening as a whole. That patch would close a real
+retry-custody gap, but would not establish custody across replacement or
 compaction, nor prevent delayed writes from recreating payload. It would also
 tie command-slot retirement to physical cleanup availability; do not extend that
-tradeoff mechanically from the preceding abort fixes.
+tradeoff mechanically from the preceding abort fixes. The consolidated
+[completion work breakdown](#commitmultipartobject-cleanup-hardening) places its
+durable handoff in milestone 1, safe deletion in milestone 2 and autonomous
+retry/retirement in milestone 3.
 
 This is not indefinite deferral or a claim that completion cleanup is solved.
 The coordinated state integration must make completion atomically:
