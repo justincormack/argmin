@@ -2,13 +2,98 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::node_client::{
+    RetainedBucketWriteReservationNodeClient, RetainedBucketWriteReservationRoute,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReservationFailure {
+    BeforeEffect,
+    LostReply,
+}
+
+// Exercise the actual retained route and SQL commit, then lose only its result.
+// This is a client-boundary fault model, not a socket/disconnect simulation.
+struct LostReleaseReplyClient {
+    inner: Arc<dyn RetainedBucketWriteReservationNodeClient>,
+    armed: Arc<AtomicBool>,
+}
+
+struct LostReleaseReplyRoute<'a> {
+    inner: Box<dyn RetainedBucketWriteReservationRoute + 'a>,
+    armed: &'a AtomicBool,
+}
+
+impl RetainedBucketWriteReservationNodeClient for LostReleaseReplyClient {
+    fn open_retained_bucket_write_reservation_route(
+        &self,
+        pg_id: crate::BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError> {
+        Ok(Box::new(LostReleaseReplyRoute {
+            inner: self
+                .inner
+                .open_retained_bucket_write_reservation_route(pg_id, bucket)?,
+            armed: &self.armed,
+        }))
+    }
+}
+
+impl RetainedBucketWriteReservationRoute for LostReleaseReplyRoute<'_> {
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        proof: &crate::BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.inner
+            .release_metadata_command_bucket_write_reservation(proof)?;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Io {
+                context: "lost retained bucket reservation release reply",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected after commit",
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn release_durable_bucket_write_reservation(
+        &self,
+        record: &crate::BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.inner.release_durable_bucket_write_reservation(record)
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        record: &crate::BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.inner.clear_durable_bucket_write_drain(record)
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        claim: &crate::BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.inner.release_bucket_delete_finalize_claim(claim)
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        claim: &crate::LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.inner.release_lifecycle_sweep_claim(claim)
+    }
+}
 
 #[test]
 fn retained_stream_abort_attempts_all_participants_before_retry_for_both_targets() {
     let _serial = lock_payload_cleanup_hook_test();
     for multipart in [false, true] {
         for failed_participant in [None, Some("file"), Some("ack")] {
-            check_retained_abort(multipart, failed_participant, false);
+            check_retained_abort(multipart, failed_participant, None);
         }
     }
 }
@@ -19,26 +104,50 @@ fn retained_stream_abort_reservation_failure_does_not_starve_physical_cleanup() 
     // UploadPart releases its creation proof when creation completes; only PUT
     // retains that proof in the session and releases it during retained abort.
     for failed_participant in [None, Some("file"), Some("ack")] {
-        check_retained_abort(false, failed_participant, true);
+        check_retained_abort(
+            false,
+            failed_participant,
+            Some(ReservationFailure::BeforeEffect),
+        );
+    }
+}
+
+#[test]
+fn retained_stream_abort_retries_committed_reservation_release_after_lost_reply() {
+    let _serial = lock_payload_cleanup_hook_test();
+    for failed_participant in [None, Some("file"), Some("ack")] {
+        check_retained_abort(
+            false,
+            failed_participant,
+            Some(ReservationFailure::LostReply),
+        );
     }
 }
 
 fn check_retained_abort(
     multipart: bool,
     failed_participant: Option<&'static str>,
-    fail_reservation_release: bool,
+    reservation_failure: Option<ReservationFailure>,
 ) {
     let tmp = test_util::tempdir();
     let ec = EcShape { k: 2, m: 1 };
-    let map = Arc::new(
-        LocalClusterMap::open(
-            tmp.path(),
-            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
-            &[0],
-            ec,
-        )
-        .unwrap(),
-    );
+    let mut map = LocalClusterMap::open(
+        tmp.path(),
+        &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+        &[0],
+        ec,
+    )
+    .unwrap();
+    let lost_release_reply = Arc::new(AtomicBool::new(false));
+    if reservation_failure == Some(ReservationFailure::LostReply) {
+        for node in map.nodes.values_mut() {
+            node.retained_bucket_write_reservation_client = Arc::new(LostReleaseReplyClient {
+                inner: Arc::clone(&node.retained_bucket_write_reservation_client),
+                armed: Arc::clone(&lost_release_reply),
+            });
+        }
+    }
+    let map = Arc::new(map);
     let cluster = current_cluster(&map);
     let bucket = crate::tests::bucket_name("retained-cleanup");
     let key = crate::tests::object_key("object");
@@ -127,7 +236,7 @@ fn check_retained_abort(
         let pg = bucket_primary.storage_node().get_pg(0).unwrap();
         crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap()
     };
-    let reservation_fault = fail_reservation_release.then(|| {
+    let reservation_fault = reservation_failure.map(|failure| {
         let proof = {
             let pg = bucket_primary.storage_node().get_pg(0).unwrap();
             crate::PgMetadataStore::get_stream_upload(&*pg, &session)
@@ -144,12 +253,15 @@ fn check_retained_abort(
         );
         // The owning PgStore injects a real SQL deletion failure on its own
         // connection. No extra runtime/connection or production hook is needed.
-        bucket_primary
-            .storage_node()
-            .get_pg(0)
-            .unwrap()
-            .test_set_bucket_reservation_release_failure(true)
-            .unwrap();
+        match failure {
+            ReservationFailure::BeforeEffect => bucket_primary
+                .storage_node()
+                .get_pg(0)
+                .unwrap()
+                .test_set_bucket_reservation_release_failure(true)
+                .unwrap(),
+            ReservationFailure::LostReply => lost_release_reply.store(true, Ordering::SeqCst),
+        }
         (proof, canary)
     });
     let files = Arc::new(Mutex::new(Vec::new()));
@@ -202,11 +314,11 @@ fn check_retained_abort(
         },
     ));
     let result = cleanup.abort(&session);
-    if failed_participant.is_some() || fail_reservation_release {
+    if failed_participant.is_some() || reservation_failure.is_some() {
         let error = result.unwrap_err();
         assert_eq!(
             error.diagnostic_cause_label(),
-            if fail_reservation_release {
+            if reservation_failure == Some(ReservationFailure::BeforeEffect) {
                 "metadata_db_error"
             } else {
                 "store_io_failure"
@@ -225,9 +337,18 @@ fn check_retained_abort(
                 Some(proof)
             );
             let rows = reservations();
-            assert_eq!(rows.len(), 2);
-            assert!(rows.iter().any(|row| proof.matches_record(row)));
+            let release_failed_before_effect =
+                reservation_failure == Some(ReservationFailure::BeforeEffect);
+            assert_eq!(rows.len(), 1 + usize::from(release_failed_before_effect));
+            assert_eq!(
+                rows.iter().any(|row| proof.matches_record(row)),
+                release_failed_before_effect
+            );
             assert!(rows.iter().any(|row| canary.matches_record(row)));
+            assert!(
+                !lost_release_reply.load(Ordering::SeqCst),
+                "lost reply must follow the actual release"
+            );
         }
     } else {
         result.unwrap();
@@ -270,7 +391,7 @@ fn check_retained_abort(
     }
     drop(file_hook);
     drop(ack_hook);
-    if reservation_fault.is_some() {
+    if reservation_failure == Some(ReservationFailure::BeforeEffect) {
         bucket_primary
             .storage_node()
             .get_pg(0)
@@ -291,8 +412,18 @@ fn check_retained_abort(
             (state.applied_log_index, state.applied_log_hash)
         })
         .collect::<Vec<_>>();
-    // The same capability reuses the exact pending abort after the transient
-    // participant failure. No new client session or reservation is created.
+    // Discard the frontend capability after an uncertain release. A fresh one
+    // must rediscover the exact pending abort even though the reservation is gone.
+    let cleanup = if reservation_failure == Some(ReservationFailure::LostReply) {
+        drop(cleanup);
+        let admission = handle.admit_current_route().unwrap();
+        admission
+            .retained_stream_upload_cleanup(&bucket, &key)
+            .unwrap()
+    } else {
+        cleanup
+    };
+    // No new client session or reservation is created.
     cleanup.abort(&session).unwrap();
     cleanup.abort(&session).unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());

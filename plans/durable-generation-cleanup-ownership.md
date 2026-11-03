@@ -6597,3 +6597,39 @@ The final full Nextest suite passed all 9,305 tests (two slow, six skipped) in
 343.391s. The Raft heartbeat write-amplification test completed in 114.880s and
 oversized version listing in 67.995s. Strict all-target/all-feature Clippy, storage
 boundary checks, formatting and `git diff --check` passed.
+
+## Ambiguous Retained Reservation Release Evidence — 2026-11-03
+
+The previous retained-abort matrix covers a reservation deletion that fails
+before its SQL effect. It does not exercise the complementary outcome: the
+deletion commits, but the caller receives an error and cannot confirm completion.
+
+The new owner-local case wraps the retained bucket-reservation client. It delegates
+to the real scoped route and transactional deletion, then injects one connection-
+reset-shaped error instead of returning success. It is armed only immediately
+before abort cleanup. No production hooks or schema changes are added. This is
+a client-boundary fault model, not an installed Unix/TLS disconnect test.
+
+The matrix exercises lost release replies alone and alongside independent first-
+file/first-acknowledgement failures. It proves the exact reservation is already
+absent while the pending abort still retains its subject, proof and staged
+segments. All physical participants are attempted and their residual rows/files
+match the injected failures. The frontend cleanup capability is then discarded;
+a freshly admitted capability rediscovers the pending abort, tolerates the
+already-absent reservation and completes cleanup. Repeated abort remains
+idempotent, applied indices/hashes on all replicas do not advance, and a separate
+same-bucket reservation remains intact.
+
+This is production-connected retry evidence under one live storage runtime, not
+a process-restart guarantee or durable-owner integration. Startup's generic
+terminal-slot cleanup can still retire this pending envelope independently of
+physical cleanup; the slot must not be mistaken for the proposed retained
+owner/window records. All six original ignored regressions remain open. No
+production behavior, format, fsync or client-session semantics change here.
+
+Validation: all three focused retained-abort cleanup tests passed, including the
+new lost-reply matrix and the existing before-effect/physical-failure controls.
+The full Nextest suite passed all 9,306 tests (two slow, six skipped) in 241.122s.
+The Raft heartbeat write-amplification test completed in 116.205s and oversized
+version listing in 61.104s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed.
