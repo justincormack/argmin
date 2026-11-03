@@ -14,6 +14,9 @@ mod reservation_disposition;
 #[path = "stream_commands/append_cleanup.rs"]
 mod append_cleanup;
 
+#[path = "stream_commands/retained_abort_cleanup.rs"]
+mod retained_abort_cleanup;
+
 struct StreamPayloadCleanupFixture {
     _tmp: test_util::TempDir,
     cluster: Arc<crate::StorageCluster>,

@@ -6443,3 +6443,43 @@ Post-review validation: all 31 focused append tests passed. The full Nextest
 suite passed all 9,297 tests (one slow, six skipped) in 250.973s; the Raft heartbeat
 test completed in 100.555s. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and `git diff --check` passed.
+
+## Retained Abort Cleanup Participant Progress — 2026-11-03
+
+The retained stream-abort path used a separate short-circuiting deletion loop.
+A failure on the first file prevented the remaining files, acknowledgement
+participants and later segments from being attempted. Repeated retained retries
+could therefore make no progress on otherwise available participants.
+
+It now reuses the common exact-subset, fallible per-segment cleanup and retains
+the first error across segments while attempting the rest. Failure still returns
+before the retained abort's `finish` operation, preserving its exact pending
+envelope for an explicit retry. Each failed participant reports its own diagnostic
+once; the aggregate adds no duplicate event. Successful cleanup ordering and
+bucket-proof/session/generation release timing are unchanged. There are no new
+durable formats, commands, retry loops or successful-path fsyncs.
+
+The owner-local regression stages two real encrypted segments for each of PUT
+and UploadPart, with successful ciphertext readback before fault injection. It
+independently fails the first file or first acknowledgement, alongside a no-fault
+control. Assertions cover a complete pass over both segments, exact remaining
+file/acknowledgement state, one correctly classified trace event per failure, and
+the pending abort's exact staged records. After removing the fault, the same
+retained capability completes cleanup; a repeated abort is idempotent, and every
+replica's applied index/hash remains unchanged by these retries. Final checks
+require absence of all captured files/rows, session and generation reservation.
+The initial regression observed only one attempted file instead of all six.
+
+This does not add durable owner/window state or solve delayed-write exclusion.
+It proves progress for the explicit retained-abort path; generic pending recovery
+still has distinct best-effort cleanup semantics and can retire a slot without
+this guarantee. A retained pending envelope is not a substitute for the planned
+durable cleanup owner. Ephemeral client-session semantics remain unchanged, and
+all six original ignored regressions remain open.
+
+Validation: the new regression first reproduced the first-file short circuit,
+then passed with the shared cleanup routine. All 77 focused stream/retained
+tests passed. The full Nextest suite passed all 9,298 tests (one slow, six
+skipped) in 246.032s; the Raft heartbeat write-amplification test completed in
+103.241s. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed.

@@ -4517,37 +4517,21 @@ impl StorageCluster {
         &self,
         segments: &[StreamUploadSegmentRecord],
     ) -> Result<(), ObjectPgActionError> {
+        let mut first_error = None;
         for segment in segments {
-            let data_pg_id = self.validated_data_pg(PgId::new(segment.data_pg_id))?;
             let ec = EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
             };
             let shard_keys =
                 Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
-            let cleanup = self
-                .local_map
-                .open_retained_payload_cleanup(
-                    segment.placement_cluster_epoch,
-                    data_pg_id,
-                    ec,
-                    &segment.segment_okh,
-                    segment.segment_vid,
-                    shard_keys,
-                )
-                .map_err(ObjectPgActionError::Store)?;
-            for entry in cleanup.entries() {
-                self.maybe_run_before_placed_payload_shard_delete_hook(entry.key())
-                    .map_err(ObjectPgActionError::Store)?;
-                entry.delete_file().map_err(ObjectPgActionError::Store)?;
-            }
-            for entry in cleanup.entries() {
-                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(entry.key())
-                    .map_err(ObjectPgActionError::Store)?;
-                entry.delete_acknowledgement().map_err(ObjectPgActionError::Store)?;
+            if let Err(error) = self.try_delete_stream_segment_payload_shard_keys(segment, shard_keys) {
+                // One unavailable participant must not starve the remaining
+                // segments. Any failure still prevents finishing the abort.
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(ObjectPgActionError::Store(error)))
     }
 
     fn delete_object_segment_payload_shards_best_effort(&self, segment: &ObjectSegmentRecord) {

@@ -187,6 +187,13 @@ does not release the stream's generation reservation, make cleanup durable after
 session removal, or revoke delayed writes. Terminal recovery's separate
 best-effort cleanup semantics are unchanged.
 
+Retained stream abort also attempts every file/acknowledgement participant and
+every staged segment before returning its first cleanup error. It must not finish
+and remove its pending abort when any participant failed. An explicit retained
+retry reuses that exact abort and idempotently deletes any remaining effects.
+This is not a guarantee for generic recovery, whose separate best-effort cleanup
+and pending-slot retirement still require durable owner/window integration.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock
