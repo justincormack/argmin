@@ -167,6 +167,11 @@ The [retained cleanup subject correction](#retained-fileacknowledgement-cleanup-
 binds each explicit cleanup subset to both its file locations and historical
 acknowledgement primary before either effect. It fixes crossed-key acknowledgement
 deletion, not missing durable ownership or delayed-write fencing.
+The [independent retirement model](#independent-cleanup-participant-retirement-model--2026-11-03)
+now splits physical cleanup and resource release into separate, fallible
+participants, including lost replies and worker restart without durable receipts.
+It assumes settled ownership and closed write authority; it does not implement
+the retained owner/window state or replace production integration evidence.
 The shared cleanup fix is coordinated with
 [unified-staged-write-publication-plan.md](unified-staged-write-publication-plan.md#shared-cleanup-investigation-before-further-implementation).
 
@@ -6483,3 +6488,68 @@ tests passed. The full Nextest suite passed all 9,298 tests (one slow, six
 skipped) in 246.032s; the Raft heartbeat write-amplification test completed in
 103.241s. Strict all-target/all-feature Clippy, storage boundary checks,
 formatting and `git diff --check` passed.
+
+## Independent Cleanup Participant Retirement Model — 2026-11-03
+
+The earlier physical-handoff model collapses deletion of files and
+acknowledgements into one action. Recent production cleanup corrections exercise
+partial failure within a live process, but do not establish the proposed durable
+owner's retirement protocol across lost replies and worker restart.
+
+The new bounded `cleanup_ownership_model::retirement` model separates two file
+participants, one independent acknowledgement participant, a generation resource
+and a bucket-reservation obligation. Each exact operation may complete, fail
+before its effect, or durably complete without delivering its reply. Successful
+confirmation includes the participant's existing durability barrier. No
+per-participant progress record is persisted: worker restart preserves the exact
+owner/obligations and effects, discards observations, and repeats idempotent
+operations before final retirement. The owner may disappear only after every
+obligation has been confirmed complete.
+
+The exhaustive graph has one error, one lost reply and one worker restart.
+Separate explorations leave each participant unavailable indefinitely and require
+reachable progress for all other participants while preserving the owner. Named
+sequences independently cover failure and lost-reply/restart for each of the five
+participants; restart discards a previously successful confirmation too.
+Mutation canaries independently omit each obligation, falsely confirm an error,
+trust an undelivered reply, and forget the durable owner on restart. These must
+produce counterexamples, not just reduce the number of successful traces.
+
+This is **abstract candidate evidence**, not production-connected verification.
+It starts after settled owner introduction, cancellation, immutable cutoff and
+in-flight write exclusion, with exact pending/live references absent. Identity
+reuse and new writes after closure are forbidden assumptions; authority,
+route retention, discovery, replication, physical admission and syscall-level
+crash ordering remain outside this model. Progress means reachability, not a
+fairness or availability guarantee. Independent resource completion here does
+not prescribe new production reservation-release ordering. No new production
+tables, commands, fsyncs or session-survival requirements are introduced.
+
+The coordinated retained owner/window integration remains the next production
+step. All six original ignored cleanup regressions remain open.
+
+Validation: the first focused run caught an undeclared restart witness in the
+unavailable-participant harness; its witness declaration was corrected. All five
+final focused tests passed. The all-available graph exhausted 9,804 states and
+41,100 transitions; all eight mutation cases produced the expected safety
+counterexamples. The full Nextest suite passed all 9,303 tests (two slow, six
+skipped) in 240.399s. The Raft heartbeat write-amplification test completed in
+114.177s and oversized version listing in 66.837s. Strict all-target/all-feature
+Clippy, storage boundary checks, formatting and `git diff --check` passed.
+
+Review identified a separate owner-loss case masked by the mutation explorer's
+shortest counterexample: every effect could be absent, with one successful reply
+lost, before a faulty restart discarded the owner. The restart transition now
+records unconfirmed retirement from the pre-restart evidence before clearing
+volatile confirmations. A named regression repeats that exact schedule for each
+participant and requires the missing-confirmation diagnostic, with no unfinished
+effect available to trigger the other invariant. Controls retain the owner on
+ordinary restart and distinguish fully confirmed completion from ambiguous
+completion before confirmations are cleared. The regression first failed with
+`None` instead of `retirement requires every exact participant confirmation`.
+
+Post-review validation: all six focused model tests passed. The full Nextest
+suite passed all 9,304 tests (one slow, six skipped) in 241.182s; the Raft
+heartbeat write-amplification test completed in 110.983s. Strict
+all-target/all-feature Clippy, storage boundary checks, formatting and
+`git diff --check` passed.

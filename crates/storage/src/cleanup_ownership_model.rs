@@ -27,6 +27,7 @@ mod preinstall;
 mod publication;
 mod renewal;
 mod replacement;
+mod retirement;
 
 #[derive(Clone, Copy, Debug)]
 enum Protocol {
