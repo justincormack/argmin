@@ -4579,12 +4579,12 @@ impl StorageCluster {
         );
     }
 
-    fn delete_stream_segment_payload_shard_keys_best_effort(
+    fn try_delete_stream_segment_payload_shard_keys(
         &self,
         segment: &StreamUploadSegmentRecord,
         shard_keys: impl IntoIterator<Item = ShardKey>,
-    ) {
-        self.delete_payload_shard_keys_best_effort_at_epoch(
+    ) -> Result<(), StoreError> {
+        self.try_delete_payload_shard_keys_at_epoch(
             segment.placement_cluster_epoch,
             segment.data_pg_id,
             EcShape {
@@ -4594,17 +4594,20 @@ impl StorageCluster {
             &segment.segment_okh,
             segment.segment_vid,
             shard_keys,
-        );
+        )
     }
 
-    fn delete_stream_append_payload_if_unreferenced_best_effort(
+    fn try_delete_stream_append_payload_if_unreferenced(
         &self,
         object_pg_id: PgId,
         segment: &StreamUploadSegmentRecord,
         shard_keys: impl IntoIterator<Item = ShardKey>,
-    ) {
+    ) -> Result<(), StoreError> {
         let shard_keys = shard_keys.into_iter().collect::<Vec<_>>();
-        let cleanup = (|| -> Result<(), StoreError> {
+        // The outer result contains inspection errors, which this wrapper owns.
+        // The inner result contains deletion errors already reported per
+        // participant. Keep inspection and deletion in the same lock scope.
+        let inspected_cleanup = (|| -> Result<Result<(), StoreError>, StoreError> {
             // The process-local lock serializes embedded clients. The storage
             // node critical section extends that fence across Unix clients so
             // no new metadata command can publish this payload between the
@@ -4633,21 +4636,23 @@ impl StorageCluster {
                 if references.iter().any(|reference| {
                     self.shard_scavenger_reference_matches_stream_segment(reference, segment)
                 }) {
-                    return Ok(());
+                    return Ok(Ok(()));
                 }
             }
 
-            self.delete_stream_segment_payload_shard_keys_best_effort(segment, shard_keys);
-            Ok(())
+            Ok(self.try_delete_stream_segment_payload_shard_keys(segment, shard_keys))
         })();
-        if let Err(error) = cleanup {
-            // A failed ownership check must fail closed: retaining an
-            // unclassified payload is safer than deleting data that another
-            // command may already have published.
-            self.emit_best_effort_payload_cleanup_error(
-                "resolve staged stream append payload ownership",
-                &error,
-            );
+        match inspected_cleanup {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                // A failed ownership check must fail closed: retaining an
+                // unclassified payload is safer than deleting referenced data.
+                self.emit_best_effort_payload_cleanup_error(
+                    "resolve staged stream append payload ownership",
+                    &error,
+                );
+                Err(error)
+            }
         }
     }
 

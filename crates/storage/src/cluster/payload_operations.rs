@@ -7093,10 +7093,10 @@ impl StorageCluster {
             &mut callbacks.maintain_lease,
         )?;
         if let Err(error) = (callbacks.maintain_lease)() {
-            self.delete_stream_segment_payload_shard_keys_best_effort(
+            self.try_delete_stream_segment_payload_shard_keys(
                 &segment_record,
                 written_shards.iter().map(|written| written.key.clone()),
-            );
+            )?;
             return Err(error);
         }
         let shard_batch = written_shards
@@ -7378,17 +7378,17 @@ impl StorageCluster {
             () => {
                 match payload_cleanup {
                     StreamAppendPayloadCleanup::EagerAllowed => self
-                        .delete_stream_segment_payload_shard_keys_best_effort(
+                        .try_delete_stream_segment_payload_shard_keys(
                             segment_record,
                             shard_batch.iter().map(|(key, _)| (*key).clone()),
                         ),
                     StreamAppendPayloadCleanup::ReferenceCheckRequired => self
-                        .delete_stream_append_payload_if_unreferenced_best_effort(
+                        .try_delete_stream_append_payload_if_unreferenced(
                             pg_id,
                             segment_record,
                             shard_batch.iter().map(|(key, _)| (*key).clone()),
                         ),
-                }
+                }.map_err(ObjectPgActionError::Store)?
             };
         }
         let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {

@@ -240,9 +240,10 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
         matches!(
             err,
             ServerError::StreamUpload(ref error)
-                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
+                if error.kind() == storage::StreamUploadFailureKind::InternalError
+                    && error.diagnostic_cause_label() == "store_io_failure"
         ),
-        "expected missing stream session after hook abort, got {err:?}"
+        "expected cleanup IO failure to take precedence over the missing session, got {err:?}"
     );
 
     assert!(

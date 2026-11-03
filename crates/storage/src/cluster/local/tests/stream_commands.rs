@@ -11,6 +11,9 @@ use crate::BucketSnapshotLoadError;
 #[path = "stream_commands/reservation_disposition.rs"]
 mod reservation_disposition;
 
+#[path = "stream_commands/append_cleanup.rs"]
+mod append_cleanup;
+
 struct StreamPayloadCleanupFixture {
     _tmp: test_util::TempDir,
     cluster: Arc<crate::StorageCluster>,
@@ -259,7 +262,13 @@ fn failed_stream_append_placed_cleanup_failure_leaves_only_files() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, crate::ObjectPgActionError::Metadata(_)));
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::Io { .. })
+        ),
+        "{error:?}"
+    );
     assert_eq!(
         cleanup_failure.invocation_count(),
         usize::from(fixture.ec.k + fixture.ec.m)

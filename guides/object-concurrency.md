@@ -175,6 +175,18 @@ session and reports rollback failures through that workflow. This only covers
 acknowledged-prefix rollback, not cleanup discovery after frontend loss or the
 revocation of delayed/ambiguous unacknowledged writes.
 
+For stream append, failures after shard writing also perform fallible cleanup:
+lease-maintenance failure and append-publication rejection report physical
+cleanup failure before the original diagnostic. Attempt all file and
+acknowledgement participants even when one fails. Once concurrent publication
+is possible, retain the existing serialized reference inspection before deletion;
+a reference preserves the payload, and failed inspection preserves it and returns
+the inspection error. Each failure is reported once: reference-inspection errors
+at the wrapper, and deletion errors at the physical participant boundary. This
+does not release the stream's generation reservation, make cleanup durable after
+session removal, or revoke delayed writes. Terminal recovery's separate
+best-effort cleanup semantics are unchanged.
+
 ### Coordinator helpers
 
 For object read/write/copy paths, use these helpers instead of open-coded lock

@@ -6376,3 +6376,70 @@ the correction. All 167 focused Direct PUT tests passed, followed by the full
 Nextest suite: 9,295 passed, one slow, six skipped, in 239.453s. The Raft heartbeat
 write-amplification test passed in 110.402s. Strict all-target/all-feature Clippy,
 storage boundary checks, formatting and `git diff --check` passed.
+
+## Stream Append Foreground Cleanup Results — 2026-11-03
+
+The companion stream path still discarded physical cleanup errors after all
+shards were written: failed lease maintenance and append-publication rejection
+used void best-effort helpers. The existing file-failure regression demonstrated
+this by retaining every file but accepting only the original metadata error.
+
+Foreground append now uses fallible exact-subset cleanup. It attempts every
+file and acknowledgement participant and returns the first cleanup failure in
+preference to the triggering request error. Successful cleanup preserves that
+original error. This covers both PUT and UploadPart through their shared append
+workflow. It neither releases their session-owned generations nor introduces
+retries, new commands, formats or successful-path durability barriers.
+
+Once concurrent publication is possible, the same object-PG serialization and
+storage-node critical section still cover reference inspection and deletion.
+A discovered reference skips deletion; an inspection failure retains the payload
+and now reaches the caller rather than being logged and discarded. Accepted,
+ambiguous and concurrently published payload ownership is not weakened. This
+does not change the separate terminal/recovery best-effort cleanup paths.
+
+The new matrix exercises both stream targets at post-write lease failure,
+pre-acknowledgement registration rejection, and pre-pending-install rejection
+after registration. Each has successful cleanup plus independent first-file
+and first-acknowledgement failures. It checks real files before rollback, exact
+diagnostics, one complete pass over every participant, precise residual file/row
+state, sessions preserved apart from the expected preparation-cursor advance,
+retained generations on all replicas, and no appended segment or pending
+publication. The prior aborted-session regression now requires
+the physical IO diagnostic instead of the metadata failure that hid it.
+
+This remains a foreground reporting correction, not durable owner/window
+integration. Unrecorded speculative payload and failed cleanup still need durable
+discovery, and local serialization alone cannot revoke delayed transport. All
+six original ignored regressions remain open; ephemeral client-session semantics
+remain unchanged.
+
+Validation: the existing file-failure regression first reproduced the hidden
+metadata diagnostic. The new matrix required fixture corrections for identifier
+encoding, captured append authority, and the expected preparation-cursor advance;
+all 113 focused stream tests then passed. The first full run passed 4,479 tests
+and failed the coordinator's corresponding cleanup-failure regression, which
+still expected `SessionNotFound`. That assertion now requires `InternalError`
+with `store_io_failure`; its cleanup observer remains asserted, and its successful-
+cleanup companion still requires `SessionNotFound`. Both focused coordinator
+tests passed. The final full Nextest run passed all 9,296 tests (one slow, six
+skipped) in 238.350s; the Raft heartbeat write-amplification test passed in
+112.191s. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed on the final code.
+
+Review found duplicate reporting on the reference-checked branch: the participant
+cleanup already emitted each deletion failure, then the wrapper emitted its
+returned error again. The wrapper now distinguishes inspection failure from the
+already-reported deletion result without releasing either serialization guard
+between inspection and deletion. Only inspection failures receive the wrapper's
+ownership-resolution label. A regression attaches a real trace and uses the
+curated exact-operation file/acknowledgement failure scenarios at the pre-install
+boundary, checking exactly one event per failed participant and the residual
+file/row state. It first reproduced the unexpected second label
+`clean unreferenced staged stream append payload` instead of
+`delete placed payload shard`.
+
+Post-review validation: all 31 focused append tests passed. The full Nextest
+suite passed all 9,297 tests (one slow, six skipped) in 250.973s; the Raft heartbeat
+test completed in 100.555s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed.
