@@ -15,6 +15,13 @@ merely to keep attempts alive. The
 [selected scope below](#selected-scope-ephemeral-attempts-durable-cleanup--2026-11-02)
 supersedes earlier recommendations that treat reservation survival as a goal.
 
+**Next-work priority — 2026-11-03:** move to coordinated retained owner/window
+integration rather than continuing the sequence of adjacent cleanup patches.
+Defer standalone `CommitMultipartObject` cleanup hardening; include completion's
+selected-payload ownership transfer and retained unselected cleanup obligations
+in that integration. Its current best-effort cleanup remains unresolved. See the
+[priority decision below](#critical-path-priority-and-completion-cleanup--2026-11-03).
+
 Status: production regression evidence, bounded design modelling, and a concrete
 [contract proposal for review](#proposed-production-contract--2026-10-29).
 The subsequent [minimum-contract and transaction review](#minimum-contract-and-transaction-review--2026-10-29)
@@ -7106,3 +7113,73 @@ tests passed after the fix. Independent source/test-design review approved the
 bounded change. Full workspace Nextest passed all 9,327 tests (one slow, six
 existing skips) in 244.200s. Strict all-target/all-feature Clippy, formatting and
 diff checks passed.
+
+## Critical-Path Priority And Completion Cleanup — 2026-11-03
+
+The allocation, local-exclusion, durability-barrier and cleanup-retry foundations
+have advanced substantially. The recent stream-abort, whole-MPU-abort and
+part-replacement fixes retain existing pending-envelope retry responsibility;
+they do not implement the shared durable owner/window or delayed-write exclusion
+contract. All six original regressions remain ignored and unresolved. Passing
+enabled tests and bounded models must not be described as closing that gate.
+
+**Selected next work:** prioritize the coordinated owner/window integration
+already identified in the integration-boundary audit, rather than automatically
+continuing the chain of local cleanup patches. Consolidate the current contract
+into a short implementation checklist before changing durable state; this is not
+a reason to restart open-ended design or modelling. Retain the selected scope:
+client attempts may fail on primary loss, while cleanup responsibility and
+accepted publication survive. Do not add reservation replication or session
+resumption merely to preserve an attempt.
+
+### Completion cleanup is part of integration, not the next standalone patch
+
+Defer a standalone upgrade of `CommitMultipartObject`'s best-effort omitted-part
+and active-session cleanup. Extending pending-command retention would close a
+real retry-custody gap, but would not establish custody across replacement or
+compaction, nor prevent delayed writes from recreating payload. It would also
+tie command-slot retirement to physical cleanup availability; do not extend that
+tradeoff mechanically from the preceding abort fixes.
+
+This is not indefinite deferral or a claim that completion cleanup is solved.
+The coordinated state integration must make completion atomically:
+
+- transfer exact ownership of selected part payload to the completed object;
+- retain durable cleanup responsibility for omitted parts, active-session
+  segments and unused/unselected windows before removing their old metadata;
+- preserve accepted publication without requiring the client session to remain
+  live, allowing unavailable cleanup to remain durably pending.
+
+Pull a standalone completion fix forward only if a concrete data-safety issue is
+found or it blocks integration or validation. Otherwise, its ownership transfer
+belongs in the first coordinated state slice, not a later optional phase.
+
+### Execution order and acceptance milestones
+
+1. **Retained owner/window state and terminal transfers.** Integrate the existing
+   reserve/create/append/terminal transactions, exact resource custody, issuer
+   binding and one-slot windows with historical route references, canonical
+   digest/checkpoint/export membership and versioned format evidence. Include
+   completion's selected/unselected ownership split. Target no additional
+   ordinary-path metadata commit; do not expose dormant fields as enforced
+   physical authority.
+2. **Finite physical authority and exclusion.** Integrate authoritative window
+   confirmation and immutable finite bounds at both file and acknowledgement
+   participants. Recheck admission after lock waits and reuse local exclusion
+   through persistence. Cleanup must outwait issued authority and drain admitted
+   effects; replica apply must remain deterministic rather than evaluate clocks.
+3. **Autonomous discovery and retirement.** Resolve accepted/uncertain publication
+   through the existing recovery protocol, preserve exact selected references,
+   and discover abandoned obligations without a returning client. Retain retry
+   custody through unavailable participants, restart and route changes; retire
+   it only after physical deletion and exact resource releases are confirmed.
+4. **Close the original acceptance gate.** Enable all six original regressions,
+   then extend restart/replacement, delayed-duplicate, partial/lost-reply and
+   historical-route coverage. Require committed MPU parts to survive a failed
+   part attempt. Measure metadata/RPC/fsync cost, retained-state growth and
+   cleanup delay. Neither owner rows alone nor further local retry fixes satisfy
+   this milestone.
+
+This priority decision records the agreed sequencing; it adds no production
+behavior or format change and does not claim that the coordinated protocol has
+been implemented or fully proven.
