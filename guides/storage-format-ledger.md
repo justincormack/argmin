@@ -20,6 +20,34 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Terminal Transfer Encoding Evidence Before Owner/Window Integration — 2026-11-03
+
+`metadata_command_v13_terminal_transfers.hex` supplements the existing current
+command corpora with twenty complete terminal-command specimens captured from
+the unchanged v13 writer. Its 49,872 file bytes have SHA-256
+`e0cdca8b99cc82317a976098e3ec45c3eab5ed5887d6e2d1568982b192969c5a`.
+No production encoding, reader, command version or mutation behavior changes.
+
+Six PUT cases cross Direct PUT versus stream-owned generation classification
+with absent, standard and multipart stale payload. Twelve completion cases
+cross absent/present omitted-part cleanup, absent/present active-session cleanup
+and all three stale-payload forms, retaining the selected payload in every case.
+Two part cases pin absent/present previous-part metadata and displaced segments.
+The original v13 corpus had only stale-bearing PUTs, completion with all cleanup
+lists populated and a previous-part-bearing part commit. The new literals pin
+those additional field branches before owner/reference transitions change.
+
+Tests require exact named-case coverage, current-writer byte equality, independent
+literal decoding, CRC integrity, all truncations, trailing-data rejection and
+older/newer rejection through full and header readers. Literal field assertions
+separate selected payload, cleanup lists, generation ownership and release-route
+classification. This is codec evidence, not authorized publication or cleanup:
+in particular the part specimens inherit the original corpus's part-2 record
+and part-3 segment, and the subject predicate must reject both. No successful
+apply/recovery or physical safety is claimed. This scoped supplement is not an
+exhaustive all-command/optional-field audit. Existing fixtures remain immutable;
+a future incompatible advancement retains these bytes as rejection evidence.
+
 ## Cleanup Command Branch Evidence Before Owner/Window Integration — 2026-11-03
 
 `metadata_command_v13_cleanup_branches.hex` supplements, without modifying, the

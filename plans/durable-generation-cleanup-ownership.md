@@ -7415,3 +7415,50 @@ followed by all 40 metadata-command tests in 0.079s. Independent source/test-des
 review approved the evidence-only slice. Full workspace Nextest passed all 9,330
 tests (two slow, six existing skips) in 248.680s. Strict all-target/all-feature
 Clippy, formatting and diff checks passed.
+
+## Terminal Transfer Encoding Evidence — 2026-11-03
+
+Inspection of milestone 1's terminal-transfer boundaries found additional missing
+literal field branches in the existing v13 object corpus: direct/streamed PUT
+without stale payload, completion without omitted or active-session cleanup, and
+part publication without previous-part metadata. These must be pinned before the
+coordinated owner/window slice changes command semantics/encoding; this is not a
+standalone `CommitMultipartObject` cleanup-policy patch.
+
+`metadata_command_v13_terminal_transfers.hex` freezes twenty complete commands
+from the unchanged v13 writer. Six PUT cases distinguish standalone versus stream
+generation ownership across absent/standard/multipart stale payload. Twelve
+completion cases independently vary omitted parts, active sessions and stale
+payload while retaining selected payload. Two part cases pin absent/present
+previous-part metadata and displaced segments. The existing corpora are unchanged.
+The ledger records the literal hash and scoped evidence; no complete format-vector
+or all-command/optional-field audit is claimed.
+
+Tests require exact named-case coverage and literal byte comparison, independent
+decoding, full/header version rejection, all truncations and trailing-data
+rejection. Separate literal assertions pin selected versus cleanup fields,
+generation classification and reservation-release/route responsibility. A shared
+fixture parser checks checksums, duplicate names and case counts for both the
+new corpus and the earlier cleanup-branch corpus. Temporary capture code is not
+retained; permanent tests cannot regenerate these bytes.
+
+An initial semantic assertion failed because the inherited format-only part
+specimen has a part-2 record and part-3 segment. Inspection confirmed those exact
+values in the original object-corpus constructor; this was not a newly discovered
+production apply race. The tests now explicitly pin both values and require the
+central subject predicate to reject them, rather than confuse successful codec
+decoding with valid mutation authority. These specimens do not prove successful
+apply/recovery or physical cleanup safety.
+
+This is another current-writer evidence prerequisite, not owner/window production
+integration. No schema, format version, production behavior or ordinary-path
+transaction changes. Completion's durable handoff and safe retry remain required
+in the coordinated milestones; all six original regressions remain open.
+
+Validation before independent review: the capture build passed. The first seven-
+test selection had six passes and the inherited part-number assertion failure
+above. After its source-backed correction and the explicit subject-rejection
+canary, all 43 metadata-command tests passed in 0.493s. Independent source/test-design
+review approved the evidence-only slice. Full workspace Nextest passed all 9,333
+tests (one slow, six existing skips) in 242.863s. Strict all-target/all-feature
+Clippy, formatting and diff checks passed.

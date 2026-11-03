@@ -6038,8 +6038,18 @@ mod tests {
     }
 
     fn immutable_v13_cleanup_branch_bytes() -> std::collections::BTreeMap<String, Vec<u8>> {
+        immutable_named_command_bytes(
+            include_str!("metadata_command_v13_cleanup_branches.hex"),
+            13,
+        )
+    }
+
+    fn immutable_named_command_bytes(
+        corpus: &str,
+        expected_count: usize,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
         let mut specimens = std::collections::BTreeMap::new();
-        for line in include_str!("metadata_command_v13_cleanup_branches.hex")
+        for line in corpus
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
         {
@@ -6054,7 +6064,7 @@ mod tests {
                 "duplicate specimen"
             );
         }
-        assert_eq!(specimens.len(), 13);
+        assert_eq!(specimens.len(), expected_count);
         specimens
     }
 
@@ -6197,6 +6207,292 @@ mod tests {
                     decode_metadata_command_envelope_for_test(&malformed).is_err(),
                     "{name}: invalid proof tag"
                 );
+            }
+        }
+    }
+
+    // Current-writer evidence for the terminal ownership transfers which the
+    // owner/window slice must change atomically. The original v13 object corpus
+    // has only displaced parts and nonempty completion cleanup with stale data.
+    fn terminal_transfer_specimens() -> std::collections::BTreeMap<String, MetadataCommandEnvelope>
+    {
+        let commands = immutable_v13_sse_s3_v5_object_command_bytes()
+            .into_iter()
+            .map(|bytes| decode_metadata_command_envelope_for_test(&bytes).unwrap())
+            .collect::<Vec<_>>();
+        let MetadataCommandPayload::CommitDirectPutObject(direct) = commands[3].payload() else {
+            panic!("expected frozen direct commit")
+        };
+        let MetadataCommandPayload::CommitMultipartObject(complete) = commands[5].payload() else {
+            panic!("expected frozen completion")
+        };
+        let MetadataCommandPayload::CommitStreamPart(part) = commands[24].payload() else {
+            panic!("expected frozen part commit")
+        };
+        let mut specimens = std::collections::BTreeMap::new();
+        for stale_kind in ["none", "standard", "multipart"] {
+            let stale_payload = match stale_kind {
+                "none" => None,
+                "standard" => direct.stale_payload.clone(),
+                "multipart" => complete.stale_payload.clone(),
+                _ => unreachable!(),
+            };
+            for stream in [false, true] {
+                let source = &direct.bucket_write_reservation;
+                let command = CommitDirectPutObjectCommand {
+                    object: direct.object.clone(),
+                    segments: direct.segments.clone(),
+                    generation_reservation_id: direct.generation_reservation_id.clone(),
+                    write_sequence: direct.write_sequence,
+                    last_modified_millis: direct.last_modified_millis,
+                    stale_payload: stale_payload.clone(),
+                    bucket_write_reservation: BucketWriteReservationProof {
+                        bucket: source.bucket.clone(),
+                        reservation_id: source.reservation_id.clone(),
+                        owner_token: source.owner_token.clone(),
+                        cluster_epoch: source.cluster_epoch,
+                        bucket_execution_generation: source.bucket_execution_generation,
+                        bucket_incarnation_generation: source.bucket_incarnation_generation,
+                        operation_kind: if stream {
+                            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        } else {
+                            PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                        }
+                        .into(),
+                        created_at: source.created_at,
+                        lease_deadline: source.lease_deadline,
+                        target_context: Some(direct.object.key.as_str().into()),
+                    },
+                };
+                assert!(specimens
+                    .insert(
+                        format!(
+                            "{}-stale-{stale_kind}",
+                            if stream { "stream-put" } else { "direct-put" }
+                        ),
+                        MetadataCommandEnvelope::new(
+                            commands[3].id(),
+                            MetadataCommandPayload::CommitDirectPutObject(Box::new(command))
+                        ),
+                    )
+                    .is_none());
+            }
+            for omitted in [false, true] {
+                for active in [false, true] {
+                    let command = CommitMultipartObjectCommand {
+                        upload_id: complete.upload_id.clone(),
+                        completion_fingerprint: complete.completion_fingerprint,
+                        bucket_write_reservation: complete.bucket_write_reservation.clone(),
+                        object: complete.object.clone(),
+                        parts: complete.parts.clone(),
+                        selected_streaming_segments: complete.selected_streaming_segments.clone(),
+                        omitted_parts: if omitted {
+                            complete.omitted_parts.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        omitted_streaming_segments: if omitted {
+                            complete.omitted_streaming_segments.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        stream_uploads: if active {
+                            complete.stream_uploads.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        stream_upload_segments: if active {
+                            complete.stream_upload_segments.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        write_sequence: complete.write_sequence,
+                        last_modified_millis: complete.last_modified_millis,
+                        stale_payload: stale_payload.clone(),
+                    };
+                    assert!(specimens
+                        .insert(
+                            format!(
+                                "complete-{}-{}-stale-{stale_kind}",
+                                if omitted { "omitted" } else { "no-omitted" },
+                                if active { "active" } else { "no-active" }
+                            ),
+                            MetadataCommandEnvelope::new(
+                                commands[5].id(),
+                                MetadataCommandPayload::CommitMultipartObject(Box::new(command))
+                            ),
+                        )
+                        .is_none());
+                }
+            }
+        }
+        for existing in [false, true] {
+            let command = CommitStreamPartCommand {
+                bucket: part.bucket.clone(),
+                key: part.key.clone(),
+                session_id: part.session_id.clone(),
+                upload: part.upload.clone(),
+                part: part.part.clone(),
+                segments: part.segments.clone(),
+                existing_part: if existing {
+                    part.existing_part.clone()
+                } else {
+                    None
+                },
+                displaced_segments: if existing {
+                    part.displaced_segments.clone()
+                } else {
+                    Vec::new()
+                },
+                bucket_write_reservation: part.bucket_write_reservation.clone(),
+            };
+            assert!(specimens
+                .insert(
+                    format!("part-{}", if existing { "replacement" } else { "first" }),
+                    MetadataCommandEnvelope::new(
+                        commands[24].id(),
+                        MetadataCommandPayload::CommitStreamPart(Box::new(command))
+                    ),
+                )
+                .is_none());
+        }
+        assert_eq!(specimens.len(), 20);
+        specimens
+    }
+
+    fn immutable_v13_terminal_transfer_bytes() -> std::collections::BTreeMap<String, Vec<u8>> {
+        immutable_named_command_bytes(
+            include_str!("metadata_command_v13_terminal_transfers.hex"),
+            20,
+        )
+    }
+
+    #[test]
+    fn terminal_transfer_v13_writer_and_decoder_match_immutable_evidence() {
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 13);
+        let frozen = immutable_v13_terminal_transfer_bytes();
+        let expected = terminal_transfer_specimens();
+        assert_eq!(
+            frozen.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &frozen {
+            assert_eq!(*bytes, expected[name].command_bytes(), "{name}");
+            let decoded = decode_metadata_command_envelope_for_test(bytes).unwrap();
+            assert_eq!(decoded, expected[name], "{name}");
+            assert_eq!(decoded.command_bytes(), *bytes, "{name}");
+            assert_applied_log_decoder_accepts(&decoded);
+            for end in 0..bytes.len() {
+                assert!(
+                    decode_metadata_command_envelope_for_test(&bytes[..end]).is_err(),
+                    "{name}: truncation at {end}"
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(
+                decode_metadata_command_envelope_for_test(&trailing).is_err(),
+                "{name}: trailing bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_transfer_v13_literal_selected_cleanup_and_generation_ownership_are_distinct() {
+        for (name, bytes) in immutable_v13_terminal_transfer_bytes() {
+            let command = decode_metadata_command_envelope_for_test(&bytes).unwrap();
+            let payload = command.payload();
+            let proof = payload.primary_bucket_write_reservation_proof().unwrap();
+            assert!(
+                matches!(payload.bucket_write_reservation_disposition(), MetadataCommandReservationDisposition::ReleaseOnApply(actual) if actual == proof)
+            );
+            assert_eq!(
+                payload
+                    .bucket_write_reservation_route_dependencies()
+                    .collect::<Vec<_>>(),
+                vec![proof]
+            );
+            let stale = match payload {
+                MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                    let expected = if name.starts_with("stream-put-") {
+                        PutObjectGenerationOwner::Stream
+                    } else {
+                        assert!(name.starts_with("direct-put-"));
+                        PutObjectGenerationOwner::Standalone
+                    };
+                    assert!(commit.generation_owner().unwrap() == expected, "{name}");
+                    assert_eq!(commit.segments.len(), 1);
+                    assert_eq!(commit.segments[0].bucket, commit.object.bucket);
+                    assert_eq!(commit.segments[0].key, commit.object.key);
+                    &commit.stale_payload
+                }
+                MetadataCommandPayload::CommitMultipartObject(commit) => {
+                    let omitted = !name.starts_with("complete-no-omitted-");
+                    let active = !name.contains("-no-active-");
+                    assert_eq!(commit.parts.len(), 1);
+                    assert_eq!(commit.selected_streaming_segments.len(), 1);
+                    assert_eq!(commit.omitted_parts.len(), usize::from(omitted));
+                    assert_eq!(
+                        commit.omitted_streaming_segments.len(),
+                        usize::from(omitted)
+                    );
+                    assert_eq!(commit.stream_uploads.len(), usize::from(active));
+                    assert_eq!(commit.stream_upload_segments.len(), usize::from(active));
+                    let selected = &commit.selected_streaming_segments[0];
+                    assert_eq!(selected.bucket, commit.object.bucket);
+                    assert_eq!(selected.key, commit.object.key);
+                    assert_eq!(selected.upload_id, commit.upload_id);
+                    for omitted in &commit.omitted_streaming_segments {
+                        assert_ne!(
+                            (selected.segment_okh, selected.segment_vid),
+                            (omitted.segment_okh, omitted.segment_vid)
+                        );
+                    }
+                    for staged in &commit.stream_upload_segments {
+                        assert_ne!(
+                            (selected.segment_okh, selected.segment_vid),
+                            (staged.segment_okh, staged.segment_vid)
+                        );
+                    }
+                    &commit.stale_payload
+                }
+                MetadataCommandPayload::CommitStreamPart(commit) => {
+                    let existing = name == "part-replacement";
+                    assert_eq!(commit.existing_part.is_some(), existing);
+                    assert_eq!(commit.displaced_segments.len(), usize::from(existing));
+                    assert_eq!(commit.segments.len(), 1);
+                    assert_eq!(commit.segments[0].upload_id, commit.upload.upload_id);
+                    // The original format corpus uses part 2 with a part-3
+                    // segment. Preserve its bytes, not a claim
+                    // that this codec specimen is valid for command apply.
+                    assert_eq!(commit.part.part_number, 2);
+                    assert_eq!(commit.segments[0].part_number, 3);
+                    assert!(!commit.has_consistent_subject());
+                    continue;
+                }
+                _ => panic!("unexpected terminal specimen: {name}"),
+            };
+            match stale {
+                None => assert!(name.ends_with("-stale-none"), "{name}"),
+                Some(ObjectPayloadReclaimCommand::Segments(_)) => {
+                    assert!(name.ends_with("-stale-standard"), "{name}")
+                }
+                Some(ObjectPayloadReclaimCommand::Multipart(_)) => {
+                    assert!(name.ends_with("-stale-multipart"), "{name}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_transfer_v13_literal_noncurrent_versions_are_rejected() {
+        for bytes in immutable_v13_terminal_transfer_bytes().values() {
+            let offset = 4 + METADATA_COMMAND_MAGIC.len();
+            assert_eq!(&bytes[offset..offset + 2], &13_u16.to_le_bytes());
+            for version in [12_u16, 14] {
+                let mut noncurrent = bytes.clone();
+                noncurrent[offset..offset + 2].copy_from_slice(&version.to_le_bytes());
+                assert_unsupported_applied_command(&noncurrent, version);
             }
         }
     }
