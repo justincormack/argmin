@@ -6553,3 +6553,47 @@ suite passed all 9,304 tests (one slow, six skipped) in 241.182s; the Raft
 heartbeat write-amplification test completed in 110.983s. Strict
 all-target/all-feature Clippy, storage boundary checks, formatting and
 `git diff --check` passed.
+
+## Independent Retained Abort Resource Cleanup — 2026-11-03
+
+The retirement model's independent-obligation review exposed a production
+short circuit before physical cleanup: retained stream abort returned immediately
+when releasing its PUT creation bucket proof failed. That prevented available
+file/acknowledgement participants from making progress even after abort apply
+had succeeded on every object-PG replica.
+
+The retained path now evaluates reservation release and physical cleanup before
+returning either result. Release remains first, and its error takes precedence
+if physical cleanup also fails. Each physical failure retains its existing
+single participant diagnostic. Finishing/removing the exact pending abort still
+requires both results to succeed, so a retry can recover the retained proof and
+segments without reconstructing a session or allocating another command.
+
+The owner-local regression extends the real encrypted two-segment/three-shard
+fixture with a PgStore-owned, connection-local temporary SQLite trigger that
+rejects the reservation deletion without changing the durable schema. It tests
+release failure alone and alongside independent file/acknowledgement failures.
+It asserts the metadata-database diagnostic, attempts at every physical
+participant, exact residual rows/files, retained pending subject/proof, and the
+still-durable failed reservation. Removing the faults lets the same capability
+finish; repeated abort is idempotent, every replica's applied index/hash is
+unchanged, and a separate same-bucket reservation survives. The initial run
+reproduced zero file attempts instead of all six. UploadPart's existing physical
+cleanup cases remain covered; its creation proof is normally released at creation
+and is not artificially inserted into a part session for this test.
+
+This changes only the explicit retained-abort path after successful replica
+apply. There are no new tables, formats, commands, successful-path fsyncs or
+session-durability guarantees. It does not wait/retry internally, change generic
+recovery's best-effort behavior, or solve delayed-write exclusion. Durable
+owner/window integration and all six original ignored regressions remain open.
+
+Validation: the new regression first reproduced the reservation-error short
+circuit. All 77 focused tests passed after the change. The boundary checker
+rejected the initial test's direct cluster-side SQLite connection; fault injection
+was moved into a test-only PgStore method using its existing connection and a
+temporary trigger, without weakening the rule. All 77 focused tests passed again.
+The final full Nextest suite passed all 9,305 tests (two slow, six skipped) in
+343.391s. The Raft heartbeat write-amplification test completed in 114.880s and
+oversized version listing in 67.995s. Strict all-target/all-feature Clippy, storage
+boundary checks, formatting and `git diff --check` passed.

@@ -1101,11 +1101,20 @@ impl StorageCluster {
                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
         }
 
-        if let Some(proof) = &abort.stream_create_bucket_write_reservation {
-            self.release_stream_create_bucket_write_reservation_proof(proof)
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-        }
-        self.delete_staged_stream_segment_payload_shards_at_retained_epoch(&abort.staged_segments)?;
+        let reservation_release = abort.stream_create_bucket_write_reservation.as_ref().map_or(
+            Ok(()),
+            |proof| {
+                self.release_stream_create_bucket_write_reservation_proof(proof)
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            },
+        );
+        // The abort is applied on every replica: reservation release and exact
+        // payload deletion are independent cleanup obligations. Attempt both,
+        // retain the first error, and keep the pending abort until both succeed.
+        let payload_cleanup = self
+            .delete_staged_stream_segment_payload_shards_at_retained_epoch(&abort.staged_segments);
+        reservation_release?;
+        payload_cleanup?;
         primary
             .retained_metadata_command_client()
             .open_retained_stream_upload_abort_route(&prepared)

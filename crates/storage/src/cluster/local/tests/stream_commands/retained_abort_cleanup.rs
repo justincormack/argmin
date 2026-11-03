@@ -8,12 +8,26 @@ fn retained_stream_abort_attempts_all_participants_before_retry_for_both_targets
     let _serial = lock_payload_cleanup_hook_test();
     for multipart in [false, true] {
         for failed_participant in [None, Some("file"), Some("ack")] {
-            check_retained_abort(multipart, failed_participant);
+            check_retained_abort(multipart, failed_participant, false);
         }
     }
 }
 
-fn check_retained_abort(multipart: bool, failed_participant: Option<&'static str>) {
+#[test]
+fn retained_stream_abort_reservation_failure_does_not_starve_physical_cleanup() {
+    let _serial = lock_payload_cleanup_hook_test();
+    // UploadPart releases its creation proof when creation completes; only PUT
+    // retains that proof in the session and releases it during retained abort.
+    for failed_participant in [None, Some("file"), Some("ack")] {
+        check_retained_abort(false, failed_participant, true);
+    }
+}
+
+fn check_retained_abort(
+    multipart: bool,
+    failed_participant: Option<&'static str>,
+    fail_reservation_release: bool,
+) {
     let tmp = test_util::tempdir();
     let ec = EcShape { k: 2, m: 1 };
     let map = Arc::new(
@@ -106,6 +120,38 @@ fn check_retained_abort(multipart: bool, failed_participant: Option<&'static str
         })
         .collect::<Vec<_>>();
     let failed_key = expected_keys[0].clone();
+    let bucket_primary = map
+        .metadata_pg_primary_node(map.epoch, PgId::new(0))
+        .unwrap();
+    let reservations = || {
+        let pg = bucket_primary.storage_node().get_pg(0).unwrap();
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap()
+    };
+    let reservation_fault = fail_reservation_release.then(|| {
+        let proof = {
+            let pg = bucket_primary.storage_node().get_pg(0).unwrap();
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session)
+                .unwrap()
+                .bucket_write_reservation
+                .expect("PUT must retain its creation proof")
+        };
+        assert!(reservations().iter().any(|row| proof.matches_record(row)));
+        let canary = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            Some("unrelated-key"),
+        );
+        // The owning PgStore injects a real SQL deletion failure on its own
+        // connection. No extra runtime/connection or production hook is needed.
+        bucket_primary
+            .storage_node()
+            .get_pg(0)
+            .unwrap()
+            .test_set_bucket_reservation_release_failure(true)
+            .unwrap();
+        (proof, canary)
+    });
     let files = Arc::new(Mutex::new(Vec::new()));
     let acks = Arc::new(Mutex::new(Vec::new()));
     let observed_files = Arc::clone(&files);
@@ -156,15 +202,33 @@ fn check_retained_abort(multipart: bool, failed_participant: Option<&'static str
         },
     ));
     let result = cleanup.abort(&session);
-    if failed_participant.is_some() {
+    if failed_participant.is_some() || fail_reservation_release {
         let error = result.unwrap_err();
-        assert_eq!(error.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            error.diagnostic_cause_label(),
+            if fail_reservation_release {
+                "metadata_db_error"
+            } else {
+                "store_io_failure"
+            },
+            "retain the first failure even when physical cleanup also fails"
+        );
         let pending = pending_metadata_command_for_test(&map, PgId::new(0), &bucket).unwrap();
         let MetadataCommandPayload::AbortStreamUpload(abort) = pending.payload() else {
             panic!("expected retained abort")
         };
         assert_eq!(abort.staged_segments, segments);
         assert_eq!(abort.session_id, session);
+        if let Some((proof, canary)) = &reservation_fault {
+            assert_eq!(
+                abort.stream_create_bucket_write_reservation.as_ref(),
+                Some(proof)
+            );
+            let rows = reservations();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|row| proof.matches_record(row)));
+            assert!(rows.iter().any(|row| canary.matches_record(row)));
+        }
     } else {
         result.unwrap();
         assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
@@ -206,6 +270,14 @@ fn check_retained_abort(multipart: bool, failed_participant: Option<&'static str
     }
     drop(file_hook);
     drop(ack_hook);
+    if reservation_fault.is_some() {
+        bucket_primary
+            .storage_node()
+            .get_pg(0)
+            .unwrap()
+            .test_set_bucket_reservation_release_failure(false)
+            .unwrap();
+    }
     let applied = map
         .nodes
         .values()
@@ -224,6 +296,15 @@ fn check_retained_abort(multipart: bool, failed_participant: Option<&'static str
     cleanup.abort(&session).unwrap();
     cleanup.abort(&session).unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
+    if let Some((proof, canary)) = &reservation_fault {
+        let rows = reservations();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows.iter().any(|row| proof.matches_record(row)));
+        assert!(
+            canary.matches_record(&rows[0]),
+            "retry must not release an unrelated proof"
+        );
+    }
     for segment in &segments {
         for index in 0..ec.k + ec.m {
             let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), index);

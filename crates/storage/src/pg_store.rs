@@ -1341,6 +1341,28 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_set_bucket_reservation_release_failure(
+        &self,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        // Connection-local fault injection: exercise the real release SQL and
+        // rollback without changing the durable schema or exposing SQLite.
+        let sql = if enabled {
+            "CREATE TEMP TRIGGER reject_bucket_reservation_release \
+             BEFORE DELETE ON main.bucket_write_reservations BEGIN \
+             SELECT RAISE(ABORT, 'injected bucket reservation release failure'); END;"
+        } else {
+            "DROP TRIGGER temp.reject_bucket_reservation_release"
+        };
+        self.conn
+            .execute_batch(sql)
+            .map_err(|source| StoreError::Db {
+                context: "configure bucket reservation release failure for test",
+                source: source.into(),
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_sqlite_configuration(&self) -> Result<TestSqliteConfiguration, StoreError> {
         let temp_store = self
             .conn

@@ -188,9 +188,13 @@ session removal, or revoke delayed writes. Terminal recovery's separate
 best-effort cleanup semantics are unchanged.
 
 Retained stream abort also attempts every file/acknowledgement participant and
-every staged segment before returning its first cleanup error. It must not finish
-and remove its pending abort when any participant failed. An explicit retained
-retry reuses that exact abort and idempotently deletes any remaining effects.
+every staged segment before returning its first cleanup error. Once abort apply
+has succeeded on all replicas, failure to release the retained PUT creation proof
+must not skip independent physical cleanup. Attempt reservation release first
+and payload cleanup second, preserving the first error if both fail. It must not
+finish and remove its pending abort until both obligations succeed. An explicit
+retained retry reuses that exact abort and idempotently releases its exact proof
+and deletes any remaining effects; unrelated reservations remain untouched.
 This is not a guarantee for generic recovery, whose separate best-effort cleanup
 and pending-slot retirement still require durable owner/window integration.
 
