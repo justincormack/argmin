@@ -6633,3 +6633,33 @@ The full Nextest suite passed all 9,306 tests (two slow, six skipped) in 241.122
 The Raft heartbeat write-amplification test completed in 116.205s and oversized
 version listing in 61.104s. Strict all-target/all-feature Clippy, storage boundary
 checks, formatting and `git diff --check` passed.
+
+## Authenticated Retained Release Reply Evidence — 2026-11-03
+
+The next transport-level canaries exercise retained reservation-proof release
+through installed, authenticated Unix and TLS/TCP servers. A server response hook
+corrupts the first proof-release envelope after dispatch has committed the real
+SQLite deletion. The client reports an authentication failure (`PayloadDecode`),
+not success; a reply counter proves it does not silently retry. Inspection then
+establishes that the exact reservation is already absent and a second reservation
+with the same bucket, key and operation remains unchanged.
+
+After discarding the failed client and connection, a fresh authenticated client
+releases the same proof twice successfully. Both retries preserve the canary and
+leave the applied metadata-command index/hash unchanged. These tests use the
+production scoped route, request codec, authentication and transactional release,
+without adding production hooks or changing protocol behavior.
+
+This models an untrustworthy post-commit response, not a literal socket disconnect
+or storage-process restart. It complements the retained-abort client-boundary
+lost-reply/physical-failure matrix above; it does not establish durable cleanup
+ownership after generic startup retires a terminal pending slot. Owner/window
+integration and all six original ignored regressions remain open.
+
+Validation: both focused Unix/TLS cases passed. Their initial setup mistakenly
+held the seeding PG guard across the RPC and produced transport timeouts; the
+guard is now dropped before dispatch, with later inspections separately scoped.
+The full Nextest suite passed all 9,308 tests (two slow, six skipped) in 239.724s.
+The Raft heartbeat write-amplification test completed in 111.703s and oversized
+version listing in 60.529s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed.

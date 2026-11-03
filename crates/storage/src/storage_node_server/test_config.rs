@@ -23,6 +23,8 @@ mod shard_ack_cleanup_tests;
 mod shard_file_cleanup_tests;
 #[path = "pending_slot_deadline_tests.rs"]
 mod pending_slot_deadline_tests;
+#[path = "retained_reservation_reply_tests.rs"]
+mod retained_reservation_reply_tests;
 
 fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::StorageRpcShardAckBatchRequest) -> Vec<u8> {
     crate::storage_rpc::encode_shard_ack_record_request(&crate::storage_rpc::StorageRpcShardAckRecordRequest {
