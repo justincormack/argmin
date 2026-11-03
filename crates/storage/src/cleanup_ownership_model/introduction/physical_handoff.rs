@@ -15,12 +15,16 @@
 //! Terminal publication is the parent's atomic abstraction, not terminal fanout.
 //! Route certificates, real clocks, RPC codecs, multiple windows, data-node restart
 //! and new-client multipart retries remain outside this graph.
+//! The retirement child refines atomic deletion into independently fallible file
+//! and acknowledgement cleanup while retaining these live admission transitions.
 
 use super::{
     Action as IntroAction, Disposition, Fault as IntroFault, Install, State as Introduction,
 };
 use super::{PRIMARY, TRAILING, WITNESS};
 use crate::bounded_explorer::{explore, Checks, Exploration, Termination};
+
+mod retirement;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Effect {

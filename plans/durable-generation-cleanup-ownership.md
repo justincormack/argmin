@@ -6851,3 +6851,72 @@ fixture mistake: successful payload reclaim also queues a bucket-finalization
 wake. The test now validates and consumes that live bucket's wake separately
 before checking the exact next payload root; no production retry or assertion
 was relaxed.
+
+## Physical Handoff And Partial Retirement Composition — 2026-11-03
+
+The independent retirement model starts with closed physical authority. The
+introduction/physical-handoff model establishes that closure but previously
+collapsed physical deletion into one successful action. The new child
+`introduction::physical_handoff::retirement` refines that action while keeping
+the parent's introduction, settlement, compaction, delayed-send/confirmation,
+local admission, persistence, cutoff, terminal publication and resource-release
+transitions live in the same exploration.
+
+File deletion and acknowledgement deletion complete independently. One cleanup
+may fail before its effect; one may durably complete without delivering its
+reply. A participant's absence is not completion evidence. The existing cutoff
+and admission-exclusion predicate is reevaluated for every attempt; it is not
+replaced by an assumed closure bit. A monotone ghost history catches recreation
+of either already-deleted participant **during partial cleanup**, before the
+other participant has completed or the owner has retired.
+
+The composed restart rule distinguishes two boundaries:
+
+- Before retirement is irrevocably accepted, discard volatile participant
+  confirmations and repeat both exact idempotent operations, even if both effects
+  are absent. The owner and obligations remain. Reinspect the introduction prefix
+  before resuming physical cleanup.
+- Once a replica has applied the exact retirement, preserve its accepted outcome
+  and converge the other replicas; do not require a removed owner to mint a new
+  cleanup attempt. This uses the parent's abstract replica-retirement transition,
+  **not** a production recovery certificate or a new durable completion receipt.
+
+Named schedules independently lose the file or acknowledgement cleanup reply,
+restart with every effect absent, and require fresh confirmations before owner
+retirement. Another matrix leaves a file/ack request either still in transport
+or confirmed but not admitted, completes cleanup, partially applies retirement,
+restarts, converges retirement, and finally rejects the delayed request without
+recreating either effect. An admitted acknowledgement is also required to finish
+across the cutoff before cleanup can begin.
+
+The exhaustive graph requires reachable convergence combining that late admitted
+acknowledgement, partial cleanup, error, lost reply and restart. Independent
+mutation explorations remove the cutoff, file exclusion or acknowledgement
+exclusion, trust an undelivered reply, or preserve pre-retirement completion
+across restart. Each must produce its specific safety counterexample. Published
+payload preservation is a separate required witness. State-limit termination
+cannot count as success.
+
+This remains **bounded abstract candidate evidence**, not production-connected
+verification. It composes one file and one acknowledgement with the parent's
+three metadata replicas, one restart, one immutable cutoff and abstract terminal
+publication. The separate five-participant retirement model still covers the
+larger independent resource set; this does not claim all of its states are
+cross-composed. Generation release remains the parent's logical owner transition,
+not a new production release order. Clock-health/skew, data-node crash, real
+durability barriers, RPC authorization, route retention, multiple windows and
+fairness remain outside this graph. The coordinated durable owner/window and
+finite physical-write-authority implementation is still the next production
+integration; no schema, format, production write path or fsync changes here.
+All six original ignored regressions remain open.
+
+Validation: all 63 cleanup-ownership model tests passed in 13.185s. The new
+all-available composition exhausted 358,462 states and 923,092 transitions; all
+five independent mutations produced their expected counterexamples. Both named
+matrices passed. Full Nextest passed all 9,321 tests (two slow, six skipped),
+with retries disabled, in 314.403s. The Raft heartbeat/checkpoint and
+1,001-version listing tests were inspected and passed in 175.083s and 64.761s
+respectively. Strict all-target/all-feature Clippy, storage boundary checks,
+formatting and `git diff --check` passed. No failing run was retried or excluded;
+the initial three-test exploration passed before adding the delayed-packet
+retirement/restart matrix.
