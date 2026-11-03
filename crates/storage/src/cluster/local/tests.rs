@@ -2084,6 +2084,7 @@ mod direct_put;
 mod late_stream_cleanup;
 mod metadata_replay;
 mod multipart;
+mod multipart_authority_race;
 mod multipart_completion;
 mod multipart_trace;
 mod object_commands;

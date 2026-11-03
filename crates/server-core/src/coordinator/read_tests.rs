@@ -259,7 +259,7 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         .lock()
         .unwrap();
     let dir = test_util::tempdir();
-    let coord = setup_coordinator(dir.path());
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(dir.path(), 4);
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -269,17 +269,56 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"cleanup-me")
         .unwrap();
 
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let payload = coord
+        .storage_node()
+        .test_capture_stream_upload_payload(&bucket, &key, &session_id)
+        .unwrap();
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_present(&payload)
+        .unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let cleanup = coord
+        .retained_stream_upload_cleanup(&admission, &bucket, &key)
+        .unwrap();
+    drop(admission);
     let cleanup_failure = coord.storage_node().test_fail_payload_ack_cleanup();
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
-    coord
+    let error = coord
         .abort_stream_put("bucket", "key", &session_id)
-        .unwrap();
+        .expect_err("unconfirmed acknowledgement cleanup must not report success");
+    assert!(
+        matches!(
+            error,
+            ServerError::StreamUpload(ref failure)
+                if failure.kind() == storage::StreamUploadFailureKind::InternalError
+                    && failure.diagnostic_cause_label() == "store_io_failure"
+        ),
+        "preserve the cleanup failure: {error:?}"
+    );
 
     assert!(
         cleanup_failure.invocation_count() > 0,
         "ack cleanup failure should emit typed cleanup context"
     );
+    assert!(!coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&payload)
+        .unwrap());
+    drop(cleanup_failure);
+    coord
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
+        .unwrap();
+    coord
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
+        .unwrap();
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&payload)
+        .unwrap());
 }
 
 #[test]

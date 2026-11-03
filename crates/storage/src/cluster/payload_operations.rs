@@ -3055,9 +3055,9 @@ impl StorageCluster {
                                 },
                             );
                         }
-                        if !reservation_authority
-                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                pg_id, &command,
+                        if !self
+                            .complete_applied_metadata_command_terminal_cleanup(
+                                pg_id, &command, reservation_authority,
                             )
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                         {
@@ -3213,9 +3213,9 @@ impl StorageCluster {
                                 },
                             );
                         }
-                        if !reservation_authority
-                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                pg_id, &command,
+                        if !self
+                            .complete_applied_metadata_command_terminal_cleanup(
+                                pg_id, &command, reservation_authority,
                             )
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                         {
@@ -4431,12 +4431,10 @@ impl StorageCluster {
                     );
                 }
             }
-            MetadataCommandPayload::CreateStreamUpload(_) => {}
-            MetadataCommandPayload::AbortStreamUpload(abort) => {
-                self.delete_staged_stream_segment_payload_shards_best_effort(
-                    &abort.staged_segments,
-                );
-            }
+            // Applied stream-abort cleanup must succeed before slot removal;
+            // it is performed by complete_applied_metadata_command_terminal_cleanup.
+            MetadataCommandPayload::CreateStreamUpload(_)
+            | MetadataCommandPayload::AbortStreamUpload(_) => {}
             MetadataCommandPayload::CommitStreamPart(commit) => {
                 self.delete_finalize_upload_part_cleanup_best_effort(
                     &crate::FinalizeStreamPartCleanup {

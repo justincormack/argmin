@@ -3140,8 +3140,8 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
         let cleanup_complete = self
-            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                pg_id, command,
+            .complete_applied_metadata_command_terminal_cleanup(
+                pg_id, command, self,
             )
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         if cleanup_complete {

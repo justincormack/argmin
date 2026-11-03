@@ -6920,3 +6920,107 @@ respectively. Strict all-target/all-feature Clippy, storage boundary checks,
 formatting and `git diff --check` passed. No failing run was retried or excluded;
 the initial three-test exploration passed before adding the delayed-packet
 retirement/restart matrix.
+
+## Applied Stream-Abort Cleanup Before Generic Retirement — 2026-11-03
+
+The production audit found a concrete loss of the existing cleanup retry record:
+explicit retained abort kept its pending command when physical deletion failed,
+but generic recovery could apply that same abort, remove its slot, and only then
+attempt best-effort deletion. The new regression reproduced this before the fix:
+an injected file failure returned `Applied` instead of retaining the abort.
+
+Applied `AbortStreamUpload` now completes its recorded physical obligations in
+the shared pre-removal boundary. Normal object publication, generic object-PG
+recovery, and the generic command finisher use it, including exact-applied replay.
+The existing bucket-reservation release is attempted first, followed by every
+file and acknowledgement of every staged segment even if release failed. Both
+must succeed before pending-slot removal. Deletion errors are propagated once;
+the former duplicate best-effort post-apply abort cleanup is removed. Historical
+payload cleanup uses the command cluster and each segment's retained placement,
+not the possibly different current-map authority used for reservation release.
+
+Owner-local encrypted multi-replica tests exercise PUT and UploadPart aborts
+through both generic finishers with independent file/ack failures. They assert
+the exact pending envelope remains, all participants are attempted, diagnostics
+are emitted once, and a later successful retry removes all effects and the slot
+without advancing the already-applied replica prefix. PUT cases additionally
+combine reservation-release failure with physical failures and preserve an
+unrelated reservation. The foreground abort canary likewise requires failed ack
+cleanup to retain the command, then finishes it through static recovery.
+
+This uses the existing pending envelope, with no new schema/encoding, cleanup
+transaction, or normal-path fsync. It does not change other command families'
+best-effort physical cleanup. Nor does it establish replicated owner survival
+through primary replacement or compaction, cover prepared writes absent from the
+abort descriptor, or revoke delayed physical requests. The durable owner/window
+and finite physical-write-authority protocol remains required; all six original
+ignored regressions remain open. This is cleanup reliability, not preservation
+of ephemeral client sessions or bucket-side reservations.
+
+Validation: all 168 focused stream-command, terminal-cleanup and pending-slot
+tests passed in 11.785s. Strict all-target/all-feature Clippy, storage boundary
+checks, formatting and `git diff --check` passed. The pre-fix regression failed
+with `failed cleanup must not retire the applied abort: Applied`. During test
+development, the foreground canary was changed from best-effort success to the
+new error-and-retry contract, and the generic reservation-error assertion was
+corrected to match the actual proof-release SQL context.
+
+The initial full-suite validation was blocked: `cargo nextest run --retries 0` ended
+after 85.127s with 2,552 passed, one SIGABRT, six skipped and 6,770 not run.
+`s3-tests::multipart::test_upload_part_replacement_racing_completion_has_consistent_terminal_state`
+triggered the HTTP-500 guard during replacement UploadPart, request
+`HF2VRU823SQM7K9U`, with cause chain
+`server_error>stream_upload>metadata_failure`. Its flight recorder shows session
+creation, 16 body bytes, first-segment append failure, successful session abort,
+then HTTP 500. The trace does not reveal the underlying metadata variant or
+establish causality for this slice. The failing test was neither modified nor
+retried. The slow Raft heartbeat/checkpoint test completed successfully in
+84.183s. Do not treat the partial suite as full validation.
+
+## UploadPart Completion/Authority-Read Race — 2026-11-03
+
+Review identified the full-suite failure above: UploadPart authority loads its
+session, upload and part-generation reservation separately. Completion can remove
+the reservation after the upload read. Both initial segment authorization and
+append-time authority revalidation previously surfaced the missing reservation
+as an internal error, producing HTTP 500 instead of `NoSuchUpload`.
+
+The shared generation loader now handles only the exact missing-reservation
+error by rechecking the upload through the same admitted, subject-bound route.
+A missing/terminal upload returns `NoSuchUpload` through the existing coordinator
+mapping. If the upload is still in progress, the original reservation error
+remains an internal invariant failure. The recheck validates the captured route
+before its storage access; no broad error remapping, session preservation,
+schema change or additional normal-path write is introduced.
+
+An owner-local node-client decorator runs real multipart completion immediately
+before the reservation read, after the earlier authority observations. Independent
+cases cover initial authorization and append-time revalidation. They verify the
+reservation really disappeared, require `NoSuchUpload`, and assert zero shard
+writes, no pending command and no metadata-prefix advancement after completion.
+A separate corruption canary removes only the reservation while leaving the
+upload in progress; both entry points must retain their internal error and leave
+the session/allocator and segment state unchanged. The pre-fix completion case
+failed deterministically with `InternalError` versus `NoSuchUpload`; the live-upload
+canary passed. The original AWS-facing race test remains unchanged.
+
+Validation so far: all three focused authority tests passed, including the
+existing atomic append-binding canary. The corrected full run passed the
+unchanged S3 replacement/completion race, but stopped after 4,488 passes on
+`server-core::coordinator::read_tests::stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup`:
+its old `unwrap()` expected best-effort success despite injected ack-deletion
+failure. This was a direct consequence of the preceding applied-abort fix, not
+another UploadPart classification failure. The coordinator canary now requires
+the exact cleanup error, verifies effects are not fully absent, then verifies
+retained idempotent retry removes them. Background sweepers are disabled for
+that controlled retry.
+
+Final validation: all 9,325 tests passed (one slow, six existing skips) in
+240.179s with `cargo nextest run --retries 0 --no-fail-fast`. This includes the
+unchanged AWS-facing replacement/completion race, both deterministic authority
+matrices, the generic abort-retirement tests and the strengthened coordinator
+cleanup/retry canary. All four focused coordinator stream-abort tests also
+passed. Strict all-target/all-feature Clippy, storage boundary checks, formatting
+and `git diff --check` passed. The Raft heartbeat/checkpoint test was inspected
+and completed in 111.831s. The earlier full-suite validation blocker is resolved;
+the six original ignored durable-owner regressions remain open.

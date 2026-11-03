@@ -1463,12 +1463,14 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
 
     fn load_stream_part_generation(
         &self,
+        upload_id: &UploadId,
         session_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         self.admission
             .require_valid_now_raw()
             .map_err(ObjectPgActionError::from)?;
-        self.admission
+        let generation = self
+            .admission
             .cluster
             .object_generation_metadata_primary_client(&self.bucket, &self.key)?
             .open_object_generation_metadata_route(
@@ -1477,7 +1479,20 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
                 &self.bucket,
                 &self.key,
             )?
-            .object_generation_reservation(session_id)
+            .object_generation_reservation(session_id);
+        match generation {
+            Err(error @ ObjectPgActionError::Metadata(
+                MetadataError::ObjectGenerationReservationNotFound { .. },
+            )) => {
+                // Completion can remove the session's reservation after the
+                // earlier upload read. Classify that race using a fresh exact
+                // admitted upload lookup, not the missing reservation alone.
+                // A still-live upload keeps the original invariant failure.
+                self.load_in_progress_multipart_upload(upload_id)?;
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     /// Binds one stream segment to the exact multipart upload, UploadPart
@@ -1517,7 +1532,7 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
             ));
         }
         let part_generation_id = self
-            .load_stream_part_generation(session_id)
+            .load_stream_part_generation(upload_id, session_id)
             .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         self.admission
             .require_valid_now_raw()
@@ -1598,7 +1613,7 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
             ));
         }
         let current_generation = self
-            .load_stream_part_generation(&authorization.session.session_id)
+            .load_stream_part_generation(upload_id, &authorization.session.session_id)
             .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         let current_upload = self
             .load_in_progress_multipart_upload(upload_id)

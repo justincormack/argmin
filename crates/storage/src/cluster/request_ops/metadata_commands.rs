@@ -3134,8 +3134,8 @@ impl super::StorageCluster {
                             );
                         }
                         if !self
-                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                pg_id, &command,
+                            .complete_applied_metadata_command_terminal_cleanup(
+                                pg_id, &command, self,
                             )?
                         {
                             return Ok(
@@ -3196,8 +3196,8 @@ impl super::StorageCluster {
                         )?;
                         if applied_on_all {
                             if !self
-                                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                    pg_id, &command,
+                                .complete_applied_metadata_command_terminal_cleanup(
+                                    pg_id, &command, self,
                                 )?
                             {
                                 return Ok(

@@ -65,6 +65,15 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
     The remaining reserved capacity must allow short completion/control
     operations to progress.
 
+UploadPart segment authority reads must distinguish completion races from broken
+live-upload state. If the session's part-generation reservation disappears
+between the separate authority reads, recheck the exact upload through the same
+admitted route. Only a missing/terminal upload establishes `NoSuchUpload`; a
+still-in-progress upload preserves the missing-reservation invariant error.
+Revalidation before append uses the same rule. The recheck must revalidate the
+captured admission before storage access; unrelated storage failures are not
+converted to missing-upload errors.
+
 ## Required Coordinator APIs
 
 ### Local shard-file mutation exclusion
@@ -190,8 +199,8 @@ a reference preserves the payload, and failed inspection preserves it and return
 the inspection error. Each failure is reported once: reference-inspection errors
 at the wrapper, and deletion errors at the physical participant boundary. This
 does not release the stream's generation reservation, make cleanup durable after
-session removal, or revoke delayed writes. Terminal recovery's separate
-best-effort cleanup semantics are unchanged.
+session removal, or revoke delayed writes. Other command families' separate
+best-effort terminal cleanup semantics are unchanged.
 
 Retained stream abort also attempts every file/acknowledgement participant and
 every staged segment before returning its first cleanup error. Once abort apply
@@ -201,8 +210,15 @@ and payload cleanup second, preserving the first error if both fail. It must not
 finish and remove its pending abort until both obligations succeed. An explicit
 retained retry reuses that exact abort and idempotently releases its exact proof
 and deletes any remaining effects; unrelated reservations remain untouched.
-This is not a guarantee for generic recovery, whose separate best-effort cleanup
-and pending-slot retirement still require durable owner/window integration.
+The same applied stream-abort obligations gate pending-slot removal in normal
+publication and both generic completion paths, including exact-applied replay.
+Payload cleanup uses the command's retained segment placements, even when bucket
+reservation release uses a separate current-map authority. Physical failures are
+reported once by the participant boundary, not repeated as best-effort work after
+slot removal. This preserves the existing exact pending command for retry; it
+does not yet establish owner survival through primary replacement/compaction,
+cover prepared writes absent from the abort descriptor, or fence delayed writes.
+Those still require durable owner/window integration.
 
 Durable object-payload reclaim follows the same independent-participant rule:
 attempt every file and acknowledgement in every recorded segment/part, preserving

@@ -302,15 +302,41 @@ fn stream_abort_ack_cleanup_failure_removes_files_and_retains_acknowledgements()
     let cleanup_failure = fixture.cluster.test_fail_payload_ack_cleanup();
     let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
 
-    fixture
+    let error = fixture
         .cluster
         .abort_stream_upload_session(&fixture.bucket, &fixture.key, &fixture.session_id)
-        .unwrap();
+        .expect_err("unconfirmed acknowledgement cleanup must retain the pending abort");
+    assert_eq!(error.diagnostic_cause_label(), "store_io_failure");
     assert_eq!(
         cleanup_failure.invocation_count(),
         usize::from(fixture.ec.k + fixture.ec.m)
     );
     assert_stream_payload_shard_state(&fixture, true, false);
+    let pg_id = PgId::new(
+        fixture
+            .cluster
+            .object_metadata_pg_id(&fixture.bucket, &fixture.key),
+    );
+    let pending =
+        pending_metadata_command_for_test(&fixture.cluster.local_map, pg_id, &fixture.bucket)
+            .expect("the applied abort remains the cleanup retry record");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::AbortStreamUpload(_)
+    ));
+    drop(cleanup_failure);
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_command_with_static_recovery_route(pg_id, &pending)
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(
+        pending_metadata_command_for_test(&fixture.cluster.local_map, pg_id, &fixture.bucket,)
+            .is_none()
+    );
+    assert_stream_payload_shard_state(&fixture, false, false);
 }
 
 fn pending_release_command(

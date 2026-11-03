@@ -130,7 +130,12 @@ preparation after publication-start. After acting-set application has converged,
 transient reservation-release failure is terminal cleanup rather than a failed
 mutation outcome. The primary pending slot remains durable so command recovery
 can retry replica convergence or release, and is removed only after both
-succeed.
+succeed. Applied `AbortStreamUpload` additionally requires successful deletion
+of every recorded staged file and acknowledgement before slot removal, in both
+foreground and generic recovery completion. Reservation-release failure must
+not skip those independent physical cleanup attempts. The exact pending abort
+remains retryable on failure; other command families' best-effort physical
+cleanup is not upgraded by this rule.
 
 ### Publication And Retry Boundary
 

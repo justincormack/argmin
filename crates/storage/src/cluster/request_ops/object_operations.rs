@@ -1345,8 +1345,8 @@ impl super::StorageCluster {
                             );
                         }
                         let completion = if !self
-                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                pg_id, &command,
+                            .complete_applied_metadata_command_terminal_cleanup(
+                                pg_id, &command, self,
                             )
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                         {
@@ -1508,8 +1508,8 @@ impl super::StorageCluster {
                                 );
                             }
                             if !self
-                                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                                    pg_id, &command,
+                                .complete_applied_metadata_command_terminal_cleanup(
+                                    pg_id, &command, self,
                                 )
                                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                             {

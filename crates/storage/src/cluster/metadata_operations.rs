@@ -6325,6 +6325,31 @@ impl StorageCluster {
         }
     }
 
+    /// Keep the exact applied abort pending until both independent cleanup
+    /// obligations succeed. Historical payload placement belongs to `self`,
+    /// even when reservation release uses a separate current-map authority.
+    fn complete_applied_metadata_command_terminal_cleanup(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let reservation_release = reservation_authority
+            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                pg_id, command,
+            );
+        let payload_cleanup = match command.payload() {
+            MetadataCommandPayload::AbortStreamUpload(abort) => self
+                .delete_staged_stream_segment_payload_shards_at_retained_epoch(&abort.staged_segments)
+                .map_err(object_pg_action_error_to_bucket_snapshot_error),
+            _ => Ok(()),
+        };
+        // Attempt every physical participant even if reservation release failed.
+        let released = reservation_release?;
+        payload_cleanup?;
+        Ok(released)
+    }
+
     fn release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
         &self,
         pg_id: PgId,

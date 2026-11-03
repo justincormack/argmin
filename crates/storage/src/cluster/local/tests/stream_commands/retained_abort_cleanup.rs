@@ -2,14 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::cluster::bucket_snapshot_error_to_object_pg_action_error;
 use crate::node_client::{
     RetainedBucketWriteReservationNodeClient, RetainedBucketWriteReservationRoute,
 };
+use crate::ObjectPgActionError;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReservationFailure {
     BeforeEffect,
     LostReply,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AbortRetry {
+    Retained,
+    GenericRecovery,
+    GenericFinisher,
+}
+
+impl AbortRetry {
+    fn finish(
+        self,
+        cluster: &StorageCluster,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        match self {
+            Self::GenericRecovery => cluster
+                .drain_pending_metadata_command_with_static_recovery_route(PgId::new(0), command),
+            Self::GenericFinisher => cluster
+                .finish_pending_metadata_command_to_acting_set(
+                    PgId::new(0),
+                    command.bucket_name(),
+                    command,
+                    false,
+                )
+                .map_err(bucket_snapshot_error_to_object_pg_action_error),
+            Self::Retained => unreachable!("retained retry uses its cleanup capability"),
+        }
+    }
 }
 
 // Exercise the actual retained route and SQL commit, then lose only its result.
@@ -93,7 +124,7 @@ fn retained_stream_abort_attempts_all_participants_before_retry_for_both_targets
     let _serial = lock_payload_cleanup_hook_test();
     for multipart in [false, true] {
         for failed_participant in [None, Some("file"), Some("ack")] {
-            check_retained_abort(multipart, failed_participant, None);
+            check_retained_abort(multipart, failed_participant, None, AbortRetry::Retained);
         }
     }
 }
@@ -108,6 +139,7 @@ fn retained_stream_abort_reservation_failure_does_not_starve_physical_cleanup() 
             false,
             failed_participant,
             Some(ReservationFailure::BeforeEffect),
+            AbortRetry::Retained,
         );
     }
 }
@@ -120,7 +152,35 @@ fn retained_stream_abort_retries_committed_reservation_release_after_lost_reply(
             false,
             failed_participant,
             Some(ReservationFailure::LostReply),
+            AbortRetry::Retained,
         );
+    }
+}
+
+#[test]
+fn generic_recovery_retains_applied_stream_abort_until_all_cleanup_succeeds() {
+    let _serial = lock_payload_cleanup_hook_test();
+    for retry in [AbortRetry::GenericRecovery, AbortRetry::GenericFinisher] {
+        for multipart in [false, true] {
+            for participant in [Some("file"), Some("ack")] {
+                check_retained_abort(multipart, participant, None, retry);
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_stream_abort_recovery_attempts_payload_cleanup_after_release_failure() {
+    let _serial = lock_payload_cleanup_hook_test();
+    for retry in [AbortRetry::GenericRecovery, AbortRetry::GenericFinisher] {
+        for participant in [None, Some("file"), Some("ack")] {
+            check_retained_abort(
+                false,
+                participant,
+                Some(ReservationFailure::BeforeEffect),
+                retry,
+            );
+        }
     }
 }
 
@@ -128,6 +188,7 @@ fn check_retained_abort(
     multipart: bool,
     failed_participant: Option<&'static str>,
     reservation_failure: Option<ReservationFailure>,
+    retry: AbortRetry,
 ) {
     let tmp = test_util::tempdir();
     let ec = EcShape { k: 2, m: 1 };
@@ -389,6 +450,59 @@ fn check_retained_abort(
             );
         }
     }
+    if retry != AbortRetry::Retained {
+        files.lock().unwrap().clear();
+        acks.lock().unwrap().clear();
+        reports.store(0, Ordering::SeqCst);
+        let pending = pending_metadata_command_for_test(&map, PgId::new(0), &bucket).unwrap();
+        let error = retry
+            .finish(&cluster, &pending)
+            .expect_err("failed cleanup must not retire the applied abort");
+        if reservation_failure == Some(ReservationFailure::BeforeEffect) {
+            assert!(
+                matches!(
+                    error,
+                    ObjectPgActionError::Metadata(crate::MetadataError::Db {
+                        context: "release metadata command durable bucket write reservation",
+                        ..
+                    })
+                ),
+                "preserve the reservation failure before any physical failure: {error:?}"
+            );
+        } else {
+            let expected_context = if failed_participant == Some("file") {
+                "retained abort file cleanup canary"
+            } else {
+                "retained abort ack cleanup canary"
+            };
+            assert!(
+                matches!(
+                    error,
+                    ObjectPgActionError::Store(StoreError::Io { context, .. })
+                        if context == expected_context
+                ),
+                "preserve the exact physical failure: {error:?}"
+            );
+        }
+        assert_eq!(
+            pending_metadata_command_for_test(&map, PgId::new(0), &bucket),
+            Some(pending)
+        );
+        assert_eq!(
+            *files.lock().unwrap(),
+            expected_keys,
+            "recovery must retry every file"
+        );
+        assert_eq!(
+            *acks.lock().unwrap(),
+            expected_keys,
+            "recovery must retry every acknowledgement"
+        );
+        assert_eq!(
+            reports.load(Ordering::SeqCst),
+            usize::from(failed_participant.is_some())
+        );
+    }
     drop(file_hook);
     drop(ack_hook);
     if reservation_failure == Some(ReservationFailure::BeforeEffect) {
@@ -424,6 +538,14 @@ fn check_retained_abort(
         cleanup
     };
     // No new client session or reservation is created.
+    if retry != AbortRetry::Retained {
+        let pending = pending_metadata_command_for_test(&map, PgId::new(0), &bucket).unwrap();
+        assert_eq!(
+            retry.finish(&cluster, &pending).unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
+    }
     cleanup.abort(&session).unwrap();
     cleanup.abort(&session).unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(0), &bucket).is_none());
