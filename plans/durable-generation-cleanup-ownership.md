@@ -7024,3 +7024,44 @@ passed. Strict all-target/all-feature Clippy, storage boundary checks, formattin
 and `git diff --check` passed. The Raft heartbeat/checkpoint test was inspected
 and completed in 111.831s. The earlier full-suite validation blocker is resolved;
 the six original ignored durable-owner regressions remain open.
+
+
+## Applied Whole-MPU Abort Cleanup Before Retirement — 2026-11-03
+
+The companion whole-MPU path had the same retry-record gap as stream abort:
+`AbortMultipartUpload` deleted committed-part and active-session metadata, then
+removed its pending envelope before best-effort physical cleanup. A deterministic
+owner-local regression reproduced this with a real encrypted committed part and
+an independently staged active part: injected file failure returned `Applied`
+instead of retaining the command.
+
+Whole-MPU abort now performs its recorded physical cleanup at the shared applied
+command pre-removal boundary. Each committed segment uses its retained placement
+epoch and the shared file/ack cleanup scope. All committed segments and active
+session segments are attempted despite individual failures. The first error is
+returned and the exact pending command remains until reservation release and all
+physical participants confirm completion. The former post-removal best-effort
+pass is removed, avoiding duplicate effects and diagnostics on this path.
+
+The regression matrix covers foreground matching-pending abort, static recovery
+and the generic finisher, independently failing file or acknowledgement deletion
+on either the committed part or active session (twelve cases). It positively
+checks every file/ack before injection, requires all six file and acknowledgement
+attempts, verifies exact residual effects and the retained envelope, then retries
+and checks absent effects, absent upload and unchanged applied replica prefixes.
+No new schema, command encoding, transaction or ordinary-path fsync is added.
+
+This only retains the existing pending-envelope retry responsibility. It does
+not establish owner survival through primary replacement/compaction, cover
+unrecorded prepared writes, or revoke delayed requests. Completion and part
+replacement still have their existing cleanup policy. Durable owner/window and
+finite physical-write-authority integration, including all six ignored original
+regressions, remains outstanding.
+
+Validation before independent review: the pre-fix regression failed with
+`unconfirmed multipart cleanup must retain the applied abort: Applied`.
+All 30 focused multipart-abort/retained-stream-abort tests passed after the fix;
+the expanded twelve-case foreground/recovery/finisher matrix also passed.
+Full workspace Nextest passed all 9,326 tests (three slow, six existing skips)
+in 272.508s. Strict all-target/all-feature Clippy, formatting and diff checks
+passed. Independent source/test-design review approved this bounded fix.
