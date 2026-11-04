@@ -210,6 +210,191 @@ All source paths below are under `crates/storage/src/`.
    and measure retained state, cleanup delay/bytes, RPC cost, 4 KiB PUT and 8 MiB
    UploadPart before declaring completion.
 
+## Milestone 1 Implementation Proposal
+
+**Status: proposed, not implemented.** This translates the coordinated checklist
+into a concrete storage-private layout and transition map. It does not reopen the
+selected contract or propose another predecessor-evidence patch. Independent
+review and human approval of this proposal precede production changes. The
+coordinated state integration remains one coherent implementation boundary;
+internal work steps below are not independently shippable partial protocols.
+
+### Record layout and ownership
+
+Use four owner-controlled table families, with table/column spellings finalized
+with the implementation. All numeric values must fit their SQLite and wire
+domains before mutation; foreign keys supplement, not replace, semantic checks.
+
+| Table family | Key and contents | Relationships |
+| --- | --- | --- |
+| `payload_staging_owners` | Object-PG-local reservation/session ID; immutable owner revision; bucket/incarnation/key; originating object-PG epoch; target; payload generation; UploadPart's separate enclosing MPU generation; original allocation issuer; lifecycle; replicated reserved end; maximum issued cutoff | No foreign key to a reservation, session, upload or object. Identity collision is an invariant error, not adoption. |
+| `payload_staging_windows` | Owner/revision and segment index; derived hash; checked one-slot `[start,end)`; issuer; immutable absolute cutoff; codec and logical/stored/shard bounds; EC shape; exact data-PG/placement epoch; canonical file locations and independent ack participant | Owned by the owner only. Exact replay compares the complete descriptor, not just index/VID. Windows are immutable and retained after selection, publication and closure. |
+| `payload_staging_references` | Exact window/key selection and destination: active stream manifest, committed upload/part **generation**, completed object **generation**, or durable reclaim identity; retain the original physical subject through completion | Child of the owner/window, never cascading from the destination. A transfer replaces the destination binding atomically, not the physical key or original owner. Unselected windows have no reference, but remain obligations. |
+| `payload_staging_resources` | Owner and obligation role; explicit `LiveResponsibility` or `ReleaseDue`; stable exact proof identity and historical bucket-PG/epoch release route, separately from renewable deadline evidence | Independent creation and finalization roles for UploadPart. An owner with no resource obligations represents explicit `NoResource` in the typed aggregate, not an ambiguous missing proof. Generation-reservation responsibility is also explicit and bound to the exact owner subject. |
+
+Prefer normalized owner-owned participant rows if required to preserve canonical
+ordering and enforce uniqueness; these are children of a window, not a separate
+physical-intent protocol. Store exact participant identities, not just enough
+information to recompute placement from a later map. Pin the corresponding
+historical routes even for an entirely unused window. No duplicated live guard,
+serialized monotonic timestamp, remote capability or per-participant receipt is
+introduced.
+
+The immutable owner revision identifies the introduction; it is not a renewable
+lease or a session heartbeat counter. This first implementation has no exceptional
+rebind/retry-window revision. A fresh attempt gets a fresh storage-minted identity.
+Lifecycle and reference changes do not remint its issuer or cutoff.
+
+Use a closed lifecycle with `Active`, `Published` and `Retiring` states.
+`Active` permits only checked preparation/append and its first terminal outcome.
+`Published` forbids further attempt allocation/adoption but can retain selected
+references and unused windows. `Retiring` likewise forbids allocation/adoption;
+it records closed metadata responsibility, **not permission to delete**. Moving
+a selected binding to a completed object or reclaim record preserves its exact
+reference regardless of lifecycle. Only a later reviewed retirement protocol
+can erase an owner/window; milestone 1 has no owner-retirement scanner or deletion
+RPC. Published owners may therefore remain indefinitely in this first slice.
+
+### Allocation and deterministic application
+
+1. Reserve/create primary builders capture the actual primary's issuer, original
+   proof, placement/participants, bounded geometry and finite cutoff while under
+   the existing authority checks. Direct PUT geometry is a bound before encryption,
+   not a claim that final ciphertext/integrity already exists. The cutoff is the
+   minimum of the selected ten-second/five-minute cap and captured request/route
+   bounds, represented with existing portable absolute-deadline semantics.
+2. Apply validates the immutable descriptor and creates owner, resources, first
+   window and existing reservation/session atomically. Every replica persists
+   the builder's issuer. Apply never checks local wall time, current local issuer
+   continuity or cross-PG availability. Failure rolls back all new and old rows.
+3. For streams, retain `stream_uploads.next_segment_vid` as the local consumed
+   cursor, distinct from the owner's replicated reserved end. The first window
+   reserves `[MIN,MIN+1)` while the local cursor starts at `MIN`. Preparation
+   validates owner/window/session subject and live issuer under the existing PG
+   lock and immediate allocation transaction, rechecks the captured fence and
+   consumes exactly that slot. A second preparation, including after a lost
+   response, cannot consume it again. Witnesses need not have prepared the slot.
+4. Fresh append validates the selected segment against that exact window, including
+   physical identity, geometry and participants. The actual-primary builder
+   captures the next immutable descriptor from the replicated reserved end;
+   apply stores the segment and descriptor and advances the reserved end and
+   maximum horizon atomically. Existing local-cursor floor advancement must not
+   consume the next window on witnesses. Exact replay/reissue preserves both
+   windows and the captured next cutoff, without allocating another interval.
+5. Direct PUT uses its already reserved payload generation as its single physical
+   VID, not the stream allocator origin. Its owner/window and encrypted payload
+   binding must agree before staging. Reject arithmetic overflow at construction,
+   decoding, apply and checkpoint validation rather than saturating a horizon or
+   wrapping an interval.
+
+No changed command carries an optional owner descriptor for a legacy path.
+Existing independently tagged inner formats remain current-only; introducing
+these records must not create fallback inference from surviving manifests.
+
+### Custody and terminal transition map
+
+The current `DirectPutWriteScope` treats `GenerationAttempted` as frontend-owned
+on normal return and unwind; only `TerminalPublication` transfers custody. That
+must change in the same implementation as proof-bearing reservation commands.
+Use explicit outcomes separating authoritative pre-introduction rejection,
+accepted/materialized introduction, and uncertain introduction. Only the first
+returns the exact proof to generic frontend release. Accepted or uncertain
+introduction remains owned by command recovery/materialized owner, including
+panic/cancellation before staging. Do not classify transport error as absence,
+or allow another drainer to release a still-live introducing attempt's proof.
+Preserve exact-command reconciliation and existing finite request budgets; do not
+reconstruct an invalidated bucket reservation to keep the client attempt alive.
+
+| Transition | Atomic owner/reference/resource effect before old rows disappear |
+| --- | --- |
+| Direct PUT reservation succeeds | `Active` owner plus first window and live exact proof/generation responsibility; frontend no longer owns generic release. |
+| Stream creation succeeds | Same transaction as generation/session creation; PUT creation proof remains live, UploadPart creation proof becomes release-due when creation settles. Keep its evidence after successful idempotent release. |
+| Append succeeds | Add the selected stream reference and next window; preserve previous selections, unused scope and release evidence. |
+| Direct or streamed PUT commit | Transfer selected references to the exact published object generation; mark owner published and terminal resources release-due before reservation/session removal. |
+| UploadPart commit/replacement | Transfer selected references to exact upload/part payload generation; retain finalization proof separately from creation proof; move displaced part references to retained cleanup/reclaim responsibility before deleting old manifests. |
+| Multipart completion | Transfer every selected part's original owner/key references to the exact completed object generation without deriving owners from hashes; close omitted-part/active-session owners and retain their windows and releases. Preserve accepted completion replay and selected ciphertext when cleanup participants fail. |
+| Stream/whole-MPU abort or Direct PUT release | Close the exact attempt, drop only its no-longer-selected manifest bindings, and retain windows/resource releases before session, MPU or reservation removal. |
+| Overwrite, delete/version removal, reclaim | Transfer displaced exact-generation bindings to the existing durable reclaim identity before removing live manifests; successful existing cleanup may leave conservative owner evidence for later reinspection. |
+| Authoritatively unstarted command abandonment | Preserve already materialized ownership and transfer unresolved release responsibility under the existing command-install serialization; recover uncertain/started commands rather than treating abandonment as proof of absence. |
+
+Keep current pre-removal abort/part-replacement retry checks and current completion
+cleanup while this state-only slice lands. Retaining an owner does not make those
+physical deletes safe against delayed writes. Do not relax pending-slot retention,
+add a new owner-driven delete path or describe this milestone as completion of
+physical cleanup. Milestones 2–3 must replace the unguarded completion path and
+supply autonomous confirmed retry, as required by the existing checklist.
+
+### Semantic, route and format integration
+
+Provide one owner-local validation implementation reused by builders, decoded
+apply and checkpoint validation. It checks both directions of the relationships:
+every selected reference names its exact window/key and valid destination, and
+every affected live manifest has the corresponding selected ownership. Validate
+crossed bucket incarnations, payload versus MPU generations, target/part,
+issuer, derived hash, interval disjointness, cutoff/horizon, geometry, canonical
+participants, lifecycle and resource roles. Never validate an expired window by
+looking at current time during replay/import. Owner-only unused scope and retained
+release-due evidence remain valid when their old destination/session is absent.
+
+Add all tables/children to the complete canonical inventory, deterministic row
+ordering, digest, checkpoint export/import and semantic validation. Import checks
+the complete staged state before replacement. Reopen/replacement changes local
+allocation lifetime, not imported owner/window identities. Log/receipt compaction
+must not affect materialized owner responsibility.
+
+Extend both summary and exact historical-route enumeration in `pg_store.rs`,
+pending-command enumeration and applicable scavenger/backfill reference queries.
+The current summary reads live placements, backfill, pending-slot/bucket-proof
+resources and reclaim claims; the exact path similarly has no owner/window
+sources. Add owner recovery epochs, every window's file/ack routes and every
+retained release route, including pending introductions of future windows.
+Do not assume an empty session or manifest inventory means a route is unreferenced.
+
+Reconfirmed source baseline for this proposal: PG schema 10; applied command 13;
+canonical state 9; checkpoint 7; storage RPC 34. Use the consolidated audit above
+as parent evidence and compare actual changed writers against it. Advance affected
+grammars once at the coherent implementation commit, keep every predecessor
+literal unchanged, and add new populated owner/window/resource/reference and
+containment-vector specimens. Do not preassign version numbers or automatically
+bump an unchanged independently versioned outer grammar. Check carrier limits
+and correctly sealed noncurrent rejection before dispatch/mutation.
+
+### Implementation work order and validation
+
+Work internally in this order, without committing incomplete intermediate states:
+
+1. Typed records, central invariants and SQL/canonical/checkpoint membership.
+2. Reserve/create/append builder inputs, command/RPC encoding and exact retry
+   matching; checked preparation; Direct PUT introduction custody/recovery.
+3. Every terminal/reference/resource transfer above, with route-reference queries
+   and existing cleanup guarantees preserved.
+4. New immutable current-format and containment evidence; populated-state and
+   production-path acceptance tests; cost comparison and final review.
+
+Use deterministic fault hooks, not sleeps. Tests must cover the checklist's
+rollback, lost preparation response, witness-first apply, exact reissue,
+same-node/new-lifetime rejection over embedded and installed Unix routes,
+independent unresolved UploadPart creation/finalization releases, every terminal
+transfer, compaction/import/reopen and two route transitions. Assert exact selected
+references, retained empty windows, historical ack/file/release participants and
+no partial mutation on deliberately crossed decoded state. Keep all six original
+ignored regressions unchanged and explicitly unresolved.
+
+Record before/after ordinary-path command, transaction and fsync counts with
+identical deterministic Direct PUT, streamed PUT and UploadPart workloads; do not
+infer zero cost merely from the absence of a new publisher. Report added row/byte
+and carrier overhead separately. No AWS behavior is being newly specified by
+these internal records; use targeted project AWS scripts only if implementation
+changes or exposes uncertain external outcomes.
+
+For implementation review, provide actual focused-test commands/results and an
+ordered final validation plan including storage doctests and
+`./scripts/check-storage-cluster-boundaries`, followed by formatting, strict
+all-target/all-feature Clippy and the admitted full `cargo nextest run` last.
+Any newly affected writer missing parent evidence or unexpected protocol change
+is a stop-and-review boundary, not permission for a shortcut or another partial
+production commit.
+
 ## Historical Progress And Supporting Decisions
 
 The sections below retain the design evolution and evidence for each landed
