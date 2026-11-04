@@ -42,6 +42,25 @@ not unit test coverage.
 Always run the full test suite before comitting in case something unexpected breaks. Use `cargo nextest run`
 fir running tests as it is faster than `cargo test`.
 
+Final validation runs cheap checks before the full suite, in this order:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo nextest run
+```
+
+Before starting the full suite, wait if another same-user nextest run is active
+(including in another checkout) or the host's 1-minute load exceeds 10. Wait
+rather than overlap full suites or kill another session's tests. Any command that
+may compile, including project test wrappers, needs an unbounded or long timeout
+(at least 3600 seconds if an explicit timeout is required); cold builds can take
+much longer than a short interactive-command budget.
+
+Run only specific relevant AWS tests through the project scripts unless the user
+explicitly requests the entire AWS suite. Do not automatically run `scripts/ci`
+or the full AWS suite as a substitute for the final checks above.
+
 We have tried to fix convergence issues on AWS, where some control plane (not data plane) operations take time
 to converge. There may be a few cases left. Locally most operations are immediate, although DeleteBucket does
 take time to converge.
