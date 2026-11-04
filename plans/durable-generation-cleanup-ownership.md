@@ -144,7 +144,11 @@ All source paths below are under `crates/storage/src/`.
 - [ ] At implementation start verify parent evidence for the **current** vector:
   PG schema 10, command 13, canonical state 9, checkpoint 7, storage RPC 34.
   Earlier plan snapshots naming schema 9/command 12/RPC 30 are historical, not
-  the next bump's baseline. Do not preassign the next numbers.
+  the next bump's baseline. Do not preassign the next numbers. The
+  [consolidated predecessor audit](#consolidated-predecessor-evidence-audit--2026-11-04)
+  records the verified baseline and closes the identified shared-record branch
+  gaps; compare the actual implementation diff with that inventory, rather than
+  starting another isolated evidence patch by default.
 - [ ] Follow [versioning](../guides/versioning.md) and the
   [format ledger](../guides/storage-format-ledger.md): freeze any missing exact
   current evidence in a separately validated parent commit before changing its
@@ -7462,3 +7466,72 @@ canary, all 43 metadata-command tests passed in 0.493s. Independent source/test-
 review approved the evidence-only slice. Full workspace Nextest passed all 9,333
 tests (one slow, six existing skips) in 242.863s. Strict all-target/all-feature
 Clippy, formatting and diff checks passed.
+
+## Consolidated Predecessor Evidence Audit — 2026-11-04
+
+The user approved one consolidated evidence prerequisite before coordinated
+owner/window integration, rather than continuing a series of isolated branch
+patches. Source inspection confirms PG schema 10, applied command 13, canonical
+state 9, checkpoint 7 and storage RPC 34. The
+[ledger audit](../guides/storage-format-ledger.md#consolidated-ownerwindow-predecessor-evidence-audit--2026-11-04)
+records the exact existing evidence and its scope; older per-format inventory
+entries must not be mistaken for current writer values.
+
+### Audit inventory and disposition
+
+| First-slice boundary | Predecessor evidence and audit result |
+| --- | --- |
+| Reserve/create/append command grammar | Original object-command corpus pins reservations, both stream targets and both creation cleanup-deadline arms. The earlier cleanup supplement pins target/integrity and abort-proof alternatives. No new reservation or session-continuity protocol is introduced. |
+| Shared object/cleanup records | The new 28-case `metadata_command_v13_owner_record_branches.hex` pins missing object/part-segment integrity, both part-record checksums, initiated delete-marker identity, object/upload optional metadata and retention/noncurrent branches. The executable inventory requires both arms of 22 named optional fields across all current object corpora, all initiated-identity alternatives, both retention modes and every legal-hold state for each object/upload family. |
+| Terminal transfers, abort, displacement and reclaim | The existing terminal supplement pins absent/standard/multipart stale payload, selected-versus-omitted/active completion payload and previous-part absence/presence. Original bytes pin delete target/mode, delete-marker displacement, whole-MPU abort and both reclaim kinds. Shared record helpers are covered once per field, not a Cartesian matrix of every occurrence. |
+| Schema/canonical/checkpoint | The full schema-v10 catalogue, exact canonical row/table/aggregate vectors and checkpoint-v7/canonical-v9/PG-v10 literal already exist. Checkpoint bytes cover complete inventory and a populated MPU row, not every populated materialized family. The owner/window change must add its own populated row/validation/export/reopen specimens together with the new vector. |
+| Reserve/create/append RPC inputs | The two reservation-builder deadline payload goldens, eight append-builder target/witness/deadline payload goldens and 37 current stream-creation frames already pin the affected construction inputs. The latter includes optional expected command, cleanup/effect deadlines, precondition alternatives and command responses. Reservation/acknowledgement lifecycle corpora and frame/authentication composites remain unchanged. |
+| Containment on advancement | New command/checkpoint and canonical-state vectors must be appended in storage-RPC, transfer/proof, authentication and control-plane composites as required by their dependency ledger. Independently tagged payload changes do not automatically bump unchanged outer grammars. This prerequisite adds no new capability, row, field or format version. |
+
+The new literal file is 60,898 bytes, SHA-256
+`b37f01904ef435998cc4d1669075e43ff74fb410fba87ef844b38e299b460ba2`.
+Tests compare all named cases with the unchanged writer and decode the literals
+independently; they check CRCs/counts/duplicate names, every truncation, trailing
+bytes, full/header rejection of versions 12/14, and unknown optional, initiated-
+identity and legal-hold tags through both readers. Literal assertions separately
+pin checksum contents and selected/displaced roles, exact marker identity and
+noncurrent time. The part fixtures preserve the predecessor's part-2/part-3
+mismatch and require subject rejection. They do not demonstrate successful apply,
+publication, cleanup authorization or physical exclusion.
+
+The first focused run exposed a test-only assumption: seed 17 is the checksum-
+bearing MPU constructor with a **live** initiated-object identity (tag 1), not
+absence (tag 0). Source inspection confirmed that branch; the negative-tag test
+now pins the actual 1-to-2 replacement before corrupting tag 2 to 3. No fixture
+or production behavior was altered to accommodate the assumption. Temporary
+capture code was removed after taking the unchanged-writer specimens.
+
+### Gate outcome and remaining production work
+
+This closes the identified shared-record branch gaps for the stated first-slice
+encoder inventory. No further missing predecessor bytes were identified within
+that scope. It is not a claim that every RPC family, scalar enum combination or
+populated checkpoint row has been exhaustively audited. At implementation start,
+compare actual changed writers with this inventory and preserve these literals
+in the separately validated parent; newly affected writers still need their own
+predecessor evidence. There is no proposed follow-on adjacent cleanup patch.
+
+Milestone 1 remains the next substantive work: retained owners/windows, atomic
+resource custody and exact terminal transfers including multipart completion.
+Milestones 2–3 must still deliver finite physical authority and autonomous
+confirmed cleanup. No production behavior, schema/version or command/fsync cost
+changes here; all six original ignored regressions remain unresolved. No AWS
+experiment was run or new AWS behavior established.
+
+Validation before independent review: strict all-target/all-feature Clippy,
+formatting and diff checks passed. After correcting the seed assertion, the
+intermediate selections passed 217 command/schema/RPC tests and 12 command-log
+tests. The final combined selection passed all **233** tests in **0.430s**,
+including all 47 metadata-command tests, canonical/checkpoint fixtures, RPC
+corpora/caps, authentication binding v2 and control-plane state/command composite
+goldens. Independent review approved the scoped evidence-only prerequisite with
+no findings. The admitted full workspace Nextest run passed all **9,337** tests
+(one slow, six existing skips) in **260.389s**; strict all-target/all-feature
+Clippy, formatting and diff checks passed. Validation logs and the independent
+review are in
+`/home/justin/.pi/agent/review-cycles/c2137d55-c229-47e7-bc5c-5de100dac832`.

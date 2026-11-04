@@ -6497,6 +6497,507 @@ mod tests {
         }
     }
 
+    // Consolidated predecessor evidence for shared object/cleanup record branches.
+    // Seeds retain the original codec-only profiles, including deliberately
+    // inconsistent subjects. Neither these specimens nor decoding authorize apply.
+    fn owner_record_branch_specimens() -> BTreeMap<String, MetadataCommandEnvelope> {
+        let commands = immutable_v13_sse_s3_v5_object_command_bytes()
+            .into_iter()
+            .map(|bytes| decode_metadata_command_envelope_for_test(&bytes).unwrap())
+            .collect::<Vec<_>>();
+        let mut specimens = BTreeMap::new();
+        macro_rules! specimen {
+            ($name:literal, $index:literal, $variant:ident, $command:ident, $change:block) => {{
+                let mut payload = commands[$index].payload().clone();
+                let MetadataCommandPayload::$variant($command) = &mut payload else {
+                    panic!("wrong seed for {}", $name)
+                };
+                $change
+                assert!(specimens.insert(
+                    $name.to_owned(),
+                    MetadataCommandEnvelope::new(commands[$index].id(), payload),
+                ).is_none());
+            }};
+        }
+        let retention = |mode| {
+            Some(ObjectRetention {
+                mode,
+                retain_until_unix_seconds: 987_654,
+            })
+        };
+        let witness = |k, m, size| {
+            Some(
+                crate::types::SegmentShardIntegrityRecord::for_zero_filled_segment(
+                    EcShape { k, m },
+                    size,
+                )
+                .1,
+            )
+        };
+        let checksum = || Some(checksum::ChecksumBytes::new([0x12, 0x34, 0x56, 0x78]).unwrap());
+        specimen!("put-tags", 3, CommitDirectPutObject, c, {
+            c.object.tags = Some(SerializedTagSet::default());
+        });
+        specimen!("put-no-metadata", 3, CommitDirectPutObject, c, {
+            c.object.metadata_blob = None;
+        });
+        specimen!("put-no-system-metadata", 3, CommitDirectPutObject, c, {
+            c.object.system_metadata_blob = None;
+        });
+        specimen!("put-governance", 3, CommitDirectPutObject, c, {
+            c.object.object_lock.retention = retention(ObjectLockMode::Governance);
+        });
+        specimen!("put-compliance", 3, CommitDirectPutObject, c, {
+            c.object.object_lock.retention = retention(ObjectLockMode::Compliance);
+        });
+        specimen!("put-hold-on", 3, CommitDirectPutObject, c, {
+            c.object.object_lock.legal_hold = StoredLegalHoldStatus::On;
+        });
+        specimen!("put-hold-off", 3, CommitDirectPutObject, c, {
+            c.object.object_lock.legal_hold = StoredLegalHoldStatus::Off;
+        });
+        specimen!("put-integrity", 3, CommitDirectPutObject, c, {
+            let s = &mut c.segments[0];
+            s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+        });
+        specimen!("metadata-no-metadata", 12, PutObjectMetadata, c, {
+            c.object.metadata_blob = None;
+        });
+        specimen!("metadata-no-system-metadata", 12, PutObjectMetadata, c, {
+            c.object.system_metadata_blob = None;
+        });
+        specimen!("metadata-noncurrent", 12, PutObjectMetadata, c, {
+            c.object.became_noncurrent_at = Some(876_543);
+        });
+        specimen!("metadata-compliance", 12, PutObjectMetadata, c, {
+            c.object.object_lock.retention = retention(ObjectLockMode::Compliance);
+        });
+        specimen!("metadata-hold-off", 12, PutObjectMetadata, c, {
+            c.object.object_lock.legal_hold = StoredLegalHoldStatus::Off;
+        });
+        specimen!("upload-no-tags", 17, CreateMultipartUpload, c, {
+            c.upload.tags = None;
+        });
+        specimen!("upload-marker-identity", 17, CreateMultipartUpload, c, {
+            c.upload.initiated_object_identity =
+                Some(crate::MultipartObjectIdentity::DeleteMarker {
+                    version_id: VersionId::from_u64(71),
+                    write_sequence: 83,
+                });
+        });
+        specimen!("upload-governance", 17, CreateMultipartUpload, c, {
+            c.upload.object_lock.retention = retention(ObjectLockMode::Governance);
+        });
+        specimen!("upload-compliance", 17, CreateMultipartUpload, c, {
+            c.upload.object_lock.retention = retention(ObjectLockMode::Compliance);
+        });
+        specimen!("upload-hold-on", 17, CreateMultipartUpload, c, {
+            c.upload.object_lock.legal_hold = StoredLegalHoldStatus::On;
+        });
+        specimen!("upload-hold-off", 17, CreateMultipartUpload, c, {
+            c.upload.object_lock.legal_hold = StoredLegalHoldStatus::Off;
+        });
+        specimen!("complete-selected-checksum", 5, CommitMultipartObject, c, {
+            c.parts[0].checksum = checksum();
+        });
+        specimen!("complete-omitted-checksum", 5, CommitMultipartObject, c, {
+            c.omitted_parts[0].checksum = checksum();
+        });
+        specimen!(
+            "complete-selected-integrity",
+            5,
+            CommitMultipartObject,
+            c,
+            {
+                let s = &mut c.selected_streaming_segments[0];
+                s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+            }
+        );
+        specimen!("complete-omitted-integrity", 5, CommitMultipartObject, c, {
+            let s = &mut c.omitted_streaming_segments[0];
+            s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+        });
+        specimen!("complete-active-integrity", 5, CommitMultipartObject, c, {
+            let s = &mut c.stream_upload_segments[0];
+            s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+        });
+        specimen!("part-new-checksum", 24, CommitStreamPart, c, {
+            c.part.checksum = checksum();
+        });
+        specimen!("part-old-checksum", 24, CommitStreamPart, c, {
+            c.existing_part.as_mut().unwrap().checksum = checksum();
+        });
+        specimen!("part-selected-integrity", 24, CommitStreamPart, c, {
+            let s = &mut c.segments[0];
+            s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+        });
+        specimen!("part-displaced-integrity", 24, CommitStreamPart, c, {
+            let s = &mut c.displaced_segments[0];
+            s.shard_integrity = witness(s.ec_k, s.ec_m, s.size);
+        });
+        specimens
+    }
+
+    fn immutable_v13_owner_record_branch_bytes() -> BTreeMap<String, Vec<u8>> {
+        immutable_named_command_bytes(
+            include_str!("metadata_command_v13_owner_record_branches.hex"),
+            28,
+        )
+    }
+
+    #[test]
+    fn owner_record_v13_writer_and_decoder_match_immutable_evidence() {
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 13);
+        let expected = owner_record_branch_specimens();
+        let frozen = immutable_v13_owner_record_branch_bytes();
+        assert_eq!(
+            frozen.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, bytes) in &frozen {
+            assert_eq!(*bytes, expected[name].command_bytes(), "{name}");
+            let decoded = decode_metadata_command_envelope_for_test(bytes).unwrap();
+            assert_eq!(decoded, expected[name], "{name}");
+            assert_applied_log_decoder_accepts(&decoded);
+            for end in 0..bytes.len() {
+                assert!(
+                    decode_metadata_command_envelope_for_test(&bytes[..end]).is_err(),
+                    "{name}: truncation at {end}"
+                );
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(
+                decode_metadata_command_envelope_for_test(&trailing).is_err(),
+                "{name}"
+            );
+            let offset = 4 + METADATA_COMMAND_MAGIC.len();
+            assert_eq!(&bytes[offset..offset + 2], &13_u16.to_le_bytes());
+            for version in [12_u16, 14] {
+                let mut noncurrent = bytes.clone();
+                noncurrent[offset..offset + 2].copy_from_slice(&version.to_le_bytes());
+                assert_unsupported_applied_command(&noncurrent, version);
+            }
+        }
+    }
+
+    #[test]
+    fn owner_record_v13_literal_optional_tags_are_checked_by_both_readers() {
+        let originals = immutable_v13_sse_s3_v5_object_command_bytes();
+        for (name, bytes) in immutable_v13_owner_record_branch_bytes() {
+            let index = if name.starts_with("put-") {
+                3
+            } else if name.starts_with("metadata-") {
+                12
+            } else if name.starts_with("upload-") {
+                17
+            } else if name.starts_with("complete-") {
+                5
+            } else {
+                assert!(name.starts_with("part-"));
+                24
+            };
+            // Each specimen changes exactly one field. Framing has no enclosing
+            // length/checksum prefix that could obscure its first changed tag.
+            let offset = originals[index]
+                .iter()
+                .zip(&bytes)
+                .position(|(old, new)| old != new)
+                .unwrap();
+            let mut malformed = bytes;
+            if name == "upload-marker-identity" {
+                // Seed 17 has a live initiated object (tag 1), not absence.
+                assert_eq!((originals[index][offset], malformed[offset]), (1, 2));
+                malformed[offset] = 3;
+            } else if name.contains("-hold-") {
+                assert_eq!(originals[index][offset], 0);
+                assert!(matches!(malformed[offset], 1 | 2));
+                malformed[offset] = 3;
+            } else {
+                assert!(
+                    matches!(
+                        (originals[index][offset], malformed[offset]),
+                        (0, 1) | (1, 0)
+                    ),
+                    "{name}"
+                );
+                malformed[offset] = 2;
+            }
+            assert!(
+                decode_metadata_command_envelope_for_test(&malformed).is_err(),
+                "{name}"
+            );
+            assert!(
+                decode_metadata_command_log_entry_header(&malformed).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_record_v13_literal_values_do_not_imply_publication_authority() {
+        for (name, bytes) in immutable_v13_owner_record_branch_bytes() {
+            let command = decode_metadata_command_envelope_for_test(&bytes).unwrap();
+            let expected_checksum = [0x12, 0x34, 0x56, 0x78];
+            match command.payload() {
+                MetadataCommandPayload::CreateMultipartUpload(c)
+                    if name == "upload-marker-identity" =>
+                {
+                    assert_eq!(
+                        c.upload.initiated_object_identity,
+                        Some(crate::MultipartObjectIdentity::DeleteMarker {
+                            version_id: VersionId::from_u64(71),
+                            write_sequence: 83,
+                        })
+                    );
+                }
+                MetadataCommandPayload::PutObjectMetadata(c) if name == "metadata-noncurrent" => {
+                    assert_eq!(c.object.became_noncurrent_at, Some(876_543));
+                }
+                MetadataCommandPayload::CommitMultipartObject(c)
+                    if name == "complete-selected-checksum" =>
+                {
+                    assert_eq!(
+                        c.parts[0].checksum.as_ref().unwrap().as_slice(),
+                        expected_checksum
+                    );
+                    assert_eq!(c.omitted_parts[0].checksum, None);
+                }
+                MetadataCommandPayload::CommitMultipartObject(c)
+                    if name == "complete-omitted-checksum" =>
+                {
+                    assert_eq!(
+                        c.omitted_parts[0].checksum.as_ref().unwrap().as_slice(),
+                        expected_checksum
+                    );
+                    assert_eq!(c.parts[0].checksum, None);
+                }
+                MetadataCommandPayload::CommitStreamPart(c) => {
+                    // Preserve the predecessor's part-2 record / part-3 segment
+                    // mismatch as codec evidence, never a valid apply fixture.
+                    assert_eq!(c.part.part_number, 2);
+                    assert_eq!(c.segments[0].part_number, 3);
+                    assert!(!c.has_consistent_subject());
+                    if name == "part-new-checksum" {
+                        assert_eq!(
+                            c.part.checksum.as_ref().unwrap().as_slice(),
+                            expected_checksum
+                        );
+                        assert_eq!(c.existing_part.as_ref().unwrap().checksum, None);
+                    } else if name == "part-old-checksum" {
+                        assert_eq!(
+                            c.existing_part
+                                .as_ref()
+                                .unwrap()
+                                .checksum
+                                .as_ref()
+                                .unwrap()
+                                .as_slice(),
+                            expected_checksum
+                        );
+                        assert_eq!(c.part.checksum, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Shared record fields, not a Cartesian product of every command occurrence.
+    // This inventory makes the audit executable: each distinct optional field has
+    // both arms in independently frozen commands. Retention and initiated-object
+    // identity additionally distinguish all of their nested sum alternatives.
+    #[test]
+    fn owner_record_v13_literal_inventory_covers_each_optional_field() {
+        use std::collections::BTreeSet;
+        let mut seen = BTreeMap::<&str, BTreeSet<&str>>::new();
+        let mut option = |field, present| {
+            seen.entry(field)
+                .or_default()
+                .insert(if present { "some" } else { "none" });
+        };
+        // Keep non-option alternatives separate from the presence inventory.
+        let mut retention_modes = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        let mut holds = BTreeSet::new();
+        let mut bytes = immutable_v13_sse_s3_v5_object_command_bytes();
+        bytes.extend(immutable_v13_cleanup_branch_bytes().into_values());
+        bytes.extend(immutable_v13_terminal_transfer_bytes().into_values());
+        bytes.extend(immutable_v13_owner_record_branch_bytes().into_values());
+        for bytes in bytes {
+            let command = decode_metadata_command_envelope_for_test(&bytes).unwrap();
+            let payload = command.payload();
+            let mut locks = Vec::new();
+            let mut uploads = Vec::new();
+            let mut parts = Vec::new();
+            let mut part_segments = Vec::new();
+            let mut stream_segments = Vec::new();
+            let object = match payload {
+                MetadataCommandPayload::CommitDirectPutObject(c) => {
+                    for s in &c.segments {
+                        option("object_segment.integrity", s.shard_integrity.is_some());
+                    }
+                    Some(&c.object)
+                }
+                MetadataCommandPayload::CommitMultipartObject(c) => {
+                    for p in &c.parts {
+                        option("object_part.checksum", p.checksum.is_some());
+                    }
+                    parts.extend(&c.omitted_parts);
+                    part_segments.extend(&c.selected_streaming_segments);
+                    part_segments.extend(&c.omitted_streaming_segments);
+                    stream_segments.extend(&c.stream_upload_segments);
+                    Some(&c.object)
+                }
+                MetadataCommandPayload::PutObjectMetadata(c) => {
+                    let o = &c.object;
+                    option("live.tags", o.tags.is_some());
+                    option("live.metadata", o.metadata_blob.is_some());
+                    option("live.system_metadata", o.system_metadata_blob.is_some());
+                    option("live.noncurrent", o.became_noncurrent_at.is_some());
+                    locks.push(("live.retention", o.object_lock));
+                    None
+                }
+                MetadataCommandPayload::CreateMultipartUpload(c) => {
+                    uploads.push(&c.upload);
+                    None
+                }
+                MetadataCommandPayload::AbortMultipartUpload(c) => {
+                    uploads.push(&c.cleanup.upload);
+                    parts.extend(&c.cleanup.parts);
+                    part_segments.extend(&c.cleanup.streaming_segments);
+                    stream_segments.extend(&c.cleanup.stream_upload_segments);
+                    None
+                }
+                MetadataCommandPayload::CommitStreamPart(c) => {
+                    option("part.existing_part", c.existing_part.is_some());
+                    uploads.push(&c.upload);
+                    parts.push(&c.part);
+                    parts.extend(&c.existing_part);
+                    part_segments.extend(&c.segments);
+                    part_segments.extend(&c.displaced_segments);
+                    None
+                }
+                MetadataCommandPayload::CreateStreamUpload(c) => {
+                    option("create.cleanup_after", c.cleanup_after.is_some());
+                    None
+                }
+                MetadataCommandPayload::AppendStreamSegment(c) => {
+                    stream_segments.push(&c.segment);
+                    None
+                }
+                MetadataCommandPayload::AbortStreamUpload(c) => {
+                    option(
+                        "abort.proof",
+                        c.stream_create_bucket_write_reservation.is_some(),
+                    );
+                    stream_segments.extend(&c.staged_segments);
+                    None
+                }
+                MetadataCommandPayload::CreateBucket(_)
+                | MetadataCommandPayload::PutBucketVersioning(_)
+                | MetadataCommandPayload::PutBucketAcl(_)
+                | MetadataCommandPayload::PutBucketProperty(_)
+                | MetadataCommandPayload::PutBucketSubresource(_)
+                | MetadataCommandPayload::MarkBucketDeleting(_)
+                | MetadataCommandPayload::DeleteFinalizedBucket(_)
+                | MetadataCommandPayload::ReserveObjectGeneration(_)
+                | MetadataCommandPayload::ReleaseObjectGeneration(_)
+                | MetadataCommandPayload::ReserveObjectVersion(_)
+                | MetadataCommandPayload::DeleteObjectVersion(_)
+                | MetadataCommandPayload::InsertDeleteMarker(_)
+                | MetadataCommandPayload::DeleteObjectPayloadReclaim(_)
+                | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => None,
+            };
+            if let Some(o) = object {
+                option("put.tags", o.tags.is_some());
+                option("put.metadata", o.metadata_blob.is_some());
+                option("put.system_metadata", o.system_metadata_blob.is_some());
+                locks.push(("put.retention", o.object_lock));
+            }
+            for u in uploads {
+                option("upload.tags", u.tags.is_some());
+                option("upload.checksum", u.checksum.is_some());
+                option("upload.identity", u.initiated_object_identity.is_some());
+                identities.insert(match u.initiated_object_identity {
+                    None => "none",
+                    Some(crate::MultipartObjectIdentity::Live { .. }) => "live",
+                    Some(crate::MultipartObjectIdentity::DeleteMarker { .. }) => "marker",
+                });
+                locks.push(("upload.retention", u.object_lock));
+            }
+            for (field, lock) in locks {
+                holds.insert((field, lock.legal_hold as u8));
+                option(field, lock.retention.is_some());
+                if let Some(retention) = lock.retention {
+                    retention_modes.insert((
+                        field,
+                        match retention.mode {
+                            ObjectLockMode::Governance => "governance",
+                            ObjectLockMode::Compliance => "compliance",
+                        },
+                    ));
+                }
+            }
+            for p in parts {
+                option("multipart_part.checksum", p.checksum.is_some());
+            }
+            for s in part_segments {
+                option("part_segment.integrity", s.shard_integrity.is_some());
+            }
+            for s in stream_segments {
+                option("stream_segment.integrity", s.shard_integrity.is_some());
+            }
+            for proof in payload.bucket_write_reservation_route_dependencies() {
+                option("proof.target", proof.target_context.is_some());
+            }
+        }
+        let fields = [
+            "abort.proof",
+            "create.cleanup_after",
+            "live.metadata",
+            "live.noncurrent",
+            "live.retention",
+            "live.system_metadata",
+            "live.tags",
+            "multipart_part.checksum",
+            "object_part.checksum",
+            "object_segment.integrity",
+            "part.existing_part",
+            "part_segment.integrity",
+            "proof.target",
+            "put.metadata",
+            "put.retention",
+            "put.system_metadata",
+            "put.tags",
+            "stream_segment.integrity",
+            "upload.checksum",
+            "upload.identity",
+            "upload.retention",
+            "upload.tags",
+        ];
+        let expected = fields
+            .into_iter()
+            .map(|field| (field, BTreeSet::from(["none", "some"])))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(seen, expected);
+        assert_eq!(identities, BTreeSet::from(["none", "live", "marker"]));
+        assert_eq!(
+            holds,
+            ["put.retention", "live.retention", "upload.retention"]
+                .into_iter()
+                .flat_map(|field| [(field, 0), (field, 1), (field, 2)])
+                .collect()
+        );
+        assert_eq!(
+            retention_modes,
+            ["put.retention", "live.retention", "upload.retention"]
+                .into_iter()
+                .flat_map(|field| [(field, "governance"), (field, "compliance")])
+                .collect()
+        );
+    }
+
     #[test]
     fn reservation_dispositions_keep_authorization_release_and_route_retention_distinct() {
         // Independent expectations for the immutable object-command corpus:

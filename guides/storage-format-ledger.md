@@ -20,6 +20,60 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Consolidated Owner/Window Predecessor Evidence Audit — 2026-11-04
+
+For the five formats below, this is the current implementation baseline. Older
+version numbers in the historical evidence descriptions and baseline inventory
+rows below are not the current writer values. Recheck these source constants
+before advancing a format; no writer changes in this evidence-only slice.
+
+| Format | Current version and owning source | Existing immutable evidence |
+| --- | --- | --- |
+| PG schema | 10, `pg_store/schema.rs` | `schema_manifests/pg_schema_v10.catalogue`, compared with the complete live SQLite catalogue |
+| Applied metadata command | 13, `metadata_command.rs` | Original 30-case v13/SSE-S3-v5 object corpus; cleanup, terminal-transfer and shared-record supplements; existing bucket/registry encoding goldens |
+| Canonical metadata state | 9, `control_plane.rs` / `pg_store/command_log.rs` | Fixed row/table/state digest vectors and canonical-v9/checkpoint-v7/PG-v10 composite |
+| Metadata checkpoint | 7, `pg_store.rs` / `pg_store/command_log.rs` | `testdata/checkpoint_v7_canonical_v9_pg_v10_sse_s3_v5.hex`, including the complete table/column inventory and one populated MPU row |
+| Storage RPC | 34, `storage_rpc/limits.rs` | Current frame/composite goldens; 37 stream-creation frames; unchanged two-arm reservation-builder and eight-case append-builder payload goldens; reservation and acknowledgement lifecycle corpora |
+
+The command audit follows the existing reserve/create/append and terminal
+encoders through their shared object, upload, part and segment records. It found
+missing present object/part-segment integrity witnesses, per-part checksums and
+initiated delete-marker identity, plus missing object/upload optional metadata,
+retention and noncurrent branches. The new
+`metadata_command_v13_owner_record_branches.hex` freezes **28** single-field
+variations from the unchanged writer: **60,898** file bytes, SHA-256
+`b37f01904ef435998cc4d1669075e43ff74fb410fba87ef844b38e299b460ba2`.
+
+An executable inventory over the original corpus and all three supplements
+requires both arms of **22 distinct optional fields**: put/live tags, metadata,
+system metadata and retention; live noncurrent timestamp; upload tags, checksum,
+initiated identity and retention; all three segment-record integrity fields;
+both part-record checksum fields; previous-part metadata; creation cleanup
+deadline; abort proof; and proof target context. It also requires all three
+initiated-identity alternatives, both retention modes and all three legal-hold
+states in each object/upload record family. Command-level stale-payload and
+cleanup-list alternatives remain pinned by the original and terminal corpora.
+This inventories shared record fields, not every occurrence or Cartesian
+combination. Independently versioned encryption/checksum/integrity leaf grammars
+retain their existing owner-local evidence.
+
+The new tests require exact case-set equality, CRCs, writer-byte equality,
+independent literal decoding, every truncation, trailing-byte rejection,
+full/header noncurrent-version rejection, and unknown optional/identity/hold tags
+through both readers. Separate literal assertions pin checksum payloads and
+selected-versus-displaced roles, initiated marker identity and noncurrent time.
+The inherited part-2/part-3 mismatch remains explicitly rejected by the subject
+predicate: these are codec specimens, not valid apply/publication fixtures.
+
+No further missing predecessor bytes were identified within this stated
+first-slice encoder/record inventory. This is not an exhaustive audit of all S3
+metadata, all RPC payload families or populated checkpoint rows. Compare the
+actual implementation diff with the inventory before bumping: newly affected
+writers outside it must still satisfy the parent-evidence rule. Existing files
+remain immutable. Opaque command/checkpoint carriers and authentication v2 keep
+their own grammar versions unless their fields change; append new containment
+vectors when the independently versioned inner representation advances.
+
 ## Terminal Transfer Encoding Evidence Before Owner/Window Integration — 2026-11-03
 
 `metadata_command_v13_terminal_transfers.hex` supplements the existing current
