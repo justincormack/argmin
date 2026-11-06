@@ -1,6 +1,7 @@
 # Plans and Current Roadmap
 
 Last reviewed: 2026-10-28. Cleanup design/model progress updated: 2026-10-29.
+Checkpoint-transfer workstream split recorded: 2026-11-06.
 
 This file is the authoritative entry point for repository plans. It records
 which work is current, what should happen next, and why other proposals are
@@ -28,7 +29,12 @@ documents.
 1. Fix [durable generation cleanup ownership](durable-generation-cleanup-ownership.md).
    Make the six ignored Direct PUT and stream late-write regressions pass by
    establishing one storage-owned write/cleanup exclusion contract.
-2. Resolve the remaining independent durability gaps recorded under
+2. Design and implement [bounded metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md)
+   as a separate workstream. Resolve the pre-existing durable/transport size
+   mismatch and aggregate-memory exposure without spool files or expanding the
+   storage interface. This gates cleanup-owner production activation, not its
+   ongoing protocol integration; the withdrawn paging experiment is not a fix.
+3. Resolve the remaining independent durability gaps recorded under
    [known gaps and required follow-up](../guides/durable-storage.md#known-gaps-and-required-follow-up):
    - [DUR-4](../guides/durable-storage.md#dur-4-mechanical-inventory-enforcement):
      mechanically enforce the persistence inventory.
@@ -39,10 +45,10 @@ documents.
    [DUR-3](../guides/durable-storage.md#dur-3-shard-unlink-durability-classification)
    now enforces durable unlink acknowledgement; write exclusion and durable
    cleanup ownership remain part of item 1, not solved by that barrier.
-3. Refresh and finish the [multihost production release gate](multihost-followup-plan.md):
+4. Refresh and finish the [multihost production release gate](multihost-followup-plan.md):
    outage/replacement/rejoin, historical payload backfill, failure containment,
    terminal convergence, operational diagnostics, and recovery controls.
-4. Use [bounded model checking](bounded-model-checking-plan.md) alongside the
+5. Use [bounded model checking](bounded-model-checking-plan.md) alongside the
    cleanup and multihost work. Model expansion supports the production fixes;
    it does not replace them.
 
@@ -81,7 +87,8 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Stream generation reservation and session creation now share one command. Next integrate retained owner/window state with replica/replay/export canaries. | Six ignored regressions remain unresolved. No added ordinary PUT/segment commit is the target; remote grants and finite bounds remain open. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Foundation checkpoint recorded; connect command descriptors, pending protection and frontend custody for coordinated activation. | Committing the foundations does not activate the protocol. Six ignored regressions remain unresolved. No added ordinary PUT/segment commit is the target. Checkpoint scalability is a separate activation dependency. |
+| Next | [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md) | Audit live PG sizes, capture allocations and the minimal bounded stream/transaction contract. | Separate workstream; no implementation active. No application spool files. Long receive transactions initially; database receive staging deferred. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |

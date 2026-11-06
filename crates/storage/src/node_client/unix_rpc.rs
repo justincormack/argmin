@@ -460,12 +460,26 @@ impl UnixStorageNodeClient {
         })?;
         let response =
             self.rpc_request(StorageRpcMessageKind::ShardScavengerReferencePage, payload)?;
-        decode_shard_scavenger_reference_page_response(&response).map_err(|error| {
+        let page = decode_shard_scavenger_reference_page_response(&response).map_err(|error| {
             self.rpc_payload_error(
                 "decode shard scavenger reference page response",
                 error.to_string(),
             )
-        })
+        })?;
+        // An incomplete page must supply a different resume position; a
+        // nonempty echo would otherwise keep the audit on this PG forever.
+        // Completion itself advances to the next PG, even with no items.
+        let stalled = !page.complete
+            && page
+                .items
+                .last()
+                .is_none_or(|item| after == Some(&item.cursor));
+        if page.items.len() > usize::from(limit.get()) || stalled
+            || page.items.iter().any(|item| matches!(&item.cursor,
+                ShardScavengerReferenceCursor::StagingWindow { pg_id: actual, .. } if *actual != pg_id.pg_id())) {
+            return Err(self.rpc_payload_error("decode shard scavenger reference page response", "crossed or non-progressing staging protection page".into()));
+        }
+        Ok(page)
     }
 
     fn list_placed_shard_scavenger_reference_page(

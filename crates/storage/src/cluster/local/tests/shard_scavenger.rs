@@ -926,6 +926,94 @@ fn cluster_shard_scavenger_revalidates_repair_after_reference_snapshot_changes()
 }
 
 #[test]
+fn staging_scavenger_protection_does_not_mask_committed_payload_repair() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let nodes = [0, 1, 2].map(NodeId::new);
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &nodes, &[0, 1, 2, 3], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let topology = map.node(nodes[0]).unwrap().storage_node().pg_topology();
+    let (bucket, key, _, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"published owner must not suppress live repair",
+    );
+    let missing = &committed.written.written_shards[0].key;
+    std::fs::remove_file(
+        cluster
+            .test_payload_shard_file_path(
+                committed.written.data_pg_id,
+                committed.written.ec,
+                &committed.segment_okh,
+                committed.generation_id,
+                missing.shard_index().get(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut pass = cluster.begin_shard_scavenger_audit_pass();
+    while pass.next_reference_pg_index < pass.pg_ids.len() {
+        cluster
+            .audit_next_shard_scavenger_pg(&mut pass)
+            .unwrap()
+            .unwrap();
+    }
+    // Add the exact owner projection alongside the real committed manifest.
+    // The owner inventory/Unix tests independently pin production projection.
+    let scan = &pass.referenced_scans[&committed.written.data_pg_id];
+    let file_nodes = (0..3)
+        .map(|index| {
+            NodeId::new(
+                scan.locations
+                    .iter()
+                    .find(|(_, key)| key.shard_index().get() == index)
+                    .unwrap()
+                    .0,
+            )
+        })
+        .collect();
+    let primary = map
+        .metadata_pg_primary_node(
+            ClusterEpoch::INITIAL,
+            PgId::new(committed.written.data_pg_id),
+        )
+        .unwrap()
+        .node_id();
+    let protection = crate::types::ShardScavengerStagingProtection {
+        identity: crate::types::ShardScavengerProtectedShardSetReference {
+            data_pg_id: committed.written.data_pg_id,
+            okh: committed.segment_okh,
+            generation_id: committed.generation_id,
+            ec: committed.written.ec,
+        },
+        placement_epoch: ClusterEpoch::INITIAL,
+        file_nodes,
+        acknowledgement_primary: primary,
+    };
+    let mut page_scans = HashMap::new();
+    cluster
+        .extend_staging_protection(&mut page_scans, &protection)
+        .unwrap();
+    crate::StorageCluster::merge_shard_scavenger_reference_page(&mut pass, page_scans).unwrap();
+    let mut observations = Vec::new();
+    while let Some(page) = cluster.audit_next_shard_scavenger_pg(&mut pass).unwrap() {
+        observations.extend(page);
+    }
+    assert!(observations.iter().any(|o| o.key.shard_key == *missing
+        && o.reason == crate::ShardScavengerObservationReason::ShardRowWithoutFile
+        && o.resolved_at.is_none()));
+    assert!(cluster
+        .list_placed_segment_shard_repairs(committed.written.data_pg_id)
+        .unwrap()
+        .iter()
+        .any(|repair| repair.work_item.shard_index == missing.shard_index()));
+}
+
+#[test]
 fn cluster_shard_scavenger_accepts_any_live_exact_repair_authority() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

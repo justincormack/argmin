@@ -649,6 +649,7 @@ pub(crate) fn decode_scavenger_payload_references_response(
 pub(crate) fn encode_shard_scavenger_reference_page_request(
     request: &StorageRpcShardScavengerReferencePageRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if let Some(cursor) = &request.after { validate_staging_cursor(cursor, Some(request.route.pg_id))?; }
     if request.limit.get() > SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: usize::from(request.limit.get()),
@@ -693,6 +694,7 @@ pub(crate) fn decode_shard_scavenger_reference_page_request(
             limit: usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT),
         });
     }
+    if let Some(cursor) = &after { validate_staging_cursor(cursor, Some(route.pg_id))?; }
     Ok(StorageRpcShardScavengerReferencePageRequest {
         route,
         after,
@@ -716,6 +718,7 @@ pub(crate) fn encode_shard_scavenger_reference_page_response(
         u16::try_from(page.items.len()).expect("bounded shard scavenger reference page fits in u16"),
     );
     for item in &page.items {
+        validate_scavenger_page_item(item)?;
         put_shard_scavenger_reference_cursor(&mut out, &item.cursor);
         put_scavenger_payload_reference(&mut out, &item.reference);
     }
@@ -741,13 +744,43 @@ pub(crate) fn decode_shard_scavenger_reference_page_response(
         if let ShardScavengerPayloadReference::Placed(placed) = &reference {
             validate_placed_scavenger_reference(placed)?;
         }
-        items.push(ShardScavengerReferencePageItem {
+        let item = ShardScavengerReferencePageItem {
             cursor,
             reference,
-        });
+        };
+        validate_scavenger_page_item(&item)?;
+        items.push(item);
     }
     decoder.finish()?;
     Ok(ShardScavengerReferencePage { items, complete })
+}
+
+fn validate_staging_cursor(cursor: &ShardScavengerReferenceCursor, pg: Option<PgId>) -> Result<(), StorageRpcPayloadError> {
+    if let ShardScavengerReferenceCursor::StagingWindow { pg_id, introduction_index, .. } = cursor {
+        if *introduction_index == 0 || pg.is_some_and(|pg| pg != *pg_id) {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid staging protection cursor subject"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_staging_protection(protection: &crate::types::ShardScavengerStagingProtection) -> Result<(), StorageRpcPayloadError> {
+    let ec = protection.identity.ec;
+    if ec::EcConfig::new(ec.k, ec.m).is_err()
+        || protection.file_nodes.len() != usize::from(ec.k) + usize::from(ec.m)
+        || protection.file_nodes.iter().collect::<std::collections::HashSet<_>>().len() != protection.file_nodes.len() {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid staging protection participants"));
+    }
+    Ok(())
+}
+
+fn validate_scavenger_page_item(item: &ShardScavengerReferencePageItem) -> Result<(), StorageRpcPayloadError> {
+    validate_staging_cursor(&item.cursor, None)?;
+    match (&item.cursor, &item.reference) {
+        (ShardScavengerReferenceCursor::StagingWindow { .. }, ShardScavengerPayloadReference::StagingProtection(protection)) => validate_staging_protection(protection),
+        (ShardScavengerReferenceCursor::StagingWindow { .. }, _) | (_, ShardScavengerPayloadReference::StagingProtection(_)) => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("crossed staging protection page item")),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn encode_shard_scavenger_reference_match_request(

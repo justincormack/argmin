@@ -170,7 +170,12 @@ fn stream_creation_evidence_checkpoint_import_keeps_ownership_without_old_log_id
         let destination = PgStore::open(destination_dir.path(), 1).unwrap();
         let epoch = ClusterEpoch::new(2).unwrap();
         let installed = destination
-            .install_metadata_transfer_checkpoint_base(1, epoch, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                1,
+                epoch,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+            )
             .unwrap();
         assert_eq!(installed.cluster_epoch, epoch);
         assert_eq!(installed.applied_log_index, 0);
@@ -216,7 +221,12 @@ fn stream_creation_evidence_witness_rows_are_not_primary_settlement() {
             .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
             .unwrap();
         witness
-            .install_metadata_transfer_checkpoint_base(1, ClusterEpoch::INITIAL, &base)
+            .install_metadata_transfer_checkpoint_base(
+                1,
+                ClusterEpoch::INITIAL,
+                &base,
+                &crate::pg_topology::PgTopology::new(&[witness.pg_id]).unwrap(),
+            )
             .unwrap();
         let command = envelope(&create, 1);
         primary

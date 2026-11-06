@@ -506,6 +506,16 @@ impl RequestWorkBudget {
         Ok(())
     }
 
+    /// Revalidate time within an already admitted attempt without charging a
+    /// second attempt. The owner loop remains responsible for retry counting.
+    fn check_deadline(&self, context: &'static str) -> Result<(), StoreError> {
+        if self.started.elapsed() >= self.budget {
+            self.emit_budget_exhausted(context);
+            return Err(StoreError::MetadataCommandContention { context });
+        }
+        Ok(())
+    }
+
     fn sleep_after_contention(&mut self, context: &'static str) -> Result<(), StoreError> {
         if self.started.elapsed() >= self.budget
             || self
@@ -715,6 +725,10 @@ struct ShardScavengerRepairAuthority {
 #[derive(Debug, Default, Clone)]
 struct ShardScavengerReferenceScan {
     locations: HashSet<ShardScavengerLocationIdentity>,
+    // Responsibility suppresses orphan diagnostics without asserting a write
+    // occurred. Keep it separate from expected readable shard locations.
+    staging_files: HashSet<ShardScavengerLocationIdentity>,
+    staging_acknowledgements: HashSet<ShardScavengerLocationIdentity>,
     repair_work_by_shard: HashMap<ShardScavengerRepairIdentity, ShardScavengerRepairCandidate>,
 }
 

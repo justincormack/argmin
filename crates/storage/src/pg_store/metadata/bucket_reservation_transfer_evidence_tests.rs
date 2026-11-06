@@ -135,7 +135,12 @@ fn bucket_reservation_discovery_survives_local_reopen_but_is_not_transferred() {
     let epoch = ClusterEpoch::new(2).unwrap();
     let source_changes = source.conn.total_changes();
     destination
-        .install_metadata_transfer_checkpoint_base(1, epoch, &evidence.checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            1,
+            epoch,
+            &evidence.checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
     drop(destination);
     let destination = PgStore::open(destination_dir.path(), 0).unwrap();
@@ -182,7 +187,12 @@ fn bucket_reservation_discovery_is_lost_when_local_checkpoint_replaces_bucket_ro
     // The current bucket-row FK cascades to local coordination rows, which are
     // absent from the checkpoint and therefore are not restored by installation.
     store
-        .install_metadata_transfer_checkpoint_base(0, epoch, &evidence.checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            0,
+            epoch,
+            &evidence.checkpoint,
+            &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
+        )
         .unwrap();
     assert_replicated_state(&store, &evidence, epoch);
     assert!(store
@@ -221,6 +231,7 @@ fn bucket_reservation_discovery_is_restored_when_checkpoint_replacement_rolls_ba
             0,
             ClusterEpoch::new(2).unwrap(),
             &evidence.checkpoint,
+            &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
         )
         .unwrap_err();
     assert!(

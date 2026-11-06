@@ -9,10 +9,15 @@ use crate::metadata_command::{MetadataTransferCommand, PendingMetadataCommandIns
 use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
+use std::time::Instant;
 
 #[cfg(test)]
 #[path = "pending_slot_effect_tests.rs"]
 mod pending_slot_effect_tests;
+
+#[cfg(test)]
+#[path = "pending_index_format_tests.rs"]
+mod pending_index_format_tests;
 
 #[cfg(test)]
 type PendingSlotEffectHook = Box<dyn FnOnce(bool)>;
@@ -237,6 +242,9 @@ pub enum MetadataCommandCheckpointValidationError {
     InvalidStreamAllocationIssuerRow {
         row_index: usize,
     },
+    InvalidStagingOwners {
+        reason: String,
+    },
     TableDigestMismatch {
         table_name: String,
         expected_digest: u64,
@@ -412,7 +420,19 @@ impl MetadataCommandCheckpoint {
                 },
             );
         }
+        self.staging_owners()?;
         Ok(())
+    }
+
+    fn staging_owners(
+        &self,
+    ) -> Result<
+        Vec<super::payload_staging::StagingOwnerRecord>,
+        MetadataCommandCheckpointValidationError,
+    > {
+        super::payload_staging::checkpoint_owners(self.pg_id, &self.table_blocks).map_err(
+            |reason| MetadataCommandCheckpointValidationError::InvalidStagingOwners { reason },
+        )
     }
 
     fn verify_table_identity(
@@ -1009,6 +1029,11 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
         order_columns: &["session_id"],
         filter: MetadataDigestFilter::AllRows,
     },
+    super::payload_staging::TABLES[0],
+    super::payload_staging::TABLES[1],
+    super::payload_staging::TABLES[2],
+    super::payload_staging::TABLES[3],
+    super::payload_staging::TABLES[4],
 ];
 
 const MULTIPART_UPLOAD_CHECKPOINT_COLUMNS: &[&str] = &[
@@ -2402,6 +2427,7 @@ impl PgStore {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
         checkpoint: &MetadataCommandCheckpoint,
+        configured_topology: &crate::pg_topology::PgTopology,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         if checkpoint.pg_id != PgId::new(self.pg_id) {
             return Err(StoreError::MetadataCheckpointInvalid {
@@ -2424,6 +2450,25 @@ impl PgStore {
                 reason: format!("{error:?}"),
             })?;
 
+        for owner in
+            checkpoint
+                .staging_owners()
+                .map_err(|error| StoreError::MetadataCheckpointInvalid {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    reason: format!("{error:?}"),
+                })?
+        {
+            owner.validate(configured_topology).map_err(|error| {
+                StoreError::MetadataCheckpointInvalid {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    reason: error.to_string(),
+                }
+            })?;
+        }
         let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -3025,6 +3070,7 @@ impl PgStore {
                 }
                 MetadataCommandLogEntryKind::Abandoned {
                     original_command_checksum,
+                    original_command_sha256,
                 } => {
                     if !entry.abandoned {
                         return Err(StoreError::MetadataCommandLogConflict {
@@ -3036,6 +3082,7 @@ impl PgStore {
                     }
                     MetadataCommandLogRangeEntryKind::Abandoned {
                         original_command_checksum,
+                        original_command_sha256,
                     }
                 }
             };
@@ -3522,38 +3569,94 @@ impl PgStore {
             return Ok(None);
         };
         let target_index = command_id.log_index().get();
-        let base =
-            self.metadata_command_log_validation_base(command_id.cluster_epoch(), target_index)?;
-        let mut applied_log_hash = base.applied_log_hash;
-        let mut raw_log_index = base.applied_log_index.saturating_add(1);
-        while raw_log_index <= target_index {
+        let checkpoints = self.metadata_command_checkpoint_candidates(
+            command_id.cluster_epoch(),
+            u64::MAX,
+            METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH,
+        )?;
+        let (mut raw_log_index, last_index, mut applied_log_hash, anchor_hash) =
+            if let Some(anchor) = checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.applied_log_index >= target_index)
+                .min_by_key(|checkpoint| checkpoint.applied_log_index)
+            {
+                // Bounded compaction may retain the source but prune its prefix.
+                // Authenticate the source's exact terminal bytes above, then its
+                // contiguous suffix against a validated later checkpoint. The
+                // starting previous hash is not trusted until the suffix closes
+                // at that checkpoint's immutable prefix hash.
+                (
+                    target_index,
+                    anchor.applied_log_index,
+                    target_previous_log_hash,
+                    anchor.applied_log_hash.value(),
+                )
+            } else {
+                let base = checkpoints.first(); // Candidates are newest first.
+                (
+                    base.map_or(1, |checkpoint| checkpoint.applied_log_index + 1),
+                    target_index,
+                    base.map_or(0, |checkpoint| checkpoint.applied_log_hash.value()),
+                    target_log_hash,
+                )
+            };
+        let mut last_previous_log_hash = applied_log_hash;
+        while raw_log_index <= last_index {
             let log_index = MetadataCommandLogIndex::new(raw_log_index)
                 .expect("historical metadata command log index is non-zero");
-            let Some(entry) = self.load_metadata_command_log_entry(
-                "load historical metadata command log entry for startup validation",
+            let (command_checksum, previous_log_hash, log_hash) = if let Some(entry) = self
+                .load_metadata_command_log_entry(
+                    "load historical metadata command log entry for startup validation",
+                    command_id.cluster_epoch(),
+                    command_id.pg_id(),
+                    log_index,
+                )? {
+                self.verify_metadata_command_log_entry(
+                    node_id,
+                    command_id.cluster_epoch(),
+                    command_id.pg_id(),
+                    log_index,
+                    &entry,
+                )?;
+                (
+                    entry.command_checksum,
+                    entry.previous_log_hash,
+                    entry.log_hash,
+                )
+            } else if let Some(receipt) = self.load_metadata_command_terminal_receipt(
+                "load historical metadata command receipt chain for startup validation",
                 command_id.cluster_epoch(),
                 command_id.pg_id(),
                 log_index,
-            )?
-            else {
+            )? {
+                // Full entries and receipts obey the same hash-chain checks.
+                // Never skip a missing link between source and chosen anchor.
+                self.verify_metadata_command_terminal_receipt(
+                    node_id,
+                    MetadataCommandId::new(
+                        command_id.cluster_epoch(),
+                        command_id.pg_id(),
+                        log_index,
+                    ),
+                    &receipt,
+                )?;
+                (
+                    receipt.command_checksum,
+                    Some(receipt.previous_log_hash),
+                    Some(receipt.log_hash),
+                )
+            } else {
                 return Err(self.metadata_command_log_conflict(node_id, command));
             };
-            self.verify_metadata_command_log_entry(
-                node_id,
-                command_id.cluster_epoch(),
-                command_id.pg_id(),
-                log_index,
-                &entry,
-            )?;
             let expected_log_hash = metadata_command_log_hash(
                 command_id.cluster_epoch(),
                 command_id.pg_id(),
                 log_index,
                 applied_log_hash,
-                entry.command_checksum,
+                command_checksum,
             );
-            if entry.previous_log_hash != Some(applied_log_hash)
-                || entry.log_hash != Some(expected_log_hash.value())
+            if previous_log_hash != Some(applied_log_hash)
+                || log_hash != Some(expected_log_hash.value())
             {
                 return Err(StoreError::MetadataCommandLogHashMismatch {
                     node_id,
@@ -3561,29 +3664,30 @@ impl PgStore {
                     cluster_epoch: command_id.cluster_epoch(),
                     log_index: raw_log_index,
                     expected_previous_log_hash: applied_log_hash,
-                    actual_previous_log_hash: entry.previous_log_hash.unwrap_or_default(),
+                    actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
                     expected_log_hash: expected_log_hash.value(),
-                    actual_log_hash: entry.log_hash.unwrap_or_default(),
+                    actual_log_hash: log_hash.unwrap_or_default(),
                 });
             }
+            last_previous_log_hash = applied_log_hash;
             applied_log_hash = expected_log_hash.value();
-            if raw_log_index == target_index {
+            if raw_log_index == last_index {
                 break;
             }
             raw_log_index = raw_log_index
                 .checked_add(1)
                 .expect("historical metadata command log index can advance");
         }
-        if applied_log_hash != target_log_hash {
+        if applied_log_hash != anchor_hash {
             return Err(StoreError::MetadataCommandLogHashMismatch {
                 node_id,
                 pg_id: self.pg_id,
                 cluster_epoch: command_id.cluster_epoch(),
-                log_index: target_index,
-                expected_previous_log_hash: target_previous_log_hash,
-                actual_previous_log_hash: target_previous_log_hash,
-                expected_log_hash: applied_log_hash,
-                actual_log_hash: target_log_hash,
+                log_index: last_index,
+                expected_previous_log_hash: last_previous_log_hash,
+                actual_previous_log_hash: last_previous_log_hash,
+                expected_log_hash: anchor_hash,
+                actual_log_hash: applied_log_hash,
             });
         }
         Ok(Some((abandoned, target_previous_log_hash, target_log_hash)))
@@ -3856,6 +3960,23 @@ impl PgStore {
         scope_bucket: Option<&BucketName>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_and_deadline_classified(
+            node_id,
+            command,
+            scope_bucket,
+            effect_fence,
+            None,
+        )
+    }
+
+    pub(crate) fn try_insert_pending_metadata_command_slot_with_effect_fence_and_deadline_classified(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), PendingMetadataCommandSlotInsertError> {
         if command.payload().is_bucket_control_pending_slot_payload() {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -3936,6 +4057,7 @@ impl PgStore {
                 "insert metadata command pending slot",
                 command.id().cluster_epoch(),
                 effect_fence,
+                operation_deadline,
             )?;
             if inserted == 1 {
                 self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
@@ -4050,6 +4172,23 @@ impl PgStore {
         bucket: &BucketName,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<bool, StoreError> {
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_and_deadline(
+            node_id,
+            command,
+            bucket,
+            effect_fence,
+            None,
+        )
+    }
+
+    pub(crate) fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_and_deadline(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+        operation_deadline: Option<Instant>,
+    ) -> Result<bool, StoreError> {
         if !command.payload().is_bucket_control_pending_slot_payload() {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
                 operation: "insert bucket-control pending metadata command",
@@ -4115,6 +4254,7 @@ impl PgStore {
                 "insert bucket control pending metadata command slot",
                 command.id().cluster_epoch(),
                 effect_fence,
+                operation_deadline,
             )?;
             if inserted == 1 {
                 self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
@@ -4131,8 +4271,11 @@ impl PgStore {
     }
 
     /// Both callers hold SQLite write serialization. Keep statement preparation
-    /// and all prerequisite reads before the final authority check, then retain
+    /// and all prerequisite reads before the final authority/deadline checks, then retain
     /// serialization through the slot and sidecar writes and transaction commit.
+    /// The optional Instant is process-local embedded work authority, never a
+    /// wire value. Remote callers carry their conservatively rebound deadline
+    /// in the effect fence instead.
     fn execute_pending_slot_insert_with_effect_fence<P: Params>(
         &self,
         sql: &str,
@@ -4140,6 +4283,7 @@ impl PgStore {
         context: &'static str,
         cluster_epoch: ClusterEpoch,
         effect_fence: AdmittedRouteEffectFence,
+        operation_deadline: Option<Instant>,
     ) -> Result<usize, StoreError> {
         let mut statement = self
             .conn
@@ -4153,6 +4297,9 @@ impl PgStore {
             hook(!self.conn.is_autocommit());
         }
         effect_fence.require_valid_for(cluster_epoch)?;
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::OperationDeadlineExceeded { context });
+        }
         statement.execute(params).map_err(|source| StoreError::Db {
             context,
             source: source.into(),
@@ -5648,7 +5795,11 @@ impl PgStore {
             entry,
         )?;
         if entry.abandoned {
-            let expected_bytes = abandoned_command_log_bytes(slot.id, slot.command_checksum);
+            let expected_bytes = abandoned_command_log_bytes(
+                slot.id,
+                slot.command_checksum,
+                checksum::sha256::digest(&slot.command_bytes),
+            );
             return Ok(
                 entry.command_checksum == checksum::crc64::checksum(&expected_bytes)
                     && entry.command_bytes == expected_bytes,
@@ -5674,7 +5825,11 @@ impl PgStore {
         };
         self.verify_metadata_command_terminal_receipt(node_id, slot.id, &receipt)?;
         let (expected_checksum, expected_bytes) = if receipt.abandoned {
-            let bytes = abandoned_command_log_bytes(slot.id, slot.command_checksum);
+            let bytes = abandoned_command_log_bytes(
+                slot.id,
+                slot.command_checksum,
+                checksum::sha256::digest(&slot.command_bytes),
+            );
             (checksum::crc64::checksum(&bytes), bytes)
         } else {
             (slot.command_checksum, slot.command_bytes.clone())
@@ -7255,7 +7410,7 @@ impl PgStore {
         })
     }
 
-    fn metadata_checkpoint_table_blocks(
+    pub(super) fn metadata_checkpoint_table_blocks(
         &self,
     ) -> Result<Vec<MetadataCheckpointTableBlock>, StoreError> {
         let mut blocks = Vec::with_capacity(METADATA_DIGEST_TABLES.len());
@@ -7826,6 +7981,56 @@ mod canonical_format_baseline_tests {
         bytes
     }
 
+    fn current_encryption_checkpoint() -> MetadataCommandCheckpoint {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
+        let owner = OwnerIdentity::from_principal("owner");
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption_type = encryption.encryption_type() as u8;
+        let encryption_state = encryption.encode_state().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
+                  system_metadata_blob, owner_principal, owner_canonical_id, \
+                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, \
+                  encryption_type, encryption_state, acl_grants, public_read, \
+                  object_generation_id, object_lock_retention_mode, object_lock_retain_until, \
+                  object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                         ?14, ?15, ?16, ?17, ?18, NULL, NULL, ?19)",
+                params![
+                    upload_id.as_str(),
+                    "checksum-bucket",
+                    "object",
+                    101_i64,
+                    UploadState::InProgress as u8,
+                    b"meta".as_slice(),
+                    b"system".as_slice(),
+                    owner.principal.as_str(),
+                    owner.canonical_id.as_str(),
+                    owner.principal.as_str(),
+                    owner.canonical_id.as_str(),
+                    ChecksumAlgorithm::Crc64nvme.wire_tag(),
+                    ChecksumType::FullObject.wire_tag(),
+                    encryption_type,
+                    encryption_state,
+                    PgStore::serialize_acl_grants(&AclGrants::default()),
+                    0_i64,
+                    1_i64,
+                    StoredLegalHoldStatus::NotSet as u8,
+                ],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap()
+    }
+
     fn frozen_checkpoint_v7() -> Vec<u8> {
         let bytes = crate::tests::frozen_hex_fixture(include_str!(
             "testdata/checkpoint_v7_canonical_v9_pg_v10_sse_s3_v5.hex"
@@ -7848,18 +8053,39 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn frozen_checkpoint_v7_decodes_and_verifies_independently_of_current_builders() {
+    fn frozen_checkpoint_v7_is_rejected_independently_of_current_builders() {
+        assert!(matches!(decode_metadata_command_checkpoint_payload(&frozen_checkpoint_v7()),
+            Err(crate::storage_rpc::StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion { actual: 7 })));
+    }
+
+    fn frozen_checkpoint_v8() -> Vec<u8> {
+        let bytes = crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/checkpoint_v8_canonical_v10_pg_v11_sse_s3_v5.hex"
+        ));
+        assert_eq!(bytes.len(), 9639);
+        assert_eq!(
+            checksum::sha256::digest(&bytes),
+            [
+                60, 224, 75, 193, 189, 145, 0, 17, 78, 126, 34, 12, 52, 164, 249, 197, 141, 99,
+                107, 194, 139, 112, 99, 55, 18, 4, 20, 75, 21, 250, 232, 206
+            ]
+        );
+        bytes
+    }
+
+    #[test]
+    fn frozen_checkpoint_v8_decodes_and_verifies_independently_of_current_builders() {
         // Start from the literal predecessor candidate, not a checkpoint built
         // with today's table registry. On a format advance keep these bytes and
         // convert this acceptance test to exact version-rejection evidence.
-        let bytes = frozen_checkpoint_v7();
+        let bytes = frozen_checkpoint_v8();
         let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
         checkpoint.verify().unwrap();
         assert_eq!(checkpoint.cluster_epoch, ClusterEpoch::INITIAL);
         assert_eq!(checkpoint.pg_id, PgId::new(1));
         assert_eq!(checkpoint.applied_log_index, 0);
-        assert_eq!(checkpoint.state_digest.value(), 8173911510360791434);
-        assert_eq!(checkpoint.checkpoint_crc64, 11001258576210703682);
+        assert_eq!(checkpoint.state_digest.value(), 12565362087893596375);
+        assert_eq!(checkpoint.checkpoint_crc64, 7976021255547752518);
         assert_eq!(
             checkpoint
                 .table_blocks
@@ -7878,13 +8104,18 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn frozen_checkpoint_v7_installs_and_reopens_with_exact_materialized_state() {
-        let bytes = frozen_checkpoint_v7();
+    fn frozen_checkpoint_v8_installs_and_reopens_with_exact_materialized_state() {
+        let bytes = frozen_checkpoint_v8();
         let checkpoint = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         store
-            .install_metadata_transfer_checkpoint_base(0, ClusterEpoch::INITIAL, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                0,
+                ClusterEpoch::INITIAL,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
+            )
             .unwrap();
         let assert_exact = |store: &PgStore| {
             let restored = store
@@ -8014,7 +8245,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn canonical_metadata_state_v8_and_v9_digests_are_stable() {
+    fn canonical_metadata_state_v8_v9_and_v10_digests_are_stable() {
         let table = &METADATA_DIGEST_TABLES[0];
         assert_eq!(table.name, "bucket_subresources");
         let values = vec![
@@ -8040,15 +8271,29 @@ mod canonical_format_baseline_tests {
         let mut v8_hasher = checksum::crc64::Hasher::new();
         digest_len_prefixed_bytes(&mut v8_hasher, METADATA_CANONICAL_PG_STATE_DOMAIN);
         digest_u8(&mut v8_hasher, 8);
-        digest_u64(&mut v8_hasher, METADATA_DIGEST_TABLES.len() as u64);
+        // V8/v9 had these exact nineteen tables. Retain their aggregate
+        // evidence; the appended staging tables belong only to v10.
+        let predecessor_tables = &METADATA_DIGEST_TABLES[..19];
+        digest_u64(&mut v8_hasher, 19);
+        let mut v9_hasher = checksum::crc64::Hasher::new();
+        digest_len_prefixed_bytes(&mut v9_hasher, METADATA_CANONICAL_PG_STATE_DOMAIN);
+        digest_u8(&mut v9_hasher, 9);
+        digest_u64(&mut v9_hasher, 19);
         for (index, table) in METADATA_DIGEST_TABLES.iter().enumerate() {
             PgStore::digest_metadata_table_digest_entry(
                 &mut state_hasher,
                 table,
                 0x1000_0000_0000_0000_u64 + index as u64,
             );
+        }
+        for (index, table) in predecessor_tables.iter().enumerate() {
             PgStore::digest_metadata_table_digest_entry(
                 &mut v8_hasher,
+                table,
+                0x1000_0000_0000_0000_u64 + index as u64,
+            );
+            PgStore::digest_metadata_table_digest_entry(
+                &mut v9_hasher,
                 table,
                 0x1000_0000_0000_0000_u64 + index as u64,
             );
@@ -8063,11 +8308,12 @@ mod canonical_format_baseline_tests {
                 5_623_325_047_351_608_253,
             )
         );
-        assert_eq!(state_digest, 617112351248260004);
+        assert_eq!(v9_hasher.finalize(), 617112351248260004);
+        assert_eq!(state_digest, 12417909696724621893);
     }
 
     #[test]
-    fn current_encryption_and_checksum_tags_match_frozen_canonical_v9_checkpoint_v7_composite() {
+    fn current_encryption_and_checksum_tags_match_frozen_canonical_v10_checkpoint_v8_composite() {
         // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
         // plaintext encryption tag. This tuple is rejection evidence only and must never be
         // regenerated from current structs.
@@ -8143,56 +8389,10 @@ mod canonical_format_baseline_tests {
                 213, 1, 21, 38, 129, 107, 15, 86, 244, 163, 226, 196, 22, 61,
             ],
         );
-        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 9);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 7);
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 10);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 8);
 
-        let tmp = test_util::tempdir();
-        let store = PgStore::open(tmp.path(), 1).unwrap();
-        let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
-        let owner = OwnerIdentity::from_principal("owner");
-        let encryption = crate::tests::metadata_only_test_encryption();
-        let encryption_type = encryption.encryption_type() as u8;
-        let encryption_state = encryption.encode_state().unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
-                  system_metadata_blob, owner_principal, owner_canonical_id, \
-                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, \
-                  encryption_type, encryption_state, acl_grants, public_read, \
-                  object_generation_id, object_lock_retention_mode, object_lock_retain_until, \
-                  object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                         ?14, ?15, ?16, ?17, ?18, NULL, NULL, ?19)",
-                params![
-                    upload_id.as_str(),
-                    "checksum-bucket",
-                    "object",
-                    101_i64,
-                    UploadState::InProgress as u8,
-                    b"meta".as_slice(),
-                    b"system".as_slice(),
-                    owner.principal.as_str(),
-                    owner.canonical_id.as_str(),
-                    owner.principal.as_str(),
-                    owner.canonical_id.as_str(),
-                    ChecksumAlgorithm::Crc64nvme.wire_tag(),
-                    ChecksumType::FullObject.wire_tag(),
-                    encryption_type,
-                    encryption_state,
-                    PgStore::serialize_acl_grants(&AclGrants::default()),
-                    0_i64,
-                    1_i64,
-                    StoredLegalHoldStatus::NotSet as u8,
-                ],
-            )
-            .unwrap();
-        store.refresh_metadata_command_state_digest().unwrap();
-
-        let checkpoint = store
-            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
-            .unwrap();
+        let checkpoint = current_encryption_checkpoint();
         checkpoint.verify().unwrap();
         let multipart_uploads = checkpoint
             .table_blocks
@@ -8222,7 +8422,7 @@ mod canonical_format_baseline_tests {
         let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
         assert_eq!(
             encoded,
-            frozen_checkpoint_v7(),
+            frozen_checkpoint_v8(),
             "append a new version-vector specimen; never rewrite the old checkpoint"
         );
         let encoded_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded);
@@ -8244,7 +8444,7 @@ mod canonical_format_baseline_tests {
                 ],
             )
         );
-        assert_eq!(
+        assert_ne!(
             current_evidence,
             (
                 8173911510360791434,
@@ -8254,6 +8454,18 @@ mod canonical_format_baseline_tests {
                     31, 41, 25, 7, 14, 222, 83, 42, 32, 109, 105, 159, 113, 94, 20, 186, 130, 235,
                     239, 105, 75, 162, 56, 147, 105, 187, 28, 167, 7, 56, 234, 50
                 ]
+            )
+        );
+        assert_eq!(
+            current_evidence,
+            (
+                12565362087893596375,
+                7976021255547752518,
+                9639,
+                [
+                    60, 224, 75, 193, 189, 145, 0, 17, 78, 126, 34, 12, 52, 164, 249, 197, 141, 99,
+                    107, 194, 139, 112, 99, 55, 18, 4, 20, 75, 21, 250, 232, 206
+                ],
             )
         );
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V2_EVIDENCE);

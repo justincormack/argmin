@@ -8,6 +8,32 @@ pub(super) type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Optio
 pub(super) type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
 impl PgStore {
+    pub(super) fn row_to_multipart_part_segment(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<MultipartPartSegmentRecord> {
+        Ok(MultipartPartSegmentRecord {
+            bucket: row.get(0)?,
+            key: row.get(1)?,
+            upload_id: row.get(2)?,
+            version_id: row.get::<_, i64>(3)? as u64,
+            part_number: row.get(4)?,
+            segment_index: row.get(5)?,
+            size: row.get::<_, i64>(6)? as u64,
+            segment_crc64: row.get::<_, i64>(7)? as u64,
+            segment_okh: Self::parse_okh_blob(&row.get::<_, Vec<u8>>(8)?, 8)?,
+            segment_vid: Self::parse_generation_id(row.get::<_, i64>(9)?, 9, "segment_vid")?,
+            data_pg_id: row.get(10)?,
+            placement_cluster_epoch: Self::parse_cluster_epoch(
+                row.get::<_, i64>(11)?,
+                11,
+                "placement_cluster_epoch",
+            )?,
+            ec_k: row.get(12)?,
+            ec_m: row.get(13)?,
+            shard_integrity: Self::parse_optional_segment_shard_integrity(row.get(14)?, 14)?,
+        })
+    }
+
     pub(super) fn serialize_acl_grants(grants: &AclGrants) -> String {
         s3_types::StoredAclGrants::from_grants(grants)
             .as_storage_str()

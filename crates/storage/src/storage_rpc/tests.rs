@@ -404,7 +404,9 @@ mod tests {
         const V32_FRAME: &[u8] = &[24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 32, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0, 0, 44, 5, 47, 184, 227, 66, 35, 102, 97, 98, 99];
         const V33_FRAME: &[u8] = &[24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 33, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0, 0, 61, 246, 16, 44, 216, 242, 90, 145, 97, 98, 99];
         const V34_FRAME: &[u8] = &[24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 34, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0, 0, 101, 112, 199, 200, 199, 4, 9, 188, 97, 98, 99];
-        assert_eq!(bytes, V34_FRAME);
+        assert_eq!(decode_storage_rpc_frame(V34_FRAME), Err(StorageRpcFrameError::UnsupportedVersion(34)));
+        const V35_FRAME: &[u8] = &[24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 35, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0, 0, 116, 131, 248, 92, 252, 180, 112, 75, 97, 98, 99];
+        assert_eq!(bytes, V35_FRAME);
         assert_eq!(decode_storage_rpc_frame(V33_FRAME), Err(StorageRpcFrameError::UnsupportedVersion(33)));
         assert_eq!(decode_storage_rpc_frame(V32_FRAME), Err(StorageRpcFrameError::UnsupportedVersion(32)));
         assert_eq!(decode_storage_rpc_frame(V29_FRAME), Err(StorageRpcFrameError::UnsupportedVersion(29)));
@@ -455,7 +457,7 @@ mod tests {
     #[test]
     fn current_storage_rpc_v34_checksum_and_encryption_versions_match_frozen_composite()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
         const HISTORICAL_V22_PLAINTEXT_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
         const HISTORICAL_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00c1010000ce03353b9e5164410700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
         const EXPECTED_V24_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605040302013a00c1010000cd0075499ca4e0b50700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
@@ -557,7 +559,9 @@ mod tests {
         assert_eq!(decode_storage_rpc_frame(&bytes_from_hex(CURRENT_V32_SSE_S3_V5_FRAME_HEX)), Err(StorageRpcFrameError::UnsupportedVersion(32)));
         const CURRENT_V33_SSE_S3_V5_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65210008070605040302013a00d30100000690513e995d12a00700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201670000000502010202020202020202020202020000000000000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
         const CURRENT_V34_SSE_S3_V5_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65220008070605040302013a00d3010000bb021e6018f0ea2f0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201670000000502010202020202020202020202020000000000000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
-        assert_eq!(encoded_frame_hex, CURRENT_V34_SSE_S3_V5_FRAME_HEX);
+        assert_eq!(decode_storage_rpc_frame(&bytes_from_hex(CURRENT_V34_SSE_S3_V5_FRAME_HEX)), Err(StorageRpcFrameError::UnsupportedVersion(34)));
+        const CURRENT_V35_SSE_S3_V5_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65230008070605040302013a00d3010000d08c24aa989442550700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201670000000502010202020202020202020202020000000000000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+        assert_eq!(encoded_frame_hex, CURRENT_V35_SSE_S3_V5_FRAME_HEX);
         assert_eq!(decode_storage_rpc_frame(&bytes_from_hex(CURRENT_V33_SSE_S3_V5_FRAME_HEX)), Err(StorageRpcFrameError::UnsupportedVersion(33)));
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
@@ -577,7 +581,7 @@ mod tests {
 
     #[test]
     fn current_storage_rpc_v34_sse_s3_v5_encryption_state_encoding_is_frozen() {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
         const HISTORICAL_V26_SSE_S3_V1_PAYLOAD_HEX: &str = "0700000009000000000000000b0000000d000000656e637279707465642d727063030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660d000000656e637279707465642d727063030000006b6579000201580000000101020304111111111111111111111111222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222333333333333444444444444444444444444000355667700";
         const HISTORICAL_V27_SSE_S3_V2_PAYLOAD_HEX: &str = "0700000009000000000000000b0000000d000000656e637279707465642d727063030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660d000000656e637279707465642d727063030000006b657900020159000000020101020304111111111111111111111111222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222333333333333444444444444444444444444000355667700";
         const HISTORICAL_V27_SSE_S3_V3_PAYLOAD_HEX: &str = "0700000009000000000000000b0000000d000000656e637279707465642d727063030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660d000000656e637279707465642d727063030000006b65790002016900000003011111111111111111111111110000000001020304111111111111111111111111222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222333333333333444444444444444444444444000355667700";
@@ -1055,8 +1059,8 @@ mod tests {
                     generation_id: GenerationId::new(5).unwrap(),
                     segment_index: 6,
                 },
-                reference: ShardScavengerPayloadReference::ReclaimOnly(
-                    ShardScavengerReclaimShardSetReference {
+                reference: ShardScavengerPayloadReference::ProtectionOnly(
+                    ShardScavengerProtectedShardSetReference {
                         data_pg_id: 7,
                         okh: [8; 16],
                         generation_id: GenerationId::new(9).unwrap(),
@@ -1152,8 +1156,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(33))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(35)),
-            Err(StorageRpcFrameError::UnsupportedVersion(35))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(34)),
+            Err(StorageRpcFrameError::UnsupportedVersion(34))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(36)),
+            Err(StorageRpcFrameError::UnsupportedVersion(36))
         );
     }
 
@@ -2245,7 +2253,7 @@ mod tests {
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
 
         for offset in [16, 29, 38] {
-            for version in [6, 7, 8, 10] {
+            for version in [6, 7, 8, 9, 11] {
                 let mut unsupported = bytes.clone();
                 unsupported[offset] = version;
                 assert_eq!(
@@ -2275,7 +2283,7 @@ mod tests {
 
         assert_eq!(decoded, request);
 
-        for version in [6, 7, 8, 10] {
+        for version in [6, 7, 8, 9, 11] {
             let mut unsupported = bytes.clone();
             unsupported[16] = version;
             assert_eq!(
@@ -2301,14 +2309,16 @@ mod tests {
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
         let historical = bytes_from_hex("0700000003000000000000000b0000000400000000000000012e1600000000000008d204000000000000");
         assert!(decode_metadata_command_transfer_matching_state_request(&historical).is_err());
-        assert_eq!(hex_bytes(&bytes), "0700000003000000000000000b0000000400000000000000012e1600000000000009d204000000000000");
+        let historical_v9 = bytes_from_hex("0700000003000000000000000b0000000400000000000000012e1600000000000009d204000000000000");
+        assert!(decode_metadata_command_transfer_matching_state_request(&historical_v9).is_err());
+        assert_eq!(hex_bytes(&bytes), "0700000003000000000000000b0000000400000000000000012e160000000000000ad204000000000000");
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
 
         for (offset, versions, carrier) in [
             (24, &[2][..], "log-hash"),
-            (33, &[6, 7, 8, 10][..], "state-digest"),
+            (33, &[6, 7, 8, 9, 11][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();
@@ -2325,6 +2335,9 @@ mod tests {
 
     #[test]
     fn metadata_command_transfer_checkpoint_base_request_round_trips() {
+        // Complete version-indexed request/response frame evidence lives in
+        // checkpoint_transfer_format_tests; these dynamic cases exercise the
+        // live checkpoint builder and malformed payload branches.
         let tmp = test_util::tempdir();
         let store = crate::PgStore::open(tmp.path(), 11).unwrap();
         let checkpoint = store
@@ -2379,12 +2392,13 @@ mod tests {
                 ],
             )
         );
-        assert_eq!((request.checkpoint.checkpoint_crc64, bytes.len(), payload_sha256), (16156628119785975756, 7225, [118, 44, 69, 139, 28, 50, 179, 2, 147, 85, 150, 130, 112, 165, 17, 76, 155, 76, 247, 73, 115, 155, 114, 76, 39, 84, 5, 35, 70, 123, 207, 43]));
+        assert_ne!((request.checkpoint.checkpoint_crc64, bytes.len(), payload_sha256), (16156628119785975756, 7225, [118, 44, 69, 139, 28, 50, 179, 2, 147, 85, 150, 130, 112, 165, 17, 76, 155, 76, 247, 73, 115, 155, 114, 76, 39, 84, 5, 35, 70, 123, 207, 43]));
+        assert_eq!((request.checkpoint.checkpoint_crc64, bytes.len(), payload_sha256), (13552775819520871438, 9048, [217, 74, 240, 1, 209, 150, 207, 21, 174, 97, 193, 162, 106, 195, 249, 183, 219, 216, 154, 180, 198, 43, 203, 245, 186, 12, 176, 168, 40, 186, 62, 249]));
         let decoded = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
 
         assert_eq!(decoded, request.checkpoint);
 
-        for unsupported in [1_u16, 2, 3, 4, 5] {
+        for unsupported in [1_u16, 2, 3, 4, 5, 6, 7, 9] {
             let mut unsupported_checkpoint = request.checkpoint.clone();
             crate::PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported_checkpoint,
@@ -2404,7 +2418,7 @@ mod tests {
         }
         for (offset, versions, carrier) in [
             (30, &[2][..], "log-hash"),
-            (39, &[6, 7, 8, 10][..], "state-digest"),
+            (39, &[6, 7, 8, 9, 11][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported_bytes = bytes.clone();
@@ -2707,6 +2721,7 @@ mod tests {
                     post_state_digest: None,
                     kind: MetadataCommandLogRangeEntryKind::Abandoned {
                         original_command_checksum: 0x55,
+                        original_command_sha256: [0x66; 32],
                     },
                 },
             ],
@@ -2720,6 +2735,69 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn metadata_command_log_entry_range_abandoned_digest_encoding() {
+        let response = StorageRpcMetadataCommandLogEntryRangeResponse {
+            entries: vec![MetadataCommandLogRangeEntry {
+                log_index: 9,
+                previous_log_hash: MetadataCommandLogHash::for_test(0x33),
+                log_hash: MetadataCommandLogHash::for_test(0x44),
+                pre_state_digest: None,
+                post_state_digest: None,
+                kind: MetadataCommandLogRangeEntryKind::Abandoned {
+                    original_command_checksum: 0x55,
+                    original_command_sha256: [0x66; 32],
+                },
+            }],
+        };
+        let old_payload = crate::tests::frozen_hex_fixture("0100000009000000000000000133000000000000000144000000000000000000015500000000000000");
+        let expected = crate::tests::frozen_hex_fixture("01000000090000000000000001330000000000000001440000000000000000000155000000000000006666666666666666666666666666666666666666666666666666666666666666");
+        let payload = encode_metadata_command_log_entry_range_response(&response).unwrap();
+        assert_eq!(payload, expected);
+        let authority = metadata_command_decode_authority_for_test();
+        assert_eq!(
+            decode_metadata_command_log_entry_range_response(&payload, &authority).unwrap(),
+            response
+        );
+        for end in old_payload.len()..payload.len() {
+            assert_eq!(
+                decode_metadata_command_log_entry_range_response(&payload[..end], &authority),
+                Err(StorageRpcPayloadError::Truncated)
+            );
+        }
+        let frame = encode_storage_rpc_frame(
+            17,
+            StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
+            &encode_storage_rpc_success_response(&payload),
+        ).unwrap();
+        let old_frame = crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/abandoned_log_range_rpc_v34.hex"
+        ));
+        assert_eq!(frame, crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/abandoned_log_range_rpc_v35.hex"
+        )));
+        assert_eq!(
+            old_frame,
+            encode_storage_rpc_frame_with_version_for_test(
+                17,
+                StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
+                &encode_storage_rpc_success_response(&old_payload),
+                34,
+            )
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&old_frame),
+            Err(StorageRpcFrameError::UnsupportedVersion(34))
+        );
+        let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
+        let decoded_payload = decode_storage_rpc_response_payload(&decoded_frame.payload)
+            .unwrap().unwrap();
+        assert_eq!(
+            decode_metadata_command_log_entry_range_response(&decoded_payload, &authority).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -2956,7 +3034,7 @@ mod tests {
 
         for (offset, versions, carrier) in [
             (16, &[2][..], "log-hash"),
-            (25, &[6, 7, 8, 10][..], "state-digest"),
+            (25, &[6, 7, 8, 9, 11][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();
@@ -3810,7 +3888,7 @@ mod tests {
                 ec: EcShape { k: 2, m: 1 },
                 shard_integrity: Some(shard_integrity),
             }),
-            ShardScavengerPayloadReference::ReclaimOnly(ShardScavengerReclaimShardSetReference {
+            ShardScavengerPayloadReference::ProtectionOnly(ShardScavengerProtectedShardSetReference {
                 data_pg_id: 4,
                 okh: [9; 16],
                 generation_id: GenerationId::new(10).unwrap(),
@@ -4021,6 +4099,26 @@ mod tests {
             .unwrap(),
             key_request
         );
+    }
+
+    #[test]
+    fn storage_rpc_v34_unpaged_protection_reference_bytes_are_unchanged() {
+        // Tag 1 has always been identity-only protection. Staging uses that
+        // same meaning without lengths, witnesses, or a new wire alternative.
+        const V34_PROTECTION_REFERENCES: &[u8] = &[
+            1, 0, 0, 0, 1, 7, 0, 0, 0,
+            8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+            9, 0, 0, 0, 0, 0, 0, 0, 2, 1,
+        ];
+        let expected = vec![ShardScavengerPayloadReference::ProtectionOnly(
+            ShardScavengerProtectedShardSetReference {
+                data_pg_id: 7,
+                okh: [8; 16],
+                generation_id: GenerationId::new(9).unwrap(),
+                ec: EcShape { k: 2, m: 1 },
+            })];
+        assert_eq!(encode_scavenger_payload_references_response(&expected), V34_PROTECTION_REFERENCES);
+        assert_eq!(decode_scavenger_payload_references_response(V34_PROTECTION_REFERENCES).unwrap(), expected);
     }
 
     #[test]
@@ -4761,7 +4859,7 @@ mod tests {
 
     #[test]
     fn generation_reserve_build_v32_request_and_deadline_encoding_is_frozen() {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
         assert_eq!(StorageRpcMessageKind::ObjectGenerationReserveCommandBuild as u16, 176);
         let mut request = StorageRpcObjectGenerationReserveCommandBuildRequest {
             object: StorageRpcObjectRequest {

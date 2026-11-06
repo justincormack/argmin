@@ -52,6 +52,17 @@ applied or abandoned state is currently represented by the command log itself;
 once the terminal log entry is durable, recovery should clean the unresolved
 slot row.
 
+An abandoned tombstone uses its independently versioned V2 grammar and persists
+SHA-256 of the complete original applied-command bytes, alongside the command
+ID and CRC64. CRC64 alone is not exact-source evidence: a different canonical
+command can preserve it while changing a reservation proof. Retained log rows,
+compacted terminal receipts, pending-slot cleanup and peering comparisons must
+all preserve/check the original SHA-256 binding. The receipt hashes the complete
+V2 tombstone, so compaction retains that binding without retaining the full
+source command. Tombstones remain materialized-state no-ops; this adds no extra
+command, transaction or fsync. V1 tombstones are unsupported, not upgraded or
+accepted through a CRC-only fallback.
+
 The transitional in-process retry cache must follow the same shape while the
 request paths are being moved over: it is keyed by PG, not by bucket or object.
 Older helper names may still mention buckets because callers use a bucket to
@@ -198,6 +209,17 @@ per-epoch replay window. The checkpoint catalogue remains the compacted-through
 watermark, so a command older than that window is rejected fail-closed and can
 never be reinstalled; it is not reported as an exact replay once its receipt has
 aged out.
+
+Historical source inspection validates a contiguous hash chain using full entries
+or retained terminal receipts. When a checkpoint at or after the source exists,
+it validates the source-to-checkpoint suffix against the nearest such verified
+checkpoint's prefix hash; the pruned earlier prefix is not required. Otherwise
+it validates forward from the preceding checkpoint/genesis base. The exact
+source checksum/SHA-256 must match in either direction. Gaps between source and
+anchor, invalid links, or a chain that does not match the checkpoint fail closed.
+Recovery custody must preserve the evidence it still needs; this does not extend
+the bounded receipt-retention window or recover a pruned source from a checkpoint
+alone.
 
 The request enters **irrevocable convergence** as soon as either:
 

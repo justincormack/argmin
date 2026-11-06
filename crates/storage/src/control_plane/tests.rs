@@ -1423,11 +1423,24 @@ fn runtime_map_current_state_digest_v3_is_stable() {
             211, 179, 111, 196, 63, 160, 2, 97, 96, 185, 134, 124, 80,
         ]
     );
+    historical_routes[0]
+        .active_metadata_proof
+        .as_mut()
+        .unwrap()
+        .state_digest
+        .encoding_version = 9;
     assert_eq!(
-        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        runtime_map_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
         [
             16, 51, 80, 191, 215, 133, 78, 47, 217, 12, 168, 148, 191, 10, 254, 105, 72, 11, 171,
             178, 210, 141, 38, 176, 63, 19, 149, 150, 66, 164, 107, 118,
+        ]
+    );
+    assert_eq!(
+        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        [
+            164, 200, 177, 241, 82, 193, 229, 14, 62, 72, 82, 43, 114, 92, 74, 231, 180, 235, 43,
+            198, 36, 172, 93, 119, 131, 119, 215, 81, 155, 47, 223, 219
         ]
     );
 }
@@ -2386,14 +2399,47 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
             "representative aggregate omitted {required_record:?}"
         );
     }
+    // Freeze the preceding composite independently; never regenerate old
+    // evidence from today's representative snapshots or current nested version.
+    let historical = crate::tests::frozen_hex_fixture(include_str!(
+        "../control_plane_state_v32_canonical_v9_aggregate.hex"
+    ));
+    assert_eq!(
+        (
+            historical.len(),
+            hex_encode(&checksum::sha256::digest(&historical))
+        ),
+        (
+            11_041,
+            "f30c3ec49cb64e56ee46b1f69b8db14bc1130941f6ca92f735e76c35b95a049c".to_owned()
+        )
+    );
+    let mut remaining = historical.as_slice();
+    let mut rejected = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let (snapshot, tail) =
+            tail.split_at(usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap());
+        if let Err(error) = parse_snapshot(std::str::from_utf8(snapshot).unwrap()) {
+            assert!(
+                matches!(error, ControlPlaneError::Parse { message, .. } if message == "unsupported canonical-state digest encoding version 9")
+            );
+            rejected += 1;
+        }
+        remaining = tail;
+    }
+    assert!(
+        rejected > 0,
+        "historical proof-bearing snapshots must be rejected"
+    );
     assert_eq!(
         (
             aggregate.len(),
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            11_041,
-            "f30c3ec49cb64e56ee46b1f69b8db14bc1130941f6ca92f735e76c35b95a049c".to_owned()
+            11_085,
+            "631110a77132387a62727e0a83f850823ef5bcf7c818a21a6e03b08cc97cd607".to_owned()
         )
     );
 }

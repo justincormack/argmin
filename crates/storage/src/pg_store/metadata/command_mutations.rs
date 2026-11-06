@@ -255,7 +255,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn apply_create_stream_upload_command(
+    pub(super) fn apply_create_stream_upload_command(
         &self,
         command: &CreateStreamUploadCommand,
     ) -> Result<(), MetadataError> {
@@ -487,7 +487,7 @@ impl PgStore {
         })
     }
 
-    fn apply_append_stream_segment_command(
+    pub(super) fn apply_append_stream_segment_command(
         &self,
         command: &AppendStreamSegmentCommand,
     ) -> Result<(), MetadataError> {
@@ -519,7 +519,7 @@ impl PgStore {
         )
     }
 
-    fn apply_abort_stream_upload_command(
+    pub(super) fn apply_abort_stream_upload_command(
         &self,
         command: &AbortStreamUploadCommand,
     ) -> Result<(), MetadataError> {
@@ -571,7 +571,7 @@ impl PgStore {
         )
     }
 
-    fn apply_commit_stream_part_command(
+    pub(super) fn apply_commit_stream_part_command(
         &self,
         command: &CommitStreamPartCommand,
     ) -> Result<(), MetadataError> {
@@ -635,7 +635,7 @@ impl PgStore {
         }
     }
 
-    fn validate_commit_stream_part_command(
+    pub(super) fn validate_commit_stream_part_command(
         &self,
         command: &CommitStreamPartCommand,
     ) -> Result<(), MetadataError> {
@@ -1121,7 +1121,7 @@ impl PgStore {
         )
     }
 
-    fn list_stream_uploads_for_multipart_upload(
+    pub(super) fn list_stream_uploads_for_multipart_upload(
         &self,
         upload_id: &UploadId,
     ) -> Result<Vec<StreamUploadRecord>, MetadataError> {
@@ -1151,7 +1151,7 @@ impl PgStore {
             })
     }
 
-    fn list_stream_segments_for_sessions(
+    pub(super) fn list_stream_segments_for_sessions(
         &self,
         sessions: &[StreamUploadRecord],
     ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError> {
@@ -1272,7 +1272,7 @@ impl PgStore {
         )
     }
 
-    fn apply_abort_multipart_upload_command(
+    pub(super) fn apply_abort_multipart_upload_command(
         &self,
         command: &AbortMultipartUploadCommand,
     ) -> Result<(), MetadataError> {

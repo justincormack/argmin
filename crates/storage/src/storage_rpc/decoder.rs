@@ -2739,14 +2739,33 @@ impl<'a> StorageRpcDecoder<'a> {
                     shard_integrity: self.read_optional_segment_shard_integrity()?,
                 },
             )),
-            1 => Ok(ShardScavengerPayloadReference::ReclaimOnly(
-                ShardScavengerReclaimShardSetReference {
+            1 => Ok(ShardScavengerPayloadReference::ProtectionOnly(
+                ShardScavengerProtectedShardSetReference {
                     data_pg_id: self.read_u32()?,
                     okh: self.read_16_bytes()?,
                     generation_id: self.read_generation_id()?,
                     ec: self.read_ec_shape()?,
                 },
             )),
+            2 => {
+                let identity = ShardScavengerProtectedShardSetReference {
+                    data_pg_id: self.read_u32()?, okh: self.read_16_bytes()?,
+                    generation_id: self.read_generation_id()?, ec: self.read_ec_shape()?,
+                };
+                let placement_epoch = self.read_cluster_epoch()?;
+                let count = self.read_u32()? as usize;
+                if count != usize::from(identity.ec.k) + usize::from(identity.ec.m) {
+                    return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("staging file participant count differs from EC geometry"));
+                }
+                let mut file_nodes = Vec::with_capacity(count);
+                for _ in 0..count { file_nodes.push(NodeId::new(self.read_u32()?)); }
+                let protection = crate::types::ShardScavengerStagingProtection {
+                    identity, placement_epoch, file_nodes,
+                    acknowledgement_primary: NodeId::new(self.read_u32()?),
+                };
+                validate_staging_protection(&protection)?;
+                Ok(ShardScavengerPayloadReference::StagingProtection(protection))
+            }
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
                 "invalid shard scavenger payload reference tag",
             )),
@@ -2816,6 +2835,17 @@ impl<'a> StorageRpcDecoder<'a> {
                 command_checksum: self.read_u64()?,
                 reference_index: self.read_u32()?,
             }),
+            7 => {
+                let cursor = ShardScavengerReferenceCursor::StagingWindow {
+                    pg_id: PgId::new(self.read_u32()?),
+                    topology_digest: self.read_exact(32)?.try_into().expect("fixed length"),
+                    attempt: self.read_session_id()?,
+                    introduction_epoch: self.read_cluster_epoch()?,
+                    introduction_index: self.read_u64()?, window_index: self.read_u32()?,
+                };
+                validate_staging_cursor(&cursor, None)?;
+                Ok(cursor)
+            }
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
                 "invalid shard scavenger reference cursor tag",
             )),

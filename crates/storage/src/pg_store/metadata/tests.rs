@@ -95,7 +95,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
 }
 
 #[test]
-fn current_pg_schema_v10_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+fn current_pg_schema_v11_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     assert_eq!(
@@ -103,7 +103,7 @@ fn current_pg_schema_v10_checksum_tags_match_frozen_owner_encoding_and_require_v
             .conn
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        10
+        11
     );
     let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
     let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");
@@ -4113,6 +4113,14 @@ fn metadata_state_digest_and_checkpoint_table_inventories_are_explicit() {
             ("pg_counters", MetadataDigestFilter::AllRows),
             ("stream_upload_segments", MetadataDigestFilter::AllRows),
             ("stream_uploads", MetadataDigestFilter::AllRows),
+            ("payload_staging_owners", MetadataDigestFilter::AllRows),
+            ("payload_staging_windows", MetadataDigestFilter::AllRows),
+            (
+                "payload_staging_participants",
+                MetadataDigestFilter::AllRows
+            ),
+            ("payload_staging_references", MetadataDigestFilter::AllRows),
+            ("payload_staging_resources", MetadataDigestFilter::AllRows),
         ]
     );
 
@@ -5085,7 +5093,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
         "framed-v4",
         "framed-v5",
         "framed-v6",
-        "framed-v8",
+        "framed-v7",
+        "framed-v9",
     ] {
         let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
             (second_checkpoint.checkpoint_crc64, vec![0])
@@ -5096,7 +5105,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
                 "framed-v4" => 4,
                 "framed-v5" => 5,
                 "framed-v6" => 6,
-                "framed-v8" => 8,
+                "framed-v7" => 7,
+                "framed-v9" => 9,
                 _ => 1,
             };
             let mut unsupported = second_checkpoint.clone();
@@ -5715,7 +5725,12 @@ fn install_metadata_transfer_checkpoint_base_restores_materialized_rows() {
     let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
     let destination_epoch = ClusterEpoch::new(19).unwrap();
     let state = destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
     assert_eq!(state.cluster_epoch, destination_epoch);
     assert_eq!(state.applied_log_index, 0);
@@ -5783,7 +5798,12 @@ fn install_metadata_transfer_checkpoint_base_restores_complete_stream_session() 
     let destination_tmp = test_util::tempdir();
     let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
     destination
-        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::new(19).unwrap(), &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            ClusterEpoch::new(19).unwrap(),
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
 
     assert_eq!(
@@ -5902,6 +5922,7 @@ fn metadata_checkpoint_rejects_malformed_payload_profiles_in_every_carrier_witho
                         2,
                         destination_epoch,
                         &checkpoint,
+                        &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap()
                     ),
                     Err(StoreError::MetadataCheckpointInvalid { .. })
                 ),
@@ -5975,7 +5996,8 @@ fn checkpoint_stream_allocation_issuer_requires_exact_physical_shape_before_inst
             destination.install_metadata_transfer_checkpoint_base(
                 2,
                 ClusterEpoch::new(19).unwrap(),
-                &checkpoint
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap()
             ),
             Err(StoreError::MetadataCheckpointInvalid { .. })
         ));
@@ -6010,7 +6032,12 @@ fn install_metadata_transfer_checkpoint_base_restores_multipart_listing_position
     let destination_tmp = test_util::tempdir();
     let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
     destination
-        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::new(19).unwrap(), &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            ClusterEpoch::new(19).unwrap(),
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
 
     assert_eq!(
@@ -6044,7 +6071,12 @@ fn checkpoint_based_transfer_replays_streamed_direct_put_commit() {
     let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
     let destination_epoch = ClusterEpoch::new(19).unwrap();
     destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
     let source_command = direct_put_terminal_cleanup_command(&bucket, &key, &session_id);
     let rebased = MetadataCommandEnvelope::new(
@@ -6099,7 +6131,12 @@ fn install_metadata_transfer_checkpoint_base_defers_foreign_keys_until_full_rest
     let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
     let destination_epoch = ClusterEpoch::new(29).unwrap();
     destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap();
 
     assert_eq!(destination.head_bucket_raw(&bucket).unwrap().name, bucket);
@@ -6140,7 +6177,12 @@ fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without
     let before = destination.metadata_command_replica_state().unwrap();
     let destination_epoch = ClusterEpoch::new(23).unwrap();
     let err = destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6173,7 +6215,7 @@ fn metadata_command_replica_state_rejects_unsupported_carrier_encodings() {
         (
             "state_digest_encoding_version",
             "state-digest",
-            &[6_u8, 7_u8, 8_u8, 10_u8][..],
+            &[6_u8, 7_u8, 8_u8, 9_u8, 11_u8][..],
         ),
     ] {
         for &version in versions {
@@ -6250,7 +6292,12 @@ fn install_metadata_transfer_checkpoint_base_rejects_resealed_noncanonical_bucke
     let before = destination.metadata_command_replica_state().unwrap();
     let destination_epoch = ClusterEpoch::new(31).unwrap();
     let err = destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6330,7 +6377,12 @@ fn install_metadata_transfer_checkpoint_base_rejects_resealed_bucket_tag_aux() {
         let before = destination.metadata_command_replica_state().unwrap();
         let destination_epoch = ClusterEpoch::new(if tombstone { 33 } else { 32 }).unwrap();
         let err = destination
-            .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                2,
+                destination_epoch,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -6394,7 +6446,12 @@ fn install_metadata_transfer_checkpoint_base_rejects_resealed_noncanonical_acl_g
     let before = destination.metadata_command_replica_state().unwrap();
     let destination_epoch = ClusterEpoch::new(34).unwrap();
     let err = destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            destination_epoch,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6444,7 +6501,12 @@ fn install_metadata_transfer_checkpoint_base_rejects_current_epoch_dirty_zero_lo
         .unwrap());
 
     let err = destination
-        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::INITIAL, &checkpoint)
+        .install_metadata_transfer_checkpoint_base(
+            2,
+            ClusterEpoch::INITIAL,
+            &checkpoint,
+            &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6629,8 +6691,10 @@ fn retained_metadata_command_log_entries_preserves_abandoned_tombstones() {
     match entries[0].kind {
         MetadataCommandLogRangeEntryKind::Abandoned {
             original_command_checksum,
+            original_command_sha256,
         } => {
             assert_eq!(original_command_checksum, command.checksum_crc64());
+            assert_eq!(original_command_sha256, command.command_sha256());
         }
         ref other => panic!("expected abandoned command entry, got {other:?}"),
     }
@@ -7334,7 +7398,7 @@ fn abandoned_log_tail_without_pending_slot_recovers_on_validation() {
 
 #[test]
 fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutation() {
-    for version in [0_u16, 2] {
+    for version in [0_u16, 1, 3] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -7346,6 +7410,11 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
         let mut command_bytes = command.abandoned_log_bytes();
         let version_offset = 4 + b"argmin-metadata-command-abandoned".len();
         command_bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
+        if version == 1 {
+            // V1 had no source digest. Retain the complete predecessor shape,
+            // not a current record with only its version tag changed.
+            command_bytes.truncate(command_bytes.len() - 32);
+        }
         let command_checksum = checksum::crc64::checksum(&command_bytes);
         store
             .conn

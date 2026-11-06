@@ -41,8 +41,12 @@ impl MetadataCommandLogHashIssuer {
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 13;
+/// Complete canonical applied-command bytes, excluding carrier framing. Shared
+/// by transport admission and retained-source carriers; neither may truncate a
+/// supported source command to make its enclosing request fit.
+pub(crate) const MAX_METADATA_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
-const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
+const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataCommandRecordFormat {
@@ -566,7 +570,10 @@ pub(crate) enum MetadataCommandAcceptance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataCommandLogEntryKind {
     Applied,
-    Abandoned { original_command_checksum: u64 },
+    Abandoned {
+        original_command_checksum: u64,
+        original_command_sha256: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,7 +634,10 @@ pub(crate) struct MetadataCommandLogRangeEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MetadataCommandLogRangeEntryKind {
     Applied(Box<MetadataCommandEnvelope>),
-    Abandoned { original_command_checksum: u64 },
+    Abandoned {
+        original_command_checksum: u64,
+        original_command_sha256: [u8; 32],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2286,6 +2296,12 @@ impl MetadataCommandEnvelope {
         canonical_command_bytes(self.id, &self.payload)
     }
 
+    /// Bind the complete original applied command, including proof identity.
+    /// CRC64 remains an integrity check, never an exact-source authenticator.
+    pub(crate) fn command_sha256(&self) -> [u8; 32] {
+        checksum::sha256::digest(&self.command_bytes())
+    }
+
     #[cfg(test)]
     pub(crate) fn command_bytes_with_encoding_version_for_test(&self, version: u16) -> Vec<u8> {
         let mut bytes = canonical_command_bytes_with_version(self.id, &self.payload, version);
@@ -2306,7 +2322,7 @@ impl MetadataCommandEnvelope {
     }
 
     pub(crate) fn abandoned_log_bytes(&self) -> Vec<u8> {
-        abandoned_command_log_bytes(self.id, self.checksum_crc64)
+        abandoned_command_log_bytes(self.id, self.checksum_crc64, self.command_sha256())
     }
 
     pub(crate) fn abandoned_log_checksum_crc64(&self) -> u64 {
@@ -2407,7 +2423,11 @@ pub(crate) fn metadata_command_log_hash(
     )
 }
 
-pub(crate) fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksum: u64) -> Vec<u8> {
+pub(crate) fn abandoned_command_log_bytes(
+    id: MetadataCommandId,
+    command_checksum: u64,
+    command_sha256: [u8; 32],
+) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, ABANDONED_METADATA_COMMAND_MAGIC);
     put_u16(&mut out, ABANDONED_METADATA_COMMAND_ENCODING_VERSION);
@@ -2415,6 +2435,9 @@ pub(crate) fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksu
     put_u32(&mut out, id.pg_id().get());
     put_u64(&mut out, id.log_index().get());
     put_u64(&mut out, command_checksum);
+    // This digest must be persisted in the tombstone itself: a receipt hashing
+    // only (ID, CRC64) does not bind the original command against substitution.
+    out.extend_from_slice(&command_sha256);
     out
 }
 
@@ -2478,9 +2501,11 @@ pub(crate) fn decode_metadata_command_log_entry_header(
         }
         MetadataCommandRecordFormat::Abandoned => {
             let original_command_checksum = decoder.read_u64()?;
+            let original_command_sha256 = decoder.read_exact(32)?.try_into().expect("32 bytes");
             (
                 MetadataCommandLogEntryKind::Abandoned {
                     original_command_checksum,
+                    original_command_sha256,
                 },
                 None,
             )
@@ -7958,18 +7983,30 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_metadata_command_v1_encoding_and_format_errors_are_stable() {
+    fn abandoned_metadata_command_v2_encoding_and_format_errors_are_stable() {
         let id = MetadataCommandId::new(
             ClusterEpoch::new(0x0102_0304_0506_0708).unwrap(),
             PgId::new(0x1122_3344),
             MetadataCommandLogIndex::new(0x1112_1314_1516_1718).unwrap(),
         );
-        let expected = b"\x21\x00\x00\x00argmin-metadata-command-abandoned\
+        let retired_v1 = b"\x21\x00\x00\x00argmin-metadata-command-abandoned\
             \x01\x00\x08\x07\x06\x05\x04\x03\x02\x01\
             \x44\x33\x22\x11\x18\x17\x16\x15\x14\x13\x12\x11\
             \x28\x27\x26\x25\x24\x23\x22\x21";
         assert_eq!(
-            abandoned_command_log_bytes(id, 0x2122_2324_2526_2728),
+            decode_metadata_command_log_entry_header(retired_v1),
+            Err(MetadataCommandFormatError::UnsupportedVersion {
+                format: MetadataCommandRecordFormat::Abandoned,
+                version: 1,
+            })
+        );
+        let expected = b"\x21\x00\x00\x00argmin-metadata-command-abandoned\
+            \x02\x00\x08\x07\x06\x05\x04\x03\x02\x01\
+            \x44\x33\x22\x11\x18\x17\x16\x15\x14\x13\x12\x11\
+            \x28\x27\x26\x25\x24\x23\x22\x21\
+            11111111111111111111111111111111";
+        assert_eq!(
+            abandoned_command_log_bytes(id, 0x2122_2324_2526_2728, [0x31; 32]),
             expected
         );
         let header = decode_metadata_command_log_entry_header(expected).unwrap();
@@ -7978,6 +8015,7 @@ mod tests {
             header.kind(),
             MetadataCommandLogEntryKind::Abandoned {
                 original_command_checksum: 0x2122_2324_2526_2728,
+                original_command_sha256: [0x31; 32],
             }
         );
 
@@ -8006,7 +8044,7 @@ mod tests {
             decode_metadata_command_log_entry_header(&unknown_magic),
             Err(MetadataCommandFormatError::UnknownMagic)
         );
-        for version in [0_u16, 2] {
+        for version in [0_u16, 1, 3] {
             let mut unsupported = expected.to_vec();
             unsupported[4 + 33..4 + 33 + 2].copy_from_slice(&version.to_le_bytes());
             assert_eq!(
@@ -8023,6 +8061,9 @@ mod tests {
             decode_metadata_command_log_entry_header(&trailing),
             Err(MetadataCommandFormatError::TrailingData)
         );
+        for end in retired_v1.len()..expected.len() {
+            assert!(decode_metadata_command_log_entry_header(&expected[..end]).is_err());
+        }
     }
 
     #[test]
@@ -8103,7 +8144,8 @@ mod tests {
         assert_eq!(
             abandoned_header.kind(),
             MetadataCommandLogEntryKind::Abandoned {
-                original_command_checksum: envelope.checksum_crc64()
+                original_command_checksum: envelope.checksum_crc64(),
+                original_command_sha256: envelope.command_sha256(),
             }
         );
         assert_eq!(abandoned_header.command_kind_name(), None);

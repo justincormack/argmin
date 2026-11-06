@@ -896,7 +896,7 @@ impl PgStore {
         )
     }
 
-    fn apply_reserve_object_generation_command(
+    pub(super) fn apply_reserve_object_generation_command(
         &self,
         command: &ReserveObjectGenerationCommand,
     ) -> Result<(), MetadataError> {
@@ -936,7 +936,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn apply_release_object_generation_command(
+    pub(super) fn apply_release_object_generation_command(
         &self,
         command: &ReleaseObjectGenerationCommand,
     ) -> Result<(), MetadataError> {
@@ -961,7 +961,7 @@ impl PgStore {
         self.reserve_object_version_explicit(&command.bucket, &command.key, command.version_id)
     }
 
-    fn apply_commit_direct_put_object_command(
+    pub(super) fn apply_commit_direct_put_object_command(
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
@@ -1239,7 +1239,7 @@ impl PgStore {
         Ok(segments == command.segments)
     }
 
-    fn stream_upload_cleanup_records_match(
+    pub(super) fn stream_upload_cleanup_records_match(
         actual: &[StreamUploadRecord],
         expected: &[TerminalStreamCleanupRecord],
     ) -> bool {
@@ -1255,7 +1255,7 @@ impl PgStore {
             })
     }
 
-    fn apply_commit_multipart_object_command(
+    pub(super) fn apply_commit_multipart_object_command(
         &self,
         command: &CommitMultipartObjectCommand,
     ) -> Result<(), MetadataError> {
@@ -1464,7 +1464,7 @@ impl PgStore {
         Ok(streaming_segments == command.selected_streaming_segments)
     }
 
-    fn multipart_completion_identity(
+    pub(super) fn multipart_completion_identity(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1864,7 +1864,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn apply_delete_object_payload_reclaim_command(
+    pub(super) fn apply_delete_object_payload_reclaim_command(
         &self,
         command: &DeleteObjectPayloadReclaimCommand,
     ) -> Result<(), MetadataError> {
@@ -1953,7 +1953,7 @@ impl PgStore {
             .map(|_| ())
     }
 
-    fn apply_delete_object_version_command(
+    pub(super) fn apply_delete_object_version_command(
         &self,
         command: &DeleteObjectVersionCommand,
     ) -> Result<(), MetadataError> {
@@ -2056,7 +2056,7 @@ impl PgStore {
         )
     }
 
-    fn apply_insert_delete_marker_command(
+    pub(super) fn apply_insert_delete_marker_command(
         &self,
         command: &InsertDeleteMarkerCommand,
     ) -> Result<(), MetadataError> {
@@ -2140,7 +2140,7 @@ impl PgStore {
         )
     }
 
-    fn validate_object_payload_reclaim_matches_durable_object(
+    pub(super) fn validate_object_payload_reclaim_matches_durable_object(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

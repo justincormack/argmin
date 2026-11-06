@@ -8372,6 +8372,7 @@ impl StorageNodeConnectionHandler {
                 request.node_id.as_u32(),
                 request.cluster_epoch,
                 &request.checkpoint,
+                self.node.pg_topology(),
             )
         }) {
             Ok(state) => {

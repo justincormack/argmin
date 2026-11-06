@@ -49,7 +49,7 @@ fn specimen(
 
 #[test]
 fn stream_append_builder_v31_codec_matches_independent_frozen_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
     assert_eq!(
         StorageRpcMessageKind::ObjectStreamAppendCommandBuild as u16,
         177

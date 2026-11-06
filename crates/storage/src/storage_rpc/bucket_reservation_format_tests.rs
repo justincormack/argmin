@@ -435,7 +435,7 @@ fn families() -> [(&'static str, StorageRpcMessageKind); 7] {
 
 fn frozen() -> BTreeMap<String, Vec<u8>> {
     let mut cases = BTreeMap::new();
-    for line in include_str!("testdata/bucket_reservation_rpc_v34.hex")
+    for line in include_str!("testdata/bucket_reservation_rpc_v35.hex")
         .lines()
         .filter(|line| !line.starts_with('#'))
     {
@@ -448,8 +448,8 @@ fn frozen() -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn bucket_reservation_v34_writer_and_reader_match_frozen_lifecycle() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+fn bucket_reservation_v35_writer_and_reader_match_frozen_lifecycle() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
     assert_eq!(
         families().map(|(_, kind)| kind as u16),
         [38, 39, 123, 40, 11, 84, 83]
@@ -481,7 +481,7 @@ fn bucket_reservation_v34_writer_and_reader_match_frozen_lifecycle() {
 }
 
 #[test]
-fn bucket_reservation_v34_rejects_truncation_trailing_data_and_other_versions() {
+fn bucket_reservation_v35_rejects_truncation_trailing_data_and_other_versions() {
     for (name, case) in specimens() {
         let bytes = &frozen()[&name];
         let frame = decode_storage_rpc_frame(bytes).unwrap();
@@ -494,7 +494,7 @@ fn bucket_reservation_v34_rejects_truncation_trailing_data_and_other_versions() 
         let mut trailing = frame.payload.clone();
         trailing.push(0);
         assert!(case.rejects(&trailing), "{name}: accepted trailing data");
-        for version in [33, 35] {
+        for version in [34, 36] {
             let bytes = encode_storage_rpc_frame_with_version_for_test(
                 REQUEST_ID,
                 case.kind(),
@@ -515,7 +515,7 @@ fn bucket_reservation_v34_rejects_truncation_trailing_data_and_other_versions() 
 }
 
 #[test]
-fn bucket_reservation_v34_rejects_unknown_optional_and_outcome_tags() {
+fn bucket_reservation_v35_rejects_unknown_optional_and_outcome_tags() {
     let frozen = frozen();
     for (name, case) in specimens() {
         let Specimen::Request(request) = &case else {
@@ -584,7 +584,7 @@ fn bucket_reservation_v34_rejects_unknown_optional_and_outcome_tags() {
 }
 
 #[test]
-fn bucket_reservation_v34_max_fields_fit_frozen_request_caps() {
+fn bucket_reservation_v35_max_fields_fit_frozen_request_caps() {
     let mut row = record(true, 9);
     row.bucket = BucketName::try_from("b".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
     row.reservation_id = "r".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN);

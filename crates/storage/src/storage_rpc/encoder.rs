@@ -1545,12 +1545,24 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
                     .as_deref(),
             );
         }
-        ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+        ShardScavengerPayloadReference::ProtectionOnly(reference) => {
             put_u8(out, 1);
             put_u32(out, reference.data_pg_id);
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
             put_ec_shape(out, reference.ec);
+        }
+        ShardScavengerPayloadReference::StagingProtection(protection) => {
+            let reference = &protection.identity;
+            put_u8(out, 2);
+            put_u32(out, reference.data_pg_id);
+            out.extend_from_slice(&reference.okh);
+            put_u64(out, reference.generation_id.get());
+            put_ec_shape(out, reference.ec);
+            put_u64(out, protection.placement_epoch.get());
+            put_u32(out, protection.file_nodes.len() as u32);
+            for node in &protection.file_nodes { put_u32(out, node.as_u32()); }
+            put_u32(out, protection.acknowledgement_primary.as_u32());
         }
     }
 }
@@ -1668,6 +1680,16 @@ fn put_shard_scavenger_reference_cursor(
             put_u64(out, *log_index);
             put_u64(out, *command_checksum);
             put_u32(out, *reference_index);
+        }
+        ShardScavengerReferenceCursor::StagingWindow { pg_id, topology_digest, attempt,
+            introduction_epoch, introduction_index, window_index } => {
+            put_u8(out, 7);
+            put_u32(out, pg_id.get());
+            out.extend_from_slice(topology_digest);
+            put_string(out, attempt.as_str());
+            put_u64(out, introduction_epoch.get());
+            put_u64(out, *introduction_index);
+            put_u32(out, *window_index);
         }
     }
 }

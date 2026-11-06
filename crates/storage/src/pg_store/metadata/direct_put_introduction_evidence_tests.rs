@@ -199,7 +199,12 @@ fn direct_put_introduction_evidence_successor_cannot_use_local_absence() {
         .unwrap();
     for (node, store) in [(1, &witness), (2, &successor)] {
         store
-            .install_metadata_transfer_checkpoint_base(node, ClusterEpoch::INITIAL, &base)
+            .install_metadata_transfer_checkpoint_base(
+                node,
+                ClusterEpoch::INITIAL,
+                &base,
+                &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
+            )
             .unwrap();
     }
     primary
@@ -436,7 +441,12 @@ fn direct_put_introduction_evidence_survives_compaction_transfer_and_restart() {
         let destination = PgStore::open(destination_dir.path(), 1).unwrap();
         let epoch = ClusterEpoch::new(epoch).unwrap();
         let installed = destination
-            .install_metadata_transfer_checkpoint_base(2, epoch, &imported_checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                2,
+                epoch,
+                &imported_checkpoint,
+                &crate::pg_topology::PgTopology::new(&[destination.pg_id]).unwrap(),
+            )
             .unwrap();
         assert_eq!(installed.cluster_epoch, epoch);
         assert_eq!(installed.applied_log_index, 0);

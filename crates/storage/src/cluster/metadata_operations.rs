@@ -4508,10 +4508,11 @@ impl StorageCluster {
         match result {
             Ok(()) => Ok(Some(())),
             Err(error)
-                if matches!(
-                    error.source(),
-                    StoreError::MetadataCommandPendingConflict { .. }
-                ) =>
+                if error.kind() != MetadataCommandApplyErrorKind::MayHaveApplied
+                    && matches!(
+                        error.source(),
+                        StoreError::MetadataCommandPendingConflict { .. }
+                    ) =>
             {
                 self.emit_metadata_command_conflict(
                     Some(primary.node_id()),
@@ -4589,54 +4590,98 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         effect_fence: Option<AdmittedRouteEffectFence>,
+        deadline: Instant,
         build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
-    ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
+    ) -> Result<ObjectPgPendingCommandInstall, BuiltPendingCommandInstallFailure> {
         let pg_lock = self
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock();
-        if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+        let _pg_guard = lock_metadata_command_pg_until(&pg_lock, deadline).ok_or_else(|| {
+            crate::node_client::storage_rpc_deadline_expired(
+                "acquire metadata command PG for built pending-slot installation",
+            )
+        })?;
+        if let Some(command) =
+            self.pending_metadata_command_for_bucket_until(pg_id, bucket, deadline)?
+        {
             return Ok(ObjectPgPendingCommandInstall::Pending(command));
         }
         let command = match build_command() {
             Ok(command) => command,
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
                 return Ok(ObjectPgPendingCommandInstall::LogConflict {
-                    pending: self.pending_metadata_command_for_bucket(pg_id, bucket)?,
+                    pending: self.pending_metadata_command_for_bucket_until(
+                        pg_id, bucket, deadline,
+                    )?,
                 });
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         if command.id().pg_id() != pg_id
             || command.id().cluster_epoch() != self.operation_epoch()
         {
-            return Err(StoreError::RouteCapabilitySubjectMismatch {
-                operation: "install built object metadata command",
-            }
-            .into());
+            return Err(BuiltPendingCommandInstallFailure::from_install(
+                command,
+                MetadataCommandPendingSlotInsertError::not_sent(
+                    StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "install built object metadata command",
+                    },
+                ),
+            ));
         }
-        match self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
+        match self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence_until(
             pg_id,
             bucket,
             &command,
             effect_fence,
+            deadline,
         ) {
             Ok(Some(())) => Ok(ObjectPgPendingCommandInstall::Installed(command)),
             Ok(None) => {
-                let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
-                    return Err(conflicting_pending_object_metadata_command(
-                        "pending slot conflicted without visible command",
+                let pending = self
+                    .pending_metadata_command_for_bucket_until(pg_id, bucket, deadline)
+                    .map_err(|source| {
+                        BuiltPendingCommandInstallFailure::from_install(
+                            command.clone(),
+                            MetadataCommandPendingSlotInsertError::definitive(source),
+                        )
+                    })?;
+                let Some(pending) = pending else {
+                    return Err(BuiltPendingCommandInstallFailure::from_install(
+                        command,
+                        MetadataCommandPendingSlotInsertError::definitive(
+                            StoreError::MetadataCommandContention {
+                                context: "pending slot conflicted without visible command",
+                            },
+                        ),
                     ));
                 };
                 Ok(ObjectPgPendingCommandInstall::Pending(pending))
             }
-            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+            // Classify uncertainty before interpreting an error's diagnostic
+            // code. Do not reobserve/drain a contender and lose the candidate
+            // after an ambiguous response, even if its source names a conflict.
+            Err(error) if error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied => {
+                Err(BuiltPendingCommandInstallFailure::from_install(command, error))
+            }
+            Err(error)
+                if matches!(error.source(), StoreError::MetadataCommandLogConflict { .. }) =>
+            {
                 Ok(ObjectPgPendingCommandInstall::LogConflict {
-                    pending: self.pending_metadata_command_for_bucket(pg_id, bucket)?,
+                    pending: self
+                        .pending_metadata_command_for_bucket_until(pg_id, bucket, deadline)
+                        .map_err(|source| {
+                            BuiltPendingCommandInstallFailure::from_install(
+                                command,
+                                MetadataCommandPendingSlotInsertError::definitive(source),
+                            )
+                        })?,
                 })
             }
-            Err(error) => Err(error.into()),
+            Err(error) => Err(BuiltPendingCommandInstallFailure::from_install(
+                command, error,
+            )),
         }
     }
 
@@ -4884,7 +4929,7 @@ impl StorageCluster {
         admission: AllocatorCleanupFreshInstallAdmission,
         work_budget: &mut RequestWorkBudget,
         build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
-    ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
+    ) -> Result<AllocatorCleanupFreshInstallOutcome, BuiltPendingCommandInstallFailure> {
         let AllocatorCleanupFreshInstallAdmission {
             completion_admission,
             effect_fence,
@@ -4913,11 +4958,13 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         work_budget: &mut RequestWorkBudget,
         build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
-    ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
+    ) -> Result<AllocatorCleanupFreshInstallOutcome, BuiltPendingCommandInstallFailure> {
+        work_budget.check_deadline("allocator command construction budget exhausted")?;
         let (command, drained_outcome) = match self.try_install_object_pg_built_pending_command(
             pg_id,
             bucket,
             effect_fence,
+            work_budget.deadline(),
             || {
                 // The PG serialization wait can consume the caller's remaining
                 // budget. Never start fresh construction with a renewed budget.
@@ -4960,7 +5007,7 @@ impl StorageCluster {
                     command: Box::new(command),
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -5055,13 +5102,19 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &RequestWorkBudget,
         build_command: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
-    ) -> Result<ApplyValidatedFreshInstallOutcome, ObjectPgActionError> {
+    ) -> Result<ApplyValidatedFreshInstallOutcome, BuiltPendingCommandInstallFailure> {
+        work_budget.check_deadline("apply-validated command construction budget exhausted")?;
         let command = match self.try_install_object_pg_built_pending_command(
             pg_id,
             bucket,
             effect_fence,
-            build_command,
+            work_budget.deadline(),
+            || {
+                work_budget.check_deadline("apply-validated command construction budget exhausted")?;
+                build_command()
+            },
         )? {
             ObjectPgPendingCommandInstall::Installed(command) => {
                 return Ok(ApplyValidatedFreshInstallOutcome::Installed(Box::new(
@@ -5076,7 +5129,14 @@ impl StorageCluster {
                 command
             }
         };
-        match self.drain_pending_object_metadata_command_outcome(publisher, pg_id, &command) {
+        // A contender is part of the current append attempt, not a new owner
+        // retry. Keep its inner accounting independent but never extend time.
+        let mut contender_budget = RequestWorkBudget::ending_at(work_budget.deadline())
+            .for_operation("apply_validated_install_contender")
+            .for_pg(pg_id);
+        match self.drain_pending_object_metadata_command_with_work_budget(
+            publisher, pg_id, &command, &mut contender_budget,
+        ) {
             Ok(outcome) => Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained {
                 command: Box::new(command),
                 outcome,
@@ -5088,7 +5148,7 @@ impl StorageCluster {
                     error,
                 })
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 

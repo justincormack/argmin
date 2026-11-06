@@ -6202,38 +6202,7 @@ impl PgMetadataStore for PgStore {
         let rows = stmt
             .query_map(
                 params![bucket, key, version_id.to_u64() as i64, part_number],
-                |row| {
-                    let okh_blob: Vec<u8> = row.get(8)?;
-                    let okh = PgStore::parse_okh_blob(&okh_blob, 8)?;
-                    Ok(MultipartPartSegmentRecord {
-                        bucket: row.get(0)?,
-                        key: row.get(1)?,
-                        upload_id: row.get(2)?,
-                        version_id: row.get::<_, i64>(3)? as u64,
-                        part_number: row.get(4)?,
-                        segment_index: row.get(5)?,
-                        size: row.get::<_, i64>(6)? as u64,
-                        segment_crc64: row.get::<_, i64>(7)? as u64,
-                        segment_okh: okh,
-                        segment_vid: Self::parse_generation_id(
-                            row.get::<_, i64>(9)?,
-                            9,
-                            "segment_vid",
-                        )?,
-                        data_pg_id: row.get(10)?,
-                        placement_cluster_epoch: Self::parse_cluster_epoch(
-                            row.get::<_, i64>(11)?,
-                            11,
-                            "placement_cluster_epoch",
-                        )?,
-                        ec_k: row.get(12)?,
-                        ec_m: row.get(13)?,
-                        shard_integrity: PgStore::parse_optional_segment_shard_integrity(
-                            row.get(14)?,
-                            14,
-                        )?,
-                    })
-                },
+                Self::row_to_multipart_part_segment,
             )
             .map_err(|e| MetadataError::Db {
                 context: "get multipart part segments",

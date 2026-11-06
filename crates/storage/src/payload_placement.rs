@@ -32,6 +32,83 @@ enum PlacementSource<'a> {
 }
 
 impl<'a> PayloadPlacementInput<'a> {
+    /// Bind descriptor construction to the node's complete configured PG set,
+    /// not just a coincidentally matching object PG. This is placement data,
+    /// not admission or permission to mutate the store.
+    pub(in crate::node_runtime) fn require_topology(
+        self,
+        topology: &crate::pg_topology::PgTopology,
+    ) -> Result<EcShape, StoreError> {
+        let server_topology;
+        let (captured, ec) = match self.source {
+            PlacementSource::Embedded(map) => (map.pg_topology(), map.default_ec_shape()),
+            PlacementSource::Server(config) => {
+                server_topology = crate::pg_topology::PgTopology::new(&config.pg_ids)
+                    .map_err(|source| StoreError::InvalidPgTopology { source })?;
+                (&server_topology, config.default_ec_shape)
+            }
+        };
+        if topology != captured {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "staging capture topology",
+            });
+        }
+        Ok(ec)
+    }
+
+    pub(in crate::node_runtime) fn require_staging_primary(
+        self,
+        epoch: ClusterEpoch,
+        pg_id: PgId,
+        node_id: NodeId,
+    ) -> Result<(), StoreError> {
+        let (captured_epoch, route_epoch, state, primary, is_member) = match self.source {
+            PlacementSource::Embedded(map) => {
+                let route = map.pg_route(pg_id).ok_or(StoreError::ClusterPgNotFound {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: epoch,
+                })?;
+                (
+                    map.epoch(),
+                    route.cluster_epoch(),
+                    route.state(),
+                    route.primary_node_id(),
+                    route.acting_set().contains(&node_id),
+                )
+            }
+            PlacementSource::Server(config) => {
+                let route = config
+                    .pg_routes
+                    .iter()
+                    .find(|route| route.pg_id == pg_id.get())
+                    .ok_or(StoreError::ClusterPgNotFound {
+                        pg_id: pg_id.get(),
+                        cluster_epoch: epoch,
+                    })?;
+                (
+                    config.cluster_epoch,
+                    route.cluster_epoch,
+                    route.state,
+                    route.primary_node_id,
+                    route.acting_set.contains(&node_id),
+                )
+            }
+        };
+        if captured_epoch != epoch || route_epoch != epoch || primary != node_id || !is_member {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "staging capture primary",
+            });
+        }
+        if state != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: epoch,
+                state,
+            });
+        }
+        Ok(())
+    }
+
     /// Check the selected append against its durable placement generation. For
     /// UploadPart this is the enclosing MPU generation, not the part's payload
     /// generation. The caller loads it under the same lock as command preflight.

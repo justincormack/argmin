@@ -1616,6 +1616,19 @@ fn control_plane_rpc_v18_operation_catalogue_is_exact() {
             .collect::<Vec<_>>()
     );
 
+    let historical = crate::tests::frozen_hex_fixture(include_str!(
+        "../../control_plane_rpc_v18_canonical_v9_catalogue.hex"
+    ));
+    assert_eq!(
+        (
+            historical.len(),
+            hex_encode(&checksum::sha256::digest(&historical))
+        ),
+        (
+            14_125,
+            "d6664e05b4b9be005dbb0dc85a3a38ab600fa7ae84daf23a6da9ec788567c6b5".to_owned()
+        )
+    );
     assert_eq!(
         (
             aggregate.len(),
@@ -1623,7 +1636,7 @@ fn control_plane_rpc_v18_operation_catalogue_is_exact() {
         ),
         (
             14_125,
-            "d6664e05b4b9be005dbb0dc85a3a38ab600fa7ae84daf23a6da9ec788567c6b5".to_owned()
+            "a90661e5561a862c07fe3c94fa4488b90d580dc6efd7d4cc6e56e4ce9811b78e".to_owned()
         )
     );
 }

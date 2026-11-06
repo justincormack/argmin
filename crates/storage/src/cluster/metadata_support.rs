@@ -362,12 +362,75 @@ enum ApplyValidatedPendingInstallOutcome {
     RetryAfterContention,
 }
 
+#[derive(Debug)]
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
     LogConflict {
         pending: Option<MetadataCommandEnvelope>,
     },
+}
+
+/// Preserve the exact introducing candidate and dispatch classification until
+/// its publisher decides resource custody. A transport error (including a lost
+/// successful reply) is never evidence that no pending command owns resources.
+#[derive(Debug)]
+#[must_use = "installation uncertainty must be considered before releasing attempt resources"]
+enum BuiltPendingCommandInstallFailure {
+    BeforeInstallation(Box<ObjectPgActionError>),
+    Rejected {
+        command: Box<MetadataCommandEnvelope>,
+        error: Box<MetadataCommandPendingSlotInsertError>,
+    },
+    Unconfirmed {
+        command: Box<MetadataCommandEnvelope>,
+        error: Box<MetadataCommandPendingSlotInsertError>,
+    },
+}
+
+impl BuiltPendingCommandInstallFailure {
+    fn from_install(
+        command: MetadataCommandEnvelope,
+        error: MetadataCommandPendingSlotInsertError,
+    ) -> Self {
+        if error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied {
+            Self::Unconfirmed {
+                command: Box::new(command),
+                error: Box::new(error),
+            }
+        } else {
+            Self::Rejected {
+                command: Box::new(command),
+                error: Box::new(error),
+            }
+        }
+    }
+
+    /// Diagnostic projection only, NOT proof that frontend cleanup is safe.
+    /// The retained-owner integration must consume custody before this projection;
+    /// existing publishers retain their current behavior until that coordinated
+    /// transition is wired. Do not infer rejection from the projected variant.
+    fn into_action_error(self) -> ObjectPgActionError {
+        match self {
+            Self::BeforeInstallation(error) => *error,
+            Self::Rejected { command, error } | Self::Unconfirmed { command, error } => {
+                drop(command);
+                error.into_source().into()
+            }
+        }
+    }
+}
+
+impl From<ObjectPgActionError> for BuiltPendingCommandInstallFailure {
+    fn from(error: ObjectPgActionError) -> Self {
+        Self::BeforeInstallation(Box::new(error))
+    }
+}
+
+impl From<StoreError> for BuiltPendingCommandInstallFailure {
+    fn from(error: StoreError) -> Self {
+        ObjectPgActionError::Store(error).into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

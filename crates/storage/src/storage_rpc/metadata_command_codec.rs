@@ -721,9 +721,11 @@ pub(crate) fn encode_metadata_command_log_entry_range_response(
             }
             MetadataCommandLogRangeEntryKind::Abandoned {
                 original_command_checksum,
+                original_command_sha256,
             } => {
                 put_u8(&mut out, 1);
                 put_u64(&mut out, *original_command_checksum);
+                out.extend_from_slice(original_command_sha256);
             }
         }
     }
@@ -782,6 +784,7 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
             }
             1 => MetadataCommandLogRangeEntryKind::Abandoned {
                 original_command_checksum: decoder.read_u64()?,
+                original_command_sha256: decoder.read_exact(32)?.try_into().expect("32 bytes"),
             },
             _ => {
                 return Err(StorageRpcPayloadError::InvalidResponseEnvelope(

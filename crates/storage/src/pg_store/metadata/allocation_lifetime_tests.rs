@@ -146,7 +146,12 @@ fn pg_allocation_lifetime_checkpoint_replacement_and_rollback_retire_prior_issue
             )
             .unwrap();
         let error = store
-            .install_metadata_transfer_checkpoint_base(0, epoch, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                0,
+                epoch,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
+            )
             .unwrap_err();
         assert!(
             error
@@ -168,7 +173,12 @@ fn pg_allocation_lifetime_checkpoint_replacement_and_rollback_retire_prior_issue
             .execute_batch("DROP TRIGGER reject_session_import")
             .unwrap();
         store
-            .install_metadata_transfer_checkpoint_base(0, epoch, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                0,
+                epoch,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap(),
+            )
             .unwrap();
         let replaced = identity(&store).unwrap();
         assert_ne!(replaced, original);
@@ -179,7 +189,12 @@ fn pg_allocation_lifetime_checkpoint_replacement_and_rollback_retire_prior_issue
         // A rejected attempt on an already initialized epoch must not restore
         // that epoch's previous local issuer either.
         assert!(store
-            .install_metadata_transfer_checkpoint_base(0, epoch, &checkpoint)
+            .install_metadata_transfer_checkpoint_base(
+                0,
+                epoch,
+                &checkpoint,
+                &crate::pg_topology::PgTopology::new(&[store.pg_id]).unwrap()
+            )
             .is_err());
         assert_eq!(identity(&store), None);
         assert_eq!(

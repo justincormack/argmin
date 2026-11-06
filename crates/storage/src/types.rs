@@ -4739,6 +4739,14 @@ pub(crate) enum ShardScavengerReferenceCursor {
         command_checksum: u64,
         reference_index: u32,
     },
+    StagingWindow {
+        pg_id: PgId,
+        topology_digest: [u8; 32],
+        attempt: SessionId,
+        introduction_epoch: ClusterEpoch,
+        introduction_index: u64,
+        window_index: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4753,24 +4761,42 @@ pub(crate) struct ShardScavengerReferencePage {
     pub complete: bool,
 }
 
-/// A payload shard set referenced only by reclaim metadata.
+/// Identity-only protection from reclaim metadata or retained staging scope.
 ///
-/// Reclaim references prevent live shard-scavenger scans from treating cleanup
-/// work as an unreferenced orphan, but they do not contain enough authoritative
-/// payload metadata to schedule data repair.
+/// This conservative projection protects the physical identity without implying
+/// a readable payload, successful write, or permission to delete. It contains
+/// neither an actual length nor integrity evidence, so cannot schedule repair
+/// or backfill. Exact historical file/ack participants remain in the owner-local
+/// window. Unpaged cleanup consumers match the identity conservatively, without
+/// deriving exact locations. Paged staging discovery instead uses the distinct
+/// exact-participant alternative below, never reclaim's current-route expansion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShardScavengerReclaimShardSetReference {
+pub(crate) struct ShardScavengerProtectedShardSetReference {
     pub data_pg_id: u32,
     pub okh: [u8; 16],
     pub generation_id: GenerationId,
     pub ec: EcShape,
 }
 
+/// Original participants protected by a retained staging window. No actual
+/// stored size or integrity evidence: absence is not a repair/backfill task.
+/// File order is shard-index order, not node-ID or acting-set order. The ack
+/// participant is independent and may hold no file. Epoch records provenance;
+/// physical file/row keys do not contain an epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShardScavengerStagingProtection {
+    pub identity: ShardScavengerProtectedShardSetReference,
+    pub placement_epoch: ClusterEpoch,
+    pub file_nodes: Vec<crate::NodeId>,
+    pub acknowledgement_primary: crate::NodeId,
+}
+
 /// Durable metadata reference to a payload shard set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShardScavengerPayloadReference {
     Placed(ShardScavengerPlacedShardSetReference),
-    ReclaimOnly(ShardScavengerReclaimShardSetReference),
+    ProtectionOnly(ShardScavengerProtectedShardSetReference),
+    StagingProtection(ShardScavengerStagingProtection),
 }
 
 /// Public access block configuration for a bucket.

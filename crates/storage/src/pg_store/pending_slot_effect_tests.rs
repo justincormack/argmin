@@ -43,6 +43,192 @@ fn seed(store: &PgStore) {
     store.refresh_metadata_command_state_digest().unwrap();
 }
 
+#[derive(Clone, Copy, Debug)]
+enum EmbeddedInsertApi {
+    Classified,
+    Generic,
+    BucketControl,
+}
+
+impl EmbeddedInsertApi {
+    fn insert(
+        self,
+        client: &dyn crate::node_client::MetadataCommandNodeClient,
+        command: &MetadataCommandEnvelope,
+        fence: Option<AdmittedRouteEffectFence>,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        let pg = command.id().pg_id();
+        let bucket = command.bucket_name();
+        match (self, fence) {
+            (Self::Classified, fence) => {
+                let result = match fence {
+                    Some(fence) => client
+                        .try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+                            pg, command, Some(bucket), fence, deadline,
+                        ),
+                    None => client.try_insert_pending_metadata_command_slot_classified_until(
+                        pg, command, Some(bucket), deadline,
+                    ),
+                };
+                result.map_err(|error| {
+                    assert_eq!(
+                        error.kind(),
+                        crate::node_client::MetadataCommandApplyErrorKind::Definitive,
+                        "SQLite rejected before effects, not an uncertain dispatch: {error:?}",
+                    );
+                    error.into_source()
+                })
+            }
+            (Self::Generic, Some(fence)) => client
+                .try_insert_pending_metadata_command_slot_with_effect_fence_until(
+                    pg,
+                    command,
+                    Some(bucket),
+                    fence,
+                    deadline,
+                ),
+            (Self::Generic, None) => client.try_insert_pending_metadata_command_slot_until(
+                pg,
+                command,
+                Some(bucket),
+                deadline,
+            ),
+            (Self::BucketControl, Some(fence)) => client
+                .try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+                    pg, command, bucket, fence, deadline,
+                )
+                .map(|_| ()),
+            (Self::BucketControl, None) => client
+                .try_insert_bucket_control_pending_metadata_command_slot_until(
+                    pg, command, bucket, deadline,
+                )
+                .map(|_| ()),
+        }
+    }
+}
+
+fn embedded_work_deadline_matrix(api: EmbeddedInsertApi) {
+    use crate::node::SharedStorageNode;
+    use crate::node_runtime::client_facade::LocalStorageNodeClient;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    for fenced in [false, true] {
+        for occupied in [false, true] {
+            // Keep admission live throughout. Only the process-local work
+            // deadline expires, so the route fence cannot mask its omission.
+            let _time = crate::clock::test_time_override_guard(1_000);
+            let dir = test_util::tempdir();
+            let node = Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap());
+            let client = LocalStorageNodeClient::new(NodeId::new(0), Arc::clone(&node));
+            let target = {
+                let pg = node.get_pg(0).unwrap();
+                seed(&pg);
+                if occupied {
+                    insert(
+                        &pg,
+                        &command(&pg, false, 1),
+                        AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+                    )
+                    .unwrap();
+                }
+                command(&pg, matches!(api, EmbeddedInsertApi::BucketControl), 2)
+            };
+            let observe = || {
+                let pg = node.get_pg(0).unwrap();
+                (
+                    pg.conn.total_changes(),
+                    pg.metadata_checkpoint_table_blocks().unwrap(),
+                    pg.metadata_command_replica_state().unwrap(),
+                    pg.pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+                        .unwrap(),
+                )
+            };
+            let before = observe();
+            let fence = fenced
+                .then(|| AdmittedRouteEffectFence::bounded(ClusterEpoch::INITIAL, 20_000, 19_000));
+            let reached = Arc::new(AtomicBool::new(false));
+            let hook_reached = Arc::clone(&reached);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let error = PgStore::test_with_before_pending_slot_effect_hook(
+                move |in_transaction| {
+                    assert!(in_transaction, "must hold SQLite write serialization");
+                    hook_reached.store(true, Ordering::SeqCst);
+                    // Wait for the captured Instant itself, not an approximate
+                    // sleep or the unrelated route clock override.
+                    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(remaining);
+                    }
+                },
+                || api.insert(&client, &target, fence, deadline),
+            )
+            .expect_err("expired work must not reach INSERT even while admission is live");
+            assert!(
+                reached.load(Ordering::SeqCst),
+                "{api:?} must reach final effect hook"
+            );
+            assert!(
+                matches!(error, StoreError::OperationDeadlineExceeded { context }
+                if context == if matches!(api, EmbeddedInsertApi::BucketControl) {
+                    "insert bucket control pending metadata command slot"
+                } else {
+                    "insert metadata command pending slot"
+                }),
+                "{api:?} fenced={fenced} occupied={occupied}: {error:?}",
+            );
+            assert_eq!(
+                observe(),
+                before,
+                "expiry must precede every slot/sidecar SQL mutation, not only roll back",
+            );
+            assert!(node.get_pg(0).unwrap().conn.is_autocommit());
+            if !occupied {
+                api.insert(
+                    &client,
+                    &target,
+                    fence,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+                let installed = observe();
+                assert!(
+                    installed.0 > before.0,
+                    "positive insertion canary must mutate SQL"
+                );
+                assert_eq!(
+                    installed.3.as_ref().unwrap().command_bytes,
+                    target.command_bytes()
+                );
+                api.insert(
+                    &client,
+                    &target,
+                    fence,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap();
+                assert_eq!(observe(), installed, "exact retry must remain idempotent");
+            }
+        }
+    }
+}
+
+#[test]
+fn embedded_classified_pending_slot_checks_work_deadline_at_sql_effect() {
+    embedded_work_deadline_matrix(EmbeddedInsertApi::Classified);
+}
+
+#[test]
+fn embedded_generic_pending_slot_checks_work_deadline_at_sql_effect() {
+    embedded_work_deadline_matrix(EmbeddedInsertApi::Generic);
+}
+
+#[test]
+fn embedded_bucket_control_pending_slot_checks_work_deadline_at_sql_effect() {
+    embedded_work_deadline_matrix(EmbeddedInsertApi::BucketControl);
+}
+
 fn insert(
     store: &PgStore,
     command: &MetadataCommandEnvelope,

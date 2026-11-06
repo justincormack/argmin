@@ -1214,7 +1214,7 @@ impl ShardScavengerObjectScanRoute for LocalShardScavengerObjectScanRoute {
     ) -> Result<ShardScavengerReferencePage, StoreError> {
         self.storage_node
             .get_pg(self.pg_id.get())?
-            .list_shard_scavenger_reference_page(after, limit)
+            .list_shard_scavenger_reference_page(self.storage_node.pg_topology(), after, limit)
     }
 
     fn shard_scavenger_reference_matches(
@@ -1231,7 +1231,7 @@ impl ShardScavengerObjectScanRoute for LocalShardScavengerObjectScanRoute {
         &self,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
         let pg = self.storage_node.get_pg(self.pg_id.get())?;
-        pg.list_shard_scavenger_payload_references()
+        pg.list_shard_scavenger_payload_references(self.storage_node.pg_topology())
     }
 }
 
@@ -6862,6 +6862,7 @@ impl MetadataCommandPeeringRoute for LocalMetadataCommandPeeringRoute<'_> {
             self.client.node_id.as_u32(),
             self.cluster_epoch,
             checkpoint,
+            self.client.storage_node.pg_topology(),
         )
     }
 
@@ -7587,8 +7588,10 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         bucket: Option<&BucketName>,
         deadline: Instant,
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
-        pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
+        self.try_insert_pending_metadata_command_slot_classified_until(
+            pg_id, command, bucket, deadline,
+        )
+        .map_err(MetadataCommandPendingSlotInsertError::into_source)
     }
 
     fn try_insert_pending_metadata_command_slot_classified_until(
@@ -7598,25 +7601,13 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         bucket: Option<&BucketName>,
         deadline: Instant,
     ) -> Result<(), MetadataCommandPendingSlotInsertError> {
-        let pg = self
-            .storage_node
-            .get_pg_until(pg_id.get(), deadline)
-            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
-        require_metadata_command_operation_deadline(deadline)
-            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
-        pg.try_insert_pending_metadata_command_slot_classified(
-            self.node_id.as_u32(),
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+            pg_id,
             command,
             bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+            deadline,
         )
-        .map_err(|error| match error {
-            crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(source) => {
-                MetadataCommandPendingSlotInsertError::definitive(source)
-            }
-            crate::pg_store::PendingMetadataCommandSlotInsertError::MayHaveApplied(source) => {
-                MetadataCommandPendingSlotInsertError::may_have_applied(source)
-            }
-        })
     }
 
     fn try_insert_pending_metadata_command_slot_with_effect_fence(
@@ -7644,15 +7635,14 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         effect_fence: AdmittedRouteEffectFence,
         deadline: Instant,
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
-        effect_fence.require_valid_for(command.id().cluster_epoch())?;
-        require_metadata_command_operation_deadline(deadline)?;
-        pg.try_insert_pending_metadata_command_slot_with_effect_fence(
-            self.node_id.as_u32(),
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+            pg_id,
             command,
             bucket,
             effect_fence,
+            deadline,
         )
+        .map_err(MetadataCommandPendingSlotInsertError::into_source)
     }
 
     fn try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
@@ -7672,11 +7662,12 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
             .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
         require_metadata_command_operation_deadline(deadline)
             .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
-        pg.try_insert_pending_metadata_command_slot_with_effect_fence_classified(
+        pg.try_insert_pending_metadata_command_slot_with_effect_fence_and_deadline_classified(
             self.node_id.as_u32(),
             command,
             bucket,
             effect_fence,
+            Some(deadline),
         )
         .map_err(|error| match error {
             crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(source) => {
@@ -7726,12 +7717,12 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         deadline: Instant,
     ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
-        require_metadata_command_operation_deadline(deadline)?;
-        pg.try_insert_bucket_control_pending_metadata_command_slot(
-            self.node_id.as_u32(),
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+            pg_id,
             command,
             bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+            deadline,
         )
     }
 
@@ -7746,11 +7737,12 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
         effect_fence.require_valid_for(command.id().cluster_epoch())?;
         require_metadata_command_operation_deadline(deadline)?;
-        pg.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+        pg.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_and_deadline(
             self.node_id.as_u32(),
             command,
             bucket,
             effect_fence,
+            Some(deadline),
         )
     }
 

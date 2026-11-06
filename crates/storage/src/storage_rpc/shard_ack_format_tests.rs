@@ -166,7 +166,7 @@ fn frozen_text(text: &str) -> BTreeMap<String, Vec<u8>> {
 }
 
 fn frozen() -> BTreeMap<String, Vec<u8>> {
-    frozen_text(include_str!("testdata/shard_ack_rpc_v34.hex"))
+    frozen_text(include_str!("testdata/shard_ack_rpc_v35.hex"))
 }
 
 #[test]
@@ -194,8 +194,8 @@ fn retired_shard_ack_v33_frames_are_rejected_unchanged() {
 }
 
 #[test]
-fn shard_ack_v34_writer_and_reader_match_frozen_frames() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+fn shard_ack_v35_writer_and_reader_match_frozen_frames() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
     assert_eq!(StorageRpcMessageKind::ShardAckRecord as u16, 12);
     assert_eq!(StorageRpcMessageKind::ShardAckValidate as u16, 13);
     let frozen = frozen();
@@ -227,7 +227,7 @@ fn shard_ack_v34_writer_and_reader_match_frozen_frames() {
 }
 
 #[test]
-fn shard_ack_v34_payloads_reject_truncation_trailing_data_and_invalid_counts() {
+fn shard_ack_v35_payloads_reject_truncation_trailing_data_and_invalid_counts() {
     for (name, (kind, specimen)) in specimens() {
         let frame = decode_storage_rpc_frame(&frozen()[&name]).unwrap();
         for end in 0..frame.payload.len() {
@@ -247,7 +247,7 @@ fn shard_ack_v34_payloads_reject_truncation_trailing_data_and_invalid_counts() {
             Specimen::Response { .. } => decode_storage_rpc_response_payload(&trailing).is_err(),
         };
         assert!(rejected, "{name}: accepted trailing byte");
-        for version in [33, 35] {
+        for version in [34, 36] {
             let bytes = encode_storage_rpc_frame_with_version_for_test(
                 REQUEST_ID,
                 kind,
@@ -322,7 +322,7 @@ fn shard_ack_record_rejects_malformed_deadlines() {
 }
 
 #[test]
-fn shard_ack_v34_batch_admits_exact_cap_and_rejects_one_extra_byte() {
+fn shard_ack_v35_batch_admits_exact_cap_and_rejects_one_extra_byte() {
     assert_eq!(STORAGE_RPC_MAX_SHARD_ACK_ITEMS, 4096);
     assert_eq!(STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN, 184_340);
     let request = request(4096);

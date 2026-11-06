@@ -25,6 +25,9 @@ use crate::{
     PlacedSegmentShardBackfillWorkItem,
 };
 
+#[path = "built_install_transport.rs"]
+mod built_install_transport;
+
 #[test]
 fn unix_direct_put_reservation_rejects_unavailable_captured_placement_before_remote_mutation() {
     let (_serial, tmp) = unix_client_tempdir();

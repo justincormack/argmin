@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::cluster::{AllocatorCleanupFreshInstallOutcome, RequestWorkBudget};
+use crate::cluster::{
+    AllocatorCleanupFreshInstallOutcome, BuiltPendingCommandInstallFailure, RequestWorkBudget,
+};
 use crate::ObjectPgActionError;
 
 struct Fixture {
@@ -59,7 +61,7 @@ impl Fixture {
         &self,
         budget: &mut RequestWorkBudget,
         build: impl FnOnce() -> Result<MetadataCommandEnvelope, ObjectPgActionError>,
-    ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
+    ) -> Result<AllocatorCleanupFreshInstallOutcome, BuiltPendingCommandInstallFailure> {
         self.cluster
             .install_allocator_cleanup_built_metadata_command(
                 crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration),
@@ -103,8 +105,11 @@ fn allocator_built_install_propagates_builder_rejection_without_installation() {
         })
         .err()
         .unwrap();
+    let BuiltPendingCommandInstallFailure::BeforeInstallation(error) = error else {
+        panic!("builder rejection must not invent an installation attempt");
+    };
     assert!(matches!(
-        error,
+        *error,
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation: "test primary builder"
         })
@@ -134,8 +139,11 @@ fn allocator_built_install_does_not_refresh_an_exhausted_caller_budget() {
         .install(&mut expired, || panic!("expired budget reached builder"))
         .err()
         .unwrap();
+    let BuiltPendingCommandInstallFailure::BeforeInstallation(error) = error else {
+        panic!("exhausted budget must not invent an installation attempt");
+    };
     assert!(matches!(
-        error,
+        *error,
         ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
     ));
     assert_eq!(f.positions(), before);
@@ -156,16 +164,91 @@ fn allocator_built_install_rejects_crossed_command_route_before_installation() {
         ),
     ] {
         let command = MetadataCommandEnvelope::new(id, valid.payload().clone());
-        let error = f.install(&mut budget(), || Ok(command)).err().unwrap();
-        assert!(matches!(
+        let error = f
+            .install(&mut budget(), || Ok(command.clone()))
+            .err()
+            .unwrap();
+        let BuiltPendingCommandInstallFailure::Rejected {
+            command: actual,
             error,
-            ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+        } = error
+        else {
+            panic!("crossed route must retain the rejected candidate");
+        };
+        assert_eq!(*actual, command);
+        assert_eq!(
+            error.kind(),
+            crate::node_client::MetadataCommandApplyErrorKind::NotSent
+        );
+        assert!(matches!(
+            error.source(),
+            StoreError::RouteCapabilitySubjectMismatch {
                 operation: "install built object metadata command"
-            })
+            }
         ));
         assert_eq!(f.positions(), before);
         assert!(pending_metadata_command_for_test(&f.map, f.pg_id, &f.bucket).is_none());
     }
+}
+
+#[test]
+fn allocator_built_install_retains_exact_candidate_when_admission_expires_during_build() {
+    let f = Fixture::new();
+    let command = f.command("expiry-in-build");
+    let before = f.positions();
+    let time = crate::clock::test_time_override_guard(1_000);
+    let fence = crate::types::AdmittedRouteEffectFence::bounded(f.map.epoch(), 6_000, 4_000);
+    let error = f
+        .cluster
+        .install_allocator_cleanup_built_metadata_command(
+            crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration),
+            f.pg_id,
+            &f.bucket,
+            Some(fence),
+            &mut budget(),
+            || {
+                time.set(4_500);
+                Ok(command.clone())
+            },
+        )
+        .err()
+        .unwrap();
+    let BuiltPendingCommandInstallFailure::Rejected {
+        command: actual,
+        error,
+    } = error
+    else {
+        panic!("expiry before installation must preserve the rejected candidate");
+    };
+    assert_eq!(*actual, command);
+    assert_ne!(
+        error.kind(),
+        crate::node_client::MetadataCommandApplyErrorKind::MayHaveApplied
+    );
+    assert!(matches!(error.source(), StoreError::RouteMapExpired { .. }));
+    assert_eq!(f.positions(), before);
+    assert!(pending_metadata_command_for_test(&f.map, f.pg_id, &f.bucket).is_none());
+}
+
+#[test]
+fn allocator_built_install_does_not_wait_for_pg_lock_after_its_deadline() {
+    let f = Fixture::new();
+    let pg_lock = f.map.runtime_state().metadata_command_pg_lock(f.pg_id);
+    let _held = pg_lock.lock();
+    let error = f
+        .cluster
+        .try_install_object_pg_built_pending_command(
+            f.pg_id,
+            &f.bucket,
+            None,
+            Instant::now(),
+            || panic!("expired lock wait reached builder"),
+        )
+        .unwrap_err();
+    let BuiltPendingCommandInstallFailure::BeforeInstallation(error) = error else {
+        panic!("lock timeout must precede construction and dispatch");
+    };
+    assert!(error.is_operation_deadline_exhaustion(), "{error:?}");
 }
 
 #[test]

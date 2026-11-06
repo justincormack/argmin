@@ -49,7 +49,9 @@ fn decimal_u64_bytes(value: u64, out: &mut [u8; 20]) -> &[u8] {
     }
 }
 
-#[derive(Debug, Clone)]
+// Construction canonicalizes the complete PG set. Value equality therefore
+// compares topology identity, not allocation identity or just the PG count.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgTopology {
     pg_ids: Box<[u32]>,
 }

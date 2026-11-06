@@ -26,7 +26,7 @@ const RETIRED_V32: &str =
     include_str!("testdata/stream_creation_rpc_v32_command_v12_sse_s3_v5.hex");
 const RETIRED_V33: &str =
     include_str!("testdata/stream_creation_rpc_v33_command_v13_sse_s3_v5.hex");
-const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v34_command_v13_sse_s3_v5.hex");
+const FROZEN: &str = include_str!("testdata/stream_creation_rpc_v35_command_v13_sse_s3_v5.hex");
 
 enum Specimen {
     Match(Box<StorageRpcStreamUploadMatchRequest>),
@@ -400,8 +400,8 @@ fn frozen_specimens(input: &str) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-fn stream_creation_rpc_v34_writers_match_frozen_command_v13_sse_s3_v5_evidence() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 34);
+fn stream_creation_rpc_v35_writers_match_frozen_command_v13_sse_s3_v5_evidence() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(current.len(), 37);
@@ -419,7 +419,7 @@ fn stream_creation_rpc_v34_writers_match_frozen_command_v13_sse_s3_v5_evidence()
 }
 
 #[test]
-fn stream_creation_rpc_v34_readers_decode_frozen_command_v13_sse_s3_v5_evidence() {
+fn stream_creation_rpc_v35_readers_decode_frozen_command_v13_sse_s3_v5_evidence() {
     let current = specimens();
     let frozen = frozen_specimens(FROZEN);
     assert_eq!(

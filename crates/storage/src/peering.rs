@@ -367,6 +367,7 @@ impl PgMetadataRetainedChainVerifier {
                 }
                 MetadataCommandLogRangeEntryKind::Abandoned {
                     original_command_checksum,
+                    original_command_sha256,
                 } => {
                     if post_state_digest != pre_state_digest {
                         return Err(invalid("abandonment changed the metadata digest"));
@@ -374,6 +375,7 @@ impl PgMetadataRetainedChainVerifier {
                     checksum::crc64::checksum(&abandoned_command_log_bytes(
                         command_id,
                         *original_command_checksum,
+                        *original_command_sha256,
                     ))
                 }
             };
@@ -477,7 +479,11 @@ fn terminal_pending_matches_row(
         MetadataCommandLogRangeEntryKind::Applied(applied) => applied.as_ref() == command,
         MetadataCommandLogRangeEntryKind::Abandoned {
             original_command_checksum,
-        } => *original_command_checksum == command.checksum_crc64(),
+            original_command_sha256,
+        } => {
+            *original_command_checksum == command.checksum_crc64()
+                && *original_command_sha256 == command.command_sha256()
+        }
     }
 }
 
@@ -1307,9 +1313,20 @@ mod tests {
             0,
             MetadataCommandLogRangeEntryKind::Abandoned {
                 original_command_checksum: pending.checksum_crc64() ^ 1,
+                original_command_sha256: pending.command_sha256(),
             },
         );
         assert!(!terminal_pending_matches_row(&pending, &abandoned));
+        let crossed_digest = retained_entry(
+            1,
+            0,
+            0,
+            MetadataCommandLogRangeEntryKind::Abandoned {
+                original_command_checksum: pending.checksum_crc64(),
+                original_command_sha256: [0; 32],
+            },
+        );
+        assert!(!terminal_pending_matches_row(&pending, &crossed_digest));
     }
 
     #[test]
@@ -1344,6 +1361,7 @@ mod tests {
                 kind: if abandoned {
                     MetadataCommandLogRangeEntryKind::Abandoned {
                         original_command_checksum: pending.checksum_crc64(),
+                        original_command_sha256: pending.command_sha256(),
                     }
                 } else {
                     MetadataCommandLogRangeEntryKind::Applied(Box::new(pending.clone()))
@@ -1477,8 +1495,12 @@ mod tests {
         let terminal_id =
             MetadataCommandId::new(log_epoch, pg_id, MetadataCommandLogIndex::new(15).unwrap());
         let original_checksum = 7650087655367533823;
-        let tombstone_checksum =
-            checksum::crc64::checksum(&abandoned_command_log_bytes(terminal_id, original_checksum));
+        let original_sha256 = [0x55; 32];
+        let tombstone_checksum = checksum::crc64::checksum(&abandoned_command_log_bytes(
+            terminal_id,
+            original_checksum,
+            original_sha256,
+        ));
         let terminal_hash = metadata_command_log_hash(
             log_epoch,
             pg_id,
@@ -1494,6 +1516,7 @@ mod tests {
             post_state_digest: Some(proof.state_digest()),
             kind: MetadataCommandLogRangeEntryKind::Abandoned {
                 original_command_checksum: original_checksum,
+                original_command_sha256: original_sha256,
             },
         });
         (
@@ -1584,6 +1607,7 @@ mod tests {
         let mut wrong_tombstone_checksum = rows.clone();
         wrong_tombstone_checksum[4].kind = MetadataCommandLogRangeEntryKind::Abandoned {
             original_command_checksum: 1,
+            original_command_sha256: [0x55; 32],
         };
         assert!(matches!(
             verify(&wrong_tombstone_checksum),
@@ -1778,6 +1802,7 @@ mod tests {
                     retained_entries[target].kind =
                         MetadataCommandLogRangeEntryKind::Abandoned {
                             original_command_checksum: 0x1234,
+                            original_command_sha256: [0x55; 32],
                         };
                 }
             }
@@ -1947,6 +1972,7 @@ mod tests {
                 20,
                 MetadataCommandLogRangeEntryKind::Abandoned {
                     original_command_checksum: 0x1234,
+                    original_command_sha256: [0x55; 32],
                 },
             )],
         )

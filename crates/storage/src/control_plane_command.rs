@@ -2783,9 +2783,12 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13, 0x14, 0x15,
             0x16, 0x17, 0x18, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
         ];
-        let mut current_v9 = historical_v8;
-        current_v9[17] = 9;
-        assert_eq!(bytes, current_v9);
+        let mut historical_v9 = historical_v8;
+        historical_v9[17] = 9;
+        assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v9)).is_err());
+        let mut current_v10 = historical_v8;
+        current_v10[17] = 10;
+        assert_eq!(bytes, current_v10);
         assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v8)).is_err());
         let mut reader = PayloadReader::new(&bytes);
         assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);
@@ -3467,6 +3470,40 @@ mod tests {
 
     #[test]
     fn control_plane_command_v20_aggregate_encoding_is_stable() {
+        let historical_v9 = crate::tests::frozen_hex_fixture(include_str!(
+            "control_plane_command_v20_canonical_v9_aggregate.hex"
+        ));
+        assert_eq!(
+            (
+                historical_v9.len(),
+                checksum::sha256::digest(&historical_v9)
+            ),
+            (
+                2_799,
+                [
+                    172, 118, 97, 155, 65, 124, 181, 87, 239, 152, 82, 67, 216, 4, 249, 137, 209,
+                    188, 91, 185, 130, 120, 74, 135, 1, 218, 96, 144, 36, 220, 252, 193
+                ]
+            )
+        );
+        let mut remaining = historical_v9.as_slice();
+        let mut rejected = 0;
+        while !remaining.is_empty() {
+            let (length, tail) = remaining.split_at(4);
+            let (command, tail) = tail
+                .split_at(usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap());
+            if let Err(error) = decode_control_plane_command(command) {
+                assert!(
+                    matches!(error, ControlPlaneError::CommandDecode { message } if message == "unsupported canonical-state digest encoding version 9")
+                );
+                rejected += 1;
+            }
+            remaining = tail;
+        }
+        assert!(
+            rejected > 0,
+            "historical proof-bearing commands must be rejected"
+        );
         let historical = crate::tests::frozen_hex_fixture(include_str!(
             "control_plane_command_v20_canonical_v8_aggregate.hex"
         ));
@@ -3496,8 +3533,8 @@ mod tests {
             (
                 2_799,
                 [
-                    172, 118, 97, 155, 65, 124, 181, 87, 239, 152, 82, 67, 216, 4, 249, 137, 209,
-                    188, 91, 185, 130, 120, 74, 135, 1, 218, 96, 144, 36, 220, 252, 193,
+                    189, 163, 51, 51, 112, 242, 192, 197, 73, 144, 239, 239, 11, 252, 238, 188,
+                    236, 205, 160, 69, 229, 141, 56, 164, 221, 128, 80, 76, 238, 158, 35, 153,
                 ],
             )
         );

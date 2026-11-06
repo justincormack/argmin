@@ -426,11 +426,14 @@ impl StorageCluster {
                             &reference,
                         )?;
                     }
-                    ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                    ShardScavengerPayloadReference::ProtectionOnly(reference) => {
                         self.extend_reclaim_referenced_shard_set(
                             &mut page_scans,
                             &reference,
                         )?;
+                    }
+                    ShardScavengerPayloadReference::StagingProtection(reference) => {
+                        self.extend_staging_protection(&mut page_scans, &reference)?;
                     }
                 }
             }
@@ -532,6 +535,9 @@ impl StorageCluster {
             for (node_id, files) in files_by_node {
                 for file in files {
                     file_locations.insert((node_id, data_pg_id, file.key.clone()));
+                    if referenced_scan.staging_files.contains(&(node_id, file.key.clone())) {
+                        continue;
+                    }
                     let observation_key = crate::types::ShardScavengerObservationKey {
                         node_id,
                         data_pg_id,
@@ -577,6 +583,10 @@ impl StorageCluster {
             }
 
             for row in shard_rows {
+                if !expected_nodes_by_shard.contains_key(&row.key)
+                    && referenced_scan.staging_acknowledgements.contains(&(primary_node_id, row.key.clone())) {
+                    continue;
+                }
                 if let Some(expected_nodes) = expected_nodes_by_shard.get(&row.key) {
                     let missing_nodes: Vec<u32> = expected_nodes
                         .iter()
@@ -810,10 +820,28 @@ impl StorageCluster {
         Ok(())
     }
 
+    fn extend_staging_protection(
+        &self,
+        scans: &mut HashMap<u32, ShardScavengerReferenceScan>,
+        protection: &crate::types::ShardScavengerStagingProtection,
+    ) -> Result<(), StoreError> {
+        let reference = &protection.identity;
+        self.validated_data_pg(PgId::new(reference.data_pg_id))?;
+        // No route lookup: a retained participant need not be a current member.
+        // The codec/store already validate the bounded exact EC participant set.
+        let scan = scans.entry(reference.data_pg_id).or_default();
+        for (key, node) in Self::payload_shard_set_keys(&reference.okh, reference.generation_id, reference.ec)
+            .into_iter().zip(&protection.file_nodes) {
+            scan.staging_files.insert((node.as_u32(), key.clone()));
+            scan.staging_acknowledgements.insert((protection.acknowledgement_primary.as_u32(), key));
+        }
+        Ok(())
+    }
+
     fn extend_reclaim_referenced_shard_set(
         &self,
         scans: &mut HashMap<u32, ShardScavengerReferenceScan>,
-        reference: &crate::types::ShardScavengerReclaimShardSetReference,
+        reference: &crate::types::ShardScavengerProtectedShardSetReference,
     ) -> Result<(), StoreError> {
         let scan = scans.entry(reference.data_pg_id).or_default();
         self.extend_referenced_shard_locations(
@@ -2147,6 +2175,8 @@ impl StorageCluster {
         for (data_pg_id, page_scan) in page_scans {
             let scan = pass.referenced_scans.entry(data_pg_id).or_default();
             scan.locations.extend(page_scan.locations);
+            scan.staging_files.extend(page_scan.staging_files);
+            scan.staging_acknowledgements.extend(page_scan.staging_acknowledgements);
             for (shard_key, candidate) in page_scan.repair_work_by_shard {
                 match scan.repair_work_by_shard.entry(shard_key) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -4659,10 +4689,15 @@ impl StorageCluster {
                     && reference.generation_id == segment.segment_vid
                     && reference.placement_cluster_epoch == segment.placement_cluster_epoch
             }
-            ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+            ShardScavengerPayloadReference::ProtectionOnly(reference) => {
                 reference.data_pg_id == segment.data_pg_id
                     && reference.okh == segment.segment_okh
                     && reference.generation_id == segment.segment_vid
+            }
+            ShardScavengerPayloadReference::StagingProtection(reference) => {
+                reference.identity.data_pg_id == segment.data_pg_id
+                    && reference.identity.okh == segment.segment_okh
+                    && reference.identity.generation_id == segment.segment_vid
             }
         }
     }

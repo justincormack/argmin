@@ -967,7 +967,7 @@ impl StorageCluster {
                 || generation_route.build_reserve_put_object_generation_command(
                     reservation_id, generation_id, bucket_write_reservation, placement, effect_fence,
                 ),
-            ) {
+            ).map_err(BuiltPendingCommandInstallFailure::into_action_error) {
                 Ok(install) => install,
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {
                     work_budget.sleep_after_contention(
@@ -1351,7 +1351,7 @@ impl StorageCluster {
                         ),
                     )
                 },
-            ) {
+            ).map_err(BuiltPendingCommandInstallFailure::into_action_error) {
                 Ok(install) => install,
                 Err(error) if object_version_allocator_command_contention(&error) => {
                     work_budget
@@ -3734,7 +3734,7 @@ impl StorageCluster {
                         ),
                     )
                 },
-            )? {
+            ).map_err(BuiltPendingCommandInstallFailure::into_action_error)? {
                 AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
                 AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget
@@ -7618,6 +7618,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 Some(route.effect_fence),
+                &work_budget,
                 || {
                     let command = stream_route.build_append_command(
                         target,
@@ -7628,7 +7629,7 @@ impl StorageCluster {
                     self.maybe_run_after_stream_append_command_id_allocated_hook(command.id());
                     Ok(command)
                 },
-            ) {
+            ).map_err(BuiltPendingCommandInstallFailure::into_action_error) {
                 Ok(ApplyValidatedFreshInstallOutcome::Installed(command)) => *command,
                 Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained { command, outcome }) => {
                     if Self::stream_append_command_matches_request(

@@ -24,6 +24,55 @@ Its current best-effort cleanup remains unresolved. See the
 [completion cleanup work breakdown](#commitmultipartobject-cleanup-hardening)
 and [priority decision](#critical-path-priority-and-completion-cleanup--2026-11-03).
 
+**Scope split — 2026-11-06:** checkpoint size/transfer and aggregate-memory fixes
+belong to [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md),
+not this integration. The uncommitted paging experiment is withdrawn. Continue
+cleanup ownership work while keeping transferability an explicit external
+production-activation dependency; the existing limits remain unresolved.
+
+**Foundation checkpoint decision — 2026-11-06:** commit the reviewed, validated
+intermediate foundations without claiming Milestone 1 activation or completion.
+The atomic safety requirement applies to **switching production custody**, not
+to retaining all supporting work in one uncommitted tree. This decision
+supersedes the earlier blanket "not independently commit-ready" wording and
+"uncommitted" status reports in the implementation history below.
+
+This checkpoint includes private owner/transition components, SQL and checkpoint
+support, materialized-owner protection/route inventory, classified installation
+results and immutable format evidence. It is not entirely inactive: schema,
+canonical/checkpoint/RPC formats, authenticated abandonment evidence and the
+installation plumbing are already used by the running binary. Production command
+dispatch still does not create the new owners or consume their descriptors, and
+frontend custody remains on the existing path. No new owner-driven deletion or
+physical-write authority is activated.
+
+Three gates are distinct:
+
+1. **Foundation commit:** a coherent intermediate tree, reviewed and passing the
+   full checks, with exact format evidence and explicit unresolved work.
+2. **Protocol activation:** mandatory command descriptors, authoritative window
+   capture, pending protection, accepted/uncertain frontend custody and terminal
+   resource/reference transfers must be connected together. Do not expose a
+   partially switched custody path or optional-owner compatibility mode.
+3. **Completion:** physical exclusion, autonomous closure/cleanup/retirement,
+   checkpoint-transferability and all end-to-end acceptance requirements pass.
+   The six original skipped regressions remain unresolved at this checkpoint.
+
+The checkpoint freezes PG schema 11, canonical state 10, checkpoint 8, applied
+command 13, abandoned-command record 2 and storage RPC 35, plus the private V1
+descriptor/source-carrier evidence. Subsequent incompatible edits need new
+versions and append-only evidence; they cannot keep revising these committed
+versions as an unfinished candidate. The unchanged pending-index specimens also
+become parent-commit evidence for the next index-format change.
+
+Foundation checkpoint validation: formatting, strict all-target/all-feature
+Clippy, the storage boundary checker, 35 storage doctests and diff checks passed.
+The final full workspace run passed **9,592 tests (one slow), six skipped** in
+**259.775 seconds** (run `579d2cbb-152c-4dfb-bfbe-49b9d3ca0fa3`). The Raft
+write-amplification gate was inspected doing active test/WAL CPU work and passed
+in 111.521 seconds. Logs are retained at
+`/tmp/argmin-cleanup-foundation-{clippy,boundaries,doc,workspace}.log`.
+
 ## Coordinated Integration Checklist — 2026-11-03
 
 This is the current execution checklist, consolidated from the contract and
@@ -88,6 +137,14 @@ an implemented end-to-end cleanup protocol.
 | `CommitDirectPutObject` / `CommitStreamPart` | Atomically bind selected keys to the published object/part and retain all other window/resource obligations before removing session/reservation rows. Part replacement transfers displaced ownership before deleting its old manifests. |
 | `CommitMultipartObject` | Atomically transfer selected-part references to the exact completed object generation, retain omitted-part, active-session and unused-window obligations, and preserve completion replay semantics. This is the durable handoff portion of completion cleanup hardening; deletion and retry are required in milestones 2–3 below. |
 | Abort/release/abandonment, overwrite/delete/reclaim | Retain or transfer exact ownership before existing metadata disappears. Serialize fresh installation against adoption of retiring ownership; recover accepted/uncertain commands rather than infer absence. A disposition/cutoff alone must not enable physical deletion. |
+
+Abandonment tombstones remain materialized-state no-ops: they advance the command
+prefix without changing its state digest. Any new ownership/resource transition
+therefore belongs to a certified cleanup follow-up, not the tombstone itself.
+Retain the exact pending source and unresolved proof custody until that follow-up
+is durably installed and converged; no gap may discard their only durable owner.
+This can require a failure-side cleanup command, but not an additional ordinary
+successful-write command/fsync.
 
 - [ ] Update exact retry/reissue matching and reservation-disposition handling
   together. An unrelated drainer cannot steal/release the introducing attempt's
@@ -162,7 +219,11 @@ All source paths below are under `crates/storage/src/`.
   Include future windows carried in pending introductions. Check RPC carrier
   size limits and noncurrent sealed rejection before mutation/dispatch.
 
-### Milestone 1: acceptance tests and commit gate
+### Milestone 1: activation acceptance gate
+
+These requirements gate activation of the integrated protocol. They do not
+prevent the foundation checkpoint described above; its commit is not evidence
+that any unchecked integration requirement has been satisfied.
 
 - [ ] Atomic rollback/no partial owner at reserve/create; Direct PUT loss before
   staging retains exact release evidence; accepted/ambiguous introduction never
@@ -212,12 +273,2159 @@ All source paths below are under `crates/storage/src/`.
 
 ## Milestone 1 Implementation Proposal
 
-**Status: proposed, not implemented.** This translates the coordinated checklist
-into a concrete storage-private layout and transition map. It does not reopen the
-selected contract or propose another predecessor-evidence patch. Independent
-review and human approval of this proposal precede production changes. The
-coordinated state integration remains one coherent implementation boundary;
-internal work steps below are not independently shippable partial protocols.
+**Status: foundation checkpoint; production integration incomplete.** This translates the
+coordinated checklist into a concrete storage-private layout and transition map.
+It does not reopen the selected contract or propose another predecessor-evidence
+patch. The reviewed proposal was approved for implementation on 2026-11-04. The
+coordinated state integration remains one coherent activation boundary;
+supporting components may be committed without shipping a partial protocol.
+
+The first internal implementation step added private owner/window/reference/resource
+records and deterministic record validation in `pg_store/payload_staging.rs`.
+At that step they were compiled and tested, but not persisted or consumed by
+command application or frontend custody. The subsequent SQL and live-format steps
+are recorded below; they do not complete a checklist item by themselves. The
+foundation checkpoint is **not activation-ready**: all command transitions,
+classified introduction custody, authoritative placement capture, retained-route
+references and live-manifest correspondence still have to be connected before
+the coordinated integration can be reviewed as a production slice. The six
+original regressions remain unresolved.
+
+The initial eleven `staging_records_` tests passed, but review found incomplete
+terminal-reference cardinality, split-destination acceptance, an unbound
+UploadPart finalization obligation, and contradictory retiring semantics. The
+corrected matrix below is now represented explicitly, with additional record
+regressions. All sixteen focused tests pass, including all 405 combinations of
+target, lifecycle and resource-role states, independent terminal-prefix and
+mixed-destination negatives, and empty-publication proof retention. Formatting,
+strict all-target/all-feature Clippy and the storage boundary checker pass.
+The record-step full `cargo nextest run --retries 0` passed **9,353 tests, six skipped** in
+240.513 seconds. These remain record-shape tests, not SQL atomicity,
+transport-loss, durable handoff or physical-cleanup acceptance evidence; the
+coordinated integration was still incomplete at that record-only step. The
+foundation checkpoint decision above supersedes its original commit restriction.
+
+The next internal step implements the proposed normalized SQL representation in
+`pg_store/payload_staging_sql.rs`: owner, immutable window, file participant,
+selected-reference and bucket-resource tables. Generation responsibility inherits
+the exact owner attempt/generation and stores only its lifecycle state. Windows
+inherit the immutable introducing revision and issuer through their owner; no
+duplicated fields may disagree after decoding. SQL CHECK/FK constraints are
+supplemented by the same deterministic record validator. Only owner-owned child
+rows cascade; no session/upload/object/reservation deletion can cascade into this
+retained evidence. An existing attempt is rejected, including byte-identical
+insertion; exact command/session idempotence must be established by the enclosing
+apply transition, not treated as permission to adopt an owner.
+
+Insertion requires the caller's transaction and uses a nested rollback savepoint,
+not a separately committed transaction. Reads likewise require a single enclosing
+snapshot for all owner/child rows. The shared typed row decoder also accepts
+production-encoded checkpoint table blocks, checking exact table/column identity,
+ordered unique keys, orphan children, prefix/cardinality, participant geometry and
+resource lifecycle. This is topology-independent representation validation, not
+route admission, cleanup authority or live-manifest correspondence. The checked
+insertion view still requires the topology-specific subject/data-PG/release-PG
+checks. Checkpoint digests remain the enclosing verifier's responsibility.
+
+At this initial SQL-contract step, the new table SQL and row codecs were exercised
+only by owner-local contract tests, not installed in the production PG schema or
+canonical/checkpoint registry. The tests used the actual SQL statements and
+production checkpoint row encoder; reopening their standalone SQL fixture did
+not count as production checkpoint/restart acceptance. No writer/version had
+advanced at that point. The subsequent live-format step below supersedes that
+status, but no command yet persists an owner and frontend custody is unchanged.
+The full runtime coupling remains required for coordinated activation; committing
+these foundations does not claim a separately complete cleanup feature.
+
+Sixteen SQL/checkpoint contract regressions cover the valid target/lifecycle/
+destination matrix, exact reopen, transaction and crossed-PG guards, every table's
+insertion-failure rollback, collision non-adoption, complete column inventory,
+missing/split references, proof loss, malformed geometry/tags, and malformed or
+orphaned checkpoint rows. Validation of this extended working state passed:
+formatting, strict all-target/all-feature Clippy, the storage boundary checker and
+`git diff --check`; the full `cargo nextest run --retries 0` passed **9,369 tests,
+six skipped**, in 240.909 seconds (run
+`9671e6a3-9ca5-41ce-b76f-9663d9bfaa9f`). This includes all sixteen new contract
+tests; no acceptance checklist item is closed by this internal step alone.
+
+Review then identified that the checked insertion view discarded its topology:
+the same object PG can occur in two topologies with different data or bucket PGs.
+The view now immutably borrows both its exact record and the validated
+`PgTopology`. Insertion requires the destination's configured topology separately
+and compares the complete canonical PG set before any SQL access, rather than
+comparing only object PG, PG count or pointer identity. The eventual node-runtime
+caller must supply its configured topology, never reconstruct it from the record
+or treat the token's topology as the destination configuration. This does not
+serialize a topology or introduce a new durable field/version.
+
+Three regressions pin this boundary: same object/bucket PG but different data PG,
+same object/data PG but different bucket PG, and separately constructed equivalent
+topologies with reordered/duplicate input IDs. Both negative matrices cover Direct
+PUT, streamed PUT and UploadPart with equal PG counts, assert the exact topology
+diagnostic and absence of all owner rows, then prove the same record is accepted
+under its originating topology. The corrected working state passed all **47**
+focused `staging_` tests, formatting, strict all-target/all-feature Clippy, the
+storage boundary checker and `git diff --check`. The full
+`cargo nextest run --retries 0` passed **9,372 tests, six skipped**, in 239.853
+seconds (run `d8bef582-381f-462f-83eb-779175650d8a`). The integration and commit
+boundary remain open as described above.
+
+The next internal step installs the five normalized tables in the live PG schema,
+canonical digest triggers/inventory and checkpoint export/replacement paths. The
+working format vector advances PG schema **10 → 11**, canonical state **9 → 10**
+and checkpoint **7 → 8** together. Applied command 13 and RPC 34 remain unchanged
+at this internal step; their command/custody changes remain pending in the same
+coordinated milestone. Previous catalogues, exact checkpoint bytes and digest
+vectors remain rejection/reference evidence, never compatibility readers.
+
+Checkpoint verification now decodes and structurally validates every owner graph
+after validating the existing digest hierarchy. Installation also validates all
+owners against the destination node's configured topology before retiring its
+allocation lifetime or replacing any state. Both embedded and installed RPC
+callers supply that node-owned topology. A matching object PG alone cannot admit
+foreign data/release placement. Replica validation does not sample wall clocks.
+
+Real `PgStore` tests cover complete checkpoint encode/decode/install/reopen,
+correctly resealed malformed owner graphs, crossed destination topologies,
+rollback after an injected insertion failure in each table, and independent
+per-column participation in incremental and full state digests. A populated
+version-indexed checkpoint fixture pins target/lifecycle/destination/resource
+tags in addition to the empty-owner inventory specimen. These are storage-owned
+persistence/format fixtures, not command-created owners or proof of terminal
+publication/physical-cleanup safety. Live manifest correspondence, command
+transitions, route retention and frontend custody remain open.
+
+Development validation caught outdated nested-version goldens and rejection lists
+in storage/control-plane tests, plus three CLI/admin fixtures still supplying
+canonical version 9. The current fixtures now use version 10, preserving old
+literal evidence and rejection coverage. The predecessor control-plane aggregate
+captures matched their pre-existing frozen hashes before being retained as
+independent files. A temporary owner-corpus capture also rejected an overlong
+test session label; shortening that label fixed fixture construction, without
+changing the format. No temporary capture code remains.
+
+Final validation: **184** focused format/persistence tests and the **three**
+affected CLI/admin tests passed. Strict all-target/all-feature Clippy,
+formatting, the storage boundary checker and `git diff --check` passed. The full
+workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,379 tests,
+six existing skips**, in **258.805 seconds** (run
+`805717ae-76cf-4b3e-9e78-4b86268c8079`). The six original acceptance regressions
+remain ignored, not fixed. No acceptance checkbox is closed by this persistence
+step; the coordinated milestone remains uncommitted and incomplete.
+
+Review correction: the dynamic storage-transfer round-trip and retained v7
+checkpoint tuple did not preserve complete enclosing wire evidence. Four literal
+v34 frames now pin the base-install request and checkpoint-export success response
+for both `(checkpoint 7, canonical 9, PG 10)` and `(checkpoint 8, canonical 10,
+PG 11)`. They embed the independently frozen PG-1 MPU specimens; the historical
+checkpoint bytes are preserved verbatim, not rebuilt from current records. Tests
+accept each v7 outer frame/checksum and response envelope before requiring the
+exact unsupported-checkpoint-7 diagnostic from the production payload reader.
+The new v8 frames also match the current production writers exactly. All **five**
+focused transfer tests passed. The format ledger records the precise carriers,
+lengths, hashes and provenance; this does not claim a complete RPC catalogue or
+close the coordinated milestone.
+
+The corrected slice passed formatting, strict all-target/all-feature Clippy,
+the storage boundary checker and `git diff --check`. The full workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,383 tests (two slow),
+six existing skips**, in **265.476 seconds** (run
+`bf093399-3c3a-41a2-92ae-839fb02674a1`). No tests were retried or newly skipped.
+
+The next internal step brings **materialized owner route retention** forward
+before command activation. `PgStore` now feeds both exact route enumeration and
+the epoch summary from one shared owner/window/resource projection: the original
+object-PG epoch, every window's exact data-PG epoch (including unused lookahead),
+and each retained proof's bucket-PG/release epoch. File and independent ack
+participants share that data-PG route; the ack primary need not hold a file.
+Neither expired cutoffs, missing sessions/reservations/manifests, terminal owner
+states nor already-released proofs remove this conservative retention evidence.
+The existing `MetadataCommandResource` category carries it through node discovery
+and RPC; no new tag, field, write transaction or format advance is introduced.
+
+Five owner-local regressions cover three distinct object/data/bucket PGs with no
+other durable reference sources, all target/lifecycle combinations, independently
+visible selected/unused window epochs and UploadPart finalization release epochs,
+checkpoint import/reopen, node aggregation and response codec preservation.
+A production runtime-config refresh regression advances twice and proves the
+original routes survive only with the owner-derived summary. The records are
+seeded through private validated SQL, not introducing commands; these tests do
+not establish command custody, installed-RPC admission or physical cleanup.
+An initial focused build caught an incorrect test-module import, corrected to
+the existing private node runtime. All **five** focused `staging_history_` tests
+then passed. Pending introductions' future descriptors, scavenger/backfill
+reference integration and command/terminal transitions remain open in the same
+uncommitted milestone. No acceptance checkbox or original ignored test closes.
+
+Validation of this working state: all **75** focused staging/history/refresh
+tests passed, as did **35** storage doctests, the storage boundary checker,
+formatting, strict all-target/all-feature Clippy and `git diff --check`.
+The admitted full workspace `cargo nextest run --retries 0 --no-fail-fast`
+passed **9,388 tests (two slow), six existing skips**, in **264.393 seconds**
+(run `a66ed79c-693b-41ef-aadc-b058cc6af56b`). No tests were retried.
+
+The next internal step starts reserve/create/append integration with shared
+**primary descriptor capture** in `pg_store/payload_staging_capture.rs`.
+It derives the issuer from the live PG allocation lifetime, binds the complete
+configured topology and captured primary route, and constructs the first window
+and append lookahead using the existing placement algorithm. The data PG uses
+the enclosing MPU generation for UploadPart, independently of the part's payload
+generation. File participants remain in shard-index order; the independently
+captured acknowledgement primary need not hold a file.
+
+Capture derives fixed encrypted geometry and finite immutable absolute wall
+cutoffs: the selected 10-second/5-minute cap intersected with the admission's
+conservatively projected effective deadline, never its raw authority timestamp
+alone. Static/unbounded admission still receives a finite window. It checks
+integer/interval bounds and preserves the original issuer/revision, prior windows
+and horizon when constructing lookahead; a reopened/replaced PG cannot extend an
+old issuer's allocation. Creation versus finalization resource responsibilities
+follow the reviewed target matrix. Capture performs no SQL write, command-ID
+allocation, commit, transport call or physical effect.
+
+This is a **builder component**, currently exercised only by owner-local tests,
+not yet invoked by production reserve/create/append commands. The enclosing
+builder must still load and validate exact reservation/session/append state under
+PG serialization, encode the descriptors, and install them with its effect fence.
+The component is not a write/cleanup grant and does not establish durable
+reservation authorization, single-consumption preparation, exact command replay,
+terminal transfer or frontend custody. Those remain coupled in the same
+uncommitted milestone; no checklist item or original ignored regression closes.
+
+Eight component tests cover all three targets, separate object/data PGs and an
+ack primary outside file placement, a same-placement-resistant MPU-generation
+canary, effective-before-raw deadline expiry with different monotonic origins,
+crossed proof/topology/primary/data routes, finite/integer limits, lookahead
+prefix preservation and same-node/new-lifetime rejection. Before/after real PG
+checkpoints pin the absence of durable side effects. Development validation caught
+a private-type import typo and three checkpoint-observer mistakes: a newly opened
+PG retains durable command epoch 1 even when the candidate descriptor is for
+epoch 5. The observers now inspect epoch 1 without changing the descriptor or
+production behavior. All eight tests passed after that correction; final extended
+validation passed all **93** focused staging/history/placement tests and **35**
+storage doctests, the storage boundary checker, formatting, strict
+all-target/all-feature Clippy and `git diff --check`. After the unrelated Nextest
+process finished and load fell below the admission gate, the single owned full
+workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,396 tests
+(one slow), six existing skips**, in **258.968 seconds** (run
+`78b1a887-342e-4bd4-a98a-e07e56e25c33`). The slow test was
+`tests::raft_production_shaped_heartbeat_write_amplification_gate`, which passed
+in 112.282 seconds. No failures were retried or tests newly skipped. No additional
+format version, command, transaction or physical authority was introduced by
+this component step; command activation and the coordinated commit gate remain
+open.
+
+The next internal step preserves **built-command installation uncertainty** at
+the shared pending-slot boundary. Allocator/cleanup and apply-validated publisher
+helpers now distinguish failure before installation from rejection of an exact
+candidate and an unconfirmed installation of that exact candidate. They retain
+the node client's `NotSent`/`Definitive`/`MayHaveApplied` classification rather
+than interpreting its diagnostic source as proof of rejection. An uncertain
+result never enters contender inspection or drain. PG-lock waiting, pending
+inspection and insertion use the caller's existing work deadline; append's
+single-contender drain now also ends at that same deadline instead of receiving
+a fresh duration. Deadline revalidation within an append attempt does not consume
+another owner retry; the contender's inner accounting remains separate from the
+outer attempt limit. The builder is checked again after the serialization wait.
+
+This is **not yet the frontend custody transfer**. The four existing publisher
+call sites still explicitly project the classified failure into their existing
+action error. Those projections must be replaced/consumed together with retained
+owner evidence, exact recovery classification and terminal resource transfers
+before the coordinated protocol can activate. In particular, this step does not
+make `DirectPutWriteScope::GenerationAttempted` safe on uncertain return/unwind,
+activate descriptor-bearing commands or close any of the six ignored regressions.
+No new wire field, format version, successful-path RPC, transaction or fsync is
+introduced by this installation-classification step.
+
+Embedded tests pin builder rejection, admission expiry between construction and
+insertion, expired PG-lock waiting, exact crossed-route rejection and existing
+one-contender handoff behavior. A real installed Unix server behind a controlled
+proxy exercises both publisher helpers, with and without an explicit effect
+fence: successful insertion, definite rejection, request loss before server
+dispatch, lost successful insertion reply and malformed successful reply. Each
+case checks the exact returned candidate, backend pending-slot state and unchanged
+apply/log positions. These are generic insertion-boundary tests, not terminal
+publication or retained-owner cleanup tests. Initial fixture failures exposed a
+wrong persistent-connection assumption and an assertion against intentionally
+redacted diagnostic formatting; the proxy now follows one connection per ordinary
+RPC and the owner-local assertion inspects the retained diagnostic directly.
+The broader run also caught three deterministic append regressions from charging
+an extra attempt at each new deadline check. Deadline-only revalidation and an
+inner contender budget ending at the unchanged outer deadline preserve the
+existing single-attempt success/contention assertions without modifying those
+tests.
+
+Final validation of this internal step: **197** focused installation, staging,
+pending-slot and append tests and **35** storage doctests passed. Formatting,
+strict all-target/all-feature Clippy, the storage boundary checker and
+`git diff --check` passed. With no other same-user Nextest process and load below
+the admission limit, the single full workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,400 tests (two slow),
+six existing skips**, in **263.094 seconds** (run
+`33176b16-b243-4ba5-8615-6222fd3c8b19`). The two slow tests passed:
+`tests::raft_production_shaped_heartbeat_write_amplification_gate` in 108.091
+seconds and
+`test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries`
+in 60.632 seconds. No automatic retries or new skips were used. The coordinated
+Milestone 1 commit gate remains open.
+
+Review found that the embedded node adapter checked the operation deadline only
+after PG mutex acquisition, then passed solely the route fence to SQLite. This
+did not match the Unix path's intersection of both bounds. The embedded adapter
+now carries the exact process-local `Instant` through transaction admission,
+prerequisite reads and statement preparation to the shared final pre-INSERT
+check, alongside (not replacing) the captured route fence. Both classified
+variants, both unclassified variants and both bucket-control deadline variants
+use this boundary. Expiry there is definitive non-installation; accepted
+insertion still finishes its atomic slot/sidecar transaction and preserves the
+existing uncertain-commit classification. No monotonic value is serialized and
+no format or transaction is added.
+
+Three owner-local regressions exercise the six APIs with empty and occupied
+slots. `BEFORE_PENDING_SLOT_EFFECT` waits until the captured work `Instant`
+expires while the route clock remains valid, preventing admission expiry from
+masking a missing work-deadline check. They assert the hook ran under SQLite
+write serialization, the exact operation-deadline diagnostic, definitive
+classification where available, unchanged table/replica/slot state and zero
+additional `total_changes` (including rolled-back mutations). Fresh successful
+insertion and exact retry are positive canaries on the same APIs.
+
+The corrected deadline boundary passed all **20** focused pending-slot/effect/
+built-install tests, formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and `git diff --check`. After checking the full-suite admission
+gate, `cargo nextest run --retries 0 --no-fail-fast` passed **9,403 tests (one
+slow), six existing skips**, in **257.728 seconds** (run
+`7d9c3da2-c825-407a-a3e0-ebc74fa3aca4`). The slow
+`tests::raft_production_shaped_heartbeat_write_amplification_gate` passed in
+109.913 seconds. No test failed, was retried or was newly skipped in these runs.
+This correction remains part of the uncommitted coordinated milestone.
+
+The next internal component binds an introduction descriptor to its exact
+reserve/create command and applies the existing live-row mutation together with
+owner insertion, inside the caller's open command transaction. This is **not yet
+production dispatch activation**: the descriptor remains a separate component
+input until mandatory command encoding, Direct PUT custody and terminal transfers
+are connected. No optional legacy descriptor path or extra commit/fsync is added.
+
+`payload_staging_introduction.rs` validates configured topology, command PG and
+original/reissued revision ordering, target, attempt, generation, incarnation,
+issuer, initial window and complete creation-proof evidence before mutation.
+UploadPart also checks its separately captured enclosing MPU generation against
+the durable upload. Replica application does not consult local clocks, remint an
+issuer, resample a route or contact another PG. A nested savepoint rolls back live
+reservation/session/high-water changes as well as every owner child if any write
+fails, without committing or discarding unrelated work in the outer transaction.
+
+Exact existing state is read-only and requires both the complete original owner
+and its still-matching live responsibility. A missing owner cannot adopt a
+pre-existing reservation/session; a retained owner cannot resurrect a missing
+reservation/session. The component does not authorize reissue or replace the
+existing acceptance/log-prefix transaction. Original revision and descriptor
+values remain unchanged when an independently authorized reissue is applied.
+
+The owner-local component tests use actual primary descriptor capture and the
+existing reserve/create mutations, including witness-first application after the
+cutoff, unchanged exact retry/reissue, reopen, independently crossed inputs and
+post-live-mutation owner-child failure. These are not command-wire, installed-RPC,
+frontend-custody or terminal-transfer acceptance tests. Those integrations and
+all six original ignored regressions remain open.
+
+Validation for this component: `cargo nextest run -p storage -E 'test(staging_)'
+with retries disabled passed **73 tests**, including seven new introduction
+regressions. The first focused run exposed an incorrect test observation:
+requesting a finalized checkpoint before the open transaction's digest update.
+The assertions now inspect canonical table blocks directly without changing
+checkpoint validation. Storage doctests passed **35 tests**; formatting, strict
+all-target/all-feature Clippy, the boundary checker and `git diff --check` passed.
+The single admitted `cargo nextest run --retries 0 --no-fail-fast` passed
+**9,410 tests (one slow), six existing skips**, in **265.744 seconds** (run
+`f513cbcc-a422-478f-acd9-e4bf2211a5e7`). The slow Raft heartbeat write-amplification
+gate passed in 107.072 seconds. No full-suite failure or retry occurred. This
+component remains uncommitted with the rest of the coordinated milestone.
+
+Review found that exact replay and checkpoint validation omitted the durable
+generation high-water fence. Both now require the exact `(bucket, key)` row in
+`object_write_counters` to have a non-NULL `max_committed_generation` at least as
+large as **every** retained owner's payload generation. This shared invariant
+applies to Active, Published and all Retiring outcomes, independently of whether
+a live reservation/session or selected manifest still exists. Replay rejects
+inconsistent state without repairing it; checkpoint verification rejects it
+before destination replacement or allocation-lifetime retirement.
+
+The regressions isolate missing, NULL, lowered, crossed-bucket and crossed-key
+counters while preserving the other replay prerequisites, including exact and
+reissued commands. Equal and higher counters are accepted. Correctly resealed
+checkpoint negatives cover all three targets and five lifecycle outcomes; valid
+imports/reopens cannot recycle generations even without a live reservation.
+The original populated checkpoint specimen, which omitted this counter, is
+preserved byte-for-byte as semantic rejection evidence. A separately named
+complete specimen appends the valid counter; no historical evidence is rewritten.
+
+The correction passed **77 focused staging tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy and the storage boundary checker.
+A same-object eight-owner canary additionally requires the counter to cover the
+highest retained generation, not just the first owner. The new checkpoint test's
+positive imports were corrected to use distinct, increasing destination epochs;
+the production same-epoch replacement rejection was not relaxed. After the
+full-suite admission check, `cargo nextest run --retries 0 --no-fail-fast` passed
+**9,414 tests (one slow), six existing skips**, in **284.997 seconds** (run
+`ff0436f2-648e-4b89-993e-99bfa176e427`). The Raft heartbeat write-amplification gate
+passed in 89.452 seconds. No full-suite failure or retry occurred. The milestone
+is still uncommitted and its pending production integrations remain open.
+
+### Append transaction component (coordinated integration in progress)
+
+The private `payload_staging_append.rs` component binds the decoded append to
+its exact retained owner, selected window and captured next-window descriptor.
+It checks the configured topology, command PG/revision ordering, target,
+incarnation, stored issuer, live generation responsibility/high-water fence,
+and complete selected stream prefix before mutation. UploadPart also requires
+its exact enclosing upload generation and live target. The selected descriptor
+must match hash, VID, data PG/epoch, codec geometry and EC shape; normal append
+preflight still validates the integrity witness and exact existing segment.
+
+Application adds the live segment, selected reference and next window in the
+existing object-PG transaction. Its savepoint also covers the local cursor;
+failure in any owner child rolls back all those changes without rolling back
+unrelated outer work. SQL inserts only the new reference, window and participant
+rows and updates the owner's reserved end/maximum cutoff. Earlier descriptors,
+references and resource obligations are not rewritten. Witness-first application
+accepts an unconsumed local cursor, advances it only past the selected VID and
+preserves the primary's issuer and lookahead; it never consumes that lookahead,
+consults replica clocks or remints authority. Exact replay after later appends or
+reopen is read-only and requires the original next-window descriptor.
+
+This remains a **component**, not production activation or physical cleanup
+completion. The next-window descriptor is temporarily a separate private input
+until mandatory command encoding and builder/preparation integration land with
+custody and terminal transfers. No optional descriptor compatibility path, new
+transaction/fsync, or wire/schema change is added by this step. The enclosing
+command acceptance/recovery boundary still owns authorization and applied-prefix
+recording. All six original regressions remain open.
+
+Owner-local tests cover both stream targets, witness-first versus prepared
+primary apply, two appends and old-command replay/reissue after reopen,
+independently crossed command/descriptor inputs, missing/changed live and prefix
+state, upload-generation binding, and late SQL child failures. Triggers reject
+rewrites of earlier windows/references/resources; state and `total_changes`
+canaries distinguish rejection before mutation from cleanup afterward. These
+metadata-only specimens perform no shard I/O and do not claim wire acceptance of
+the not-yet-encoded descriptor.
+
+Validation: after correcting a boxed-command test constructor, all **84 focused
+staging tests** and **35 storage doctests** passed. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. With no other same-user Nextest run and load below the admission gate,
+the single `cargo nextest run --retries 0 --no-fail-fast` passed **9,421 tests
+(one slow), six existing skips**, in **259.265 seconds** (run
+`52d0913b-755f-41af-bc8a-ece915e31e76`). The reported slow test was
+`raft_production_shaped_heartbeat_write_amplification_gate`; it remained
+CPU-active and passed in **112.209 seconds**. No full-suite failure or retry
+occurred. The component remains uncommitted with the coordinated milestone.
+
+### Unpublished closure transaction component (integration in progress)
+
+The private `payload_staging_close.rs` component handles ordinary standalone
+generation release and streamed PUT/UploadPart abort. It validates the exact
+active owner, command subject/kind/ordering, live generation and high-water
+fence before mutation. Stream abort additionally binds the session's incarnation,
+target, stored issuer, consumed cursor, codec and stable creation proof, and
+compares the complete staged prefix against both the command and retained window
+references. Append and closure share the same stream-row/window correspondence
+check. Parent MPU existence is not a prerequisite for closing its exact session;
+this does not grant authority over another attempt or a committed part.
+
+The existing release/abort mutation and owner update share one enclosing command
+transaction and rollback savepoint. The owner becomes
+`Retiring(Unpublished)`; selected stream bindings disappear, but every window,
+participant, immutable cutoff, generation fence and exact resource remains.
+Generation and live creation-proof responsibilities become `ReleaseDue`.
+UploadPart's already-due creation proof remains unchanged, and ordinary abort
+does not invent a finalization proof. Closure is neither physical deletion
+authority nor confirmation that cleanup has completed; conservative release
+evidence remains even after the corresponding live reservation is removed.
+
+This component applies only an active-to-unpublished transition. A terminal owner
+or missing live row does **not** prove an arbitrary command was already applied.
+The enclosing command acceptance/recovery boundary must establish exact replay;
+terminal replay/cleanup integration remains pending. Authoritative finalization
+abandonment, which transfers its distinct finalization proof, is also a separate
+pending transition. Production dispatch, command encoding and frontend custody
+are not activated here, and no schema/wire bump or ordinary-path commit/fsync is
+introduced. Published-owner transfers and all six original regressions remain
+open in the same uncommitted milestone.
+
+Owner-local tests exercise all three targets, empty and populated stream
+prefixes, closure after expiry/reopen, exact retained-owner route dependencies,
+independently crossed command/live state, co-crossed command and durable segment
+rows, rollback after live deletion or late ownership-write failure, and a second
+independently introduced attempt for the same object. Metadata-only fixtures do
+not write or delete shard files. The first focused run had 90 passes and one
+new-test failure: it incorrectly expected `LivePlacement` references to survive
+abort. The corrected expectation independently enumerates the exact retained
+`MetadataCommandResource` object/data/release routes; production retention was
+not changed.
+
+Validation of the corrected component passed **92 focused staging tests**, **35
+storage doctests**, formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and diff checks. After the full-suite admission gate, one
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,429 tests (one slow),
+six existing skips**, in **287.255 seconds** (run
+`9c10056d-36f1-4f96-a8e6-bec178975964`). The slow test,
+`raft_production_shaped_heartbeat_write_amplification_gate`, passed in **87.443
+seconds**. No full-suite failure or retry occurred. The coordinated milestone
+remains uncommitted and its production integration/physical-cleanup gates remain
+open.
+
+### UploadPart publication/replacement component (integration in progress)
+
+The private `payload_staging_part.rs` component transfers an active part attempt's
+complete selected stream prefix to its exact committed part generation. It binds
+the decoded command to the owner, live session, original stored issuer, enclosing
+upload generation, generation high-water fence and configured topology. Existing
+part-command validation still checks the upload, size, CRC, generation and exact
+staged/displaced rows. An additional equality check requires the committed
+integrity witness to be the staged witness, not merely a different valid witness.
+
+The part mutation, session/reservation removal, new selected-reference destination,
+generation release responsibility and separate finalization-proof custody share
+the existing object-PG transaction. Creation proof and all windows, participants
+and cutoffs remain unchanged. No clocks, current allocation lifetime, route
+refresh or cross-PG storage are consulted during application. Creation and
+finalization may retain distinct historical bucket-PG epochs.
+
+Replacement resolves the displaced owner by bucket/key, upload ID, part number
+and payload generation, including for a zero-segment part. It never infers the
+creator from a physical hash. Missing or duplicate owners, changed retained
+prefixes and already-unreferenced owners are rejected before mutation. The exact
+old owner becomes `Retiring(PublishedUnreferenced)` in the same transaction; its
+windows and both proof responsibilities survive while selected references are
+removed. A failure anywhere rolls back the live part/session and both owners
+without committing or discarding unrelated outer work.
+
+This remains an inactive component within the coordinated milestone. The existing
+command acceptance/recovery boundary must establish replay/reissue; surviving
+part rows or a terminal owner are not inferred replay authority. Mandatory command
+encoding, frontend custody, other terminal transfers, autonomous physical cleanup
+and all six original regressions remain open. This component adds no schema/wire
+change or ordinary-path commit/fsync. The exact displaced-owner lookup currently
+uses a filtered owner-table query; its indexing/access path must be settled with
+the remaining terminal lookup inventory before production activation, preserving
+the existing frozen schema evidence if that requires another schema version.
+
+Owner-local metadata-only tests cover empty and multi-segment publication,
+cross-epoch proof retention and reopen, replacement of Published and retained
+parts, independently crossed authority, valid-but-substituted integrity evidence,
+missing/duplicate/co-crossed displaced state, and failure injection at live-part,
+proof and both ownership updates. They do not write shard files or claim
+end-to-end publication/custody acceptance. The replacement fixture was corrected
+during review to introduce its second attempt at epoch 6 after the first part's
+epoch-6 publication, rather than stepping back to its original epoch 5.
+
+Validation: all **99 focused staging tests**, including seven new part-transition
+regressions, and **35 storage doctests** passed. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks passed.
+With no other same-user Nextest run and load below the admission gate, the single
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,436 tests (one slow),
+six existing skips**, in **263.017 seconds** (run
+`42429890-3384-4483-a899-9153cac3d1b4`). The slow test was
+`raft_production_shaped_heartbeat_write_amplification_gate`, which passed in
+**108.966 seconds**. No test failure or retry occurred. The milestone remains
+uncommitted; none of the end-to-end physical-cleanup gates closes in this step.
+
+### Fresh standard-object publication component (integration in progress)
+
+The private `payload_staging_object.rs` component binds Direct PUT and streamed
+PUT publication to the exact active owner, stable creation proof, live generation
+responsibility/high-water fence, configured topology and selected physical
+windows. Direct PUT selects exactly its one reserved window; a stream selects its
+complete retained prefix, never the lookahead. It compares every published
+segment's subject, version, index, hash, VID, placement, codec geometry and EC
+shape. Stream publication additionally binds the session incarnation, original
+stored issuer, consumed cursor and exact staged size/CRC/integrity witness. Total
+object size must equal the selected segment total. Existing apply validation
+continues to enforce the session proof and committed-encryption relationship.
+
+Live object/segment publication, reservation/session removal, selected Object
+references and generation/creation `ReleaseDue` responsibility share the existing
+object-PG transaction and rollback savepoint. No window, participant, cutoff or
+proof identity is removed or reminted. Heartbeat deadline changes do not replace
+the original retained proof evidence. Application does not consult local clocks,
+the current allocation lifetime, another PG or a renewed route. The enclosing
+command boundary still owns exact replay/reissue authorization; this component
+does not infer it from already-published objects.
+
+At this step the component was deliberately **fresh-version publication only**:
+it rejected a supplied stale-payload reclaim or an existing live row at the target
+version before mutation. The standard-source overwrite component below supersedes
+that restriction for standard null versions; multipart-source transfer remains
+required before activation. A payloadless null delete marker may be replaced, and a new
+numbered version preserves older versions and their owners. The existing
+production dispatcher remains unchanged; these temporary component restrictions
+are not new S3 behavior. No schema/wire change or ordinary-path command/fsync is
+added. Other terminal transfers, encoding, frontend custody and all six original
+physical-cleanup regressions remain open in the same uncommitted milestone.
+
+Seven owner-local metadata-only regressions cover Direct PUT, empty and populated
+streams, null/numbered versions, expiry/reopen and heartbeat evidence, payloadless
+marker replacement, prepared-but-unselected lookahead, version-history retention,
+fail-closed displacement, independently crossed command/live state, valid witness
+substitution, and late SQL failures across publication and custody. They perform
+no shard I/O and do not claim payload decryption or installed-command acceptance.
+An intermediate focused run passed 101 tests and failed four new tests after the
+fixture incorrectly used payload generation as the object write sequence. The
+existing stale-write check correctly rejected sequence 12 when sequence 1 was
+required. The fixture now uses the same `next_object_write_sequence` query as
+production builders; the check was not weakened.
+
+Final validation passed **106 focused staging tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks. With no other same-user Nextest run and load below the admission
+gate, the single `cargo nextest run --retries 0 --no-fail-fast` passed **9,443
+tests (one slow), six existing skips**, in **280.089 seconds** (run
+`8a0f3784-6cfa-48b8-8fd0-6a4490d6e038`). The slow Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **97.077
+seconds**. No full-suite failure or retry occurred. The coordinated milestone
+remains uncommitted; the pending overwrite, terminal/custody and physical-cleanup
+requirements are not closed by this component.
+
+Review found that segment/window EC comparison did not bind the independently
+supplied `object.ec`. Publication now requires the object-level shape to match
+the retained window geometry before mutation, including the initial window of
+an empty stream. A dedicated decoded-command regression changes only that field,
+independently crossing `k` and `m` to other valid shapes for Direct PUT and empty,
+single- and multi-segment streams. It checks the exact owner-boundary error,
+unchanged SQL `total_changes` and canonical state, then successfully applies the
+original command and checks the persisted object's EC shape. Before the fix,
+the new test failed because a `3+1` object over `2+1` windows returned `Ok(())`.
+The corrected component passed **107 focused staging tests**, **35 storage
+doctests**, formatting, strict all-target/all-feature Clippy, the storage boundary
+checker and diff checks. The admitted single workspace run passed **9,444 tests
+(two slow), six existing skips**, in **263.363 seconds** (run
+`33c7b172-08f6-4fda-98c2-2ef6aee60318`), without a full-suite failure or retry.
+The Raft heartbeat gate passed in 108.338 seconds; the 1,001-version oversized-
+listing test passed in 61.652 seconds. This correction remains part of the same
+uncommitted milestone and does not activate production dispatch.
+
+### Standard-source overwrite-to-reclaim component (integration in progress)
+
+Standard-object publication now transfers a displaced standard null version's
+exact Object references to Reclaim references in the same existing object-PG
+transaction as the new object/segments, reclaim root/segments, new terminal
+owner, and session/reservation removal. This covers Direct PUT and streamed PUT
+as both source and replacement, including empty streams. The old owner becomes
+`Retiring(PublishedRetained)`; its original physical windows, unused lookahead,
+file/ack participants, issuer, cutoffs, generation responsibility and bucket proof
+evidence remain intact. The new owner's published custody is unchanged.
+
+Before effects, the component reconstructs the expected reclaim from the live
+manifest using the existing central full-payload validator, normalizing only
+`created_at`. It requires one exact logical standard-object owner for the
+bucket/key/generation, including when there are no selected segments. It binds
+that owner's incarnation to the replacement, its full selected prefix and EC/
+codec geometry to the durable old object/segments, and its generation high-water
+fence to the durable counter. Missing/duplicate owners, split or crossed
+references, changed physical placement, and an already existing reclaim root are
+not treated as replay or permission to adopt responsibility. Numbered versions
+cannot be overwritten by this component; publishing a new version still leaves
+all older manifests and owners untouched.
+
+The SQL transition compares both exact checked before-records and their validated
+after-records under the configured topology. A late failure in manifest, reclaim,
+resource or either owner updates rolls back the complete handoff while preserving
+unrelated outer-transaction work. There is no extra command, transaction commit,
+fsync, clock decision, route refresh, cross-PG inspection or physical shard
+deletion. Exact replay/reissue remains the enclosing command boundary's duty,
+not an inference from surviving roots or a published owner.
+
+This remains an inactive internal component of the same uncommitted milestone.
+Multipart-source displacement is rejected before mutation until the MPU
+completion component establishes its part-owner-to-object transfer. Delete and
+reclaim-terminal transfers, mandatory encoding, frontend custody and autonomous
+physical cleanup remain open; none of the six ignored acceptance regressions is
+closed here. The new logical owner lookup joins the pending indexing/access-path
+review before activation. No frozen schema or format evidence changes.
+
+Owner-local metadata-only regressions exercise source/replacement and lifecycle
+matrices, restart before and after the transfer, expired cutoffs, exact old/new
+owner preservation, forged reclaim lists, absent/duplicate/crossed owners,
+co-crossed manifest/reclaim geometry, root non-adoption and late SQL rollback.
+These fixtures do not write shard files or claim end-to-end custody acceptance.
+The first focused run passed 111 tests and rejected two new fixture introductions:
+the replacement-stream helper captured a distinct reservation but constructed the
+command with the default proof. Supplying the exact captured proof fixed that
+fixture without weakening validation. The next run passed 114 tests and failed
+the root non-adoption setup because it called a transaction-opening helper inside
+an open transaction. The fixture now commits setup before seeding that root, then
+opens the transaction under test. All **115 focused staging tests**, including
+eight new overwrite regressions, and **35 storage doctests** subsequently passed.
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker and
+diff checks pass. After the process/load admission gate, the single workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,452 tests (one slow),
+six existing skips**, in **260.013 seconds** (run
+`e8d02d6b-89c9-4f6e-b29f-c38752b8bde8`). The Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **110.437
+seconds**. No full-suite failure or retry occurred. The coordinated milestone
+remains uncommitted and incomplete; this result does not close its physical-
+cleanup acceptance gates.
+
+### Fresh multipart completion component (integration in progress)
+
+The private completion component (now shared in `payload_staging_multipart.rs`)
+prepares the complete
+ownership transition before removing any upload, part or session metadata. It
+checks the canonical completion proof subject/epoch, live upload identity and
+state, selected-part ordering and exact object-part projection, total size, and
+the complete selected/omitted segment and active-session partition. Each part
+must have exactly one original owner, including empty parts. Selected and omitted
+parts are checked against that owner's physical prefix, incarnation, codec/EC
+geometry, integrity witness and durable generation high-water fence. Active
+attempts additionally bind their actual session, generation reservation, stored
+allocation issuer, consumed cursor and staged prefix.
+
+Completion resolves owners by logical upload/part/payload generation, never by
+parsing shard hashes. A complete upload-owner inventory rejects an active or
+still-selected owner hidden by missing live rows, even if a rebuilt command
+matches those incomplete rows exactly. Already closed/replaced attempts remain
+unchanged durable obligations, not re-adopted work.
+
+Selected part references move to the exact completed object generation and part
+number while retaining the original payload generation and every physical
+window. Published versus retiring-retained lifecycle is preserved. Omitted parts
+become `Retiring(PublishedUnreferenced)`; live attempts become
+`Retiring(Unpublished)` with generation release due. Both retain their complete
+windows, unused lookahead, participants, cutoff and original proof evidence.
+The existing command payload apply and all checked owner updates share one outer
+rollback savepoint in the object-PG transaction. No new commit/fsync, network
+inspection, clock evaluation, physical deletion or owner retirement is added.
+The completion operation's own bucket proof remains with its exact pending
+command under the existing release-before-slot-removal boundary; it is not
+mistaken for an UploadPart creation/finalization proof or copied to every part.
+
+The initial component permitted only fresh object versions or replacement of a
+payloadless null marker. The standard-null-source handoff is now composed with
+completion as recorded below; multipart-source displacement remains rejected
+before effects until its separate retained-owner transfer is implemented.
+Exact accepted-command replay/reissue belongs to the enclosing command boundary;
+an absent upload, surviving object or empty terminal owner does not authorize
+this component's fresh-apply entry point. Production dispatch and cleanup remain
+unchanged. Mandatory command encoding, custody activation, remaining terminal
+transfers and all six original physical-cleanup regressions remain open in the
+same uncommitted coordinated milestone.
+
+Metadata-only regressions exercise mixed selected/omitted/active/closed owners,
+empty and multi-segment parts, null/numbered versions, retiring selected owners,
+restart on both sides of application, expired cutoffs, crossed commands and
+co-crossed durable state, missing live rows/owners and late SQL rollback across
+manifest, upload, session and owner updates. They also pin the retained generation
+high-water fence after publication under the older enclosing upload generation.
+They do not claim physical deletion or payload-decryption acceptance.
+
+The initial focused run passed 116 tests and failed five new completion tests at
+one shared postcondition: the fixture expected the upload-scoped segment query
+to be empty, but that query correctly retains the completed object's selected
+segments. The assertion now requires exactly the selected committed rows, with
+no omitted or staging rows, rather than expecting their deletion. No production
+validation was weakened. All **121 focused staging tests**, including six new
+completion regressions, and **35 storage doctests** pass. The boundary checker,
+formatting, strict all-target/all-feature Clippy and diff checks pass. After the
+process/load gate, the single workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,458 tests (one slow),
+six existing skips**, in **263.605 seconds** (run
+`51bba74a-d0ab-4c21-bf07-c46ee4d5512d`). The Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **108.745
+seconds**. No full-suite failure or retry occurred. The coordinated milestone
+remains uncommitted, with production activation and physical-cleanup acceptance
+still open.
+
+Review correction: completion now binds every durable part's aggregate placement
+epoch before accepting its projection into the completed manifest. For a
+nonempty part it must equal the first selected window's epoch (and the exact
+segment comparison binds that window to the durable segment). For an empty part,
+the production UploadPart rule uses its finalization operation's epoch, retained
+in the owner's exact finalization proof. Neither an unused window's creation
+epoch nor the later MPU completion epoch may replace it. The empty-part fixture
+now follows this production rule; completion fixtures advance to epoch 7 after
+creation/placement at 5 or 6 and part finalization at 6.
+
+Two dedicated regressions co-cross only the durable part's aggregate epoch and
+the rebuilt, checksummed completion command. They cover empty, one- and
+two-segment parts, both selected parts and the omitted part, reject with the
+ownership error before any SQL mutation, and then prove the original manifest
+still publishes exactly. Both regressions failed against the previous validator
+because application returned `Ok(())`: empty part 3 accepted epoch 5 instead of
+6, and nonempty part 3 accepted epoch 6 instead of 5. These are metadata-only
+non-mutation tests, not new physical-cleanup acceptance claims.
+
+Validation after the correction: **123 focused staging tests** and **35 storage
+doctests** pass, as do formatting, strict all-target/all-feature Clippy, the
+storage boundary checker and diff checks. After confirming no other Nextest run
+and a one-minute host load below 10, the single workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,460 tests (one slow),
+six existing skips**, in **276.248 seconds** (run
+`0db964ef-776f-42f3-b278-4cb76c7d80d6`). The Raft heartbeat
+write-amplification gate passed in **98.577 seconds**; it had completed by the
+time its slow notification was inspected. No full-suite failure or retry
+occurred. This correction remains part of the uncommitted coordinated milestone;
+production activation and physical-cleanup acceptance remain open.
+
+### Whole-MPU abort component (integration in progress)
+
+Completion and whole-upload abort now share `payload_staging_multipart.rs`'s
+authoritative upload snapshot, original-owner inventory, part/window validation
+and active-session validation. Abort requires its exact canonical reservation
+operation, bucket/key/incarnation/epoch and internally consistent cleanup
+subject. It compares every cleanup record with durable upload, part, segment
+and session state before applying the shared ownership transitions. In-progress
+and aborting uploads are eligible; a completing upload is not.
+
+Every published or retiring-retained part becomes
+`Retiring(PublishedUnreferenced)`. Every active part attempt becomes
+`Retiring(Unpublished)` with generation release due. All physical windows,
+unused lookahead, allocation issuers, immutable cutoffs and original creation/
+finalization proof evidence remain unchanged. Previously closed/replaced owners
+remain exact independent obligations. Missing live rows cannot hide an owner,
+nor can rebuilding the abort cleanup from crossed durable metadata replace its
+original window/generation authority. An upload with no part attempts requires
+no synthetic owner. A different upload on the same bucket/key remains untouched.
+
+The existing abort payload mutation and the entire checked owner transfer share
+one outer rollback savepoint in the existing object-PG transaction. No new
+commit/fsync, network inspection, physical deletion, owner retirement or
+clock-dependent replica validation is added. The abort operation's own bucket
+proof remains owned by the exact pending command and its existing terminal
+release boundary, not conflated with a part's creation/finalization resources.
+Absent-upload replay remains the enclosing accepted-command boundary's decision;
+this fresh component rejects it without mutation.
+
+Metadata-only tests exercise empty and nonempty parts, active and previously
+closed attempts, retiring published parts, in-progress/aborting uploads,
+restart before and after abort, expired cutoffs and a different local allocation
+lifetime. Independent negatives cross the command/proof/cleanup, remove live rows
+or owners, rebuild cleanup over crossed durable state, and verify rollback at
+live-row deletion and owner-transfer boundaries while preserving outer work.
+These do not claim ciphertext cleanup or deletion-exclusion acceptance.
+Production dispatch, mandatory command encoding, frontend custody, remaining
+terminal transfers and the six original physical-cleanup regressions remain open
+in the same uncommitted coordinated milestone.
+
+The initial focused run passed 129 tests and failed the new same-key isolation
+canary during fixture construction: `complete-part-100` hex-encoded to 34
+characters, exceeding the session-ID limit. It never reached abort application.
+Using distinct two-digit attempt numbers corrected the fixture without weakening
+validation. All **130 focused staging tests**, including seven new whole-MPU
+abort regressions, then passed, as did **35 storage doctests**, formatting,
+strict all-target/all-feature Clippy, the storage boundary checker and diff
+checks. The same-key canary additionally checks both unrelated generation
+reservations, not only its retained owner and live manifest/session records.
+
+After confirming no other same-user Nextest run and host load below 10, the
+single workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,467
+tests (one slow), six existing skips**, in **259.221 seconds** (run
+`48e2f058-662d-4730-8276-9427f9f56c59`). The Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **112.280
+seconds**. No full-suite failure or retry occurred. The coordinated milestone
+remains uncommitted and incomplete; this component does not close production
+activation or physical-cleanup acceptance.
+
+### Completion-over-standard overwrite component (integration in progress)
+
+`CommitMultipartObject` can now replace a standard null-version object through
+the same retained-owner validation used by Direct PUT and streamed PUT. The
+shared preflight compares the complete reclaim record against the durable
+standard manifest, resolves exactly one original owner even for an empty stream,
+and checks incarnation, codec/EC geometry, generation high-water and every
+selected physical window. Rebuilding a reclaim descriptor from crossed durable
+rows does not replace that original provenance. An existing reclaim root is not
+accepted as replay or permission to adopt an owner.
+
+The old owner moves from exact `Object` references to exact `Reclaim` references
+and `Retiring(PublishedRetained)`, preserving all selected/unselected windows,
+cutoffs, original issuer and resource evidence. Standard publication and MPU
+completion share this SQL transition. Completion's new object/part publication,
+selected/omitted/active owner transfers, old reclaim insertion and old ownership
+transfer are enclosed by the same rollback savepoint in the existing object-PG
+transaction. No additional command, commit/fsync, clock evaluation, network
+inspection, physical deletion or owner retirement is introduced.
+
+A new numbered completion leaves the old null version and its owner untouched.
+Replacing an already-existing numbered version remains rejected before effects.
+Multipart-source replacement was rejected in this slice and is implemented by
+the following shared displacement component. Exact accepted-command replay stays with its enclosing
+command boundary, not inferred from a surviving reclaim row or completed object.
+
+Seven metadata-only regressions cover Direct PUT and empty/multi-segment streamed
+sources, empty/nonempty completed parts, retiring old owners, restart on both
+sides of application, expired cutoffs and renewed process-local allocation
+lifetimes. Negatives exercise forged full reclaim lists, missing/duplicate owners,
+co-crossed durable manifests/rebuilt reclaim records and a co-crossed
+owner/resource incarnation. Trigger failures cover reclaim insertion, old
+manifest removal, new publication and both sides of the owner handoff; rollback
+must preserve the entire old state and unrelated outer transaction work.
+
+The first focused run passed 136 tests and failed the new rollback fixture before
+application because its trigger named nonexistent `object_segments_reclaim`.
+The fixture now uses the actual `object_segments_reclaims` and
+`object_segment_reclaim_segments` table names. No production validation was
+weakened. This remains metadata/ownership integration, not physical-cleanup
+acceptance. Production activation, mandatory encoding/custody integration,
+the remaining delete/reclaim/abandonment transfers and
+the six original acceptance regressions remain open in the same uncommitted
+coordinated milestone.
+
+Validation after the fixture correction: **137 focused staging tests** and
+**35 storage doctests** pass, as do formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks. After the process/load
+gate, the single workspace `cargo nextest run --retries 0 --no-fail-fast` passed
+**9,474 tests (two slow), six existing skips**, in **261.456 seconds** (run
+`eb68ee9d-65bd-4ee5-a4f3-280dd83db3dc`). The Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **109.469
+seconds**. The oversized-version-listing test, whose setup writes 1,001 versions
+sequentially, passed in **60.173 seconds**, before its slow notification was
+inspected. No full-suite failure or retry occurred. The milestone remains
+uncommitted and incomplete; no physical-cleanup acceptance gate is closed.
+
+### Multipart-source overwrite component (integration in progress)
+
+Direct PUT, streamed PUT and MPU completion now share the null-version
+displacement boundary for completed multipart sources as well as standard
+sources. The complete command-provided reclaim descriptor must first equal the
+durable manifest. Multipart validation additionally resolves the original upload
+identity from the completed object and exactly one retained owner per selected
+part generation, including zero-segment parts. It binds object/part counts and
+sizes, incarnation, upload/object generation, codec, part EC and aggregate
+placement epoch, derived part placement, generation high-water and every
+segment/witness to those original owners. The empty-part epoch rule reuses the
+retained finalization proof, not the overwrite epoch or unused window.
+
+A complete owner-inventory check rejects a manifest/reclaim pair that silently
+omits a completed part. Duplicate owners are not selected arbitrarily. Previously
+omitted, aborted and closed attempts remain unchanged independent obligations.
+All selected owners transfer exact `Object { generation, part_number }`
+references to the corresponding `Reclaim` destinations, preserving original
+windows, issuer, cutoffs and resource proofs. Already-retiring retained owners
+remain supported. The shared SQL transition runs inside the same rollback
+savepoint as old manifest removal, reclaim insertion and new object publication;
+a failure on a later part rolls back earlier owner transfers too. No command,
+fsync, network call, local-clock decision, physical deletion or retirement is
+added. Existing numbered versions remain non-replaceable by these components.
+
+Six metadata-only regressions cover all three replacement paths, empty/nonempty
+source parts, retiring owners, restart on both sides, missing/forged reclaim
+lists, missing/duplicate owners, co-crossed durable manifests and reconstructed
+reclaim descriptors, omitted completed parts and independent segment-field
+substitutions. SQL fault injection covers reclaim publication, old manifests and
+later-part ownership transfer, preserving the complete old state and unrelated
+outer transaction work. These are transaction/ownership tests, not physical
+cleanup acceptance. Production activation, mandatory encoding and custody,
+remaining delete/reclaim/abandonment transitions and the six original acceptance
+gates remain open in the same uncommitted milestone.
+
+The initial focused run passed 140 tests and failed one new negative: its EC
+mutation set `ec_k = 2`, which was already the fixture's value. Changing the
+mutation to increment the existing value makes it an actual crossed geometry;
+no production check was weakened.
+
+Validation: **143 focused staging tests** and **35 storage doctests** pass,
+along with formatting, strict all-target/all-feature Clippy, the storage boundary
+checker and diff checks. After the same-user process/load gate, the single
+workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,480 tests
+(one slow), six existing skips**, in **281.090 seconds** (run
+`0cdf8866-26a0-4de0-8ff0-a3d8923ddc9a`). The Raft heartbeat write-amplification
+gate was CPU-active when inspected and passed in **95.547 seconds**. No
+full-suite failure or retry occurred. The coordinated milestone remains
+uncommitted and incomplete; this does not close physical-cleanup acceptance.
+
+Review correction: multipart displacement now enumerates **all** segment rows
+for the exact bucket/key/version that terminal application deletes, independently
+of both the listed parts and upload ID. It partitions that inventory by part,
+validates each selected partition against the retained owner/windows, and rejects
+any leftover partition before mutation. `multipart_part_segments` has no foreign
+key to `object_parts`; reading only listed part numbers could otherwise erase an
+orphan descriptor without including its physical payload in reclaim. The new
+query shares row decoding with ordinary per-part reads and introduces no writes
+or durability boundary.
+
+The orphan-row regression reproduced the defect before the fix: overwrite
+returned success (`unlisted version segment must reject overwrite: ()`). Its
+matrix covers Direct PUT, streamed PUT and MPU completion, orphan part numbers
+before/between/after the selected manifest, and both original and foreign upload
+IDs. It verifies zero mutations and preservation of the orphan row and all
+checkpoint-visible state. A separate positive canary proves another version's
+segments neither block overwrite nor get consumed.
+
+Corrected validation: **145 focused staging tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks pass. After the process/load gate, the single workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,482 tests (one slow),
+six existing skips**, in **264.910 seconds** (run
+`41995616-9089-4c14-9685-90cc056939a8`). The Raft heartbeat
+write-amplification gate was CPU-active when inspected and passed in **108.261
+seconds**. Apart from the deliberate pre-fix reproduction above, no test failed
+or was retried. The broader milestone and activation gates remain open, and the
+corrected slice remains part of the same uncommitted change.
+
+### Object-version deletion handoff (integration in progress)
+
+Fresh `DeleteObjectVersion` application now has an owner-aware transaction
+component for both current-object and explicit-version deletion. Its canonical
+operation/proof subject, PG/epoch, target layout and generation must match before
+effects. Current-delete authority additionally requires the actual current live
+version; it cannot be substituted for explicit deletion of an older version or
+a delete marker. Specific marker deletion checks the exact durable write sequence
+and requires no payload owner. This component is not yet production dispatch.
+
+Live deletion reuses the full overwrite-to-reclaim preflight without inventing a
+replacement object. It supports null and numbered standard/multipart versions,
+including empty streams and parts. Full reclaim equality, exact original owners,
+incarnation, geometry/witnesses, high-water and the complete version-scoped
+multipart segment inventory are checked before any live row disappears. The
+existing null-only overwrite rule stays at the overwrite entry point.
+
+Reclaim insertion, live object/manifest removal, current-version bookkeeping and
+every retained owner `Object` → `Reclaim` transfer share the existing object-PG
+transaction and rollback savepoint. Selected windows and resource evidence remain
+intact; omitted/aborted multipart attempts are untouched. The handoff adds no
+command/fsync, physical deletion, clock decision or resource release. Missing
+objects and surviving reclaim roots are not fresh-command replay evidence;
+accepted replay/reissue remains the enclosing command boundary's responsibility.
+
+Metadata-only tests cover Direct PUT, empty/multi-segment streamed PUT and
+empty/nonempty multipart sources, both delete modes and version kinds, retiring
+owners, restart, crossed command/proof/target fields, noncurrent-versus-specific
+authority, payloadless markers, missing empty owners and orphan segment rows.
+A current-version deletion canary also checks that the older version becomes
+current again with its exact manifest/segments and all original owners unchanged.
+Fault injection covers reclaim insertion, manifest/object deletion, write-counter
+updates and later-part owner transitions, preserving all old state and unrelated
+outer transaction work on failure. Delete-marker creation is covered by the
+following component; reclaim completion, abandonment, mandatory encoding/frontend
+custody and production activation remain open, alongside the physical-exclusion/worker
+milestones and six original acceptance gates.
+
+Validation: all **152 focused staging tests**, including seven new deletion
+regressions, and **35 storage doctests** pass. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks also
+pass. The full run waited for another same-user Nextest run in the sibling
+checkout to finish and for host load to fall below 10; that process was left
+untouched. The single workspace `cargo nextest run --retries 0 --no-fail-fast`
+then passed **9,489 tests (one slow), six existing skips**, in **261.181
+seconds** (run `3628dc47-da01-4fe9-95ba-f61afa97929c`). The Raft heartbeat
+write-amplification gate passed in **110.773 seconds**, before its running
+process could be inspected following the slow notification. No test failure or
+retry occurred. This remains part of the uncommitted coordinated milestone, not
+production activation or physical-cleanup acceptance.
+
+### Delete-marker publication handoff (integration in progress)
+
+Fresh `InsertDeleteMarker` application now has an owner-aware transaction
+component. It validates the exact canonical marker reservation subject, PG and
+epoch, and the captured next write sequence before mutation. It loads the exact
+target version, not whichever version is current: a null marker can displace a
+noncurrent null payload while a newer numbered version remains intact. New
+numbered markers preserve all existing payloads and owners. Replacing a null
+marker or creating a marker for an absent version needs no payload owner; an
+existing numbered version cannot be replaced. This is not production dispatch.
+
+Null live-payload displacement reuses the complete standard/multipart
+overwrite-to-reclaim validation, including empty payload owners and the full
+version-scoped segment inventory. Reclaim insertion, old manifest removal,
+marker publication, version bookkeeping and all selected owner `Object` →
+`Reclaim` transfers share the existing transaction and rollback savepoint.
+Original windows, resource obligations and omitted/aborted part attempts remain
+intact. No additional command/fsync, physical deletion, clock decision or
+reservation release is introduced. A visible matching marker is not a fresh
+command's replay certificate; accepted replay/reissue still belongs to the
+enclosing command boundary.
+
+Eight metadata-only regressions cover Direct PUT, empty/multi-segment streamed
+PUT and empty/nonempty multipart null displacement, retiring owners, restart,
+numbered marker publication and subsequent marker removal, noncurrent-null
+displacement beside a newer numbered payload, and payloadless targets. They
+independently check crossed authority/reclaim/sequence fields, missing empty
+owners, orphan multipart rows and numbered-version replacement rejection before
+mutation. Fault injection covers reclaim insertion, manifest removal, marker
+insertion, write-counter updates and later-part ownership transfers; every failure
+preserves the complete old checkpoint-visible state and unrelated outer
+transaction work. These tests do not claim physical deletion or decryptability.
+
+Validation: all **160 focused staging tests**, **35 storage doctests**, formatting,
+strict all-target/all-feature Clippy, the storage boundary checker and diff checks
+pass. With no other same-user Nextest run active and host load below 10, the single
+workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,497 tests
+(two slow), six existing skips**, in **263.726 seconds** (run
+`059ab52d-b968-4e0b-9d6a-29b6725e2c67`). The Raft heartbeat write-amplification
+gate passed in **111.845 seconds** and the oversized `ListObjectVersions` test in
+**60.082 seconds**, before their running processes could be inspected after the
+slow notifications. Source inspection confirms the former exercises 116 PGs,
+256 retained epochs and repeated checkpoint/heartbeat work, while the latter
+performs 1,001 sequential versioned PUTs and cleanup; this is not an isolated
+runtime attribution. No test failed or was retried.
+
+Reclaim completion is covered by the following component; abandonment, mandatory
+encoding/frontend custody and production activation remain open, alongside the
+physical-exclusion/worker milestones and six original physical-cleanup acceptance
+gates. This remains part of the same coordinated uncommitted change.
+
+### Reclaim completion handoff (integration in progress)
+
+Fresh `DeleteObjectPayloadReclaim` application now has an owner-aware transaction
+component. It requires the exact existing root and independently reconstructs its
+entire standard segment or ordered multipart part/segment descriptor from the
+retained owners. Matching a command to a corrupted root alone cannot discard
+protection. Owner discovery uses the exact bucket/key/object generation, including
+empty streams/parts and omitted or aborted multipart attempts; it never infers
+provenance from shard hashes or only enumerates nonempty references. All affected
+owners retain their original incarnation, topology, high-water, introduction
+ordering and target binding. A still-live object generation rejects completion.
+
+The component validates the command/claim PG, epoch and subject. A primary-local
+claim must match exactly; claim absence on a replica is allowed. A reissued
+envelope can retain its original claim epoch, and apply evaluates no lease clocks.
+Missing roots and already-unreferenced owners are not fresh replay certificates;
+the enclosing accepted-command boundary remains responsible for exact replay.
+
+Root removal, matching claim removal and all selected owner transitions share
+the existing object-PG transaction and rollback savepoint. Selected owners become
+`Retiring(PublishedUnreferenced)` and lose only their exact `Reclaim` bindings.
+Their windows, file/ack participants, immutable cutoffs, generation high-water,
+creation/finalization release evidence and historical routes remain unchanged.
+Omitted/aborted owners and other object generations are untouched. This neither
+retires owners nor manufactures physical-deletion/resource-release confirmations;
+later cleanup still needs conservative reinspection. No extra command/fsync,
+clock decision, network call or physical deletion is introduced. Production
+dispatch is not activated by this component.
+
+Seven metadata-only regressions cover Direct PUT, empty/multi-segment streamed
+PUT and empty/nonempty multipart roots, null and numbered source versions,
+primary-claim versus replica application, later-epoch reissue, restart and exact
+route retention. Adversarial cases cover crossed command/claim identities,
+command-and-durable-root co-forgeries, missing empty owners/high-water,
+live-object destinations, and same-key generation isolation. Failures at claim
+deletion, root deletion, reference removal and later-part lifecycle updates roll
+back the full checkpoint-visible state without discarding unrelated work in the
+outer transaction. No physical cleanup completion is asserted by these tests.
+
+Development validation caught two fixture compilation errors (a private import
+path and a conflicting mutable borrow), then two setup failures that called a
+transaction-starting root helper inside an existing transaction. The corrected
+owner-local corruption fixture replaces the complete root/child set in the
+enclosing transaction and explicitly asserts stored-root/command equality before
+testing independent-owner rejection. All **167 focused staging tests** and **35
+storage doctests** now pass. Formatting, strict all-target/all-feature Clippy,
+the storage boundary checker and diff checks pass; Clippy's two redundant unit
+expressions were removed before the final run. With no other same-user Nextest
+run active and host load below 10, the single workspace
+`cargo nextest run --retries 0 --no-fail-fast` passed **9,504 tests (one slow),
+six existing skips**, in **261.502 seconds** (run
+`6f76c71f-9ee3-46f8-80a9-5c4d853794c7`). The Raft heartbeat
+write-amplification gate was inspected while running: its CPU time advanced to
+88 seconds over 92 seconds elapsed, and it subsequently passed in **109.123
+seconds**. No full-suite failure or automatic retry occurred. The component
+remains part of the uncommitted coordinated milestone.
+
+The following component starts abandonment integration. Mandatory descriptor
+encoding, frontend custody, remaining reference inventories and coordinated
+production activation remain open. The physical-authority/worker milestones and
+six original acceptance regressions are
+not closed by this metadata-only handoff.
+
+### UploadPart finalization-abandonment follow-up (integration in progress)
+
+`payload_staging_abandonment.rs` adds a private transaction component for an exact
+abandoned `CommitStreamPart` whose attempt is still active. It authenticates the
+source through the existing linked terminal-log/receipt validator, not a raw
+tombstone row or inferred command absence. Source and follow-up must bind the
+same PG, bucket, key and session. Order is lexicographic `(epoch, log index)`:
+the same epoch requires a later index; a later epoch can start cleanup at index
+one. The source must likewise follow owner introduction in epoch-relative order.
+Its proof and historical release route remain bound to the original source epoch,
+not relabelled with the cleanup epoch. The source
+also binds the retained upload/part/payload generations, encryption and canonical
+finalization reservation subject. A contradictory started pending source fails
+closed. Actual session/window/high-water and complete staged-prefix validation
+are shared with ordinary abort; the failed source's old committed-part snapshot
+need not still be current.
+
+Ordinary session closure and retention of the distinct finalization release proof
+share one outer rollback savepoint/command transaction. The owner becomes
+`Retiring(Unpublished)` with both creation and finalization proofs release-due;
+its windows, cutoffs, participants and exact historical release routes remain.
+Committed parts, including a replacement published after the failed source was
+built, are untouched. Neither expiry nor missing live metadata certifies replay,
+and this component grants no physical-deletion authority or cleanup completion.
+
+**Tombstone/encoding integration contract:** existing abandonment records carry
+the source ID/checksum, not a materialized cleanup transition. Both recording and
+replay preserve the materialized digest. Keep that contract: authenticate the
+source, then perform closure/proof transfer in a separate certified follow-up.
+The component currently takes source and cleanup envelopes separately; this is
+not an optional production side input. Activation requires mandatory encoded
+source/certificate context, the corresponding command-format evidence, validated
+derivation/reissue, and exact pending-slot/recovery custody together. Never clear
+source proof custody first and enqueue the follow-up afterward. Do not silently
+extend `abandoned_recovery_follow_up` or call ordinary abort dispatch without
+that certificate. The terminal-owner custody component below covers an already
+closed unpublished attempt or an exact obligation already retained; conflicting
+obligations and other command-family abandonment remain part of the integration
+audit, not implicit replay.
+The remaining introduction-order audit is recorded below, with reset-index
+canaries: a later-epoch test that also increases the index does not demonstrate
+epoch-relative ordering. Completing that component audit is not a claim that
+the remaining recovery wiring is complete.
+
+This refines the earlier model's atomic abandonment/handoff abstraction: the
+implementation retains custody across tombstone recording and the distinct
+materializing follow-up, rather than mutating state under a no-op tombstone.
+No additional ordinary-path transaction/fsync is introduced; failure-side
+follow-up cost must be included in the final command/transaction measurements.
+Production dispatch is not activated by this component.
+
+The initial six metadata-only regressions cover empty/multi-segment attempts,
+restart, compacted terminal receipts, immutable owner/release-route retention, committed
+part preservation and a competing replacement. Absent, unlinked, applied,
+substituted and publication-started source evidence fails without mutation;
+independent crossed proof/owner subjects, command order and actual staged prefix
+are also rejected. Injected failures at session/generation removal, lifecycle
+update and late finalization-resource insertion roll back the full
+checkpoint-visible state while retaining unrelated outer-transaction work.
+
+Initial compilation identified test API mismatches and a missing database-error
+conversion. The first focused run passed five tests
+and failed one new fixture: deleting its parent MPU cascaded the committed part
+before the assertion could inspect it. The preservation matrix now uses actual
+part publication/replacement and independently pins the changed source snapshot.
+All **173 focused staging tests** and **35 storage doctests** pass, including
+independent crossed upload IDs and same-nonce encryption key material. Formatting,
+strict all-target/all-feature Clippy, the storage boundary checker and diff
+checks pass. With no other same-user Nextest run and load below 10, the single
+workspace `cargo nextest run --retries 0 --no-fail-fast` passed **9,510 tests
+(one slow), six existing skips**, in **261.250 seconds** (run
+`4693e3ac-30c6-46ec-9940-4a1f274f7fac`). The Raft heartbeat
+write-amplification gate was inspected while running: 79 CPU seconds over 82
+elapsed; it then passed in **109.942 seconds**. No full-suite test failed or was
+retried. The coordinated milestone remains uncommitted and not production
+activated.
+
+Review correction: the original same-epoch requirement blocked cleanup if the
+source tombstone committed before an epoch transition. Merely permitting a new
+epoch at the outer boundary was insufficient: the shared closure helper also
+compared indices across epochs, as did source-versus-introduction validation.
+All three comparisons on this path now use epoch-relative order. The original
+source checksum, linked log/terminal receipt, exact subject and proof validation
+remain required; the existing command acceptance boundary still rejects stale
+follow-up epochs and invalid current-log positions.
+
+A new regression uses the production matching-state transfer operation to
+advance the replica epoch/reset its log, then reopens the store. The old-epoch
+cleanup is explicitly rejected as stale; a new-epoch index-one follow-up passes
+acceptance, transfers responsibility, records its applied state/digest, survives
+restart and replays as already applied. The matrix covers empty/multi-segment
+attempts, linked tombstones/compacted receipts, and source index one after an
+earlier-epoch introduction. Missing/substituted historical source evidence leaves
+all ownership unchanged. The ordinary closure restart matrix also uses a reset
+index for Direct PUT, streamed PUT and UploadPart.
+
+Review-fix validation: development caught an incorrect private import path and
+a missing read transaction in the new regression's final reopen assertion; both
+were corrected. All **174 focused staging tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy, storage boundary checks and diff
+checks pass. With no other same-user Nextest run active and load below 10, the
+single `cargo nextest run --retries 0 --no-fail-fast` passed **9,511 tests (one
+slow), six existing skips**, in **262.205 seconds** (run
+`55ab41c2-f252-4b5b-bdd5-c68a33d57a75`). The Raft heartbeat write-amplification
+gate was inspected while running (91 CPU seconds over 95 elapsed) and passed in
+**109.750 seconds**. No full-suite failure or retry occurred. This correction
+remains in the same uncommitted, not-production-activated milestone.
+
+### Remaining component epoch-order audit (integration in progress)
+
+All staging command-position comparisons now share the private `command_follows`
+predicate: the PG must match and `(epoch, log index)` must increase. Introduction
+alone additionally permits its exact original ID; subsequent transitions are
+strictly later. The audit corrected index-only comparisons in introduction
+reissue, append, standard-object and part publication, whole-MPU completion/abort,
+delete/version removal, delete-marker displacement and reclaim completion.
+Abandonment and ordinary unpublished closure use the same predicate instead of
+separate tuple comparisons. A source search leaves no independent relative-index
+comparison in these staging components; integer-domain and SQL encoding checks
+are not command-order comparisons.
+
+This does not remint placement, proof identity, issuer, geometry or cutoff. The
+remaining resource-epoch checks are intentional: creation proof binds its
+original owner epoch, a finalization proof binds its own command, and a reclaim
+claim cannot predate owner introduction or postdate its apply envelope. Current
+command acceptance still rejects stale epochs and log gaps. This predicate is
+necessary ordering, **not recovery authorization**: existing recovery certificates
+and their same-epoch reissue rules are unchanged. The coordinated integration
+still needs the explicitly authorized historical-source/current-epoch cleanup
+handoff described above; these tests do not claim an installed recovery RPC can
+already perform it.
+
+Ten additional metadata-only regressions cover the strict same-PG comparison
+matrix and nine operation families. Each operation matrix anchors its fixture's
+prerequisite materialized state, advances through production matching-state
+transfer, round-trips the unchanged command payload at index one, requires
+`Apply`, runs the component, records the applied command/digest, reopens the store
+and requires `AlreadyApplied` with exact checkpoint-visible state. They include
+all three introduction targets, both append targets, empty/nonempty streams and
+parts, null/numbered objects, current/specific deletion, mixed selected/omitted/
+active/closed MPU ownership, all reclaim layouts, and primary-local claim versus
+replica absence. Introduction uses original index eleven versus new index one;
+append captures its descriptor before lifetime replacement and preserves the old
+issuer, demonstrating replica materialization rather than fresh allocation.
+
+No schema, command/RPC grammar, ordinary-path transaction or fsync is added by
+this audit. Production dispatch remains inactive. All **184 focused staging
+tests**, **35 storage doctests**, formatting, strict all-target/all-feature Clippy,
+the storage boundary checker and `git diff --check` pass. The full workspace
+Nextest run passed **9,521 tests (one slow), six existing skips**, in **263.212
+seconds** (run `3f2f8c1a-d58b-4597-a370-3c626bd151c1`), with no failure or retry.
+The Raft heartbeat write-amplification gate was flagged at 60 seconds and had
+completed successfully in **108.414 seconds** before process inspection.
+The following component covers already-terminal abandonment custody. Remaining
+integration includes mandatory descriptor/source-certificate encoding, frontend
+custody, reference inventories and coordinated activation. This audit remains
+part of the same uncommitted milestone.
+
+### Terminal-owner abandonment custody (integration in progress)
+
+The UploadPart abandonment component now distinguishes three explicit custody
+outcomes: closing an active attempt and retaining its proof, retaining a missing
+proof on an already closed unpublished owner, and finding the exact stable proof
+already retained. These are **not** command-replay or physical-cleanup receipts.
+The ordinary command-acceptance boundary must still accept and record the exact
+follow-up. Source authentication still requires the linked abandoned log/receipt,
+PG/epoch-relative ordering, exact attempt/upload/part/payload-generation subject,
+bucket incarnation, and canonical finalization-proof operation/target.
+
+A terminal follow-up is proof-only: it must carry an empty staged-payload list.
+It neither calls the ordinary abort mutation nor consumes encryption/segment
+metadata from the failed source. It changes no windows, selected references,
+placement, cutoff, generation responsibility or creation proof. In particular,
+an old payload-bearing abort cannot be repurposed to clean a published owner.
+Before proof transfer, the existing terminal owner must validate against the
+configured topology, retain its non-recycling generation high-water, and have no
+surviving session, staged rows or reservation under its attempt ID. Absence alone
+does not establish terminality or authenticate the source.
+
+Only `Retiring(Unpublished)` with no finalization resource can acquire one; the
+single inserted release-resource row retains its historical bucket-PG route.
+Any terminal lifecycle already retaining the same stable proof and release route
+reports custody present without a write, preserving even its original renewable
+lease evidence. At this intermediate step, a different finalization obligation
+was rejected without replacing or releasing either proof, leaving source/pending
+custody intact. That single-role limitation is superseded by the additional
+obligation slots described below; it is not an activation prerequisite to prove
+that competing finalization proofs cannot exist.
+
+The component remains inactive in production. Mandatory source/certificate
+encoding must distinguish this proof-only transition from ordinary abort and
+preserve custody through its acceptance/recording boundary; it must not dispatch
+through generic payload-deletion cleanup. No schema/wire grammar, new ordinary
+transaction/fsync, physical deletion or confirmation authority is added here.
+
+The new restart/compaction schedule exposed a shared historical-validation gap:
+when a checkpoint is later than the source, compaction removes the preceding log
+entries even while their terminal receipts remain. Historical validation now
+walks either full entries or verified receipts in a contiguous hash chain. The
+bounded-pruning correction below authenticates against a later checkpoint when
+the earlier prefix has aged out; otherwise validation uses the predecessor
+checkpoint/genesis base. It still checks the source receipt against its expected
+checksum and SHA-256. A missing or tampered link between source and anchor, a
+self-consistent but unlinked receipt, or substituted source evidence rejects
+before effects. Receipt retention remains bounded; this
+does not authorize missing history or replace the mandatory durable certificate
+custody required by coordinated activation.
+
+Seven new regressions cover closed attempts after restart/compaction and an epoch
+reset to index one; closure by MPU completion without changing completed payload;
+missing/lowered generation fences and contradictory live rows; conflicting
+finalization proofs on part/object owners; failed resource insertion preserving
+the outer transaction; corrupted receipt chains; and exact stable custody after
+part publication, object completion or part replacement, with independently
+changed renewal evidence. The original active-closure matrix remains in place.
+These are metadata-only components, not installed recovery RPC or physical
+cleanup acceptance tests.
+
+The first focused compilation caught an owner-local fixture calling a private
+reservation helper; the fixture now restores exact captured rows without
+widening that API. The first executed matrix passed nine tests and failed three:
+the receipt-chain gap above, a fixture restoring unrelated reservation rows, and
+an assertion counting digest-trigger writes as resource inserts. Those have been
+corrected. All **192 focused staging/receipt tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and `git diff --check` pass. Full workspace Nextest passed **9,528 tests (two
+slow), six existing skips**, in **260.664 seconds** (run
+`4faf3899-0db8-489c-ba29-1897fb66753f`), with no full-suite failure or retry.
+The Raft heartbeat write-amplification gate was inspected while active (63 CPU
+seconds over 65 elapsed) and passed in **112.233 seconds**. The oversized
+ListObjectVersions cap test, which creates 1,001 versions, passed in **60.061
+seconds** before process inspection. The coordinated milestone remains
+uncommitted and production activation remains open.
+
+**Bounded receipt pruning correction:** prefix-only validation was insufficient:
+a sole checkpoint at `N` and its retained source at `N-1` can outlive the receipt
+prefix needed to walk from genesis. Historical inspection now chooses the
+nearest verified checkpoint at or after the source, validates each full entry or
+receipt from the exact source through that checkpoint, and requires the final
+hash to equal its recorded prefix hash. The source's starting predecessor hash
+is not trusted independently; only reaching the checkpoint authenticates that
+suffix. If no such checkpoint exists, the prior predecessor-checkpoint/genesis
+validation remains. Catalogue bounds, checkpoint verification and bounded
+receipt retention are unchanged. Missing source evidence is still an error for
+the custody transition, even if a later checkpoint exists.
+
+The new reduced-retention matrix keeps only two receipts, explicitly asserts
+that no checkpoint at/before the source and no earlier receipt/full log survives,
+then completes exact proof transfer and applied replay across restart for empty
+and nonempty attempts, both in the source epoch and at index one of a successor
+epoch. The receipt corruption matrix now attacks the required suffix, not an
+irrelevant pruned prefix. It includes missing links/source, bad checksum/hash,
+a self-consistent unlinked receipt, changed source SHA-256 and a completely
+relinked source/suffix whose terminal hash disagrees with the checkpoint.
+Validation: **193 focused staging/receipt tests**, **35 storage doctests**,
+formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and `git diff --check` pass. Full workspace Nextest passed **9,529 tests (one
+slow), six existing skips**, in **275.244 seconds** (run
+`a3da4a92-1793-436c-b27c-09cb51b02d25`), with no failure or retry. The Raft
+heartbeat write-amplification gate was inspected while active (74 CPU seconds
+over 75 elapsed) and passed in **100.914 seconds**. The correction remains in
+the same uncommitted milestone; production staging activation is still open.
+
+### Materialized protection-inventory component — 2026-11-05
+
+The private `payload_staging_inventory.rs` component now enumerates retained
+windows in bounded pages under the caller's object-PG read transaction. It
+enumerates owners rather than joining only selected/live manifests, validates
+the complete owner against the configured topology and generation high-water,
+and keeps each selected reference separate from the window's unused scope.
+Every lifecycle remains discoverable, even after cutoff expiry or removal of
+sessions, reservations, manifests and pending commands. A missing window or
+malformed owner fails discovery rather than appearing as an empty inventory.
+
+The projection retains the original data PG/epoch, ordered file participants
+and independent acknowledgement primary. Exact matching checks those identities,
+hash, physical VID and shard index; it never recomputes current placement or
+infers file order from sorted node IDs. A private process-local cursor binds the
+PG/topology, attempt, introduction and window index. A replaced introduction
+requires restarting discovery; a completed page scan is not a global absence
+proof or deletion permission. The page cap is 64 windows; a page loads at most
+65 owners, each bounded by the existing central window limit. All owner/child
+reads share the caller's SQLite snapshot, and scanning performs no writes.
+
+This is **protection-only evidence**, not a readable/backfillable placed segment.
+A window's maximum geometry cannot supply an actual length, CRC or integrity
+witness, and a selected binding alone is not such a witness either. Do not
+convert unused windows into the existing placed-reference variant or treat
+them as repair candidates. The component deliberately does not expose such a
+conversion. Ordinary manifest-backed backfill discovery remains unchanged.
+
+At this component-only step it was not yet called by production scavenger or
+reference-checked cleanup scans. The unpaged integration below supersedes that
+part of the status. The paged adapter, its wire cursor/response grammar,
+pending-command descriptors, and replacement/reinspection integration remain
+required before coordinated activation. No schema/wire version, command, fsync,
+frontend custody, physical effect or cleanup permission changes in this slice;
+the six original ignored physical-cleanup regressions remain unresolved.
+
+Owner-local coverage exercises the three target kinds and five lifecycle states
+without other reference sources; selected and unused windows; reopen/checkpoint
+import; page sizes 1, 2, 64 and an oversized request across several attempts;
+independent PG/epoch/hash/VID/shard/file-node/ack-node negatives; crossed cursors,
+replaced introductions and malformed/unfenced owners. A deterministic two-
+connection regression changes child placement after the read snapshot is fixed
+and proves that the inventory observes either complete snapshot, not mixed
+rows.
+
+The first focused compile caught a test import through the restricted PG-store
+facade; the test now uses its existing private owner-local module path without
+widening visibility. All **six focused inventory tests** passed. Formatting,
+strict all-target/all-feature Clippy, the storage boundary checker and
+`git diff --check` passed. Full workspace Nextest passed **9,535 tests (one
+slow), six existing skips**, in **261.336 seconds** (run
+`d6d65601-5c74-4519-acd1-9c5f6423aff2`), with no test failure or retry. The Raft
+heartbeat write-amplification gate was inspected while active (85 CPU seconds
+over 90 elapsed, with the WAL thread running) and passed in **113.417 seconds**.
+This remains part of the same uncommitted coordinated milestone.
+
+### Unpaged cleanup-reference integration — 2026-11-05
+
+The production unpaged reference scan now includes all materialized staging
+windows through the validated protection inventory. Embedded clients supply
+the owning node's configured topology; the installed Unix handler uses that
+same scoped local route, not caller-selected topology. Live manifests, pending
+commands, reclaim roots and complete owner/child graphs are read in one deferred
+SQLite snapshot under the existing PG lock. The scan reuses a caller-owned
+transaction without ending it; otherwise it starts and closes a read-only
+transaction, with rollback on failure. No write, new durable transaction or
+fsync is introduced.
+
+The existing tag-1 identity-only reference has been renamed in Rust from
+`ReclaimOnly` to `ProtectionOnly`, and its record to
+`ShardScavengerProtectedShardSetReference`. Its fields, tags, widths, bounds and
+wire interpretation (non-readable protection) are unchanged. The projection
+contains data PG, hash, physical VID and EC shape; it intentionally omits actual
+stored size, CRC and integrity witness. Unpaged reference-checked stream-append
+cleanup therefore retains matching physical identities even without a live
+manifest or after terminal closure. Existing backfill source checks accept only
+`Placed`, and placed-only paged discovery remains manifest/pending-backed: an
+owner window alone cannot mint a readable repair/backfill source.
+
+This projection is conservative, not an exact physical-location inventory: it
+matches the identity without narrowing to an epoch or file node. Exact original
+file/ack participants remain in the retained window. It does not authorize
+physical deletion, establish absence, or replace the bounded owner inventory.
+In particular, **do not feed staging windows into the existing paged reclaim
+expansion**, which derives expected locations from the current route. Paged audit
+integration at this step still required the separate exact-participant/cursor
+work, now implemented in the next entry. Pending
+introduction descriptors, frontend custody and full production owner activation
+also remain open; the six original physical-cleanup acceptance skips are unchanged.
+
+Coverage extends the three-target/five-lifecycle restart/checkpoint matrix to
+the production PG-store scan, checks all windows across more than one internal
+page, and asserts placed-only discovery stays empty for owner-only state. The
+installed-server regression calls both embedded and Unix scoped clients against
+the same node, checks a closed 68-window owner and its unused scope, and corrupts
+a later window to require an error rather than a successful prefix. A separate
+transaction regression rejects a malformed later owner while preserving caller
+work and ending only an internally owned read transaction. Existing exact tag-1
+page evidence is untouched; a literal unpaged specimen additionally pins the
+unchanged v34 payload.
+
+The initial full run stopped with **8,482 passed, one failed and 1,055 not run**:
+the new installed-Unix diagnostic assertion searched `Display`, which
+intentionally redacts `StorageNodeFailureDetail`. The server had correctly
+rejected the malformed owner. The assertion now uses the existing owner-local
+test-only `as_str()` accessor, retaining both the exact `Internal` code and
+the staging-inventory context check; production redaction is unchanged. All
+**11 focused tests** passed after that correction, and formatting, strict
+all-target/all-feature Clippy, boundary checks and `git diff --check` pass.
+The final full workspace run passed **9,538 tests (one slow), six existing
+skips**, in **261.400 seconds** (run
+`49cfeaf3-9b6c-42fd-a6fa-d8f37fd6e566`). The Raft heartbeat write-amplification
+gate was inspected while active (64 CPU seconds over 66 elapsed) and passed in
+**111.599 seconds**. The original failed run is retained at
+`/tmp/argmin-staging-unpaged-workspace.log`; final validation is recorded at
+`/tmp/argmin-staging-unpaged-workspace-final.log`. This remains in the same
+uncommitted milestone, with production owner activation and physical cleanup
+still open.
+
+### Paged staging-protection audit integration — 2026-11-05
+
+The production paged audit now enumerates materialized staging owners after its
+existing manifest/reclaim/pending phases. Each page uses one deferred SQLite
+read snapshot under the owning PG lock and the node's configured topology;
+an enclosing transaction is preserved. Complete owner validation, including the
+generation high-water, precedes projection. Missing children or an invalid later
+window invalidate that owner's response, not just the corrupt item. Cursor
+identity binds the source PG, canonical-topology fingerprint, attempt,
+introduction epoch/index and window index. Replacing the introduction fails the
+resume attempt rather than skipping the replacement's prefix. A later pass still
+rediscovers insertions before its cursor; completion is not global absence proof.
+
+The new `StagingProtection` alternative carries the original ordered file
+participants, independent acknowledgement primary and placement epoch, with
+only identity/EC information. Audit does **not** expand this through current
+placement. Separate protection sets suppress orphan diagnostics at the captured
+physical participants; unused scope does not assert that a file/row should
+exist, and supplies no repair or backfill authority. Protection must not mask
+repair when the same identity also has a live readable manifest; a real
+committed-object/missing-shard canary pins that overlap. Physical file/row keys have
+no epoch component; the captured epoch remains provenance, not a reason to
+ignore a matching retained physical identity. Existing placed references retain
+their repair behavior, and placed-only discovery continues excluding owners.
+The current audit inspects acknowledgement rows at the active primary; an old
+ack participant is retained in the protection record but this slice does not
+add historical acknowledgement scanning or authorize deletion there.
+
+Storage RPC advances **34 → 35** for cursor tag 7 and reference tag 2. The codec
+rejects crossed alternatives, zero introduction indexes, wrong route PGs,
+duplicate file nodes and counts inconsistent with the EC shape. The Unix client
+also checks the returned page's PG, bound and progress shape. Literal new
+request/response specimens and v35 enclosing composites are appended; all v34
+corpora and inline evidence remain unchanged and rejected. Checkpoint-7 nested
+rejection is exercised within newly appended v35 frames, independently of old
+outer-version rejection. No schema, command, canonical-state or checkpoint
+change is needed by this read-only integration.
+
+Coverage extends the target/lifecycle/reopen/checkpoint matrix to the production
+paged query, uses installed embedded/Unix clients across a 68-window owner,
+checks crossed/replaced cursors and caller transaction ownership, and exercises
+the complete two-pass audit with original file-only, ack-only and unused scope.
+Wrong file participants and crossed acknowledgement primaries are independent
+negative canaries; no retained-only window creates a repair job. This does not
+complete pending-introduction descriptors, frontend custody, producer activation,
+finite physical-write authority or autonomous cleanup. The original six
+physical-cleanup acceptance skips remain open.
+
+Short pending-reference pages preserve their incomplete result instead of
+falling through to the staging phase. A damaged-sidecar regression returns the
+remaining four records of a page as incomplete and then rejects the missing
+suffix; it cannot certify completion. This applies to both placed and reclaim
+pending phases.
+
+Validation: **278 focused tests passed**. Two earlier focused runs exposed
+version-dependent test expectations: the future-version rejection still named
+35, and an authentication-v2 composite still expected an embedded v34 frame.
+The former now rejects retired v34/future v36; the latter retains both old
+literals as rejection evidence and appends v35. Their full failure output is
+preserved in `/tmp/argmin-staging-paged-focused.log` and
+`/tmp/argmin-staging-paged-focused-final.log`; neither was treated as flaky.
+The first full build was deliberately interrupted before tests to preserve the
+pending reader's short-page/incomplete signal, then formatting and strict
+all-target/all-feature Clippy were repeated. The corrected full workspace run
+passed **9,545 tests (one slow), six existing skips**, in **263.576 seconds**
+(run `d5cc8fc3-b53d-4734-a339-ba40a3487214`).
+The slow Raft heartbeat write-amplification test was inspected while active
+(74 CPU seconds over 77 elapsed) and passed in **112.684 seconds**. Final output
+is `/tmp/argmin-staging-paged-workspace-final.log`; focused verified output is
+`/tmp/argmin-staging-paged-focused-verified.log`. Boundary and diff checks pass.
+The coordinated milestone remains uncommitted and incomplete.
+
+Review correction: an incomplete Unix page now rejects an unchanged final
+cursor as well as an empty result. The malicious-peer matrix sends
+`after = Some(cursor)` and returns one otherwise valid item with that exact
+cursor and `complete = false`; the extended regression reproduced acceptance
+before the check was added. Independent positive cases still accept a changed
+cursor on an incomplete page and an empty completed page. This is a
+request/response progress check, not a new wire grammar or globally ordered
+snapshot guarantee. The intentional pre-fix failure is retained at
+`/tmp/argmin-staging-cursor-red.log`. After the correction, all **15 focused
+tests** passed, along with formatting, strict all-target/all-feature Clippy,
+the storage boundary checker and `git diff --check`. Full workspace Nextest
+passed **9,545 tests (one slow), six existing skips**, in **281.792 seconds**
+(run `05979099-0b44-4f51-9279-d10341592d65`); the Raft heartbeat
+write-amplification gate passed in **97.064 seconds**. Full output is retained
+at `/tmp/argmin-staging-cursor-workspace.log`. No commit was made.
+
+### Command-field descriptor boundary — 2026-11-05
+
+The next integration component is a bounded, canonical descriptor grammar in
+`pg_store/payload_staging_descriptor.rs`. Opaque introduction and append values
+retain the captured immutable subject and window. They are **descriptions, not
+write authority, custody receipts or recovery certificates**. An introduction
+can describe only the first active window; lifecycle, empty selected prefix,
+reserved end, horizon and target-specific resource roles are derived, not
+independently supplied tags. Append carries the complete original subject and
+one adjacent lookahead window, not an arbitrary replacement owner graph.
+
+The V1 grammar has separate introduction/append kinds, a 16 KiB complete-value
+framing bound, bounded file participants, exact string framing and no trailing
+bytes. The framing cap is not a proof-field limit: central resource validation
+requires reservation IDs and owner tokens to be 1–256 UTF-8 bytes, within the
+authoritative reservation's SQL limits and release transport. Operation and
+target strings remain bound to their canonical operation and exact object key.
+It retains absolute cutoff, original issuer, physical hash/VID interval,
+codec/EC/size bounds, data PG/epoch, shard-index-ordered file nodes and independent
+acknowledgement primary. Introduction additionally retains the complete stable
+creation proof, observed lease evidence and historical release PG. Decoding
+validates representation without sampling time, route state or local allocation
+lifetime. Actual configured topology and command/live-state correspondence are
+still mandatory at the transaction boundary; decoding alone cannot authorize
+insertion. Append application additionally compares its complete immutable
+subject to the retained owner before any live mutation.
+
+Five complete literal V1 specimens pin Direct PUT, streamed PUT and UploadPart
+introductions, plus both stream append variants. They are append-only evidence
+for this new field grammar, **not current applied-command or RPC specimens**.
+The live command envelope remains version 13: no current command/RPC yet carries
+these fields. Its coordinated version advance must make the relevant descriptor
+mandatory and checksum-covered, append complete enclosing composites, account
+for the descriptor bound in frame admission, and integrate pending protection,
+builder capture, application and classified frontend custody together. This step
+does not turn on owner production, change frontend cleanup, or add a transaction
+or fsync. At that step the separate abandonment-source certificate and distinct
+finalization-obligation integration remained open. The six original acceptance skips remain
+unresolved; this is still the same uncommitted milestone.
+
+Coverage includes all target/kind round trips, every truncated prefix,
+unknown versions/kinds/codecs, invalid UTF-8/lengths/optional tags, identity-field
+boundaries and secondary frame-cap rejection, independent window/proof mutations,
+terminal-owner and nonadjacent-window construction, and internally valid windows at illegal append
+positions. Decode/re-encode preserves captured values even after their cutoff;
+it does not extend or grant authority. Decoded component tests apply witness-first
+with an independent local issuer, replay without writes, and reject crossed
+command subjects, incarnation, data PG and release PG before effects. These are
+component tests, not installed-transport acceptance tests.
+
+Initial compilation caught incorrect NodeId/test-helper
+accessors, a temporary topology borrow and missing parentheses around test
+or-patterns; these were corrected before execution. The first six and expanded
+nine focused descriptor tests passed. Final validation passed **217 focused
+staging tests**, including all ten descriptor regressions, formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and `git diff --check`.
+The full workspace Nextest run passed **9,555 tests (one slow), six existing
+skips**, in **264.943 seconds** (run
+`2fe45f4d-fd2d-4de1-9ee9-ea45ec8672fa`), with no test failure or retry. The Raft
+heartbeat write-amplification gate had passed in **109.721 seconds** by the time
+its slow notification was inspected. Full output is retained at
+`/tmp/argmin-staging-descriptor-workspace.log`. The coordinated milestone remains
+uncommitted and incomplete.
+
+Review correction: the former approximately 16 KiB owner-token positive case
+was invalid: it could not be acquired in the authoritative reservation table.
+The new independent 257-byte reservation-ID case first reproduced acceptance
+for Direct PUT; its failure is retained at
+`/tmp/argmin-staging-proof-bounds-red.log`. Both identity fields now share the
+central 256-byte limit for all creation/finalization roles, so the same check
+protects descriptor capture/decode, local row loading and correctly sealed
+checkpoint imports. ASCII and multibyte 256-byte positives and 257/258-byte
+negatives pin byte rather than character counting. A real source-reservation
+canary acquires both 256-byte identities, carries that proof through the
+descriptor and production release-request codec, and releases the exact row.
+Leading-NUL identities also fail the source SQL length lower bound and now
+fail shared resource validation; the source-reservation and descriptor canaries
+pin that case independently for both fields.
+An exactly 16 KiB, otherwise well-framed descriptor containing an oversized
+token now fails resource validation; one extra byte fails frame admission.
+No schema or encoding grammar changes, and all five frozen V1 specimens remain
+unchanged. The first post-correction focused build caught a checkpoint-test
+fixture using `String` instead of the checkpoint's `Vec<u8>` text representation;
+that fixture was corrected before running tests. Final validation passed all
+**221 focused staging tests**, formatting, strict all-target/all-feature Clippy,
+the storage boundary checker and `git diff --check`. Full workspace Nextest
+passed **9,559 tests (one slow), six existing skips**, in **263.333 seconds**
+(run `642c5169-c4b7-4710-9a3a-682e7dd9cbea`), without failure or retry. The Raft
+heartbeat write-amplification gate had passed in **111.576 seconds** when its
+slow notification was inspected. Output is retained at
+`/tmp/argmin-staging-proof-bounds-workspace.log`; the milestone remains
+uncommitted and incomplete.
+
+### Exact abandonment-source carrier — 2026-11-06
+
+The recovery integration now has a bounded, opaque `PartFinalizationSource` in
+`pg_store/payload_staging_abandonment_source.rs`. It retains the complete original
+`CommitStreamPart` envelope and checksum. It is cloneable descriptive evidence,
+not a certificate that the source was abandoned, an owner-release receipt, or
+physical deletion authority. Its only apply operation invokes the existing
+transactional source/owner/follow-up checks; the raw two-envelope closure helper
+is now private to the abandonment implementation. Decoding never caches or
+invents a durable disposition, samples time, or mints another window.
+
+The source carrier has its own V1 framing and a current applied-command V13
+nested payload. Its 22-byte header is in addition to the supported 2 MiB source
+command. RPC and source admission now use one command-size constant without
+changing the existing transport limit. Exact length, framing/version and CRC
+checks precede typed command decoding; unrelated command variants and tombstones
+are rejected. The frozen complete V1/command-V13/SSE-S3-V5 specimen preserves the
+unchanged predecessor source bytes, rather than regenerating historical evidence.
+
+All existing abandonment-component schedules now encode/decode this carrier
+before the custody transition, including witness/history validation, pruned
+receipt prefixes, restart, cross-epoch follow-up, terminal-owner preservation and
+transaction rollback. New tests independently cover every truncated prefix,
+bad framing/checksum/length, correctly resealed unsupported nested versions,
+unrelated kinds, exact-at-cap admission including header overhead, and a
+same-ID/same-subject proof substitution. A valid decoded source is first rejected
+without its tombstone, then the unchanged source succeeds only after exact durable
+abandonment; a substituted source still rejects without mutation.
+
+This is another component of the **same uncommitted, incomplete milestone**:
+no live command/RPC embeds the carrier yet. Command activation must still make
+the applicable cleanup field mandatory and checksum-covered, update enclosing
+size limits for the complete source plus cleanup, add pending-reference/history
+protection, and coordinate builders, apply dispatch and frontend accepted/uncertain
+custody. Distinct concurrent finalization obligations were still unresolved at
+that step; the additional-obligation component below provides the retained
+representation and handoff. No additional ordinary-path command, transaction or fsync is
+introduced, and the six original physical-cleanup acceptance skips remain open.
+
+Validation: the first focused build caught an undeclared `hex` test-helper use;
+it was replaced with the existing `frozen_hex_fixture` helper, with no dependency
+added and no tests executed in that failed build. All **20 focused abandonment
+tests** then passed. Formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and `git diff --check` passed. Full workspace Nextest passed
+**9,564 tests (one slow), six existing skips**, in **261.093 seconds** (run
+`b32cd392-f478-4131-b855-153f03db705b`), without a test failure or retry.
+The slow `raft_production_shaped_heartbeat_write_amplification_gate` was inspected
+while active (74 CPU seconds over 78 elapsed) and passed in **113.058 seconds**.
+Logs are retained at `/tmp/argmin-staging-abandonment-carrier-focused.log`,
+`/tmp/argmin-staging-abandonment-carrier-focused-corrected.log` and
+`/tmp/argmin-staging-abandonment-carrier-workspace.log`. No commit was made.
+
+#### Review correction: cryptographic abandoned-source binding
+
+The preceding exact-source claim was too strong: V1 abandonment tombstones
+retained only the original command ID and CRC64. Hashing that tombstone into a
+terminal receipt did not authenticate the original source. A deterministic
+regression changes the finalization reservation proof and compensates eight ETag
+bytes to retain the original CRC64. Before the fix, it returned
+`Ok(ClosedAndRetained)` and transferred the wrong proof; the exact failure is
+retained in `/tmp/argmin-staging-source-sha-red.log`.
+
+The live tombstone writer/reader now use **abandoned-command encoding V2**, with
+an additional fixed 32-byte SHA-256 over the complete original applied-command
+bytes. Original CRC64 remains an integrity field, not source authentication.
+Retained row matching and pending-slot comparisons include the digest;
+compacted receipt SHA-256 covers the complete V2 tombstone. The peering/RPC
+retained-log representation carries the same digest, and terminal-pending
+comparison checks it independently of CRC64. This changes the failure-side
+record already written in the existing transaction, not command count/fsync or
+materialized-state tombstone semantics.
+
+The exact V1 literal already in the parent commit is preserved as rejection
+evidence. V2 grammar and V2/applied-V13/SSE-S3-V5 composite literals are appended;
+the original source-carrier bytes are unchanged. The RPC field is folded into
+the milestone's existing, uncommitted 34 → 35 transition. Applied commands remain
+V13 and the source carrier remains V1. No schema/checkpoint/state-digest advance
+is required by this self-versioned record change, and no V1 fallback is allowed.
+
+The collision matrix independently crosses reservation ID and owner token for
+empty and nonempty parts, before/after reopen and after log compaction. Each
+crossed carrier remains canonical with the correct CRC64, but must reject
+without SQL or owner mutation; the original source then succeeds. Separate
+peering negatives preserve CRC64 while crossing only the SHA-256 field. Frozen
+wire evidence and truncated-digest rejection pin the receiving boundary.
+
+Validation: the collision regression first failed with the exact unintended
+`ClosedAndRetained` result above. After the durable-format correction, all **48
+initial focused tests** passed. Adding the wire fixture first exposed an
+incorrect RPC-kind name at compile time (`MetadataCommandLogEntryRange` versus
+the actual `MetadataCommandRetainedLogEntries`); no tests ran in that attempt.
+The corrected wire test and the expanded **569-test staging/metadata/peering
+set** passed. Formatting, strict all-target/all-feature Clippy, storage boundary
+checks and `git diff --check` passed. Full workspace Nextest passed **9,566 tests
+(one slow), six existing skips**, in **299.765 seconds**, run
+`1985bad6-9117-4065-8c01-5c0d38c577b8`. The slow Raft heartbeat amplification test
+had already passed in **79.786 seconds** when inspected. No test failure was
+retried or relaxed. Logs are retained at
+`/tmp/argmin-staging-source-sha-{red,focused,rpc-fixture,rpc-fixture-corrected,focused-final,clippy,workspace}.log`.
+The corrected coordinated slice remains uncommitted and incomplete.
+
+### Retained-window local preparation component — 2026-11-06
+
+`pg_store/payload_staging_preparation.rs` adds the missing primary-local
+consumption boundary for streamed PUT and UploadPart. It requires an already
+acquired SQLite **write** transaction, not merely an open deferred/read
+transaction. Under that transaction it reloads the exact retained owner, session,
+generation reservation/high-water, UploadPart upload and selected prefix, and
+compares them with the captured append authority. It validates the actual
+configured topology and current primary, exact file/ack participants, codec/EC
+geometry, window index and unconsumed cursor. The original allocation lifetime
+must still be live; copying replicated issuer fields is not delegation.
+
+The existing request fence is intersected with the window's immutable absolute
+cutoff, bound to the local monotonic clock. After statement preparation and all
+metadata/placement reads, the lifetime and effective deadline are checked
+immediately before the cursor UPDATE. The update consumes exactly `start..end`
+from the retained one-slot window. It does not extend the reserved end, change a
+cutoff, rewrite an owner, create a manifest, or issue physical-write authority.
+The enclosing allocator transaction must commit before returning its result.
+An ambiguous/lost successful reply cannot authorize a second preparation;
+only an accepted append can install the next retained window.
+
+The owner-local matrix covers both stream targets: one-shot consumption and
+lookahead progression, lost replies, absent/deferred writer admission, admission
+expiry before the raw timestamp, window expiry despite an unbounded/renewed
+route fence, session/generation/high-water/prefix mismatches, crossed placement
+inputs, UPDATE failure/rollback, restart before and after consumption, witness-
+first introduction and same-process lifetime replacement. Non-mutation cases
+assert unchanged SQLite `total_changes`, not just equality after rollback.
+The positive path measures the existing production allocator's UPDATE and
+digest-trigger cost and requires the same write count.
+
+This remains a component of the **same uncommitted, incomplete milestone**.
+Production preparation still uses the existing path until mandatory descriptor
+fields, builders/apply dispatch and frontend accepted/uncertain custody activate
+together. There is no optional-owner fallback in the new component. It introduces
+no format change, transaction, commit or fsync, and does not satisfy the installed
+Unix or physical-exclusion acceptance gates. Pending-introduction protection and
+coordinated activation remain open. The next component addresses distinct
+finalization obligations.
+
+The initial seven-test run passed six tests and failed
+the new cost assertion (`84` versus `82`): `total_changes` includes the two
+existing digest/revision trigger updates as well as the cursor update. The
+corrected assertion compares against the measured production allocator rather
+than assuming one changed row. The original output is retained at
+`/tmp/argmin-staging-preparation-focused.log`.
+The corrected, expanded **256-test staging/allocator set** passed, including all
+eight new preparation regressions. Formatting, strict all-target/all-feature
+Clippy, storage boundary checks and `git diff --check` passed. Full workspace
+Nextest passed **9,574 tests (two slow), six existing skips**, in **264.124
+seconds**, run `5d13b968-1e7b-437e-9043-8684fba4bd72`. Both slow tests had completed
+successfully when inspected: the Raft heartbeat amplification gate in 108.840
+seconds and the oversized ListObjectVersions limit case in 60.454 seconds.
+The full run had no failures or retries. Logs are retained at
+`/tmp/argmin-staging-preparation-{focused,focused-corrected,clippy,boundaries,workspace}.log`.
+No commit was made; activation and the coordinated milestone remain incomplete.
+
+### Independent abandoned-finalization obligations — 2026-11-06
+
+The terminal-owner handoff no longer assumes a single finalization proof. A
+published/retiring UploadPart owner retains its original terminal proof plus an
+append-only collection of **additional release-due obligations**. These are not
+sessions, renewed write authority, release receipts or permission to delete
+payload. Only a follow-up authenticated against the exact original source's
+V2 tombstone/receipt can add an obligation. The source must still bind the exact
+attempt, upload, part, payload generation, bucket incarnation and canonical
+reservation operation/target; an already retained proof does not bypass source
+authentication.
+
+The existing resource table's `role` key now addresses explicit slots: `0` is
+creation, `1` is the original terminal finalization, and `2..` are additional
+abandoned-finalization obligations in replicated follow-up order. Additional
+slots must be contiguous, release-due, on a terminal UploadPart owner, and have
+unique stable proof identities, including against slot 1. Their proof epochs
+may differ; every exact historical bucket-PG release route remains retained.
+Renewable lease evidence is not identity and is not rewritten on a duplicate.
+Live/direct/stream-PUT owners cannot acquire additional obligations.
+
+Each newly authenticated proof appends one row inside the existing follow-up
+transaction. The original proof, lifecycle, selected Part/Object/Reclaim
+references, windows, issuer, generation responsibility and cutoffs remain
+unchanged. A savepoint also rolls back a failure *after* insertion while preserving
+the caller's outer work. An exact retained proof returns custody present without
+a write; normal command acceptance/recording still decides replay. This resolves
+the single-slot component's safe-but-nonconverging rejection, without adding any
+ordinary-path command, commit or fsync.
+
+The change folds into the milestone's already pending **PG 10 → 11** schema
+advance, as required by the one-transition-per-commit rule. It widens the slot
+CHECK and constrains additional slots to release-due. Column order, canonical
+ordering and checkpoint framing are unchanged; all previously captured
+checkpoint/transfer and descriptor bytes are preserved. The pending schema-11
+catalogue is updated against the current initializer; committed schema-10 and
+earlier evidence is untouched. An additional literal checkpoint specimen covers
+multiple proof slots. This is not an upgrade reader or a second format bump.
+
+Validation: the first **236-test staging/schema run**, seven new focused tests,
+and the final **243-test staging/schema run** passed. The new history canary
+initially failed to compile because its iterator yields values, not references;
+that dereference was corrected before running the new tests. Formatting, strict
+all-target/all-feature Clippy and the storage boundary checker passed. Full
+workspace Nextest then passed **9,581 tests, six skipped**, in **262.561 seconds**
+(run `3a2aaf23-a83a-4391-8d9b-53de0c624c35`), with no failures or retries. The two
+slow notifications completed successfully: the production-shaped Raft heartbeat
+write-amplification gate in 105.904 seconds and the oversized ListObjectVersions
+limit case in 61.844 seconds. Logs are retained at
+`/tmp/argmin-staging-obligations-{focused,focused-final,new,new-corrected,clippy,boundaries,workspace}.log`.
+Mandatory descriptor/source fields, installed dispatch, pending protection and
+frontend accepted/uncertain custody still need coordinated activation. The
+milestone remains uncommitted and incomplete; no physical-cleanup acceptance
+claim is made.
+
+### External dependency: bounded metadata checkpoint transfer — 2026-11-06
+
+Checkpoint sizing and transfer are a **separate workstream**, tracked in
+[Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md). They are
+not an implementation slice of this cleanup-ownership plan.
+
+The existing whole-checkpoint decoder limits each table to 100,000 rows and
+the existing RPC frame limits the complete payload to 64 MiB. Valid durable
+state can exceed either limit; local candidate loading also skips checkpoints
+which that decoder rejects. These are pre-existing general PG limitations,
+not unique to owner records. Retaining independently authenticated abandoned
+finalization proofs makes the gap more visible and can exacerbate it. The
+owner's integer slot domain is not a practical PG-wide capacity guarantee.
+
+The uncommitted paging experiment is withdrawn: its page/spool reader, relaxed
+row limit, export-session RPCs and paging-specific tests are removed. The
+separate plan records both the original limitations and the experiment's
+aggregate-memory and zero-candidate findings. No checkpoint scalability fix,
+new transfer interface, spool file or receive-staging schema is being added
+here. Existing whole-checkpoint limits remain; their removal is not claimed.
+
+Keep the cleanup-specific SQL, topology validation, canonical/checkpoint format
+advances and immutable transfer composites in this milestone. They describe
+the owner graph correctly; they do not prove that arbitrarily large valid PGs
+can be recovered or transferred.
+
+Do not reject or discard an already authenticated abandoned proof at retention
+time to fit a transport limit. Cleanup ownership integration may continue, but
+**production activation remains gated on resolving this external transferability
+dependency**. The separate workstream must demonstrate recovery of valid
+accumulated obligations without silently dropping evidence. No per-owner quota,
+replicated capacity-reservation protocol, or promise of session continuity is
+introduced as a substitute.
+
+Withdrawal validation: formatting, strict all-target/all-feature Clippy and the
+storage boundary checker passed. Full workspace Nextest passed **9,581 tests,
+six skipped**, in **262.000 seconds** (run
+`ef8078f2-7475-46de-bcd6-6d0df73dbcdf`), with no failures. The 22 tests removed
+with the experiment account for the difference from its previous run; the
+remaining ownership, checkpoint and frozen transfer-format tests are retained.
+Logs are at `/tmp/argmin-checkpoint-scope-{clippy,boundaries,workspace}.log`.
+This validates the withdrawal, not a fix for the external transferability gap.
+
+### Command-bound pending descriptor projection — 2026-11-06
+
+`pg_store/payload_staging_descriptor_binding.rs` adds a private borrowed binding
+between a decoded introduction/append descriptor, its exact command envelope
+and the configured topology. Descriptor application now consumes this bound
+view rather than taking another independently supplied command or topology.
+The binding is descriptive: it is **not** command acceptance, recovery
+authorization, physical-write authority or a cached live-state certificate.
+Application still checks the authoritative reservation/session/owner state
+inside the enclosing transaction before any mutation.
+
+Binding rejects crossed command kind/subject/target, nonadjacent append position,
+invalid command ordering/checksum, foreign topology and placement newer than
+the carrying command. Introduction reuses the existing shared correspondence
+validator; append binds both the consumed segment subject and the next window.
+Full selected-prefix, witness and live-responsibility validation remains at
+application. The immutable descriptor bytes and their V1 specimens are unchanged.
+
+The bound view projects an unused first/lookahead window as **protection**, never
+as a readable placed payload with invented length, checksum or witness. It keeps
+the exact shard-index-ordered file participants and independent acknowledgement
+primary. Its historical route set retains the carrying object-PG epoch, original
+owner object-PG epoch and window data-PG epoch; introduction also retains the
+creation proof's original bucket-PG release route. Append relies on the already
+materialized owner's independent creation-proof retention. These projections
+consult no clock, current route or physical storage and continue protecting the
+original scope after cutoff or command reissue.
+
+The owner-local tests cover Direct PUT, streamed PUT and UploadPart introductions,
+both append targets, independent command-field substitutions, same-object-PG
+foreign topologies, future placements, non-sorted file placement with a separate
+acknowledgement owner, and expired/reissued protection. Existing decoded
+replica-apply and no-write exact-replay tests now use the bound interface. A
+separate canary changes the live allocator after binding and requires rejection
+without application effects, proving that binding does not cache live authority.
+
+**Integration remains open:** current commands/RPCs still do not carry these
+descriptors, and production pending-sidecar/scavenger projections do not yet
+consume this component. Their mandatory fields, bounds, exact composite evidence,
+builder/apply dispatch, frontend accepted/uncertain custody and terminal transfers
+must be connected together. The command envelope remains version 13; there is no
+format change, new command, transaction or fsync in this component. Production
+cleanup responsibility is unchanged, all six acceptance skips remain open, and
+the coordinated milestone remains uncommitted and incomplete. Checkpoint
+scalability stays in its separate workstream.
+
+Validation: the initial **18 focused descriptor tests** passed; after adding
+independent multipart-target and future-placement canaries, all **249 focused
+staging tests** passed. Formatting, strict all-target/all-feature Clippy, the
+storage boundary checker and `git diff --check` passed. Full workspace Nextest
+**failed**: **5,902 passed, one failed, six skipped; 3,685 were not run**, in
+**219.705 seconds** (run `5fac2d53-85e1-4692-b09b-468b2ef196e2`).
+`cluster::local::tests::direct_put::direct_put_irreversible_handoff_wakes_static_authorized_recovery`
+failed at `crates/storage/src/cluster/local/tests/direct_put.rs:6992` with
+`assertion failed: !inject_once.load(Ordering::SeqCst)` after 0.451 seconds.
+The expected uncertainty injection had not fired. That assertion precedes
+inspection of the commit result, so the output does not establish the underlying
+outcome or cause. The test was neither changed nor rerun in that validation
+attempt; full validation was not green. The Raft heartbeat
+write-amplification test crossed the slow threshold, was inspected actively
+using CPU, and passed in 102.613 seconds. Complete logs are retained at
+`/tmp/argmin-staging-command-binding-{focused,staging,clippy,boundaries,workspace}.log`.
+
+The user handed that failure off for review and authorized a rerun. Formatting
+and strict Clippy passed, followed by **9,588 tests passed (two slow), six
+skipped**, in **284.828 seconds** (run
+`d5ec84a5-15ff-4be5-98e4-5f9b95bdc539`). The recovery-handoff test passed unchanged
+in that rerun; this does not explain or resolve its earlier failure. Output is
+retained at `/tmp/argmin-staging-tests-rerun.W2LSmD/workspace.log`.
+
+Review correction: both deepest introduction/append application functions now
+**consume their private bound descriptor types**; they no longer accept an
+independently supplied envelope, topology, owner or lookahead window. The bound
+types' representation stays private to the binding module. Read-only accessors
+let the transaction implementations inspect the already-bound inputs, but cannot
+mint a bound value. The exact retained-subject comparison and live-state checks
+are at the append implementation itself, so calling that typed implementation
+directly cannot bypass the convenience method's checks.
+
+Component fixtures use explicitly named `cfg(test)` description adapters for
+malformed descriptions and old-window replay. These adapters still invoke the
+production binder and typed application; they expose no unchecked application
+of staging descriptors.
+Signature-checked tests call both deepest functions for all applicable targets,
+and test-adapter future-placement cases require unchanged SQL mutation counts
+and canonical state. The crossed-incarnation and changed-live-allocator canaries
+also call the deepest append boundary directly. This corrects the earlier
+structural-enforcement claim without activating production dispatch or changing
+the command/descriptor encodings.
+
+During migration, the focused run caught the missing-transaction append canary
+still entering through its fixture adapter. The adapter's subject lookup now
+fails first with the persistence layer's transaction-required error. The canary
+now binds while the transaction is open, closes it, and calls the deepest typed
+application function, preserving its exact `AppendError::TransactionRequired`
+assertion. The failed run is retained at
+`/tmp/argmin-staging-bound-apply-focused.log`; the corrected **251 focused tests**
+passed at `/tmp/argmin-staging-bound-apply-focused-final.log`. Formatting, strict
+all-target/all-feature Clippy and the storage boundary checker also passed.
+
+Full workspace validation after this correction passed **9,590 tests (two slow),
+six skipped**, in **263.767 seconds** (run
+`4813124e-46a3-445c-8857-d866d43a7436`), with no failures. The Raft
+write-amplification test was inspected actively using CPU and passed in
+110.524 seconds; the 1,001-version listing test passed in 60.364 seconds.
+Output is retained at `/tmp/argmin-staging-bound-apply-workspace.log` and
+Clippy/boundary output at `/tmp/argmin-staging-bound-apply-{clippy,boundaries}.log`.
+The coordinated milestone remains uncommitted and incomplete.
+
+### Pending-index format prerequisite — 2026-11-06
+
+Tracing the next command-integration step identified a previously unspecified
+format dependency. The current pending-slot route sidecar accepts at most two
+`(epoch, bucket-route-hash)` entries; it cannot express the exact object/data PG
+routes of an unused window. Pending scavenger pages likewise encode either a
+54-byte placed reference or a 30-byte reclaim protection reference. Neither
+record carries the window identity, placement participants and acknowledgement
+owner projected by the reviewed bound descriptors.
+
+Owner-local `pending_index_format_tests.rs` now freezes the unchanged route
+checksum grammar for zero/one/two dependencies and literal placed/reclaim records
+through pending-slot installation and SQLite reopen. This supplements, rather
+than replaces, existing paging/replacement tests and schema catalogues. No
+writer, command version, schema or production custody decision changes in this
+step. The format ledger records containment and the parent-commit evidence gate;
+these specimens must be retained before replacing the old index writers.
+
+The coordinated activation must therefore include all of the following:
+
+- Derive pending protection only from a command-bound introduction/append
+  descriptor. An unused window is protection-only, never a placed/readable
+  payload with invented size, CRC or witness.
+- Retain exact object-PG, data-PG and creation-release bucket-PG/epoch
+  dependencies as applicable, including a window with no selected shard yet.
+  A bucket-hash-only sidecar cannot stand in for that route inventory.
+- Bind the projection to the exact pending command identity/checksum and update
+  it atomically with slot insertion, replacement, abandonment and removal. Keep
+  inspection bounded without decoding the complete command in the lease-critical
+  path; reject missing, crossed or malformed index evidence.
+- Give pending-window paging its own exact slot-bound cursor/progress semantics;
+  do not reuse a materialized-owner cursor before the owner exists. Preserve
+  files and acknowledgement records without feeding unused windows to readable
+  backfill/repair work. Update the RPC grammar and immutable composites if its
+  cursor/reference representation changes.
+- Connect mandatory command descriptors, builders/apply, pending protection,
+  accepted/uncertain frontend custody and terminal transfers together. Freezing
+  this evidence does not independently make that integration safe or complete.
+
+Checkpoint scalability remains a separate activation dependency. This step
+does not reintroduce export sessions, spool files or checkpoint paging. The six
+original acceptance skips remain open.
+
+Validation: the two new focused format tests passed. After adding independent
+index-reader assertions, formatting, strict all-target/all-feature Clippy,
+35 storage doctests and the storage boundary checker passed. Full workspace
+Nextest passed **9,592 tests (one slow), six skipped**, in **261.054 seconds**
+(run `44c884ce-8eba-467c-b977-30fea8df8a5a`), including both new tests. The Raft
+write-amplification gate was inspected while running (active CPU work, chiefly
+its WAL thread) and passed in 111.015 seconds. Logs are retained at
+`/tmp/argmin-staging-pending-format-{focused,doc,clippy,boundaries,workspace}.log`.
+No production writer was changed and no commit was made.
+
+Review correction: the route-sidecar checksum expectations are now literal u64
+values for all three counts, independently checked with bitwise CRC-64/NVME.
+The test compares both checksum entry points against those literals and queries
+the raw SQL checksum column after reopen for exact equality. It no longer derives
+its expected result from the same checksum implementation being tested; the
+existing input bytes and corruption-rejection checks remain unchanged.
+
+Review-correction validation: both focused tests, formatting, strict Clippy,
+the storage boundary checker and `git diff --check` passed. Full workspace
+Nextest passed **9,592 tests (one slow), six skipped**, in **261.296 seconds**
+(run `cb00f4b5-f634-41d0-b047-b034a5a2a5db`). The Raft write-amplification gate
+was inspected doing active test/WAL CPU work and passed in 111.612 seconds.
+Logs are at `/tmp/argmin-staging-pending-crc-{focused,clippy,boundaries,workspace}.log`.
 
 ### Record layout and ownership
 
@@ -227,10 +2435,10 @@ domains before mutation; foreign keys supplement, not replace, semantic checks.
 
 | Table family | Key and contents | Relationships |
 | --- | --- | --- |
-| `payload_staging_owners` | Object-PG-local reservation/session ID; immutable owner revision; bucket/incarnation/key; originating object-PG epoch; target; payload generation; UploadPart's separate enclosing MPU generation; original allocation issuer; lifecycle; replicated reserved end; maximum issued cutoff | No foreign key to a reservation, session, upload or object. Identity collision is an invariant error, not adoption. |
+| `payload_staging_owners` | Object-PG-local reservation/session ID; immutable owner revision; bucket/incarnation/key; originating object-PG epoch; target; payload generation; UploadPart's separate enclosing MPU generation; original allocation issuer; lifecycle and retirement outcome; replicated reserved end; maximum issued cutoff | No foreign key to a reservation, session, upload or object. Identity collision is an invariant error, not adoption. |
 | `payload_staging_windows` | Owner/revision and segment index; derived hash; checked one-slot `[start,end)`; issuer; immutable absolute cutoff; codec and logical/stored/shard bounds; EC shape; exact data-PG/placement epoch; canonical file locations and independent ack participant | Owned by the owner only. Exact replay compares the complete descriptor, not just index/VID. Windows are immutable and retained after selection, publication and closure. |
 | `payload_staging_references` | Exact window/key selection and destination: active stream manifest, committed upload/part **generation**, completed object **generation**, or durable reclaim identity; retain the original physical subject through completion | Child of the owner/window, never cascading from the destination. A transfer replaces the destination binding atomically, not the physical key or original owner. Unselected windows have no reference, but remain obligations. |
-| `payload_staging_resources` | Owner and obligation role; explicit `LiveResponsibility` or `ReleaseDue`; stable exact proof identity and historical bucket-PG/epoch release route, separately from renewable deadline evidence | Independent creation and finalization roles for UploadPart. An owner with no resource obligations represents explicit `NoResource` in the typed aggregate, not an ambiguous missing proof. Generation-reservation responsibility is also explicit and bound to the exact owner subject. |
+| `payload_staging_resources` | Owner and obligation slot; explicit `LiveResponsibility` or `ReleaseDue`; stable exact proof identity and historical bucket-PG/epoch release route, separately from renewable deadline evidence | Slots 0/1 retain creation/original finalization; contiguous slots 2.. retain additional authenticated abandoned finalizations for terminal UploadPart owners. `NoResource` denotes a role never acquired, not confirmation that its proof was released. Milestone 1 retains generation/creation evidence through closure, as specified in the matrix below. Generation responsibility binds the exact owner subject. |
 
 Prefer normalized owner-owned participant rows if required to preserve canonical
 ordering and enforce uniqueness; these are children of a window, not a separate
@@ -245,15 +2453,81 @@ lease or a session heartbeat counter. This first implementation has no exception
 rebind/retry-window revision. A fresh attempt gets a fresh storage-minted identity.
 Lifecycle and reference changes do not remint its issuer or cutoff.
 
+Retained owners also require the non-recycling generation high-water for their
+exact bucket/key. Terminal cleanup, bucket removal and future owner retirement
+must not erase or lower that counter while any retained owner still needs it.
+Reservation/session presence is not a substitute for this fence, and import or
+replay must not silently reconstruct it from those shorter-lived references.
+
 Use a closed lifecycle with `Active`, `Published` and `Retiring` states.
 `Active` permits only checked preparation/append and its first terminal outcome.
 `Published` forbids further attempt allocation/adoption but can retain selected
 references and unused windows. `Retiring` likewise forbids allocation/adoption;
-it records closed metadata responsibility, **not permission to delete**. Moving
-a selected binding to a completed object or reclaim record preserves its exact
-reference regardless of lifecycle. Only a later reviewed retirement protocol
-can erase an owner/window; milestone 1 has no owner-retirement scanner or deletion
+it records closed metadata responsibility, **not permission to delete**. Retiring
+records additionally distinguish `Unpublished`, `PublishedRetained`, and
+`PublishedUnreferenced`. This preserves whether terminal publication occurred,
+even for a zero-segment stream or after all selected bindings have been removed.
+Moving a published binding between part, completed object and reclaim destinations
+preserves its entire exact reference set across `Published` and
+`Retiring(PublishedRetained)`; closing allocation must not invalidate a live
+reference. Only a later reviewed retirement protocol can erase an owner/window;
+milestone 1 has no owner-retirement scanner or deletion
 RPC. Published owners may therefore remain indefinitely in this first slice.
+
+#### Reference and resource matrix
+
+Let `N` be the number of retained windows. A stream's selected prefix has `N - 1`
+segments; its final window is unused lookahead. Direct PUT owns one window and
+selects it only at publication. Every nonempty selected set is the exact ordered
+prefix `0..count`, and every member has the **same complete destination identity**.
+Do not accept individually valid rows split between Part/Object/Reclaim, a hole,
+an omitted terminal member, or a selected lookahead window.
+
+| Lifecycle | Direct PUT references | Streamed PUT / UploadPart references | Allowed destination |
+| --- | --- | --- | --- |
+| `Active` | None | Exactly `N - 1` | Stream only |
+| `Published` | Exactly one | Exactly `N - 1` | Object or Reclaim; UploadPart may also bind its exact Part |
+| `Retiring(PublishedRetained)` | Exactly one | Exactly `N - 1` | Same terminal destinations as Published, including live Object/Part |
+| `Retiring(Unpublished)` | None | None | None; formerly staged segments remain window obligations |
+| `Retiring(PublishedUnreferenced)` | None | None | None; publication provenance and release obligations remain |
+
+An empty streamed publication legitimately selects zero segments; the explicit
+publication state, not whether references happen to be present, determines proof
+custody. Reference removal and the change to `PublishedUnreferenced` must be one
+atomic transition when the exact manifest/reclaim binding is removed. It is not
+evidence that physical cleanup completed. Likewise, marking an owner unpublished
+is not a way to forget an earlier publication; transition validation and live
+manifest correspondence are still required at the SQL/command boundary.
+
+In the following table, **Due** means retained exact release responsibility,
+including conservative evidence after a successful idempotent release. It does
+not mean that the reservation must still exist or that it must be kept alive.
+
+| Target and lifecycle | Generation | Creation proof | Finalization proof |
+| --- | --- | --- | --- |
+| Direct/streamed PUT, Active | Live | Live | NoResource |
+| Direct/streamed PUT, any terminal lifecycle | Due | Due | NoResource |
+| UploadPart, Active | Live | Due | NoResource |
+| UploadPart, Published / retiring published (retained or unreferenced) | Due | Due | Due |
+| UploadPart, Retiring(Unpublished) | Due | Due | NoResource, or Due from an authoritatively abandoned finalization |
+
+The introducing transaction always creates generation and creation-proof
+responsibility. This milestone retains their evidence through closure rather than
+allowing `NoResource` to erase it. A pending UploadPart finalization owns its proof
+until atomic publication transfers it to the owner; it cannot appear early on an
+Active owner. Authoritative abandonment may transfer it only in a certified
+cleanup follow-up while closing the attempt as unpublished, or in a proof-only
+follow-up after another transition already closed it as unpublished. An exact
+obligation already retained is custody evidence, not an apply/replay certificate.
+Once the original finalization is retained, any terminal UploadPart lifecycle may
+retain a distinct authenticated abandoned proof in an additional release-due
+slot. Those slots preserve independent stable identities and historical release
+routes, cannot appear on Active/direct/stream-PUT owners, and cannot overwrite
+the original finalization or another slot. The tombstone itself
+does not change ownership or the materialized digest. Removing references after
+publication never removes the finalization obligation. No extra command/fsync is
+introduced merely to clear a
+successfully released proof; later retirement remains separately gated.
 
 ### Allocation and deterministic application
 
@@ -315,7 +2589,7 @@ reconstruct an invalidated bucket reservation to keep the client attempt alive.
 | Multipart completion | Transfer every selected part's original owner/key references to the exact completed object generation without deriving owners from hashes; close omitted-part/active-session owners and retain their windows and releases. Preserve accepted completion replay and selected ciphertext when cleanup participants fail. |
 | Stream/whole-MPU abort or Direct PUT release | Close the exact attempt, drop only its no-longer-selected manifest bindings, and retain windows/resource releases before session, MPU or reservation removal. |
 | Overwrite, delete/version removal, reclaim | Transfer displaced exact-generation bindings to the existing durable reclaim identity before removing live manifests; successful existing cleanup may leave conservative owner evidence for later reinspection. |
-| Authoritatively unstarted command abandonment | Preserve already materialized ownership and transfer unresolved release responsibility under the existing command-install serialization; recover uncertain/started commands rather than treating abandonment as proof of absence. |
+| Authoritatively unstarted command abandonment | The tombstone leaves materialized ownership unchanged. Retain exact source/proof custody across a certified cleanup follow-up that closes/transfers responsibility before pending custody is discarded. Recover uncertain/started commands rather than treating abandonment as proof of absence. |
 
 Keep current pre-removal abort/part-replacement retry checks and current completion
 cleanup while this state-only slice lands. Retaining an owner does not make those
@@ -342,12 +2616,20 @@ the complete staged state before replacement. Reopen/replacement changes local
 allocation lifetime, not imported owner/window identities. Log/receipt compaction
 must not affect materialized owner responsibility.
 
-Extend both summary and exact historical-route enumeration in `pg_store.rs`,
-pending-command enumeration and applicable scavenger/backfill reference queries.
-The current summary reads live placements, backfill, pending-slot/bucket-proof
-resources and reclaim claims; the exact path similarly has no owner/window
-sources. Add owner recovery epochs, every window's file/ack routes and every
-retained release route, including pending introductions of future windows.
+Both summary and exact historical-route enumeration in `pg_store.rs` now include
+materialized owner recovery epochs, every window's file/ack route and every
+retained release route, alongside live placements, backfill, pending-slot/bucket
+resources and reclaim claims. Pending-command enumeration still needs future
+descriptors when reserve/create/append carry them. The owner-local bounded
+protection inventory now retains exact windows and selected bindings without
+pretending that unused scope is readable payload. The production unpaged
+reference-check path now includes conservative identity-only protections over
+embedded/Unix routes, without granting backfill eligibility. Production paged
+audit now carries exact original file/ack participants in a separate protection
+alternative, with a topology/PG/introduction-bound resume cursor and v35 wire
+evidence. It suppresses orphan diagnostics, not missing-readable-shard repair;
+unused scope remains excluded from placed-only backfill discovery. Pending
+introduction descriptors and production owner activation remain open.
 Do not assume an empty session or manifest inventory means a route is unreferenced.
 
 Reconfirmed source baseline for this proposal: PG schema 10; applied command 13;
@@ -363,11 +2645,12 @@ and correctly sealed noncurrent rejection before dispatch/mutation.
 
 Work internally in this order, without committing incomplete intermediate states:
 
-1. Typed records, central invariants and SQL/canonical/checkpoint membership.
+1. Typed records, central invariants and SQL/canonical/checkpoint membership,
+   including materialized-owner route retention before command activation.
 2. Reserve/create/append builder inputs, command/RPC encoding and exact retry
    matching; checked preparation; Direct PUT introduction custody/recovery.
-3. Every terminal/reference/resource transfer above, with route-reference queries
-   and existing cleanup guarantees preserved.
+3. Every terminal/reference/resource transfer above, with pending-introduction
+   and scavenger/backfill references and existing cleanup guarantees preserved.
 4. New immutable current-format and containment evidence; populated-state and
    production-path acceptance tests; cost comparison and final review.
 
@@ -1391,10 +3674,12 @@ Under the same object-PG command serialization and SQLite transaction boundary:
   unavailable or contradictory observations are not an absent command;
 - publication-start, any accepted apply, or ambiguous apply requires convergence
   of that command, not expiry-driven abandonment;
-- only authoritatively unstarted abandonment can atomically record abandonment,
-  preserve/seal the cleanup owner and intents, and remove the pending slot. If
-  cross-replica abandonment is partial, the slot remains recoverable until the
-  handoff is established; never clear it first and enqueue work afterward.
+- only authoritatively unstarted abandonment can record its terminal decision.
+  The tombstone is a materialized-state no-op. Preserve existing owners and exact
+  pending source/proof custody until a certified cleanup follow-up has atomically
+  materialized the required closure/transfer. If cross-replica abandonment or
+  follow-up installation is partial, custody remains recoverable; never clear it
+  first and enqueue work afterward.
 
 Pending installation is primary-local. Terminal replica apply must therefore
 accept the exact replicated `Open` owner/intents and atomically produce published
@@ -4056,6 +6341,11 @@ before attempting release; authorization validation and release timing are
 separate decisions.
 
 ### Reviewable implementation sequence
+
+The foundation checkpoint above permits supporting components to be committed
+before completing this sequence. The coupling requirements below apply to
+production activation, and the checkpoint's current format vector supersedes
+the historical version numbers in this original proposal.
 
 1. Define the private owner/window and resource-obligation records together with
    SQL constraints and canonical table membership. Integrate reserve/create,

@@ -1159,6 +1159,37 @@ impl PgStore {
 
     pub(crate) fn list_shard_scavenger_reference_page(
         &self,
+        topology: &crate::PgTopology,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        // One read snapshot covers parent and child tables. Reuse an enclosing
+        // transaction without committing or rolling back its caller's work.
+        let transaction = if self.conn.is_autocommit() {
+            Some(
+                self.conn
+                    .unchecked_transaction()
+                    .map_err(|error| StoreError::Db {
+                        context: "begin scavenger reference page snapshot",
+                        source: error.into(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let page = self.list_shard_scavenger_reference_page_in_snapshot(topology, after, limit)?;
+        if let Some(transaction) = transaction {
+            transaction.commit().map_err(|error| StoreError::Db {
+                context: "finish scavenger reference page snapshot",
+                source: error.into(),
+            })?;
+        }
+        Ok(page)
+    }
+
+    fn list_shard_scavenger_reference_page_in_snapshot(
+        &self,
+        topology: &crate::PgTopology,
         after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
     ) -> Result<ShardScavengerReferencePage, StoreError> {
@@ -1187,6 +1218,7 @@ impl PgStore {
                 Some(ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }) => 4,
                 Some(ShardScavengerReferenceCursor::PendingPlacedCommand { .. }) => 5,
                 Some(ShardScavengerReferenceCursor::PendingReclaimCommand { .. }) => 6,
+                Some(ShardScavengerReferenceCursor::StagingWindow { .. }) => 7,
             }
         };
 
@@ -1313,8 +1345,12 @@ impl PgStore {
 
         if start_phase <= 5 {
             let remaining = limit - items.len();
-            self.extend_placed_segment_backfill_pending_page(&mut items, pending_after, remaining)?;
-            if items.len() == limit {
+            let complete = self.extend_placed_segment_backfill_pending_page(
+                &mut items,
+                pending_after,
+                remaining,
+            )?;
+            if !complete || items.len() == limit {
                 return Ok(ShardScavengerReferencePage {
                     items,
                     complete: false,
@@ -1322,9 +1358,27 @@ impl PgStore {
             }
         }
 
-        let remaining = limit - items.len();
-        let complete =
-            self.extend_pending_reclaim_reference_page(&mut items, pending_after, remaining)?;
+        if start_phase <= 6 {
+            let remaining = limit - items.len();
+            let complete =
+                self.extend_pending_reclaim_reference_page(&mut items, pending_after, remaining)?;
+            if !complete || items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+        let remaining = std::num::NonZeroU16::new((limit - items.len()) as u16)
+            .expect("page has remaining capacity");
+        let complete = super::payload_staging::extend_scavenger_protection_page(
+            &self.conn,
+            crate::PgId::new(self.pg_id()),
+            topology,
+            after,
+            remaining,
+            &mut items,
+        )?;
         Ok(ShardScavengerReferencePage { items, complete })
     }
 
@@ -1392,7 +1446,8 @@ impl PgStore {
                 Some(
                     ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
                     | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
-                    | ShardScavengerReferenceCursor::PendingReclaimCommand { .. },
+                    | ShardScavengerReferenceCursor::PendingReclaimCommand { .. }
+                    | ShardScavengerReferenceCursor::StagingWindow { .. },
                 ) => 0,
             }
         };
@@ -1552,7 +1607,8 @@ impl PgStore {
             )?,
             ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
             | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
-            | ShardScavengerReferenceCursor::PendingReclaimCommand { .. } => None,
+            | ShardScavengerReferenceCursor::PendingReclaimCommand { .. }
+            | ShardScavengerReferenceCursor::StagingWindow { .. } => None,
         };
         Ok(actual.as_ref() == Some(expected))
     }
@@ -1669,8 +1725,8 @@ impl PgStore {
                             generation_id,
                             segment_index: row.get(3)?,
                         },
-                        reference: ShardScavengerPayloadReference::ReclaimOnly(
-                            ShardScavengerReclaimShardSetReference {
+                        reference: ShardScavengerPayloadReference::ProtectionOnly(
+                            ShardScavengerProtectedShardSetReference {
                                 data_pg_id: row.get(4)?,
                                 okh: Self::parse_okh_blob(&okh_blob, 5)?,
                                 generation_id: Self::parse_generation_id(
@@ -1755,8 +1811,8 @@ impl PgStore {
                             part_number: row.get(3)?,
                             segment_index: row.get(4)?,
                         },
-                        reference: ShardScavengerPayloadReference::ReclaimOnly(
-                            ShardScavengerReclaimShardSetReference {
+                        reference: ShardScavengerPayloadReference::ProtectionOnly(
+                            ShardScavengerProtectedShardSetReference {
                                 data_pg_id: row.get(5)?,
                                 okh: Self::parse_okh_blob(&okh_blob, 6)?,
                                 generation_id: Self::parse_generation_id(
@@ -2265,7 +2321,7 @@ impl PgStore {
                         reference_index: u32::try_from(reference_index)
                             .expect("metadata command reclaim reference count must fit in u32"),
                     },
-                    reference: ShardScavengerPayloadReference::ReclaimOnly(
+                    reference: ShardScavengerPayloadReference::ProtectionOnly(
                         Self::decode_pending_reclaim_reference(encoded)?,
                     ),
                 });
@@ -2321,7 +2377,7 @@ impl PgStore {
                             )
                         })?;
                 }
-                ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                ShardScavengerPayloadReference::ProtectionOnly(reference) => {
                     if (reclaim_reference_count as usize).is_multiple_of(references_per_page) {
                         reclaim_pages.push(Vec::with_capacity(
                             references_per_page * PENDING_RECLAIM_REFERENCE_RECORD_LEN,
@@ -2341,6 +2397,11 @@ impl PgStore {
                                 "reclaim reference count overflow",
                             )
                         })?;
+                }
+                ShardScavengerPayloadReference::StagingProtection(_) => {
+                    return Err(Self::invalid_pending_placed_reference_index(
+                        "materialized staging scope is not a pending manifest reference",
+                    ));
                 }
             }
         }
@@ -2388,7 +2449,7 @@ impl PgStore {
 
     fn decode_pending_reclaim_reference(
         encoded: &[u8],
-    ) -> Result<ShardScavengerReclaimShardSetReference, StoreError> {
+    ) -> Result<ShardScavengerProtectedShardSetReference, StoreError> {
         debug_assert_eq!(encoded.len(), PENDING_RECLAIM_REFERENCE_RECORD_LEN);
         let data_pg_id = u32::from_be_bytes(encoded[0..4].try_into().unwrap());
         let okh = encoded[4..20].try_into().unwrap();
@@ -2396,7 +2457,7 @@ impl PgStore {
             encoded[20..28].try_into().unwrap(),
         ))
         .ok_or_else(|| Self::invalid_pending_placed_reference_index("zero generation id"))?;
-        Ok(ShardScavengerReclaimShardSetReference {
+        Ok(ShardScavengerProtectedShardSetReference {
             data_pg_id,
             okh,
             generation_id,
@@ -2481,6 +2542,33 @@ impl PgStore {
 
     pub(crate) fn list_shard_scavenger_payload_references(
         &self,
+        topology: &crate::pg_topology::PgTopology,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        // All manifests, pending commands and owner/child rows must come from
+        // one snapshot. This is a read-only deferred transaction, not a new
+        // write/fsync or network critical section. Preserve an enclosing txn.
+        let transaction = self
+            .conn
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
+            .map_err(|source| StoreError::Db {
+                context: "begin shard scavenger reference snapshot",
+                source: source.into(),
+            })?;
+        let references = self.list_shard_scavenger_payload_references_in_snapshot(topology)?;
+        if let Some(transaction) = transaction {
+            transaction.commit().map_err(|source| StoreError::Db {
+                context: "finish shard scavenger reference snapshot",
+                source: source.into(),
+            })?;
+        }
+        Ok(references)
+    }
+
+    fn list_shard_scavenger_payload_references_in_snapshot(
+        &self,
+        topology: &crate::pg_topology::PgTopology,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
         let mut references = Vec::new();
         self.extend_scavenger_encrypted_placed_references(
@@ -2523,6 +2611,12 @@ impl PgStore {
             "list multipart reclaim segment shard scavenger references",
         )?;
         self.extend_scavenger_pending_command_references(&mut references)?;
+        super::payload_staging::extend_scavenger_protection_references(
+            &self.conn,
+            PgId::new(self.pg_id()),
+            topology,
+            &mut references,
+        )?;
         Ok(references)
     }
 
@@ -2819,8 +2913,8 @@ impl PgStore {
         generation_id: GenerationId,
         ec: EcShape,
     ) {
-        references.push(ShardScavengerPayloadReference::ReclaimOnly(
-            ShardScavengerReclaimShardSetReference {
+        references.push(ShardScavengerPayloadReference::ProtectionOnly(
+            ShardScavengerProtectedShardSetReference {
                 data_pg_id,
                 okh,
                 generation_id,
@@ -2988,8 +3082,8 @@ impl PgStore {
         let rows = stmt
             .query_map([], |row| {
                 let okh_blob: Vec<u8> = row.get(1)?;
-                Ok(ShardScavengerPayloadReference::ReclaimOnly(
-                    ShardScavengerReclaimShardSetReference {
+                Ok(ShardScavengerPayloadReference::ProtectionOnly(
+                    ShardScavengerProtectedShardSetReference {
                         data_pg_id: row.get(0)?,
                         okh: PgStore::parse_okh_blob(&okh_blob, 1)?,
                         generation_id: PgStore::parse_generation_id(
@@ -4224,12 +4318,17 @@ mod tests {
             })
             .unwrap();
 
-        let references = store.list_shard_scavenger_payload_references().unwrap();
+        let references = store
+            .list_shard_scavenger_payload_references(
+                &crate::pg_topology::PgTopology::new(&[0, 7]).unwrap(),
+            )
+            .unwrap();
         let mut page_after = None;
         let mut paged_items = Vec::new();
         loop {
             let page = store
                 .list_shard_scavenger_reference_page(
+                    &crate::PgTopology::new(&[store.pg_id()]).unwrap(),
                     page_after.as_ref(),
                     std::num::NonZeroU16::new(1).unwrap(),
                 )
@@ -4251,7 +4350,7 @@ mod tests {
             .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::Placed(reference) if reference.okh == [0x11; 16])));
         assert!(paged_items
             .iter()
-            .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::ReclaimOnly(reference) if reference.okh == [0x33; 16])));
+            .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::ProtectionOnly(reference) if reference.okh == [0x33; 16])));
         let object_segment = references
             .iter()
             .find_map(|reference| match reference {
@@ -4303,7 +4402,7 @@ mod tests {
         let reclaim = references
             .iter()
             .find_map(|reference| match reference {
-                ShardScavengerPayloadReference::ReclaimOnly(reference)
+                ShardScavengerPayloadReference::ProtectionOnly(reference)
                     if reference.okh == [0x33; 16] =>
                 {
                     Some(reference)
@@ -4461,7 +4560,8 @@ mod tests {
                 first_page_cursor = page.items.last().map(|item| item.cursor.clone());
                 first_page_reference = page.items.last().and_then(|item| match &item.reference {
                     ShardScavengerPayloadReference::Placed(reference) => Some(reference.clone()),
-                    ShardScavengerPayloadReference::ReclaimOnly(_) => None,
+                    ShardScavengerPayloadReference::ProtectionOnly(_)
+                    | ShardScavengerPayloadReference::StagingProtection(_) => None,
                 });
             }
             seen += page.items.len();
@@ -4659,6 +4759,7 @@ mod tests {
         loop {
             let page = store
                 .list_shard_scavenger_reference_page(
+                    &crate::PgTopology::new(&[store.pg_id()]).unwrap(),
                     cursor.as_ref(),
                     NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
                 )
@@ -4666,7 +4767,7 @@ mod tests {
             assert!(page.items.len() <= usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
             assert!(page.items.iter().all(|item| matches!(
                 item.reference,
-                ShardScavengerPayloadReference::ReclaimOnly(_)
+                ShardScavengerPayloadReference::ProtectionOnly(_)
             )));
             seen += page.items.len();
             cursor = page.items.last().map(|item| item.cursor.clone());
@@ -4677,6 +4778,36 @@ mod tests {
         assert_eq!(seen, REFERENCE_COUNT);
 
         let replacement = command_for(2, reclaim_segments[..2].to_vec());
+        // A short pending prefix must not fall through into the staging phase
+        // and report completion when its remaining sidecar pages are missing.
+        let topology = crate::PgTopology::new(&[store.pg_id()]).unwrap();
+        let prefix = store
+            .list_shard_scavenger_reference_page(&topology, None, NonZeroU16::new(60).unwrap())
+            .unwrap();
+        assert_eq!(prefix.items.len(), 60);
+        store.conn.execute_batch("BEGIN").unwrap();
+        store.conn.execute("DELETE FROM metadata_command_pending_reclaim_reference_pages WHERE page_index >= 1", []).unwrap();
+        let short = store
+            .list_shard_scavenger_reference_page(
+                &topology,
+                Some(&prefix.items.last().unwrap().cursor),
+                NonZeroU16::new(64).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(short.items.len(), 4);
+        assert!(
+            !short.complete,
+            "staging phase must not certify a truncated pending inventory"
+        );
+        assert!(store
+            .list_shard_scavenger_reference_page(
+                &topology,
+                Some(&short.items.last().unwrap().cursor),
+                NonZeroU16::new(64).unwrap()
+            )
+            .is_err());
+        assert!(!store.conn.is_autocommit());
+        store.conn.execute_batch("ROLLBACK").unwrap();
         store
             .test_replace_pending_metadata_command_slot(&replacement, Some(&bucket))
             .unwrap();
@@ -4695,6 +4826,7 @@ mod tests {
         assert_eq!(indexed_pages, 1);
         let page = store
             .list_shard_scavenger_reference_page(
+                &crate::PgTopology::new(&[store.pg_id()]).unwrap(),
                 None,
                 NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
             )
@@ -4766,6 +4898,7 @@ mod tests {
             .unwrap();
         let restarted = store
             .list_shard_scavenger_reference_page(
+                &crate::PgTopology::new(&[store.pg_id()]).unwrap(),
                 cursor.as_ref(),
                 NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
             )
@@ -4816,6 +4949,7 @@ mod tests {
         store.test_insert_object_segment(&placed_segment).unwrap();
         let durable_restart = store
             .list_shard_scavenger_reference_page(
+                &crate::PgTopology::new(&[store.pg_id()]).unwrap(),
                 cursor.as_ref(),
                 NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
             )

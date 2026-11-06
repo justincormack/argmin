@@ -20,14 +20,310 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Owner/Window Foundation Checkpoint — 2026-11-06
+
+This checkpoint records reviewed foundations, not activation or completion of
+the coordinated cleanup-ownership protocol. Its schema, checkpoint, RPC and
+abandoned-command formats are live; production commands do not yet create new
+staging owners or switch frontend custody. This is the current frozen format
+vector, superseding the predecessor values below. Later incompatible changes
+require new versions and retained predecessor evidence, even while integration
+remains incomplete.
+
+| Format | Checkpoint version | Change |
+| --- | --- | --- |
+| PG schema | **11** | Five normalized owner/window/participant/reference/resource tables; replica-state digest version 10 |
+| Canonical metadata state | **10** | Complete ordered inclusion of all five tables and columns in incremental/full state digests |
+| Metadata checkpoint | **8** | Complete owner graph export; deterministic structural validation and destination-topology validation before replacement |
+| Applied metadata command | **13**, unchanged | Owner introduction/terminal-transfer command integration remains pending |
+| Storage RPC | **35** | Paged audit adds a staging-window cursor (tag 7) and exact-participant protection reference (tag 2); checkpoint/digest changes alone did not require an outer bump |
+| Abandoned-command log record | **2** | Tombstones bind the original applied-command bytes with SHA-256 as well as CRC64 |
+| Private staging descriptor / abandonment-source carrier | **1 / 1** | Frozen component encodings; not yet embedded in live command envelopes |
+
+### Pending-index predecessor evidence
+
+`pg_store/pending_index_format_tests.rs` freezes the **unchanged** pending-index
+grammars present in PG schema 10 and still emitted by the schema-11 checkpoint
+writer. These deliberately untagged SQLite encodings are owned by `pg_store`:
+
+- Route-dependency checksum input: literal
+  `argmin.metadata.pending-route-dependencies.v1`, then big-endian u64 command
+  epoch, PG, log index and command CRC64; u8 dependency count; ordered pairs of
+  u64 dependency epoch and bucket-route hash. Independent literal inputs cover
+  zero, one and two entries, including hashes/checksums with the high bit set.
+  Their literal CRC64 values are respectively `aa81fe2caff1fe8f`,
+  `c6cfcd4370d840aa` and `a6a244c4dc1203bd`; both production computation and the
+  raw SQL checksum column after reopen must equal these fixed values.
+  The schema accepts two dependencies; current command projection emits at most
+  one bucket reservation. SQL restart/readback and corrupted-checksum rejection
+  exercise the production sidecar reader without decoding the command.
+- Placed-reference record: 54 bytes, comprising u32 data PG, 16-byte hash, u64
+  generation, placement epoch, stored length and CRC64, then u8 `k` and `m`.
+- Reclaim-protection record: 30 bytes, comprising u32 data PG, 16-byte hash, u64
+  generation, then u8 `k` and `m`. It deliberately carries no readable-payload
+  length, checksum or integrity witness.
+
+The latter two literal records are compared with bytes written by real pending
+slot installation and reopened from SQLite. Existing paging tests separately
+cover bounded multi-page scans and transactional replacement. These new tests
+do not alter any writer, version, schema or old fixture. They are format evidence,
+not proof that pending commands already protect owner windows.
+
+The containing durable format is the **PG schema**, whose catalogue freezes the
+sidecar columns/page tables but not these blob/checksum grammars. Pending indexes
+are derived from the exact pending command and are not materialized canonical
+checkpoint state. An incompatible index change must advance the containing PG
+schema, retain this evidence, and update slot installation/replacement/readers
+together. This foundation checkpoint retains the evidence with the unchanged
+index writer, establishing the parent-commit gate required by `versioning.md`
+for the subsequent index-format change.
+Changes to the command carrier or scavenger wire grammar additionally require
+their own coordinated versions and composite evidence.
+
+### Owner persistence at the checkpoint
+
+`schema_manifests/pg_schema_v11.catalogue` pins the schema-initialization
+catalogue, including CHECK/FK clauses and static triggers. Digest bootstrap
+separately installs registry-derived triggers, exercised by the per-column
+incremental/full-digest tests. The catalogue's file SHA-256 is
+`3d310e97719df8dc5a0dfb8e4bc9b24ee714da20f7e45afc7dff54b08a57f25d`.
+Schema 11 permits additional terminal UploadPart
+release obligations: resource slots 0/1 retain creation/original finalization,
+and contiguous slots 2.. retain independently authenticated abandoned proofs.
+Additional slots are release-due only; central SQL/checkpoint validation rejects
+gaps, duplicate stable identities and invalid lifecycle/subject/topology. This is
+included in this checkpoint's single 10 → 11 transition, not a second bump in
+one commit. Schema 11 is now frozen, not an editable candidate.
+The schema-10 catalogue and checkpoint-7 bytes remain untouched and rejected;
+canonical-state-v8/v9 aggregate evidence remains independent of the current
+table inventory. No migration or old reader is introduced.
+
+Immutable checkpoint-8/canonical-10/PG-11 fixtures are appended under
+`pg_store/testdata/`: `checkpoint_v8_canonical_v10_pg_v11_sse_s3_v5.hex`
+(9,639 decoded bytes) preserves the MPU/encryption representative with empty
+owner tables; `checkpoint_v8_canonical_v10_pg_v11_staging.hex` (20,881 decoded
+bytes) populates eight owners and every current target, lifecycle, destination,
+generation-responsibility and bucket-resource role/state tag, but omitted the
+required generation high-water. Those original bytes are retained unchanged as
+correctly sealed **semantic rejection** evidence. The additional
+`checkpoint_v8_canonical_v10_pg_v11_staging_generation_fence.hex` retains that
+owner corpus with its durable object-generation counter and is the current
+accepted representative (20,942 decoded bytes, SHA-256
+`7f9b717357d7bed0aed5bd75a2ccad320279d1c0f4f84c704fe3ad18dae9ceb7`). Their decoded
+bytes, SHA-256 values, state digests and checkpoint CRCs are pinned by tests, along
+with literal coverage assertions. These are owner-local format specimens, not
+proof that commands already create or transfer durable custody.
+
+`checkpoint_v8_canonical_v10_pg_v11_abandoned_finalizations.hex` additionally pins
+slots 2 and 3, independent proof epochs, and their retained original terminal
+proof (11,658 decoded bytes, SHA-256
+`6b706d4eeaa414e5040daecbde816e5507c292f092dff210271e4c7d244a8643`).
+The original accepted and semantic-rejection specimens above remain unchanged.
+SQL loading and checkpoint import reject noncontiguous slots, live additional
+obligations, duplicate stable identities (even with changed lease evidence),
+missing terminal custody and crossed release PGs before destination replacement.
+
+Checkpoint scaling is outside this pending ownership-format change.
+The uncommitted paging/export-session experiment has been withdrawn; no page
+format or export-session RPC kinds are added. The existing 100,000-row
+per-table decoder limit and 64 MiB whole-frame transport limit remain unresolved
+in [Metadata checkpoint transfer](../plans/metadata-checkpoint-transfer-plan.md).
+The cleanup-specific checkpoint validation, version advances and immutable
+composites below are retained; they are not evidence of bounded large-PG
+transfer or aggregate memory use.
+
+The nested canonical-version advance appends proof/carrier, runtime-config,
+runtime-map digest, control-plane state/command/RPC and storage transfer
+composites without changing their outer versions. The preceding control-plane
+state-v32, command-v20 and RPC-v18 canonical-v9 aggregates are now retained as
+literal files, captured with the unchanged predecessor writer/version and
+verified against their existing frozen hashes before adding the v10 vectors.
+Their decoded SHA-256 values remain respectively
+`f30c3ec49cb64e56ee46b1f69b8db14bc1130941f6ca92f735e76c35b95a049c`,
+`ac76619b417cb557ef985243d804f989d1bc5bb982784a8701da609024dcfcc1`, and
+`d6664e05b4b9be005dbb0dc85a3a38ab600fa7ae84daf23a6da9ec788567c6b5`.
+Proof-bearing predecessor state/commands and standalone v9 proof carriers are
+rejected. Proof-free outer messages remain current; outer grammar has not changed.
+
+The initial storage-transfer evidence included four literal complete v34 frames under
+`storage_rpc/testdata/`, tested by `checkpoint_transfer_format_tests.rs`:
+
+| Composite (RPC / checkpoint / canonical / PG schema) | Carrier | Decoded frame bytes | Decoded SHA-256 |
+| --- | --- | --- | --- |
+| 34 / 7 / 9 / 10 | Base-install request | 7,884 | `3550759a9078a8cca55298ce0b8fc4107a2995317d30e6126140662ee38e926b` |
+| 34 / 7 / 9 / 10 | Checkpoint-export success response | 7,874 | `95274953efc07179a54c330dd88d53b50fbe67849f88133804f00c22d3e6c3fa` |
+| 34 / 8 / 10 / 11 | Base-install request | 9,707 | `bce17e0f1a2e0ffe99735df0fe0b60b7280053d0cf476d91b8bb33707686eb67` |
+| 34 / 8 / 10 / 11 | Checkpoint-export success response | 9,697 | `72a7dbefe02d5dbe7040aea87d1e39fc59c4a1444c6f488b0790713af10a1c27` |
+
+The following describes their original v34 validation. The paged-audit integration
+below appends v35 counterparts and retains these v34 bytes as outer-version
+rejection evidence; exact nested-v7 rejection is now exercised inside v35.
+
+The filenames encode that complete vector and carrier. Both use the independently
+frozen PG-1 MPU checkpoint specimens above, including SSE-S3-v5 state. The v7
+composites preserve those original checkpoint bytes verbatim inside the unchanged
+v34 routing/frame and success-envelope writers; they do not relabel a current
+checkpoint or regenerate historical bytes during the test. Production decoding
+must accept the outer frame and checksum (and the response success envelope),
+then return exactly `UnsupportedMetadataCheckpointEncodingVersion { actual: 7 }`
+for each carrier. The v8 counterparts decode to the expected request/response
+and match the current production encoders byte-for-byte, including outer framing.
+The checkpoint-bearing response is an export response, not the base-install
+acknowledgement. These four frames pin those two carriers, not the entire RPC
+catalogue. The separate empty-PG-11 transfer round-trip and its retained old
+checkpoint tuple remain useful coverage but are not complete composite evidence.
+
+Materialized owner/window/resource routes now participate in both exact history
+enumeration and the epoch-floor summary. They use the existing
+`MetadataCommandResource` reference kind (wire tag 4): object recovery, every
+window's data-PG route, and each proof's historical bucket-PG release route remain
+needed after pending commands, sessions and reservations disappear. The existing
+route-reference grammar and format versions do not change. Expiry and lifecycle
+do not prune these references; retirement remains separately gated.
+
+The unpaged cleanup-reference scan also projects retained staging windows into
+the existing identity-only protection alternative (wire tag 1). The Rust names
+are now `ProtectionOnly` / `ShardScavengerProtectedShardSetReference`; the wire
+fields and their non-readable meaning were unchanged, so that step kept RPC 34.
+The immutable v22 reclaim-page payload is unchanged, and
+`storage_rpc_v34_unpaged_protection_reference_bytes_are_unchanged` pins a literal
+unpaged response. This projection is deliberately conservative and contains no
+actual size, CRC or witness; it cannot authorize repair/backfill or deletion.
+Exact historical participants stay in the owner graph. The paged audit cursor
+and exact-participant integration were not covered by this reuse of the unpaged
+response shape; the separate v35 integration below now supplies them.
+
+Paged audit advances the frame grammar to **35**. Cursor tag 7 carries the
+object PG, SHA-256 of the complete canonical PG topology (domain
+`staging-protection-cursor-topology-v1`), attempt, introduction epoch/index and
+window index. Reference tag 2 carries the identity-only shard set, original
+placement epoch, ordered file nodes and independent acknowledgement primary.
+The topology fingerprint is a resume-domain check, not authentication or cleanup
+authority. Participant counts are EC-bounded and unique; crossed cursor/reference
+alternatives fail decoding. These alternatives contain no readable geometry,
+checksum or witness, and cannot authorize repair, backfill or deletion.
+
+Literal `staging_scavenger_rpc_v35_{request,response}.hex` specimens pin the new
+framed grammar. The stream-creation, bucket-reservation and shard-acknowledgement
+corpora have separate v35 files, with every v34 specimen retained and rejected.
+All four checkpoint-transfer composites are also appended at v35 (including
+checkpoint-7 semantic-rejection specimens), preserving the original payloads.
+Current tests compare complete encoder output to the new literals; historical
+bytes are not regenerated or edited. Inline frame/encryption evidence is likewise
+appended, as are authentication-v2 request/response composites containing v35
+frames (with v34 composites retained and rejected). Existing payload-only tag-1
+evidence remains unchanged.
+
+Persistence tests cover actual checkpoint install/reopen, correctly resealed
+malformed owner graphs, foreign destination topology, replacement rollback at
+each table and every column's incremental/full digest participation. Retention
+tests use validated owner-only SQL specimens, including empty windows and two
+production runtime-config refreshes. Command transactions, pending-introduction
+and scavenger/backfill references, live-manifest correspondence, frontend custody
+and physical-write exclusion remain required by the coordinated plan; these
+tables alone do not authorize cleanup or close that milestone.
+
+### Staging command-field grammar (not yet in live envelopes)
+
+The coordinated integration additionally defines V1 introduction/append
+descriptors in `pg_store/payload_staging_descriptor.rs`. The magic is
+`staging\0`, followed by little-endian u16 version 1 and kind 0 (introduction)
+or 1 (append). The complete descriptor is bounded to 16 KiB as a secondary
+framing/allocation limit, not permission for individual fields to reach that
+size. Central resource validation requires reservation IDs and owner tokens to
+be 1–256 UTF-8 bytes, fitting both the authoritative reservation's 256-character
+SQL columns and release transport. Leading-NUL identities also fail the source
+SQL nonzero-length requirement and are rejected. Canonical operation and exact target-key
+binding independently constrain the other proof strings. These checks also
+apply to captured owner records, SQL loads and checkpoint validation.
+
+Each descriptor contains the original subject and one immutable window;
+introduction also carries the creation-proof/release-route evidence. Lifecycle
+and resource roles are derived
+from the introduction target, not independent serialized choices. No monotonic
+clock, remaining-duration lease or local allocation cursor is encoded.
+
+Five complete literals under `pg_store/testdata/staging_descriptor_v1_*.hex`
+pin Direct PUT / streamed PUT / UploadPart introductions (417 / 417 / 564 bytes)
+and streamed PUT / UploadPart append windows (241 / 385 bytes). They are checked
+against both encoding and decoding. Preserve these files when this field grammar
+advances. These are not checksummed command envelopes, transport frames, or
+authority certificates: decoded descriptors still require actual-store topology,
+command correspondence and ordinary command acceptance/recovery validation.
+
+No current writer embeds these values yet, so applied-command version 13 and the
+live format vector above do not change in this step. Coordinated activation must
+advance the command grammar, make the relevant field mandatory and covered by
+the command checksum, preserve the predecessor corpus, append complete command
+and RPC composites, and adjust enclosing bounds. The standalone descriptor tests
+do not satisfy that enclosing-format gate.
+
+### Staging abandonment-source carrier (not yet in live envelopes)
+
+`pg_store/payload_staging_abandonment_source.rs` owns an independent V1 carrier
+for the exact failed `CommitStreamPart` command. Its layout is eight literal
+bytes `stg-abnd`, little-endian u16 version 1, u64 original command CRC64, u32
+canonical-command length, and those complete command bytes. The source retains
+its independently versioned applied-command grammar; it is not reconstructed
+from only a session ID, proof or selected segment list. Other command kinds,
+abandonment tombstones, unsupported carrier/nested versions, trailing bytes,
+bad lengths and checksum mismatches fail decoding.
+
+The complete carrier bound is **22 bytes plus the 2 MiB command limit**, not
+2 MiB including its header. The command limit is shared with RPC admission.
+Framing and the declared nested length are checked before command decoding.
+`testdata/staging_abandonment_source_v1_command_v13.hex` freezes the complete
+V1/command-V13/SSE-S3-V5 composite using the unchanged source specimen from the
+predecessor command corpus. A future nested-only advance retains this specimen
+and appends a new version-vector composite; it does not silently rewrite V1.
+
+This value is descriptive evidence, **not an abandonment certificate or cleanup
+authority**. Applying it requires the exact durable source tombstone/terminal
+chain, actual owner/topology, follow-up identity/order, and caller-owned
+transaction. Those checks are repeated at application, including after reopen,
+compaction and epoch advancement. The carrier itself is not persisted or sent
+by current production command dispatch. Coordinated activation still must make
+it a mandatory checksum-covered field for the applicable follow-up, include
+both source and cleanup overhead in enclosing bounds, retain pending source
+custody until transfer, and append the complete command/RPC composites. It adds
+no successful-write transaction or fsync by itself.
+
+The exact-source binding requires **abandoned-command record V2**: it appends
+the 32-byte SHA-256 of the original applied-command bytes after the original
+CRC64. V1's `(ID, CRC64)` record was insufficient, including when hashed into a
+compacted receipt. Current receipt SHA-256 covers the complete V2 tombstone;
+retained-row and pending-slot comparisons reconstruct that same record from the
+candidate's complete bytes. Peering's retained-log response carries both source
+CRC64 and SHA-256 and compares both. This raw response-field addition is included
+in this checkpoint's RPC **34 → 35** advance, not an additional version bump.
+The applied-command grammar stays V13 and the source carrier stays V1. No SQL
+column, materialized-state digest grammar, checkpoint grammar, or hash-chain
+algorithm changes for this correction: command-log bytes are self-versioned,
+and tombstones still do not mutate materialized state.
+
+`storage_rpc/testdata/abandoned_log_range_rpc_v{34,35}.hex` pins complete
+retained-log response frames without/with the source digest. The current encoder
+matches the V35 literal; V34 fails frame admission, and every truncated digest
+fails current payload decoding. The existing all-applied entry-range size bound
+still dominates the fixed-size abandoned entries.
+
+The parent commit's exact V1 tombstone literal is retained as rejection evidence,
+with a new complete V2 literal and a V2/applied-V13/SSE-S3-V5 composite in
+`testdata/staging_abandonment_tombstone_v2_command_v13.hex`. Its source digest was
+independently computed with `sha256sum`. Owner tests deliberately compensate an
+ETag to keep CRC64 unchanged while independently crossing reservation ID or owner
+token, then prove rejection without custody mutation before/after reopen and
+compaction. The original source still converges. Correctly resealed V1 records
+fail before recovery effects; no legacy reader or CRC-only match remains.
+
 ## Consolidated Owner/Window Predecessor Evidence Audit — 2026-11-04
 
-For the five formats below, this is the current implementation baseline. Older
+For the five formats below, this records the audited predecessor baseline. Older
 version numbers in the historical evidence descriptions and baseline inventory
-rows below are not the current writer values. Recheck these source constants
-before advancing a format; no writer changes in this evidence-only slice.
+rows below are not the current writer values. The foundation checkpoint above
+advances the stated subset; this audit itself changed no writer.
 
-| Format | Current version and owning source | Existing immutable evidence |
+| Format | Predecessor version and owning source | Existing immutable evidence |
 | --- | --- | --- |
 | PG schema | 10, `pg_store/schema.rs` | `schema_manifests/pg_schema_v10.catalogue`, compared with the complete live SQLite catalogue |
 | Applied metadata command | 13, `metadata_command.rs` | Original 30-case v13/SSE-S3-v5 object corpus; cleanup, terminal-transfer and shared-record supplements; existing bucket/registry encoding goldens |
@@ -351,12 +647,12 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | --- | --- | --- | --- |
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 10`; version zero is valid only with no user schema objects | Recorded: immutable catalogues retain versions 1 through 10. Version 10 adds the mandatory stream allocation issuer node and 128-bit process lifetime, and advances the replica-state digest constraint to 9. Production initialization matches the exact v10 catalogue; nonempty version-zero state, versions 1 through 9, and 11 are rejected before initialization. Checkpoint import rejects malformed issuer fields before mutation. |
 | Applied metadata-command envelope | `storage` | magic `argmin-metadata-command`; command encoding 13 | Recorded: v13 adds the stream allocation issuer to the exact generation/session creation command. All current variants have stable checksum evidence; the 30 literal v12/SSE-S3-v5 object specimens remain rejection-only beside earlier corpora. Header/full decoders reject noncurrent outer and nested versions before effects. |
-| Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 1 | Recorded: exact current bytes, typed framing/version failures, and resealed persisted old/new-version rejection before recovery mutation or publication |
+| Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 2 | Recorded: V2 binds original-command SHA-256 as well as CRC64; exact V1 bytes remain rejection evidence. Current literal/composite, framing/version failures, CRC-collision rejection and resealed persisted old/new-version rejection precede recovery effects. |
 | Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain and opaque fixed-width `MetadataCommandLogHash` carrier version 1 | Recorded for the coordinated carrier slice: PG hash columns remain schema-bound and every exported proof carries the independent version and value; broader command-log-format evidence remains a separate row below |
 | Metadata checkpoint payload | `storage` | private `ARGMCPKT` plus big-endian `u16` checkpoint encoding 7 | Recorded: v7 carries schema-10 stream issuer fields and canonical-state v9. A literal current v7/state-v9/schema-v10/SSE-S3-v5 specimen independently decodes, verifies, installs, and reopens. The complete v6/state-v8/schema-v9/SSE-S3-v5 bytes and earlier evidence remain immutable; retired/newer versions and malformed issuer rows are rejected before import. |
 | Canonical metadata state digest | `storage` | private domain `argmin.metadata.pg-state` and opaque fixed-width `CanonicalStateDigest` carrier version 9 | Recorded: v9 includes both durable stream issuer fields. Prior v8 composites remain immutable; current independently versioned outer carriers append state-v9 evidence without changing their grammar versions. Replica state and every exported proof carry version and value; runtime configuration, control-plane state/commands/RPC, checkpoint, and storage-RPC readers reject noncurrent carriers. |
 | Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v5`; every present PG read route contains both proof-carrier versions and values | Recorded for the coordinated carrier slice: exact v5 text, versions 4/6, incomplete/noncurrent carrier rejection, and restart/publication coverage are owner-local |
-| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 34 | Recorded: v34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
+| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 35 | Recorded: v35 adds exact-participant staging protection pages and appends v35 enclosing corpora, retaining v34 rejection evidence. V34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
 | Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Recorded: exact request/response bytes cover absent and present transcript tags, a fixed production-derived transcript digest seals its domain/length/input grammar, typed framing/version failures are distinct owner-locally, and authenticator-valid versions 0/3 are rejected before server dispatch or mutation |
 | Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Recorded: exact v1 bytes, owner-typed framing/version failures, allocation-ordering evidence, and valid signed inner envelopes in server-facing versions 0/2 fixtures prove rejection before authentication, dispatch, or mutation |
 | Control-plane logical state | `storage` | canonical text with leading `version=32` | Recorded: owner-typed missing/unsupported-version classification and an 11,041-byte representative aggregate sealing unavailable-node observations, proof-bound singleton unavailable-PG transitions, historical-route proof-floor/provenance, destination-route evidence, PG-local metadata log epochs, topology, leases, transfers, prior-primary state, route references, and pending-command branches. Immutable v28 through v31 aggregates remain rejection-only evidence; versions 28/29/30/31/33 are rejected through both single-authority open and replicated snapshot installation without mutation or publication. |
@@ -490,7 +786,7 @@ self-describing record has an older-version reader or a default-version fallback
 | Format | Defining marker | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
 | --- | --- | --- | --- | --- | --- |
 | Applied metadata-command envelope | Private `METADATA_COMMAND_MAGIC` followed by little-endian `METADATA_COMMAND_ENCODING_VERSION = 12` in `metadata_command.rs` | `canonical_command_bytes()`, reached through `MetadataCommandEnvelope::command_bytes()` before pending-slot, applied-log, transfer, or storage-RPC publication | `decode_metadata_command_log_entry_header()` for retained/applied log inspection and `decode_metadata_command_envelope()` for pending-slot, scavenger, transfer, and storage-RPC use; persistence paths verify the separately stored CRC64 before either decoder | Recorded. V12 adds the exact stream payload generation; the literal v11/SSE-S3-v5 corpus remains rejection-only. V11 added the optional, versioned per-segment shard-integrity witness. Stable CRC64 fixtures cover every current payload kind and representative nested branches; every fixture round-trips both decoders. The append-only v10 corpus is regenerated with the exact former grammar, omitting witness fields, and remains immutable rejection evidence beside the v9, v8, and v7 corpora. Owner-local persistence fixtures reseal noncurrent pending slots and applied-log rows, including the applied hash chain, and prove recovery rejects them without changing durable rows, replica state, or materialized state. Correctly authenticated current storage-RPC frames carrying independently checksummed noncurrent envelopes are rejected before mutation dispatch and leave the durable command log and replica state unchanged. | None for the current v12 baseline. A future incompatible envelope change advances this inner version and appends permanent old/new fixtures; it does not add an older-version reader. |
-| Abandoned metadata-command record | Private `ABANDONED_METADATA_COMMAND_MAGIC` followed by little-endian `ABANDONED_METADATA_COMMAND_ENCODING_VERSION = 1` in `metadata_command.rs` | `abandoned_command_log_bytes()`, reached through `MetadataCommandEnvelope::abandoned_log_bytes()` before terminal-log persistence | `decode_metadata_command_log_entry_header()` after the separately stored CRC64 is verified by `PgStore::verify_metadata_command_log_entry()` | Recorded. A fixed v1 fixture pins the complete marker, little-endian version and identity fields, and original-command checksum. The applied and abandoned readers share a private typed format error; direct fixtures distinguish missing/truncated marker and version, unknown magic, trailing data, and unsupported versions 0 and 2. Owner-local persistence fixtures reseal versions 0 and 2 with valid row checksums, send them through production recovery, and prove rejection leaves replica state, materialized-state digest, command bytes, checksum, and unpublished recovery hashes unchanged. | None for the current v1 baseline. A future incompatible record change advances this inner version and appends permanent old/new fixtures; it does not add an older-version reader. |
+| Abandoned metadata-command record | Private `ABANDONED_METADATA_COMMAND_MAGIC` followed by little-endian `ABANDONED_METADATA_COMMAND_ENCODING_VERSION = 2` in `metadata_command.rs` | `abandoned_command_log_bytes()`, reached through `MetadataCommandEnvelope::abandoned_log_bytes()` before terminal-log persistence | `decode_metadata_command_log_entry_header()` after the separately stored CRC64 is verified by `PgStore::verify_metadata_command_log_entry()` | Recorded. The unchanged V1 literal remains rejected; V2 pins marker/version, command identity, original CRC64 and full original-command SHA-256. Direct tests cover truncation, unknown magic, trailing data and unsupported 0/1/3; persisted resealed rejection leaves state and recovery hashes unchanged. A frozen V2/applied-V13 composite pins digest derivation, and compensated-CRC proof substitution is rejected using retained rows and compacted receipts. | Future incompatible changes advance this inner version and append evidence, never a CRC-only fallback or older-version reader. |
 | Metadata-command log hash chain | Private `ARGMIN-METADATA-COMMAND-LOG-V1` domain inside `metadata_command_log_hash()`; raw PG columns remain CRC64 integers while every exported value is the opaque carrier `MetadataCommandLogHash` version 1 | Applied publication and contiguous-tail advancement compute the hash before publishing it in the schema-v7 log/replica state; abandoned rows may first be recorded with null chain fields and are hashed when the contiguous tail advances | Log-suffix validation and abandoned-tail recovery recompute the chain before advancing durable replica state; transfer, checkpoint, runtime-map, control-plane, and RPC readers reject a noncurrent carrier before comparison or publication | Corrupt durable hash and unproven-prefix tests establish fail-closed recovery and transfer behavior. An exact v1 hash golden seals the domain, field order, little-endian integer widths, and CRC64 result. Exact carrier fixtures and wrong-version tests cover the direct containers advanced in the coordinated slice. | Recorded for the carrier introduction. A later hash-algorithm change advances only the inner version while the fixed version-plus-`u64` carrier shape remains unchanged; raw command-log columns remain bound to the PG schema. |
 
 The applied envelope is persisted in pending-slot and metadata-command-log rows and is nested inside

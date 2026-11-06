@@ -10118,9 +10118,12 @@ mod proof_format_baseline_tests {
                 0x14, 0x15, 0x16, 0x17, 0x18, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
                 0x27, 0x28,
             ];
-        let mut current_v9 = historical_v8;
-        current_v9[17] = 9;
-        assert_eq!(bytes, current_v9);
+        let mut historical_v9 = historical_v8;
+        historical_v9[17] = 9;
+        assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v9)).is_err());
+        let mut current_v10 = historical_v8;
+        current_v10[17] = 10;
+        assert_eq!(bytes, current_v10);
         assert!(read_pg_metadata_proof(&mut PayloadReader::new(&historical_v8)).is_err());
         let mut reader = PayloadReader::new(&bytes);
         assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);

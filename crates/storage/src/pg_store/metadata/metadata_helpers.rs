@@ -354,7 +354,7 @@ impl PgStore {
         Ok(())
     }
 
-    fn advance_object_generation_high_water_in_open_txn(
+    pub(super) fn advance_object_generation_high_water_in_open_txn(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

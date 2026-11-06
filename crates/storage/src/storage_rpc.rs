@@ -57,7 +57,7 @@ use crate::{
         SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
         ShardScavengerObservationKey, ShardScavengerObservationReason,
         ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-        ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
+        ShardScavengerPlacedShardSetReference, ShardScavengerProtectedShardSetReference,
         ShardScavengerReferenceCursor, ShardScavengerReferencePage,
         ShardScavengerReferencePageItem, StorageClass, StoredLegalHoldStatus, StoredObject,
         StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
@@ -115,3 +115,10 @@ mod shard_ack_format_tests;
 #[cfg(test)]
 #[path = "storage_rpc/bucket_reservation_format_tests.rs"]
 mod bucket_reservation_format_tests;
+
+#[cfg(test)]
+#[path = "storage_rpc/checkpoint_transfer_format_tests.rs"]
+mod checkpoint_transfer_format_tests;
+
+#[cfg(test)]
+mod staging_scavenger_format_tests;

@@ -144,6 +144,8 @@ mod allocation_lifetime;
 mod command_log;
 #[path = "pg_store/metadata.rs"]
 mod metadata;
+#[path = "pg_store/payload_staging.rs"]
+mod payload_staging;
 #[path = "pg_store/rows.rs"]
 mod rows;
 #[path = "pg_store/scavenger.rs"]
@@ -182,7 +184,7 @@ pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, Scavenger
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 pub(crate) const METADATA_COMMAND_CHECKPOINT_MAGIC: &[u8; 8] = b"ARGMCPKT";
-pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 7;
+pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 8;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
@@ -218,6 +220,8 @@ FROM stream_uploads";
 pub struct PgClusterMapHistoryReferenceSummary {
     pub oldest_live_placement_epoch: Option<ClusterEpoch>,
     pub oldest_durable_backfill_epoch: Option<ClusterEpoch>,
+    /// Includes materialized staging-owner/window/release responsibility, even
+    /// after its introducing command, session or reservation has disappeared.
     pub oldest_metadata_command_resource_epoch: Option<ClusterEpoch>,
     pub oldest_object_payload_reclaim_claim_epoch: Option<ClusterEpoch>,
 }
@@ -262,8 +266,9 @@ pub enum PgClusterMapHistoryRouteReferenceKind {
     LivePlacement,
     DurableBackfillSource,
     DurableBackfillDesired,
-    /// Exact routes needed to finish a metadata command, including its pending slot and
-    /// bucket-write reservation.
+    /// Exact routes needed to finish a metadata command or its retained resource
+    /// responsibility: pending slots, bucket reservations and materialized
+    /// staging owners/windows/releases. These obligations can outlive the log.
     MetadataCommandResource,
     ObjectPayloadReclaimClaim,
 }
@@ -1448,6 +1453,12 @@ impl PgStore {
         )?;
         self.extend_direct_cluster_map_history_route_references(
             &mut references,
+            payload_staging::ROUTE_REFERENCES,
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+            "list staging owner cluster-map history route references",
+        )?;
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
             "SELECT DISTINCT pg_id, cluster_epoch FROM object_payload_reclaim_claims",
             PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
             "list object payload reclaim claim cluster-map history route references",
@@ -1593,6 +1604,19 @@ impl PgStore {
         )?;
         let mut oldest =
             parse_optional_cluster_epoch(raw_epoch, "oldest metadata command resource epoch")?;
+        let staging_epoch = self.query_row_cached(
+            &format!(
+                "SELECT MIN(cluster_epoch) FROM ({})",
+                payload_staging::ROUTE_REFERENCES
+            ),
+            [],
+            "compute oldest staging owner route epoch",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        oldest = min_optional_epoch(
+            oldest,
+            parse_optional_cluster_epoch(staging_epoch, "oldest staging owner route epoch")?,
+        );
         if let Some(command) = self.pending_metadata_command_route_references(0)? {
             for dependency in command.dependencies {
                 oldest = min_optional_epoch(oldest, Some(dependency.cluster_epoch));
