@@ -6927,10 +6927,7 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
     create_test_bucket(&cluster, &bucket);
     let recovery_handle =
         crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
-    let recovery_sweeper =
-        crate::StoragePendingMetadataCommandRecoverySweeper::acquire_shared(&recovery_handle)
-            .unwrap();
-    let wake_count_before_commit = recovery_sweeper.test_wake_count();
+    let (recovery_started_tx, recovery_started_rx) = std::sync::mpsc::sync_channel(1);
 
     let reservation_id = crate::tests::stream_session_id("route-shift");
     let generation_id = cluster
@@ -6973,6 +6970,18 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
                     if commit.object.bucket == hook_bucket && commit.object.key == hook_key
             ) && inject_once_for_hook.swap(false, Ordering::SeqCst)
             {
+                // This hook runs with foreground recovery leadership already held.
+                // Starting the sweeper earlier lets its initial scan win leadership
+                // after pending installation and bypass the uncertainty injection.
+                let recovery_sweeper =
+                    crate::StoragePendingMetadataCommandRecoverySweeper::acquire_shared(
+                        &recovery_handle,
+                    )
+                    .unwrap();
+                let wake_count_before_handoff = recovery_sweeper.test_wake_count();
+                recovery_started_tx
+                    .send((recovery_sweeper, wake_count_before_handoff))
+                    .unwrap();
                 crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::InjectAfterBudgetExpiry
             } else {
                 crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::None
@@ -6989,7 +6998,13 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
         },
     );
 
-    assert!(!inject_once.load(Ordering::SeqCst));
+    assert!(
+        !inject_once.load(Ordering::SeqCst),
+        "direct PUT must inject uncertainty before recovery: {result:?}"
+    );
+    let (recovery_sweeper, wake_count_before_handoff) = recovery_started_rx
+        .try_recv()
+        .expect("uncertainty injection must start the static recovery owner");
     assert_eq!(action_calls.load(Ordering::SeqCst), 1);
     match result {
         Err(crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
@@ -7010,7 +7025,7 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
         Err(error) => panic!("unexpected direct PUT recovery handoff error: {error:?}"),
     }
     assert!(
-        recovery_sweeper.test_wake_count() > wake_count_before_commit,
+        recovery_sweeper.test_wake_count() > wake_count_before_handoff,
         "direct PUT recovery handoff must wake the static recovery owner"
     );
     let recovery_deadline = Instant::now() + Duration::from_secs(2);
