@@ -114,7 +114,4 @@ After every commit, check that the expected commit exists and that the worktree 
 Normally this means verifying the tree is clean before reporting success. Do not start new work from an unexpectedly
 dirty tree; stop and resolve it first. Only proceed with a dirty tree when that state is intentional and explicit.
 
-## Diary
-
-We keep a diary os the work we did. This is a historical record, so only append to it. We will update this at
-the end of the day, not after every work session.
+If disk space runs out, just report this and wait, do not try to clean up.
