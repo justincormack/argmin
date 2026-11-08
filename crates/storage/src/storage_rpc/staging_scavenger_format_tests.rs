@@ -4,6 +4,32 @@
 use super::*;
 use crate::StoreError;
 
+#[test]
+fn pending_staging_rpc_v35_predecessors_remain_rejected() {
+    for corpus in [
+        include_str!("testdata/staging_scavenger_rpc_v35_response.hex"),
+        include_str!("testdata/stream_creation_rpc_v35_command_v13_sse_s3_v5.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v35_checkpoint_v7_export_response_canonical_v9_pg_v10.hex"),
+        include_str!("testdata/abandoned_log_range_rpc_v35.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v35_checkpoint_v8_install_request_canonical_v10_pg_v11.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v35_checkpoint_v8_export_response_canonical_v10_pg_v11.hex"),
+        include_str!("testdata/staging_scavenger_rpc_v35_request.hex"),
+        include_str!("testdata/bucket_reservation_rpc_v35.hex"),
+        include_str!("testdata/shard_ack_rpc_v35.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v35_checkpoint_v7_install_request_canonical_v9_pg_v10.hex"),
+    ] {
+        let lines = corpus.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect::<Vec<_>>();
+        let specimens = if lines[0].contains(' ') {
+            lines.iter().map(|l| l.split_once(' ').unwrap().1.to_owned()).collect::<Vec<_>>()
+        } else { vec![lines.concat()] };
+        for specimen in specimens {
+            let bytes = crate::tests::frozen_hex_fixture(&specimen);
+            assert_eq!(decode_storage_rpc_frame(&bytes), Err(StorageRpcFrameError::UnsupportedVersion(35)));
+            assert!(matches!(read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(bytes)), Err(StorageRpcStreamError::Frame(StorageRpcFrameError::UnsupportedVersion(35)))));
+        }
+    }
+}
+
 fn cursor() -> ShardScavengerReferenceCursor {
     ShardScavengerReferenceCursor::StagingWindow {
         pg_id: PgId::new(3),
@@ -13,6 +39,23 @@ fn cursor() -> ShardScavengerReferenceCursor {
         introduction_index: 9,
         window_index: 2,
     }
+}
+
+fn pending_cursor() -> ShardScavengerReferenceCursor {
+    ShardScavengerReferenceCursor::PendingStagingWindow {
+        cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        pg_id: PgId::new(3),
+        log_index: 9,
+        command_checksum: 0x1122,
+        protection_checksum: 0x3344,
+        topology_digest: [10; 32],
+    }
+}
+
+fn pending_page() -> ShardScavengerReferencePage {
+    let mut result = page();
+    result.items[0].cursor = pending_cursor();
+    result
 }
 
 fn page() -> ShardScavengerReferencePage {
@@ -38,8 +81,8 @@ fn page() -> ShardScavengerReferencePage {
 }
 
 #[test]
-fn staging_scavenger_v35_matches_frozen_request_and_response() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 35);
+fn staging_scavenger_v36_matches_frozen_request_and_response() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 36);
     let request = StorageRpcShardScavengerReferencePageRequest {
         route: StorageRpcBucketPgRequest {
             node_id: NodeId::new(7),
@@ -51,11 +94,11 @@ fn staging_scavenger_v35_matches_frozen_request_and_response() {
     };
     for (input, payload) in [
         (
-            include_str!("testdata/staging_scavenger_rpc_v35_request.hex"),
+            include_str!("testdata/staging_scavenger_rpc_v36_request.hex"),
             encode_shard_scavenger_reference_page_request(&request).unwrap(),
         ),
         (
-            include_str!("testdata/staging_scavenger_rpc_v35_response.hex"),
+            include_str!("testdata/staging_scavenger_rpc_v36_response.hex"),
             encode_storage_rpc_success_response(
                 &encode_shard_scavenger_reference_page_response(&page()).unwrap(),
             ),
@@ -75,7 +118,7 @@ fn staging_scavenger_v35_matches_frozen_request_and_response() {
         assert_eq!(decoded.payload, payload);
     }
     let request_frame = crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/staging_scavenger_rpc_v35_request.hex"
+        "testdata/staging_scavenger_rpc_v36_request.hex"
     ));
     let decoded =
         read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(request_frame)).unwrap();
@@ -84,7 +127,7 @@ fn staging_scavenger_v35_matches_frozen_request_and_response() {
         request
     );
     let response_frame = decode_storage_rpc_frame(&crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/staging_scavenger_rpc_v35_response.hex"
+        "testdata/staging_scavenger_rpc_v36_response.hex"
     )))
     .unwrap();
     let response = decode_storage_rpc_response_payload(&response_frame.payload)
@@ -97,7 +140,133 @@ fn staging_scavenger_v35_matches_frozen_request_and_response() {
 }
 
 #[test]
-fn staging_scavenger_v35_rejects_malformed_participants_and_crossed_cursor() {
+fn pending_staging_scavenger_v36_matches_frozen_request_and_response() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 36);
+    let request = StorageRpcShardScavengerReferencePageRequest {
+        route: StorageRpcBucketPgRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(6).unwrap(),
+            pg_id: PgId::new(3),
+        },
+        after: Some(pending_cursor()),
+        limit: NonZeroU16::new(64).unwrap(),
+    };
+    let request_bytes = crate::tests::frozen_hex_fixture(include_str!(
+        "testdata/pending_staging_scavenger_rpc_v36_request.hex"
+    ));
+    let response_bytes = crate::tests::frozen_hex_fixture(include_str!(
+        "testdata/pending_staging_scavenger_rpc_v36_response.hex"
+    ));
+    for (bytes, payload) in [
+        (
+            &request_bytes,
+            encode_shard_scavenger_reference_page_request(&request).unwrap(),
+        ),
+        (
+            &response_bytes,
+            encode_storage_rpc_success_response(
+                &encode_shard_scavenger_reference_page_response(&pending_page()).unwrap(),
+            ),
+        ),
+    ] {
+        assert_eq!(
+            encode_storage_rpc_frame(
+                17,
+                StorageRpcMessageKind::ShardScavengerReferencePage,
+                &payload
+            )
+            .unwrap(),
+            *bytes
+        );
+        assert_eq!(decode_storage_rpc_frame(bytes).unwrap().payload, payload);
+    }
+    let frame =
+        read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(request_bytes)).unwrap();
+    assert_eq!(
+        decode_shard_scavenger_reference_page_request(&frame.payload).unwrap(),
+        request
+    );
+    let frame = decode_storage_rpc_frame(&response_bytes).unwrap();
+    let response = decode_storage_rpc_response_payload(&frame.payload)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decode_shard_scavenger_reference_page_response(&response).unwrap(),
+        pending_page()
+    );
+}
+
+#[test]
+fn pending_staging_scavenger_v36_rejects_malformed_and_crossed_evidence() {
+    let original = pending_page();
+    let bytes = encode_shard_scavenger_reference_page_response(&original).unwrap();
+    for end in 0..bytes.len() {
+        assert!(decode_shard_scavenger_reference_page_response(&bytes[..end]).is_err());
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(decode_shard_scavenger_reference_page_response(&trailing).is_err());
+    for case in 0..8 {
+        let mut bad = original.clone();
+        let item = &mut bad.items[0];
+        let ShardScavengerPayloadReference::StagingProtection(protection) = &mut item.reference
+        else {
+            unreachable!()
+        };
+        let ShardScavengerReferenceCursor::PendingStagingWindow {
+            log_index,
+            cluster_epoch,
+            ..
+        } = &mut item.cursor
+        else {
+            unreachable!()
+        };
+        match case {
+            0 => *log_index = 0,
+            1 => *log_index = u64::MAX,
+            2 => *cluster_epoch = ClusterEpoch::new(u64::MAX).unwrap(),
+            3 => protection.placement_epoch = ClusterEpoch::new(6).unwrap(),
+            4 => {
+                protection.file_nodes.pop();
+            }
+            5 => protection.file_nodes[1] = protection.file_nodes[0],
+            6 => protection.identity.ec.k = 0,
+            7 => {
+                item.reference =
+                    ShardScavengerPayloadReference::ProtectionOnly(protection.identity.clone())
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            encode_shard_scavenger_reference_page_response(&bad).is_err(),
+            "case {case}"
+        );
+        let mut raw = vec![1, 1, 0];
+        put_shard_scavenger_reference_cursor(&mut raw, &bad.items[0].cursor);
+        put_scavenger_payload_reference(&mut raw, &bad.items[0].reference);
+        assert!(
+            decode_shard_scavenger_reference_page_response(&raw).is_err(),
+            "case {case}"
+        );
+    }
+    let mut request = StorageRpcShardScavengerReferencePageRequest {
+        route: StorageRpcBucketPgRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(6).unwrap(),
+            pg_id: PgId::new(3),
+        },
+        after: Some(pending_cursor()),
+        limit: NonZeroU16::new(64).unwrap(),
+    };
+    let mut bytes = encode_shard_scavenger_reference_page_request(&request).unwrap();
+    request.route.pg_id = PgId::new(4);
+    assert!(encode_shard_scavenger_reference_page_request(&request).is_err());
+    bytes[12..16].copy_from_slice(&4_u32.to_le_bytes());
+    assert!(decode_shard_scavenger_reference_page_request(&bytes).is_err());
+}
+
+#[test]
+fn staging_scavenger_v36_rejects_malformed_participants_and_crossed_cursor() {
     let original = page();
     let bytes = encode_shard_scavenger_reference_page_response(&original).unwrap();
     for end in 0..bytes.len() {
@@ -193,16 +362,20 @@ fn storage_rpc_v34_predecessor_corpora_remain_rejected() {
 fn staging_scavenger_unix_rejects_crossed_and_nonprogressing_peer_pages() {
     use crate::node_runtime::client_facade::{ShardScavengerNodeClient, UnixStorageNodeClient};
     use std::os::unix::fs::PermissionsExt;
-    for case in 0..6 {
+    for (pending, case) in [false, true]
+        .into_iter()
+        .flat_map(|pending| (0..6).map(move |case| (pending, case)))
+    {
         let tmp = test_util::tempdir();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = tmp.path().join("peer.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let after = (case >= 3).then(cursor);
-        let mut response = page();
+        let after = (case >= 3).then(|| if pending { pending_cursor() } else { cursor() });
+        let mut response = if pending { pending_page() } else { page() };
         match case {
             0 => {
-                if let ShardScavengerReferenceCursor::StagingWindow { pg_id, .. } =
+                if let ShardScavengerReferenceCursor::StagingWindow { pg_id, .. }
+                | ShardScavengerReferenceCursor::PendingStagingWindow { pg_id, .. } =
                     &mut response.items[0].cursor
                 {
                     *pg_id = PgId::new(4);
@@ -221,10 +394,14 @@ fn staging_scavenger_unix_rejects_crossed_and_nonprogressing_peer_pages() {
             }
             4 => {
                 response.complete = false;
-                if let ShardScavengerReferenceCursor::StagingWindow { window_index, .. } =
-                    &mut response.items[0].cursor
-                {
-                    *window_index += 1;
+                match &mut response.items[0].cursor {
+                    ShardScavengerReferenceCursor::StagingWindow { window_index, .. } => {
+                        *window_index += 1
+                    }
+                    ShardScavengerReferenceCursor::PendingStagingWindow { log_index, .. } => {
+                        *log_index += 1
+                    }
+                    _ => unreachable!(),
                 }
             }
             5 => response.items.clear(), // Empty completion still advances the audit to the next PG.
@@ -272,10 +449,10 @@ fn staging_scavenger_unix_rejects_crossed_and_nonprogressing_peer_pages() {
                         ..
                     })
                 ),
-                "case {case}: {result:?}"
+                "pending {pending}, case {case}: {result:?}"
             );
         } else {
-            assert_eq!(result.unwrap(), expected, "case {case}");
+            assert_eq!(result.unwrap(), expected, "pending {pending}, case {case}");
         }
     }
 }

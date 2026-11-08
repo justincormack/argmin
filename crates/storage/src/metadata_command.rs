@@ -2042,6 +2042,14 @@ pub(crate) struct AbortStreamUploadCommand {
     pub(crate) stream_create_bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
+impl AbortStreamUploadCommand {
+    pub(crate) fn has_consistent_segment_subjects(&self) -> bool {
+        self.staged_segments
+            .iter()
+            .all(|segment| segment.session_id == self.session_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitStreamPartCommand {
     pub(crate) bucket: BucketName,

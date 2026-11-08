@@ -35,6 +35,15 @@ mod sql;
 #[path = "payload_staging_capture.rs"]
 mod capture;
 
+#[path = "payload_staging_candidate.rs"]
+mod candidate;
+
+#[path = "payload_staging_submission.rs"]
+mod submission;
+
+#[path = "payload_staging_command_context.rs"]
+mod command_context;
+
 #[path = "payload_staging_descriptor.rs"]
 mod descriptor;
 
@@ -77,6 +86,7 @@ mod abandonment;
 #[path = "payload_staging_inventory.rs"]
 mod inventory;
 
+pub(super) use descriptor::PendingStagingProtection;
 pub(super) use sql::{ROUTE_REFERENCES, SCHEMA, TABLES};
 
 pub(super) fn extend_scavenger_protection_page(

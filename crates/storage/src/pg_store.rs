@@ -140,12 +140,19 @@ impl crate::error::DatabaseError {
 
 #[path = "pg_store/allocation_lifetime.rs"]
 mod allocation_lifetime;
+#[path = "pg_store/command_build_snapshot.rs"]
+mod command_build_snapshot;
+#[cfg(test)]
+#[path = "pg_store/command_build_snapshot_tests.rs"]
+pub(in crate::node_runtime) mod command_build_snapshot_tests;
 #[path = "pg_store/command_log.rs"]
 mod command_log;
 #[path = "pg_store/metadata.rs"]
 mod metadata;
 #[path = "pg_store/payload_staging.rs"]
 mod payload_staging;
+#[path = "pg_store/pending_staging_index.rs"]
+mod pending_staging_index;
 #[path = "pg_store/rows.rs"]
 mod rows;
 #[path = "pg_store/scavenger.rs"]
@@ -735,6 +742,9 @@ pub struct PgStore {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
     conn: Connection,
+    // A failed transaction recovery must never be reused through node access.
+    // Only reopening the store (with normal startup recovery) clears retirement.
+    connection_retired: std::cell::Cell<bool>,
     allocation_lifetime: allocation_lifetime::PgAllocationLifetime,
     shard_file_mutations: std::sync::Arc<ShardFileMutations>,
     clean_metadata_digest_revision: AtomicU64,
@@ -743,6 +753,8 @@ pub struct PgStore {
     payload_reclaim_scan_cursor: std::cell::RefCell<Option<PayloadReclaimRoot>>,
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_pending_slot_rollbacks: std::cell::Cell<u8>,
     #[cfg(test)]
     fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -968,12 +980,15 @@ pub(crate) fn inspect_pg_shard_inventory(
         shards_dir,
         tmp_dir: pg_dir.join("tmp"),
         conn,
+        connection_retired: std::cell::Cell::new(false),
         allocation_lifetime: allocation_lifetime::PgAllocationLifetime::retired(),
         shard_file_mutations: Default::default(),
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         payload_reclaim_scan_cursor: Default::default(),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_pending_slot_rollbacks: std::cell::Cell::new(0),
         #[cfg(test)]
         fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -1186,6 +1201,25 @@ fn open_and_validate_existing_pg_database_file(
 }
 
 impl PgStore {
+    pub(in crate::node_runtime) fn require_usable_connection(&self) -> Result<(), StoreError> {
+        if self.connection_retired.get() {
+            return Err(StoreError::Db {
+                context: "access retired PG metadata connection",
+                source: crate::error::DatabaseError::new(format!(
+                    "PG {} requires reopen and recovery after failed pending-slot rollback",
+                    self.pg_id
+                )),
+            });
+        }
+        Ok(())
+    }
+
+    fn retire_connection(&self) {
+        self.connection_retired.set(true);
+        self.allocation_lifetime.retire();
+        self.conn.flush_prepared_statement_cache();
+    }
+
     /// Fresh allocation/building only, under the actual node's PG lock. A
     /// retired store may still inspect or converge already published commands.
     pub(in crate::node_runtime) fn require_live_allocation_lifetime(
@@ -1209,6 +1243,7 @@ impl PgStore {
     pub(in crate::node_runtime) fn begin_allocation_lifetime_replacement(
         &self,
     ) -> Result<PgAllocationReplacement<'_>, StoreError> {
+        self.require_usable_connection()?;
         self.allocation_lifetime.begin_replacement()
     }
 
@@ -1286,12 +1321,15 @@ impl PgStore {
             shards_dir,
             tmp_dir,
             conn,
+            connection_retired: std::cell::Cell::new(false),
             allocation_lifetime: allocation_lifetime::PgAllocationLifetime::new()?,
             shard_file_mutations: Default::default(),
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             payload_reclaim_scan_cursor: Default::default(),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_pending_slot_rollbacks: std::cell::Cell::new(0),
             #[cfg(test)]
             fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1483,7 +1521,7 @@ impl PgStore {
             references.insert(PgClusterMapHistoryRouteReference::new(
                 PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
                 dependency.cluster_epoch,
-                PgId::new(pg_topology.pg_for_bucket_route_hash(dependency.bucket_route_hash)),
+                dependency.target.resolve(pg_topology)?,
             ))?;
         }
         Ok(())

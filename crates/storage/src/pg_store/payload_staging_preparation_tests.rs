@@ -19,7 +19,7 @@ fn targets() -> [StagingTarget; 2] {
     [StagingTarget::StreamPut, multipart_target()]
 }
 
-fn expected(pg: &PgStore, owner: &StagingOwnerRecord) -> ExpectedStreamAppendState {
+pub(super) fn expected(pg: &PgStore, owner: &StagingOwnerRecord) -> ExpectedStreamAppendState {
     let session = pg.get_stream_upload(&owner.subject.id.attempt).unwrap();
     match &owner.subject.target {
         StagingTarget::StreamPut => ExpectedStreamAppendState::PutObject {
@@ -45,7 +45,7 @@ fn request(owner: &StagingOwnerRecord) -> PrepareStreamUploadSegmentAppendReq {
     }
 }
 
-fn prepare(
+pub(super) fn prepare(
     pg: &PgStore,
     owner: &StagingOwnerRecord,
     expected: &ExpectedStreamAppendState,

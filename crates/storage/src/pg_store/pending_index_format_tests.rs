@@ -1,10 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable evidence for the untagged pending indexes present in PG schema 10
-//! and unchanged in schema 11. These are metadata-only fixtures: no command is
-//! applied and no shard payload is written. Keep these literals when the indexes
-//! acquire staging-window protection; do not regenerate them with a new writer.
+//! Immutable evidence for the untagged pending indexes present in PG schemas
+//! 10/11. The route grammar is now rejection-only evidence; placed/reclaim
+//! records remain current in schema 12. No command is applied and no shard
+//! payload is written. Preserve the literals when changing a later writer.
 
 use super::*;
 use crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND;
@@ -14,30 +14,7 @@ fn hex(value: &str) -> Vec<u8> {
 }
 
 #[test]
-fn pending_index_route_v1_frozen_checksum_inputs_and_sql_roundtrip() {
-    let id = MetadataCommandId::new(
-        ClusterEpoch::new(0x0102_0304_0506_0708).unwrap(),
-        PgId::new(0x1122_3344),
-        MetadataCommandLogIndex::new(0x2122_2324_2526_2728).unwrap(),
-    );
-    let command_checksum = 0x8182_8384_8586_8788;
-    let dependencies = [
-        PendingMetadataCommandRouteDependency {
-            cluster_epoch: ClusterEpoch::new(0x3132_3334_3536_3738).unwrap(),
-            bucket_route_hash: 0x9192_9394_9596_9798,
-        },
-        PendingMetadataCommandRouteDependency {
-            cluster_epoch: ClusterEpoch::new(0x4142_4344_4546_4748).unwrap(),
-            bucket_route_hash: 0xa1a2_a3a4_a5a6_a7a8,
-        },
-    ];
-    // Independent byte specimens: command epoch, eight-byte PG, index, checksum,
-    // one-byte count, then ordered (epoch, bucket-hash) pairs. The two-entry case
-    // pins the schema's accepted capacity, even though current commands project
-    // at most one reservation proof. CRC literals were independently checked
-    // using bitwise CRC-64/NVME (reflected polynomial 0x9a6c9329ac4bc9b5,
-    // all-ones initial state and final XOR); never derive expectations from
-    // the production checksum implementation.
+fn pending_index_route_v1_frozen_checksum_and_retired_schema_rejection() {
     let specimens = [
         (
             concat!(
@@ -76,69 +53,56 @@ fn pending_index_route_v1_frozen_checksum_inputs_and_sql_roundtrip() {
             0xa6a2_44c4_dc12_03bd_u64,
         ),
     ];
+    // Frozen V1 inputs and CRCs remain independent of the V2 writer. The
+    // historical table is populated from its immutable schema catalogue, then
+    // rejected by current schema admission without rewriting the evidence.
     for (count, (specimen, expected_checksum)) in specimens.into_iter().enumerate() {
         let mut input = b"argmin.metadata.pending-route-dependencies.v1".to_vec();
         input.extend(hex(specimen));
-        assert_eq!(
-            checksum::crc64::checksum(&input),
-            expected_checksum,
-            "pending route index CRC parameters changed for count {count}",
-        );
-        let checksum = PgStore::pending_metadata_command_route_dependency_checksum(
-            id,
-            command_checksum,
-            &dependencies[..count],
-        );
-        assert_eq!(
-            checksum, expected_checksum,
-            "pending route index grammar changed for count {count}",
-        );
-
+        assert_eq!(checksum::crc64::checksum(&input), expected_checksum);
         let tmp = test_util::tempdir();
-        let store = PgStore::open(tmp.path(), id.pg_id().get()).unwrap();
-        // The lease-critical reader must use the sidecar, not decode command
-        // bytes. This raw test seam deliberately supplies undecodable bytes.
-        store
-            .test_insert_raw_pending_metadata_command_slot(id, command_checksum, b"opaque", None)
+        let path = tmp.path().join("predecessor.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        let catalogue = include_str!("schema_manifests/pg_schema_v11.catalogue");
+        let table = catalogue
+            .find(":CREATE TABLE metadata_command_pending_route_dependencies (")
             .unwrap();
-        store
-            .replace_pending_metadata_command_route_dependency_sidecar(
-                &PendingMetadataCommandRouteDependencySidecar {
-                    command_checksum,
-                    dependencies: dependencies[..count].to_vec(),
-                    checksum,
-                },
-            )
-            .unwrap();
-        drop(store);
-        let store = PgStore::open(tmp.path(), id.pg_id().get()).unwrap();
-        let persisted_checksum: i64 = store
-            .conn
-            .query_row(
-                "SELECT dependency_checksum FROM metadata_command_pending_route_dependencies \
-                 WHERE singleton = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(persisted_checksum as u64, expected_checksum);
+        let prefix = catalogue[..table].rfind("sql=").unwrap();
+        let length: usize = catalogue[prefix + 4..table].parse().unwrap();
+        let schema = &catalogue[table + 1..table + 1 + length];
+        conn.execute(schema, []).unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute(
+            "INSERT INTO metadata_command_pending_route_dependencies VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                0x8182_8384_8586_8788_u64 as i64, count as i64,
+                (count >= 1).then_some(0x3132_3334_3536_3738_i64),
+                (count >= 1).then_some(0x9192_9394_9596_9798_u64 as i64),
+                (count == 2).then_some(0x4142_4344_4546_4748_i64),
+                (count == 2).then_some(0xa1a2_a3a4_a5a6_a7a8_u64 as i64),
+                expected_checksum as i64,
+            ],
+        ).unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let before = conn.total_changes();
+        let error = super::super::schema::init_pg_schema(&conn).unwrap_err();
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+        assert!(error
+            .to_string()
+            .contains("unsupported version 11; expected 12"));
+        assert_eq!(conn.total_changes(), before);
+        let persisted: i64 = conn.query_row(
+            "SELECT dependency_checksum FROM metadata_command_pending_route_dependencies WHERE singleton = 0",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(persisted as u64, expected_checksum);
         assert_eq!(
-            store.pending_metadata_command_route_references(0).unwrap(),
-            Some(PendingMetadataCommandRouteReferences {
-                id,
-                command_checksum,
-                dependencies: dependencies[..count].to_vec(),
-            }),
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            11
         );
-        store
-            .conn
-            .execute(
-                "UPDATE metadata_command_pending_route_dependencies \
-                 SET dependency_checksum = ?1 WHERE singleton = 0",
-                [checksum.wrapping_add(1) as i64],
-            )
-            .unwrap();
-        assert!(store.pending_metadata_command_route_references(0).is_err());
     }
 }
 

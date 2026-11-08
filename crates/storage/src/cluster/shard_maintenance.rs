@@ -390,6 +390,7 @@ impl StorageCluster {
             pg_ids,
             next_reference_pg_index: 0,
             reference_after: None,
+            reference_progress: Default::default(),
             next_pg_index: 0,
             prior_unreferenced,
             current_unreferenced: HashSet::new(),
@@ -400,6 +401,7 @@ impl StorageCluster {
         &self,
         pass: &mut ShardScavengerAuditPass,
     ) -> Result<Option<Vec<ShardScavengerObservation>>, StoreError> {
+        pass.reference_progress.require_active()?;
         if let Some(source_pg_id) = pass.pg_ids.get(pass.next_reference_pg_index).copied() {
             let node = self
                 .local_map
@@ -413,41 +415,60 @@ impl StorageCluster {
                     NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT)
                         .expect("reference page limit is nonzero"),
                 )?;
-            let mut page_scans = HashMap::new();
-            let mut next_reference_after = None;
-            for item in page.items {
-                next_reference_after = Some(item.cursor.clone());
-                match item.reference {
-                    ShardScavengerPayloadReference::Placed(reference) => {
-                        self.extend_referenced_shard_set(
-                            &mut page_scans,
-                            source_pg_id,
-                            &item.cursor,
-                            &reference,
-                        )?;
-                    }
-                    ShardScavengerPayloadReference::ProtectionOnly(reference) => {
-                        self.extend_reclaim_referenced_shard_set(
-                            &mut page_scans,
-                            &reference,
-                        )?;
-                    }
-                    ShardScavengerPayloadReference::StagingProtection(reference) => {
-                        self.extend_staging_protection(&mut page_scans, &reference)?;
-                    }
-                }
-            }
-            Self::merge_shard_scavenger_reference_page(pass, page_scans)?;
-            if let Some(cursor) = next_reference_after {
-                pass.reference_after = Some(cursor);
-            }
-            if page.complete {
-                pass.next_reference_pg_index += 1;
-                pass.reference_after = None;
-            }
+            self.accept_shard_scavenger_reference_page(pass, source_pg_id, page)?;
             return Ok(Some(Vec::new()));
         }
 
+        self.audit_shard_scavenger_physical_pg(pass)
+    }
+
+    fn accept_shard_scavenger_reference_page(
+        &self,
+        pass: &mut ShardScavengerAuditPass,
+        source_pg_id: PgId,
+        page: crate::types::ShardScavengerReferencePage,
+    ) -> Result<(), StoreError> {
+        let progress = pass
+            .reference_progress
+            .preview(pass.reference_after.as_ref(), &page)?;
+        let mut page_scans = HashMap::new();
+        let mut next_reference_after = None;
+        for item in page.items {
+            next_reference_after = Some(item.cursor.clone());
+            match item.reference {
+                ShardScavengerPayloadReference::Placed(reference) => {
+                    self.extend_referenced_shard_set(
+                        &mut page_scans,
+                        source_pg_id,
+                        &item.cursor,
+                        &reference,
+                    )?;
+                }
+                ShardScavengerPayloadReference::ProtectionOnly(reference) => {
+                    self.extend_reclaim_referenced_shard_set(&mut page_scans, &reference)?;
+                }
+                ShardScavengerPayloadReference::StagingProtection(reference) => {
+                    self.extend_staging_protection(&mut page_scans, &reference)?;
+                }
+            }
+        }
+        Self::merge_shard_scavenger_reference_page(pass, page_scans)?;
+        pass.reference_progress = progress;
+        if let Some(cursor) = next_reference_after {
+            pass.reference_after = Some(cursor);
+        }
+        if page.complete {
+            pass.next_reference_pg_index += 1;
+            pass.reference_after = None;
+            pass.reference_progress = Default::default();
+        }
+        Ok(())
+    }
+
+    fn audit_shard_scavenger_physical_pg(
+        &self,
+        pass: &mut ShardScavengerAuditPass,
+    ) -> Result<Option<Vec<ShardScavengerObservation>>, StoreError> {
         let Some(pg_id) = pass.pg_ids.get(pass.next_pg_index).copied() else {
             return Ok(None);
         };

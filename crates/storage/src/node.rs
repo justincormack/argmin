@@ -433,18 +433,23 @@ impl LocalStorageNode {
     #[cfg(test)]
     pub(crate) fn get_pg(&self, pg_id: u32) -> Result<&PgStore, StoreError> {
         observability::trace_scope!(TRACE_TARGET, "LocalStorageNode::get_pg", "pg_id={}", pg_id);
-        self.stores
+        let store = self
+            .stores
             .get(&pg_id)
-            .ok_or(StoreError::PgNotFound { pg_id })
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        store.require_usable_connection()?;
+        Ok(store)
     }
 }
 
 impl StorageNode for LocalStorageNode {
     fn get_pg_store(&self, pg_id: u32) -> Result<&dyn ShardStore, StoreError> {
-        self.stores
+        let store = self
+            .stores
             .get(&pg_id)
-            .map(|s| s as &dyn ShardStore)
-            .ok_or(StoreError::PgNotFound { pg_id })
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        store.require_usable_connection()?;
+        Ok(store as &dyn ShardStore)
     }
 
     fn pg_ids(&self) -> &[u32] {
@@ -1063,8 +1068,8 @@ impl SharedStorageNode {
         &self,
     ) -> Result<PgClusterMapHistoryRouteReferences, StoreError> {
         let mut references = PgClusterMapHistoryRouteReferences::default();
-        for pg in self.stores.values() {
-            let pg = pg.lock().unwrap_or_else(|e| e.into_inner());
+        for &pg_id in self.stores.keys() {
+            let pg = self.get_pg(pg_id)?;
             references.merge(pg.cluster_map_history_route_references(&self.pg_topology)?)?;
         }
         Ok(references)
@@ -1686,13 +1691,11 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         #[cfg(test)]
-        {
-            Ok(pg_lock_test_hook::lock_pg(mutex, pg_id))
-        }
+        let guard = pg_lock_test_hook::lock_pg(mutex, pg_id);
         #[cfg(not(test))]
-        {
-            Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
-        }
+        let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        guard.require_usable_connection()?;
+        Ok(guard)
     }
 
     pub(crate) fn get_pg_until(
@@ -1724,6 +1727,7 @@ impl SharedStorageNode {
                             "acquire local PG for metadata command confirmation",
                         ));
                     }
+                    guard.require_usable_connection()?;
                     return Ok(guard);
                 }
                 Err(std::sync::TryLockError::Poisoned(error)) => {
@@ -1734,6 +1738,7 @@ impl SharedStorageNode {
                             "acquire local PG for metadata command confirmation",
                         ));
                     }
+                    guard.require_usable_connection()?;
                     return Ok(guard);
                 }
                 Err(std::sync::TryLockError::WouldBlock) => {

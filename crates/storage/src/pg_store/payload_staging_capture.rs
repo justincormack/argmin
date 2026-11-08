@@ -13,12 +13,40 @@ use crate::node_runtime::payload_placement::PayloadPlacementInput;
 use crate::types::AdmittedRouteEffectFence;
 use crate::StoreError;
 
+#[path = "payload_staging_fresh_capture.rs"]
+mod fresh;
+
+#[path = "payload_staging_fresh_append_capture.rs"]
+mod fresh_append;
+
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum StagingCaptureError {
+    #[error("fresh staging capture requires the primary's enclosing metadata snapshot")]
+    SnapshotRequired,
+    #[error("fresh staging capture does not bind the next command candidate")]
+    Command,
+    #[error("fresh staging capture cannot adopt existing attempt responsibility")]
+    IndependentlyOwned,
+    #[error("fresh staging capture differs from the current generation candidate")]
+    StaleGeneration,
+    #[error("fresh staging capture differs from the current multipart upload")]
+    Upload,
     #[error(transparent)]
     Invariant(#[from] StagingInvariant),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Metadata(#[from] crate::MetadataError),
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Descriptor(#[from] descriptor::DescriptorError),
+    #[error(transparent)]
+    Introduction(#[from] introduction::IntroductionError),
+    #[error(transparent)]
+    Append(#[from] append::AppendError),
+    #[error(transparent)]
+    Persistence(#[from] sql::PersistenceError),
 }
 
 /// Logical inputs already checked by the enclosing primary command builder.
@@ -41,6 +69,36 @@ pub(in super::super) struct StagingCapture<'a> {
 }
 
 impl StagingCapture<'_> {
+    fn require_fresh_command(
+        &self,
+        pg: &super::super::PgStore,
+        node_id: NodeId,
+        command: &crate::metadata_command::MetadataCommandEnvelope,
+    ) -> Result<(), StagingCaptureError> {
+        if pg.conn.is_autocommit() {
+            return Err(StagingCaptureError::SnapshotRequired);
+        }
+        let epoch = self.effect_fence.cluster_epoch();
+        self.effect_fence.require_valid_for(epoch)?;
+        pg.require_live_allocation_lifetime()?;
+        self.placement.require_topology(self.topology)?;
+        self.placement
+            .require_staging_primary(epoch, PgId::new(pg.pg_id), node_id)?;
+        if !command.verify_checksum()
+            || command.id().cluster_epoch() != epoch
+            || command.id().pg_id().get() != pg.pg_id
+            || pg.metadata_command_replica_state()?.cluster_epoch > epoch
+            || pg
+                .pending_metadata_command_slot_any_epoch(node_id.as_u32())?
+                .is_some()
+            || pg.max_metadata_command_log_index(epoch)?.checked_add(1)
+                != Some(command.id().log_index().get())
+        {
+            return Err(StagingCaptureError::Command);
+        }
+        Ok(())
+    }
+
     pub(in super::super) fn introduction(
         &self,
         pg: &super::super::PgStore,

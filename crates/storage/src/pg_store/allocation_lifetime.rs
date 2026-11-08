@@ -34,6 +34,10 @@ fn fresh_identity() -> Result<[u8; 16], StoreError> {
 }
 
 impl PgAllocationLifetime {
+    pub(super) fn retire(&self) {
+        self.state.set(State::Retired);
+    }
+
     /// Inspection-only stores do not own an allocation lifetime.
     pub(super) fn retired() -> Self {
         Self {

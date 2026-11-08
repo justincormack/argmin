@@ -13,6 +13,110 @@ enum FailurePoint {
 }
 
 #[test]
+fn pending_payload_discovery_prevents_cleanup_after_live_session_removal() {
+    // A pending reference on either the primary or a replica must prevent
+    // reference-checked cleanup, even after every live manifest has gone.
+    for primary_holds_slot in [true, false] {
+        let fixture = stream_payload_cleanup_fixture("b2", b"pending payload survives its session");
+        let cluster = &fixture.cluster;
+        let (target, segment) = cluster
+            .prepare_stream_segment_append(
+                &fixture.bucket,
+                &fixture.key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: fixture.session_id.clone(),
+                    segment_index: 0,
+                    size: fixture.encrypted.logical_size,
+                    segment_crc64: fixture.encrypted.storage_crc64,
+                    payload_crc64: fixture.encrypted.payload_crc64,
+                },
+            )
+            .unwrap();
+        let written = cluster
+            .write_stream_segment_payload_shards(&segment, &fixture.encrypted.storage_bytes)
+            .unwrap();
+        let segment = stream_segment_with_shard_integrity(
+            segment,
+            fixture.encrypted.storage_bytes.len(),
+            &written,
+        );
+        let shard_batch = written
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        cluster
+            .register_payload_shard_acks(segment.data_pg_id, &shard_batch)
+            .unwrap();
+        assert_stream_payload_shard_state(&fixture, true, true);
+        let pg_id: PgId = cluster
+            .object_metadata_pg(&fixture.bucket, &fixture.key)
+            .into();
+        let command = MetadataCommandEnvelope::new(
+            cluster.next_object_metadata_command_id(pg_id).unwrap(),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                bucket: fixture.bucket.clone(),
+                key: fixture.key.clone(),
+                target,
+                segment: segment.clone(),
+            })),
+        );
+        let nodes = cluster
+            .local_map
+            .metadata_pg_acting_nodes(cluster.operation_epoch(), pg_id)
+            .unwrap();
+        assert!(nodes.len() > 1);
+        let primary = cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+            .unwrap();
+        let holder = nodes
+            .iter()
+            .find(|node| (node.node_id() == primary.node_id()) == primary_holds_slot)
+            .unwrap();
+        holder
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(
+                holder.node_id().as_u32(),
+                &command,
+                Some(&fixture.bucket),
+            )
+            .unwrap();
+        for node in &nodes {
+            let pg = node.storage_node().get_pg(pg_id.get()).unwrap();
+            // Owner-local fault: publication remains pending after session loss.
+            crate::PgMetadataStore::delete_stream_upload(&*pg, &fixture.session_id).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        cluster
+            .try_delete_stream_append_payload_if_unreferenced(
+                pg_id,
+                &segment,
+                written.iter().map(|written| written.key.clone()),
+            )
+            .unwrap();
+        assert_stream_payload_shard_state(&fixture, true, true);
+        // Negative canary: without the pending reference there is no hidden
+        // live manifest, prospective staging owner or remaining lease masking it.
+        assert!(holder
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .test_clear_pending_metadata_command_slot()
+            .unwrap());
+        cluster
+            .try_delete_stream_append_payload_if_unreferenced(
+                pg_id,
+                &segment,
+                written.iter().map(|written| written.key.clone()),
+            )
+            .unwrap();
+        assert_stream_payload_shard_state(&fixture, false, false);
+    }
+}
+
+#[test]
 fn reference_checked_stream_append_cleanup_reports_each_failure_once() {
     let _serial = lock_payload_cleanup_hook_test();
     for fail_file in [true, false] {

@@ -15,7 +15,7 @@ use crate::pg_store::PgStore;
 use crate::types::{AbortMultipartUploadCleanup, ListPartsReq};
 use crate::{MetadataError, UploadState};
 
-fn command(pg: &PgStore, owner: &StagingOwnerRecord) -> MetadataCommandEnvelope {
+pub(super) fn command(pg: &PgStore, owner: &StagingOwnerRecord) -> MetadataCommandEnvelope {
     let StagingTarget::UploadPart { upload_id, .. } = &owner.subject.target else {
         unreachable!()
     };

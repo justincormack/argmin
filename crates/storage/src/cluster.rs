@@ -142,6 +142,7 @@ use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
 mod local;
 mod request_ops;
+mod scavenger_progress;
 
 include!("cluster/core.rs");
 

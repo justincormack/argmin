@@ -2926,6 +2926,7 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let node = &self.client.storage_node;
         let pg = node.get_pg(self.pg_id.get())?;
+        let snapshot = pg.command_build_snapshot()?;
         match PgMetadataStore::get_object_generation_reservation(
             &*pg,
             &self.bucket,
@@ -2962,7 +2963,7 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
             self.route_cluster_epoch,
             &pg,
         )?;
-        Ok(MetadataCommandEnvelope::new(
+        let command = MetadataCommandEnvelope::new(
             id,
             MetadataCommandPayload::ReserveObjectGeneration(
                 crate::metadata_command::ReserveObjectGenerationCommand::new(
@@ -2973,7 +2974,10 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute<'_> {
                     crate::clock::current_time_millis(),
                 ),
             ),
-        ))
+        );
+        snapshot.finish()?;
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        Ok(command)
     }
 
     fn object_generation_reservation(
@@ -4090,6 +4094,7 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             hook();
         }
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let snapshot = pg.command_build_snapshot()?;
         let command = crate::metadata_command::AppendStreamSegmentCommand {
             bucket: self.bucket.clone(),
             key: self.key.clone(),
@@ -4128,10 +4133,13 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             self.route_cluster_epoch,
             &pg,
         )?;
-        Ok(MetadataCommandEnvelope::new(
+        let command = MetadataCommandEnvelope::new(
             id,
             MetadataCommandPayload::AppendStreamSegment(Box::new(command)),
-        ))
+        );
+        snapshot.finish()?;
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        Ok(command)
     }
 
     fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError> {
@@ -5590,6 +5598,7 @@ impl LocalStorageNodeClient {
             hook();
         }
         let pg = self.storage_node.get_pg(pg_id.get())?;
+        let snapshot = pg.command_build_snapshot()?;
         match (&request.request.target, &request.precondition) {
             (
                 StreamUploadTarget::PutObject,
@@ -5705,7 +5714,7 @@ impl LocalStorageNodeClient {
             .require_valid_for(route_cluster_epoch)?;
         let command_id =
             self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;
-        Ok(MetadataCommandEnvelope::new(
+        let command = MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CreateStreamUpload(Box::new(
                 CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline_and_issuer(
@@ -5717,7 +5726,12 @@ impl LocalStorageNodeClient {
                     pg.stream_allocation_issuer(self.node_id)?,
                 ),
             )),
-        ))
+        );
+        snapshot.finish()?;
+        request
+            .effect_fence
+            .require_valid_for(route_cluster_epoch)?;
+        Ok(command)
     }
 
     fn load_stream_upload_segments(

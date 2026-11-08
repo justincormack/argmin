@@ -303,10 +303,97 @@ listing. Both scans attempt every PG, retain the first error for their caller,
 and continue converging later PGs so one broken route cannot starve unrelated
 pending commands.
 
-Cross-PG reservation routes are stored in a fixed-width sidecar in the same
+Cross-PG reservation routes are stored in a bounded sidecar in the same
 transaction as the pending slot. Its integrity checksum binds the complete
 command ID, command checksum, and every retained route dependency, so heartbeat
 construction does not read, allocate, hash, or decode the command envelope.
+Schema 12 uses up to five tagged 17-byte dependency records (bucket-route hash
+or exact PG), ordered without duplicates. Exact PGs are not rehashed and must
+belong to the configured topology. Current commands still project only their
+ordinary reservation; the new owner-window descriptors and their exact pending
+dependencies are not yet wired into production publication.
+The same pending-slot transaction also initializes a bounded staging-protection
+index, currently explicitly empty for production commands. Its private nonempty
+writer consumes command-bound introduction/lookahead projection, checks the exact
+pending envelope and topology, and retains shard-index-ordered file owners and
+the independent acknowledgement owner. Scavenger paging consumes it as exact
+protection-only evidence, with a cursor bound to the slot, index checksum and
+topology; changed slots restart discovery, and malformed indexes fail closed.
+The audit pass enforces native phase/key progress across responses. Only a
+pending-slot cursor permits a restart; the retired slot/index identity cannot
+reappear, and at most eight replacements may restart one PG's scan. Cycles or
+exhausted restart budgets invalidate the pass before physical auditing. The
+maintenance worker discards partial references and prior absence evidence,
+backs off, then starts fresh discovery rather than treating truncation as
+completion. Progress history retains only the bounded retired pending identities,
+not every scanned key.
+It conveys neither readable payload nor physical authority. Production nonempty
+descriptor dispatch and frontend custody activation are still pending.
+The owner-local bound pending installer derives route/window indexes from the
+immutable command/descriptor before entry. Session-backed placed/reclaim pages
+are derived inside the existing pending transaction, so they cannot reuse a
+pre-transaction session view. Fresh append/nonempty-abort protection requires the
+exact bucket/key/session encryption row; a missing or crossed row is not an empty
+inventory. Multipart terminal commands must supply one subject-matching header
+for every stream segment, without duplicate session headers. Empty aborts need
+no session geometry. This strict projection is shared with complete-context
+inspection; source-bearing abandonment retains its separate original-source
+geometry. Projection failure rejects a fresh installation before its first slot
+write, while an exact existing slot (or failed inspection) keeps possible-
+acceptance classification and is never repaired. Applied replay remains separate
+and does not require a session that terminal application already removed.
+Unpaged discovery of an already-installed command has a different obligation:
+an append/nonempty abort continues to protect each exact shard-set identity even
+after the live session disappears. Only an exact bucket/key/session lookup may
+supply placed geometry and its command-carried integrity witness. Missing or
+crossed live subjects yield protection-only references, not empty discovery or
+invented backfill authority; malformed encryption or incomplete terminal stream
+headers fail the entire scan closed. This uses the existing read snapshot and
+does not rewrite the pending indexes or grant cleanup authority.
+The slot, pages and indexes are installed together;
+no extra transaction or successful-write durability barrier is introduced.
+It cannot pair a different command with that projection. Exact
+retries, including ordinary commands with an empty staging projection, compare
+the retained route/window evidence and both payload-page indexes without patching
+them. Payload validation derives expected pages from the bound command under the
+same transaction and compares both slot counts, every page index/count and exact
+encoded bytes, including absence of extra rows for an empty index. Blob reads
+are bounded before materialization; missing/corrupt rows are not repaired by an
+exact retry. The empty staging row
+must exist with the exact command-bound checksum; a missing row is not equivalent
+to an empty projection. A known exact slot with damaged or mismatched evidence
+retains possible-acceptance
+classification. A nested insertion uses a savepoint so an index failure cannot
+leave a prefix that its caller could commit. This plumbing does not yet activate
+nonempty descriptors in command/RPC dispatch or authenticate the full future
+descriptor carrier; the bounded indexes are inspection projections, not that
+carrier or physical authority.
+Occupied-slot same-payload reissue uses the same projection transaction. A bound
+successor borrows the original immutable description rather than accepting a new
+window or cutoff. Replacement validates the observed source and its indexes
+under SQL serialization, derives replacement payload pages in that same
+transaction, keeps the publication-start guard, and updates the slot,
+reference pages and both indexes together. Nested replacement uses a savepoint;
+index failure cannot leave a partially replaced slot for an outer commit.
+Exact replacement replay validates the successor indexes too, and retains
+`MayHaveApplied` classification if that evidence is missing or corrupt. Ordinary
+replacement cannot erase a nonempty bound projection. This is owner-local
+same-epoch integration plumbing, not activation of descriptor-bearing recovery
+RPCs or cleanup-derivative handoffs.
+The preparatory fresh-introduction capture entry derives its subject from the
+exact reserve/create command under the primary's enclosing metadata snapshot.
+It rejects occupied attempts, stale generation/command candidates and crossed
+stream authority, and loads the enclosing MPU generation itself. Capture is
+read-only and does not authorize acceptance or physical writes. Production
+builder wiring, mandatory descriptor carriers and frontend custody remain part
+of the coordinated activation; retries must preserve, not recapture, descriptors.
+Fresh append capture likewise loads its retained owner under the primary snapshot
+and requires its prepared, unselected tail, exact file/ack placement, live
+responsibility and original issuer. It binds the derived lookahead to the next
+command without writing state. Replica apply retains its distinct replay rules;
+it does not acquire local preparation authority, and a restarted primary cannot
+recapture an old descriptor. Production dispatch is not yet switched to these
+capture components.
 The slot remains the durable cleanup owner: terminal cleanup releases every
 command-owned reservation before removing the exact pending slot.
 
@@ -1025,6 +1112,15 @@ belongs to append allocation and append commands, not to generic stream-session
 equality.
 
 Stream creation selects the next generation read-only under the object-PG lock.
+The primary builders for Direct PUT generation reservation, stream creation and
+stream append keep one deferred, query-only SQLite snapshot across their reads.
+They end that snapshot before returning a candidate and recheck the captured
+admission; error/unwind also rolls it back and restores the connection mode.
+The scope performs no write transaction or fsync, and does not authorize pending
+installation or preserve a candidate across later state changes. No network or
+physical shard IO belongs inside it. Staging-descriptor activation remains
+separate, coordinated work in the durable-cleanup ownership plan.
+
 The single `CreateStreamUpload` apply transaction commits the explicit generation
 reservation/high-water, session, and applied log together on each replica. PUT
 and UploadPart no longer publish an earlier `ReserveObjectGeneration`; Direct PUT

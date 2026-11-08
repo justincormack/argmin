@@ -7980,7 +7980,26 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
     }
     assert_bucket_write_reservations_released(&map, &bucket);
 
+    // Terminal recovery starts with accepted protection, not a fresh append
+    // whose geometry source never existed. These are metadata-only commands;
+    // create the real session before insertion, then inject its terminal state.
+    let create_terminal_session = |session_id: &crate::SessionId| {
+        let upload = cluster
+            .load_in_progress_multipart_upload(&bucket, &target_key, &target_upload_id)
+            .unwrap();
+        assert_eq!(
+            cluster
+                .create_upload_part_stream_session(
+                    &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+                    2,
+                    session_id,
+                )
+                .unwrap(),
+            *session_id,
+        );
+    };
     let terminal_session_id = crate::SessionId::try_from("8c".repeat(16)).unwrap();
+    create_terminal_session(&terminal_session_id);
     let terminal_target = crate::StreamUploadTarget::UploadPart {
         upload_id: target_upload_id.clone(),
         part_number: 2,
@@ -8013,6 +8032,16 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
         })),
     );
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &terminal_append);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::delete_stream_upload(&*pg, &terminal_session_id).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
 
     let mismatched_append = terminal_append.clone();
     let mismatch_guard = cluster.test_install_terminal_stream_apply_failure_hook(Arc::new(
@@ -8063,6 +8092,7 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
     }
 
     let terminal_state_session_id = crate::SessionId::try_from("8d".repeat(16)).unwrap();
+    create_terminal_session(&terminal_state_session_id);
     let terminal_state_append = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             cluster.operation_epoch(),
@@ -8075,27 +8105,30 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
             target: terminal_target,
             segment: crate::StreamUploadSegmentRecord {
                 shard_integrity: None,
-                session_id: terminal_state_session_id,
+                session_id: terminal_state_session_id.clone(),
                 ..terminal_segment
             },
         })),
     );
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &terminal_state_append);
-    let hooked_terminal_state_append = terminal_state_append.clone();
-    let terminal_state_guard = cluster.test_install_terminal_stream_apply_failure_hook(Arc::new(
-        move |command, failure| {
-            if command == &hooked_terminal_state_append {
-                failure.source =
-                    BucketSnapshotLoadError::Metadata(MetadataError::StreamSessionNotInProgress {
-                        state: 1,
-                    });
-            }
-        },
-    ));
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::set_stream_upload_state(
+            &*pg,
+            &terminal_state_session_id,
+            crate::StreamUploadState::Completing,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
     cluster
         .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
         .expect("a terminal stream-session state must authorize abandonment");
-    drop(terminal_state_guard);
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     for node_id in node_ids {
         let pg = map

@@ -95,7 +95,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
 }
 
 #[test]
-fn current_pg_schema_v11_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+fn current_pg_schema_v12_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     assert_eq!(
@@ -103,7 +103,7 @@ fn current_pg_schema_v11_checksum_tags_match_frozen_owner_encoding_and_require_v
             .conn
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        11
+        12
     );
     let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
     let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");

@@ -17,6 +17,7 @@ use crate::node_runtime::pg_store::PgStore;
 #[path = "payload_staging_descriptor_binding.rs"]
 mod binding;
 
+pub(in super::super) use binding::PendingStagingProtection;
 #[cfg(test)]
 pub(super) use binding::{apply_append_for_test, apply_introduction_for_test};
 pub(super) use binding::{BoundAppendDescriptor, BoundIntroductionDescriptor};
@@ -27,7 +28,7 @@ const VERSION: u16 = 1;
 // satisfy their individual durable/transport limits in central validation.
 // File participants have the independent EC maximum of 32. This limit is also
 // an input to the eventual enclosing command/RPC size admission.
-const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024;
+pub(super) const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum DescriptorError {

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND;
+use crate::node_runtime::pg_store::command_build_snapshot_tests::BuilderSnapshotProbe;
 use crate::storage_rpc::{
     encode_object_generation_reserve_command_build_request,
     encode_object_metadata_command_build_response,
@@ -222,6 +223,7 @@ fn builder_matrix(remote: bool) {
             crate::clock::current_time_millis() + 60_000,
             crate::clock::monotonic_time_millis() + 59_000,
         );
+        let snapshot_probe = BuilderSnapshotProbe::install(&node, pg_id.get());
         let result = route.build_reserve_put_object_generation_command(
             &reservation_id,
             GenerationId::MIN,
@@ -229,6 +231,7 @@ fn builder_matrix(remote: bool) {
             placement,
             fence,
         );
+        snapshot_probe.assert_finished();
         assert_eq!(
             observe(),
             before,
@@ -259,6 +262,34 @@ fn builder_matrix(remote: bool) {
             continue;
         }
         let command = result.unwrap();
+        if !remote {
+            // Expire after every builder read and its earlier fence check, at
+            // snapshot teardown. A completed read view must not extend authority.
+            let clock = crate::clock::test_time_override_guard(1_000);
+            let control = clock.control();
+            let probe =
+                BuilderSnapshotProbe::install_with_before_rollback(&node, pg_id.get(), move || {
+                    control.set(4_500)
+                });
+            let error = route
+                .build_reserve_put_object_generation_command(
+                    &reservation_id,
+                    GenerationId::MIN,
+                    &proof,
+                    placement,
+                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000),
+                )
+                .unwrap_err();
+            probe.assert_finished();
+            assert!(
+                matches!(
+                    error,
+                    ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+                ),
+                "{error:?}"
+            );
+            assert_eq!(observe(), before);
+        }
         assert_eq!(command.id().pg_id(), pg_id.pg_id());
         assert_eq!(command.id().cluster_epoch(), config.cluster_epoch);
         assert_eq!(command.id().log_index().get(), before.1 + 1);

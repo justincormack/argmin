@@ -16,7 +16,7 @@ use crate::pg_store::PgStore;
 use crate::types::{MultipartPartSegmentRecord, ObjectPartRecord};
 use crate::{MetadataError, ObjectSegmentRecord, OwnerIdentity, StoredObject, VersionId};
 
-fn command(
+pub(super) fn command(
     pg: &PgStore,
     owner: &StagingOwnerRecord,
     version: VersionId,

@@ -466,9 +466,9 @@ impl UnixStorageNodeClient {
                 error.to_string(),
             )
         })?;
-        // An incomplete page must supply a different resume position; a
-        // nonempty echo would otherwise keep the audit on this PG forever.
-        // Completion itself advances to the next PG, even with no items.
+        // Per-response sanity only: the audit pass also enforces native keyset
+        // order and bounded pending-slot restarts across responses, rejecting
+        // multi-response cycles. Completion can legitimately have no items.
         let stalled = !page.complete
             && page
                 .items
@@ -476,7 +476,7 @@ impl UnixStorageNodeClient {
                 .is_none_or(|item| after == Some(&item.cursor));
         if page.items.len() > usize::from(limit.get()) || stalled
             || page.items.iter().any(|item| matches!(&item.cursor,
-                ShardScavengerReferenceCursor::StagingWindow { pg_id: actual, .. } if *actual != pg_id.pg_id())) {
+                ShardScavengerReferenceCursor::StagingWindow { pg_id: actual, .. } | ShardScavengerReferenceCursor::PendingStagingWindow { pg_id: actual, .. } if *actual != pg_id.pg_id())) {
             return Err(self.rpc_payload_error("decode shard scavenger reference page response", "crossed or non-progressing staging protection page".into()));
         }
         Ok(page)

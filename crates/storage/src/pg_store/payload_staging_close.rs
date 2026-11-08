@@ -177,18 +177,18 @@ impl<'a> Closure<'a> {
     }
 }
 
-pub(in super::super) fn apply_in_open_transaction(
+fn prepare_in_open_transaction<'a>(
     pg: &PgStore,
     configured_topology: &PgTopology,
-    envelope: &MetadataCommandEnvelope,
-) -> Result<(), CloseError> {
+    envelope: &'a MetadataCommandEnvelope,
+) -> Result<(Closure<'a>, StagingOwnerRecord, StagingOwnerRecord), CloseError> {
     if pg.conn.is_autocommit() {
         return Err(CloseError::TransactionRequired);
     }
     let bound = Closure::from_envelope(envelope)?;
     let owner = sql::load(&pg.conn, PgId::new(pg.pg_id), bound.subject().2)?
         .ok_or(CloseError::LiveResponsibility)?;
-    let checked = owner.validate(configured_topology)?;
+    owner.validate(configured_topology)?;
     if !envelope.verify_checksum()
         || envelope.id().pg_id() != owner.subject.object_pg
         || !command_follows(owner.subject.id.introduction, envelope.id())
@@ -198,6 +198,26 @@ pub(in super::super) fn apply_in_open_transaction(
     }
     bound.validate_live(pg, &owner)?;
     let closed = owner.closed_unpublished()?;
+    closed.validate(configured_topology)?;
+    Ok((bound, owner, closed))
+}
+
+/// Observation only. Application repeats these checks in its own transaction.
+pub(super) fn validate_in_open_transaction(
+    pg: &PgStore,
+    configured_topology: &PgTopology,
+    envelope: &MetadataCommandEnvelope,
+) -> Result<(), CloseError> {
+    prepare_in_open_transaction(pg, configured_topology, envelope).map(|_| ())
+}
+
+pub(in super::super) fn apply_in_open_transaction(
+    pg: &PgStore,
+    configured_topology: &PgTopology,
+    envelope: &MetadataCommandEnvelope,
+) -> Result<(), CloseError> {
+    let (bound, owner, closed) = prepare_in_open_transaction(pg, configured_topology, envelope)?;
+    let checked = owner.validate(configured_topology)?;
     let checked_closed = closed.validate(configured_topology)?;
     let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
     bound.apply_live(pg)?;

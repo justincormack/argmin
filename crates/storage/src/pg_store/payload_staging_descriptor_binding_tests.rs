@@ -93,6 +93,18 @@ fn staging_bound_introduction_protects_unused_scope_and_exact_historical_routes(
                         ),
                     ])
                 );
+                let indexed = pending.route_dependencies();
+                assert!(indexed.len() <= 4);
+                assert!(indexed.windows(2).all(|pair| pair[0] < pair[1]));
+                assert_eq!(
+                    indexed.into_iter().map(|dependency| {
+                        let crate::node_runtime::pg_store::command_log::PendingRouteTarget::ExactPg(pg) = dependency.target else {
+                            panic!("captured routes must not be remapped as bucket hashes");
+                        };
+                        route(dependency.cluster_epoch, pg)
+                    }).collect::<BTreeSet<_>>(),
+                    pending.historical_routes(),
+                );
                 assert_eq!(descriptor.encode().unwrap(), original_bytes);
             });
         }
@@ -127,6 +139,20 @@ fn staging_bound_append_protects_lookahead_without_turning_it_into_readable_payl
             // Consumed/current payload references are separately derived from
             // the append command. Do not substitute that readable segment here.
             assert_ne!(pending.reference(), expected_protection(&owner.windows[0]));
+            assert_eq!(
+                pending.route_dependencies().len(),
+                pending.historical_routes().len()
+            );
+            for dependency in pending.route_dependencies() {
+                let crate::node_runtime::pg_store::command_log::PendingRouteTarget::ExactPg(pg) =
+                    dependency.target
+                else {
+                    panic!("append dependencies must retain exact PGs");
+                };
+                assert!(pending
+                    .historical_routes()
+                    .contains(&route(dependency.cluster_epoch, pg)));
+            }
         });
     }
 }

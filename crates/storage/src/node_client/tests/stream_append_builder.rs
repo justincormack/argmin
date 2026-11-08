@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::node_runtime::pg_store::command_build_snapshot_tests::BuilderSnapshotProbe;
 use crate::storage_rpc::{
     encode_object_metadata_command_build_response, StorageRpcObjectMetadataCommandBuildResponse,
 };
@@ -134,6 +135,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     &key,
                 )
                 .unwrap();
+            let snapshot_probe = BuilderSnapshotProbe::install(&node, pg_id.get());
             let command = creation_route
                 .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
                     request: &create,
@@ -150,6 +152,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     },
                 })
                 .unwrap();
+            snapshot_probe.assert_finished();
             node.get_pg(0)
                 .unwrap()
                 .apply_metadata_command_and_record(config.node_id.as_u32(), &command)
@@ -205,6 +208,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     .object_generation_segment_data_pg(&bucket, &key, reserved, 0)
                     .get()
             };
+            let snapshot_probe = BuilderSnapshotProbe::install(&node, pg_id.get());
             let error = route
                 .build_append_command(
                     &target,
@@ -213,6 +217,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     PayloadPlacementInput::from_server_config(&config),
                 )
                 .unwrap_err();
+            snapshot_probe.assert_finished();
             assert_unprepared_append_error(&error, remote);
             assert_eq!(
                 observe(),
@@ -267,6 +272,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                 assert_unprepared_append_error(&error, remote);
                 assert_eq!(observe(), before, "crossed preparation changed state");
             }
+            let snapshot_probe = BuilderSnapshotProbe::install(&node, pg_id.get());
             let built = route
                 .build_append_command(
                     &target,
@@ -275,6 +281,7 @@ fn stream_append_primary_builder_is_read_only_and_checks_durable_subject() {
                     PayloadPlacementInput::from_server_config(&config),
                 )
                 .unwrap();
+            snapshot_probe.assert_finished();
             assert_eq!(built.id().log_index().get(), before.2 + 1);
             assert!(
                 matches!(built.payload(), MetadataCommandPayload::AppendStreamSegment(append)

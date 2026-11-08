@@ -39,6 +39,7 @@ pub(in super::super::super) struct PendingStagingProtection<'a> {
     subject: &'a StagingSubject,
     window: &'a StagingWindow,
     command: &'a MetadataCommandEnvelope,
+    topology: &'a PgTopology,
     creation_release: Option<&'a StagingBucketResource>,
 }
 
@@ -80,6 +81,7 @@ impl BoundIntroductionDescriptor<'_> {
             subject: &owner.subject,
             window: &owner.windows[0],
             command: self.command,
+            topology: self.topology,
             creation_release: Some(creation_release),
         }
     }
@@ -172,6 +174,7 @@ impl BoundAppendDescriptor<'_> {
             subject: &self.descriptor.subject,
             window: &self.descriptor.window,
             command: self.command,
+            topology: self.topology,
             // The already materialized owner independently retains creation
             // custody and its release route; an append cannot introduce it.
             creation_release: None,
@@ -223,8 +226,65 @@ pub(in super::super) fn apply_append_for_test(
 }
 
 impl PendingStagingProtection<'_> {
+    /// Reissue carries the exact immutable description; there is no second
+    /// caller-selected descriptor that could renew a cutoff or change scope.
+    /// This is correspondence, not recovery admission or slot acceptance.
+    pub(in super::super::super) fn reissue<'a>(
+        &'a self,
+        replacement: &'a MetadataCommandEnvelope,
+    ) -> Result<PendingStagingProtection<'a>, crate::StoreError> {
+        if !replacement.verify_checksum()
+            || replacement.payload() != self.command.payload()
+            || replacement.id().pg_id() != self.command.id().pg_id()
+            || replacement.id().cluster_epoch() != self.command.id().cluster_epoch()
+            || replacement.id().log_index() <= self.command.id().log_index()
+        {
+            return Err(crate::StoreError::RouteCapabilitySubjectMismatch {
+                operation: "pending-staging-reissue-description",
+            });
+        }
+        Ok(PendingStagingProtection {
+            subject: self.subject,
+            window: self.window,
+            command: replacement,
+            topology: self.topology,
+            creation_release: self.creation_release,
+        })
+    }
+
+    pub(in super::super::super) fn index_inputs(
+        &self,
+    ) -> (
+        &MetadataCommandEnvelope,
+        &PgTopology,
+        &StagingSubject,
+        &StagingWindow,
+    ) {
+        (self.command, self.topology, self.subject, self.window)
+    }
+
+    pub(in super::super::super) fn route_dependencies(
+        &self,
+    ) -> Vec<crate::node_runtime::pg_store::command_log::PendingMetadataCommandRouteDependency>
+    {
+        use crate::node_runtime::pg_store::command_log::{
+            PendingMetadataCommandRouteDependency, PendingRouteTarget,
+        };
+        self.historical_routes()
+            .into_iter()
+            .map(|route| PendingMetadataCommandRouteDependency {
+                cluster_epoch: route.cluster_epoch(),
+                target: PendingRouteTarget::ExactPg(route.pg_id()),
+            })
+            .collect()
+    }
+
     pub(in super::super::super) fn reference(&self) -> ShardScavengerPayloadReference {
-        ShardScavengerPayloadReference::StagingProtection(ShardScavengerStagingProtection {
+        ShardScavengerPayloadReference::StagingProtection(self.staging_reference())
+    }
+
+    pub(in super::super::super) fn staging_reference(&self) -> ShardScavengerStagingProtection {
+        ShardScavengerStagingProtection {
             identity: ShardScavengerProtectedShardSetReference {
                 data_pg_id: self.window.participants.data_pg.get(),
                 okh: self.window.segment_hash,
@@ -234,7 +294,7 @@ impl PendingStagingProtection<'_> {
             placement_epoch: self.window.participants.placement_epoch,
             file_nodes: self.window.participants.files.clone(),
             acknowledgement_primary: self.window.participants.acknowledgement_primary,
-        })
+        }
     }
 
     pub(in super::super::super) fn historical_routes(

@@ -2846,6 +2846,18 @@ impl<'a> StorageRpcDecoder<'a> {
                 validate_staging_cursor(&cursor, None)?;
                 Ok(cursor)
             }
+            8 => {
+                let cursor = ShardScavengerReferenceCursor::PendingStagingWindow {
+                    cluster_epoch: self.read_cluster_epoch()?,
+                    pg_id: PgId::new(self.read_u32()?),
+                    log_index: self.read_u64()?,
+                    command_checksum: self.read_u64()?,
+                    protection_checksum: self.read_u64()?,
+                    topology_digest: self.read_exact(32)?.try_into().expect("fixed length"),
+                };
+                validate_staging_cursor(&cursor, None)?;
+                Ok(cursor)
+            }
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
                 "invalid shard scavenger reference cursor tag",
             )),

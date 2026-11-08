@@ -831,7 +831,10 @@ fn staging_paged_inventory_rejects_crossed_or_replaced_cursors_without_writes() 
 #[test]
 fn staging_paged_audit_protects_original_files_and_independent_acks_without_inventing_repairs() {
     use crate::types::ShardScavengerObservationReason;
-    for ack_is_current in [true, false] {
+    for (pending, ack_is_current) in [false, true]
+        .into_iter()
+        .flat_map(|pending| [true, false].map(|ack| (pending, ack)))
+    {
         let tmp = test_util::tempdir();
         let nodes = [0, 1, 2, 3].map(NodeId::new);
         let map = std::sync::Arc::new(
@@ -845,9 +848,10 @@ fn staging_paged_audit_protects_original_files_and_independent_acks_without_inve
         );
         let cluster =
             crate::StorageCluster::from_static_local_map(std::sync::Arc::clone(&map)).unwrap();
-        let mut owner = fixture(StagingTarget::StreamPut)
-            .closed_unpublished()
-            .unwrap();
+        let mut owner = fixture(StagingTarget::StreamPut);
+        if !pending {
+            owner = owner.closed_unpublished().unwrap();
+        }
         let window = &mut owner.windows[0];
         let data_pg = window.participants.data_pg;
         let primary = map
@@ -898,13 +902,19 @@ fn staging_paged_audit_protects_original_files_and_independent_acks_without_inve
         let object_node = map
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, owner.subject.object_pg)
             .unwrap();
-        seed(
-            &object_node
+        {
+            let pg = object_node
                 .test_node()
                 .get_pg(owner.subject.object_pg.get())
-                .unwrap(),
-            &owner,
-        );
+                .unwrap();
+            if pending {
+                // No materialized owner exists: only the command-bound unused
+                // window protects these exact file/ack participants.
+                super::pending_index::install(&pg, &owner, &super::introduction::command(&owner));
+            } else {
+                seed(&pg, &owner);
+            }
+        }
         let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
         let unresolved: Vec<_> = observations
             .iter()

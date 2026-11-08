@@ -4739,6 +4739,15 @@ pub(crate) enum ShardScavengerReferenceCursor {
         command_checksum: u64,
         reference_index: u32,
     },
+    /// One unused window carried by this exact pending slot, not an owner row.
+    PendingStagingWindow {
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: u64,
+        command_checksum: u64,
+        protection_checksum: u64,
+        topology_digest: [u8; 32],
+    },
     StagingWindow {
         pg_id: PgId,
         topology_digest: [u8; 32],

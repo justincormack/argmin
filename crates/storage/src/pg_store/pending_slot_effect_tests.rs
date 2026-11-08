@@ -473,6 +473,111 @@ fn pending_slot_effect_fence_preserves_failure_classification_and_rollback() {
 }
 
 #[test]
+fn pending_slot_failed_savepoint_rollback_recovers_entire_connection_as_uncertain() {
+    let dir = test_util::tempdir();
+    let store = PgStore::open(dir.path(), 0).unwrap();
+    seed(&store);
+    let target = command(&store, false, 1);
+    store.conn.execute_batch("CREATE TEMP TABLE caller_work (value INTEGER);
+        CREATE TEMP TRIGGER fail_pending BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'nested sidecar failure'); END;
+        BEGIN IMMEDIATE; INSERT INTO caller_work VALUES (17);").unwrap();
+    store.test_fail_pending_slot_rollbacks(1);
+    let result = store.try_insert_pending_metadata_command_slot_classified(
+        0,
+        &target,
+        Some(target.bucket_name()),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(PendingMetadataCommandSlotInsertError::MayHaveApplied(_))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        store.conn.is_autocommit(),
+        "failed savepoint rollback left enclosing transaction usable"
+    );
+    store.require_usable_connection().unwrap();
+    let count: u32 = store
+        .conn
+        .query_row("SELECT count(*) FROM caller_work", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "recovery must roll back the caller transaction too"
+    );
+    assert!(store
+        .pending_metadata_command_slot_any_epoch(0)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn pending_slot_failed_rollback_retires_node_access_until_reopen() {
+    use crate::node::SharedStorageNode;
+    use std::time::Duration;
+
+    let dir = test_util::tempdir();
+    let node = SharedStorageNode::open(dir.path(), &[0, 1]).unwrap();
+    let target = {
+        let store = node.get_pg(0).unwrap();
+        seed(&store);
+        let target = command(&store, false, 1);
+        store.conn.execute_batch("CREATE TEMP TRIGGER fail_pending BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'retired sidecar failure'); END;").unwrap();
+        store.test_fail_pending_slot_rollbacks(2);
+        let result = store.try_insert_pending_metadata_command_slot_classified(
+            0,
+            &target,
+            Some(target.bucket_name()),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(PendingMetadataCommandSlotInsertError::MayHaveApplied(_))
+            ),
+            "{result:?}"
+        );
+        assert!(!store.conn.is_autocommit());
+        target
+    };
+    for deadline in [None, Some(Instant::now() + Duration::from_secs(5))] {
+        let result = match deadline {
+            None => node.get_pg(0),
+            Some(deadline) => node.get_pg_until(0, deadline),
+        };
+        let Err(error) = result else {
+            panic!("retired PG remained available")
+        };
+        assert!(
+            matches!(
+                error,
+                StoreError::Db {
+                    context: "access retired PG metadata connection",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+    assert!(node.cluster_map_history_route_references().is_err());
+    assert!(node.get_pg(1).is_ok(), "retirement crossed to another PG");
+    drop(node);
+    let node = SharedStorageNode::open(dir.path(), &[0, 1]).unwrap();
+    node.recover_pg_metadata_command_state(NodeId::new(0))
+        .unwrap();
+    let store = node.get_pg(0).unwrap();
+    assert!(store.conn.is_autocommit());
+    assert!(store
+        .pending_metadata_command_slot_any_epoch(0)
+        .unwrap()
+        .is_none());
+    store
+        .try_insert_pending_metadata_command_slot_classified(0, &target, Some(target.bucket_name()))
+        .unwrap();
+}
+
+#[test]
 fn pending_slot_effect_fence_has_one_successful_write_transaction() {
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
     for bucket_control in [false, true] {

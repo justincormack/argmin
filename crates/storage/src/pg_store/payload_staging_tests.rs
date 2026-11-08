@@ -10,11 +10,77 @@ mod persistence;
 #[path = "payload_staging_capture_tests.rs"]
 mod capture;
 
+#[path = "payload_staging_fresh_capture_tests.rs"]
+mod fresh_capture;
+
+#[path = "payload_staging_fresh_append_capture_tests.rs"]
+mod fresh_append_capture;
+
+#[path = "payload_staging_candidate_tests.rs"]
+mod candidate;
+
+#[path = "payload_staging_received_candidate_tests.rs"]
+mod received_candidate;
+
+#[path = "payload_staging_submission_tests.rs"]
+mod submission;
+
+#[path = "payload_staging_reissue_submission_tests.rs"]
+mod reissue_submission;
+
+#[path = "payload_staging_context_submission_tests.rs"]
+mod context_submission;
+
+#[path = "payload_staging_application_tests.rs"]
+mod application;
+
+#[path = "payload_staging_command_context_tests.rs"]
+mod command_context;
+
+#[path = "payload_staging_context_reissue_tests.rs"]
+mod context_reissue;
+
+#[path = "payload_staging_context_retention_tests.rs"]
+mod context_retention;
+
+#[path = "payload_staging_context_match_tests.rs"]
+mod context_match;
+
+#[path = "payload_staging_context_inventory_tests.rs"]
+mod context_inventory;
+
+#[path = "payload_staging_context_preparation_tests.rs"]
+mod context_preparation;
+
+#[path = "payload_staging_bucket_finalization_tests.rs"]
+mod bucket_finalization;
+
 #[path = "payload_staging_descriptor_tests.rs"]
 mod descriptor;
 
 #[path = "payload_staging_descriptor_binding_tests.rs"]
 mod descriptor_binding;
+
+#[path = "pending_staging_index_tests.rs"]
+mod pending_index;
+
+#[path = "pending_staging_install_tests.rs"]
+mod pending_install;
+
+#[path = "pending_payload_transaction_tests.rs"]
+mod pending_payload_transaction;
+
+#[path = "pending_payload_validation_tests.rs"]
+mod pending_payload_validation;
+
+#[path = "pending_payload_subject_tests.rs"]
+mod pending_payload_subject;
+
+#[path = "pending_payload_discovery_tests.rs"]
+mod pending_payload_discovery;
+
+#[path = "pending_staging_paging_tests.rs"]
+mod pending_paging;
 
 #[path = "payload_staging_introduction_tests.rs"]
 mod introduction;

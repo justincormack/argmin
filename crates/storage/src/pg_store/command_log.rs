@@ -11,6 +11,10 @@ use crate::storage_rpc::{
 };
 use std::time::Instant;
 
+#[path = "pending_slot_projection.rs"]
+mod pending_slot_projection;
+use pending_slot_projection::PendingSlotProjection;
+
 #[cfg(test)]
 #[path = "pending_slot_effect_tests.rs"]
 mod pending_slot_effect_tests;
@@ -18,6 +22,10 @@ mod pending_slot_effect_tests;
 #[cfg(test)]
 #[path = "pending_index_format_tests.rs"]
 mod pending_index_format_tests;
+
+#[cfg(test)]
+#[path = "pending_route_index_tests.rs"]
+mod pending_route_index_tests;
 
 #[cfg(test)]
 type PendingSlotEffectHook = Box<dyn FnOnce(bool)>;
@@ -36,8 +44,11 @@ const METADATA_COMMAND_CHECKPOINT_CAPTURE_LIMIT: usize =
 const METADATA_COMMAND_CHECKPOINT_RETAIN_EPOCHS: usize = 4;
 const METADATA_COMMAND_TERMINAL_RECEIPT_RETAIN_PER_EPOCH: u64 = 4096;
 const PENDING_METADATA_COMMAND_ROUTE_DEPENDENCY_DOMAIN: &[u8] =
-    b"argmin.metadata.pending-route-dependencies.v1";
-const MAX_PENDING_METADATA_COMMAND_ROUTE_DEPENDENCIES: usize = 2;
+    b"argmin.metadata.pending-route-dependencies.v2";
+// One ordinary reservation plus at most four distinct routes projected by a
+// bound introduction (current/origin object PG, window data PG, release PG).
+pub(super) const MAX_PENDING_METADATA_COMMAND_ROUTE_DEPENDENCIES: usize = 5;
+const PENDING_ROUTE_DEPENDENCY_RECORD_LEN: usize = 17;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataCommandCheckpointCandidateRow {
@@ -1262,10 +1273,53 @@ pub(crate) struct PendingMetadataCommandSlot {
     pub(crate) scope_bucket: Option<BucketName>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PendingRouteTarget {
+    BucketHash(u64),
+    ExactPg(PgId),
+}
+
+impl PendingRouteTarget {
+    fn encoding(self) -> (u8, u64) {
+        match self {
+            Self::BucketHash(hash) => (0, hash),
+            Self::ExactPg(pg) => (1, u64::from(pg.get())),
+        }
+    }
+
+    pub(super) fn resolve(
+        self,
+        topology: &crate::pg_topology::PgTopology,
+    ) -> Result<PgId, StoreError> {
+        match self {
+            Self::BucketHash(hash) => Ok(PgId::new(topology.pg_for_bucket_route_hash(hash))),
+            Self::ExactPg(pg) if topology.contains_pg(pg) => Ok(pg),
+            Self::ExactPg(_) => Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "pending-command-route-topology",
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PendingMetadataCommandRouteDependency {
     pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket_route_hash: u64,
+    pub(crate) target: PendingRouteTarget,
+}
+
+impl PendingMetadataCommandRouteDependency {
+    pub(super) fn for_bucket_write_reservations(command: &MetadataCommandEnvelope) -> Vec<Self> {
+        command
+            .payload()
+            .bucket_write_reservation_route_dependencies()
+            .map(|proof| Self {
+                cluster_epoch: proof.cluster_epoch,
+                target: PendingRouteTarget::BucketHash(
+                    crate::pg_topology::PgTopology::bucket_route_hash(proof.bucket.as_str()),
+                ),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1362,7 +1416,9 @@ impl PgStore {
         );
         for dependency in dependencies {
             digest_u64(&mut hasher, dependency.cluster_epoch.get());
-            digest_u64(&mut hasher, dependency.bucket_route_hash);
+            let (tag, value) = dependency.target.encoding();
+            digest_u8(&mut hasher, tag);
+            digest_u64(&mut hasher, value);
         }
         hasher.finalize()
     }
@@ -1370,16 +1426,8 @@ impl PgStore {
     fn pending_metadata_command_route_dependency_sidecar(
         command: &MetadataCommandEnvelope,
     ) -> PendingMetadataCommandRouteDependencySidecar {
-        let dependencies = command
-            .payload()
-            .bucket_write_reservation_route_dependencies()
-            .map(|proof| PendingMetadataCommandRouteDependency {
-                cluster_epoch: proof.cluster_epoch,
-                bucket_route_hash: crate::pg_topology::PgTopology::bucket_route_hash(
-                    proof.bucket.as_str(),
-                ),
-            })
-            .collect::<Vec<_>>();
+        let dependencies =
+            PendingMetadataCommandRouteDependency::for_bucket_write_reservations(command);
         assert!(
             dependencies.len() <= MAX_PENDING_METADATA_COMMAND_ROUTE_DEPENDENCIES,
             "metadata command route dependencies exceeded the schema bound"
@@ -1401,30 +1449,38 @@ impl PgStore {
         &self,
         sidecar: &PendingMetadataCommandRouteDependencySidecar,
     ) -> Result<(), StoreError> {
-        let dependency = |index: usize| sidecar.dependencies.get(index).copied();
-        let dependency_0 = dependency(0);
-        let dependency_1 = dependency(1);
+        let dependencies = &sidecar.dependencies;
+        if dependencies.len() > MAX_PENDING_METADATA_COMMAND_ROUTE_DEPENDENCIES
+            || dependencies
+                .iter()
+                .any(|d| d.cluster_epoch.get() > i64::MAX as u64)
+            || dependencies.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "pending-command-route-index",
+            });
+        }
+        let mut encoded =
+            Vec::with_capacity(dependencies.len() * PENDING_ROUTE_DEPENDENCY_RECORD_LEN);
+        for dependency in dependencies {
+            encoded.extend_from_slice(&dependency.cluster_epoch.get().to_be_bytes());
+            let (tag, value) = dependency.target.encoding();
+            encoded.push(tag);
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
         self.execute_cached(
             "INSERT INTO metadata_command_pending_route_dependencies \
-             (singleton, command_checksum, dependency_count, \
-              dependency_0_cluster_epoch, dependency_0_bucket_route_hash, \
-              dependency_1_cluster_epoch, dependency_1_bucket_route_hash, dependency_checksum) \
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             (singleton, command_checksum, dependency_count, encoded_dependencies, dependency_checksum) \
+             VALUES (0, ?1, ?2, ?3, ?4) \
              ON CONFLICT(singleton) DO UPDATE SET \
                  command_checksum = excluded.command_checksum, \
                  dependency_count = excluded.dependency_count, \
-                 dependency_0_cluster_epoch = excluded.dependency_0_cluster_epoch, \
-                 dependency_0_bucket_route_hash = excluded.dependency_0_bucket_route_hash, \
-                 dependency_1_cluster_epoch = excluded.dependency_1_cluster_epoch, \
-                 dependency_1_bucket_route_hash = excluded.dependency_1_bucket_route_hash, \
+                 encoded_dependencies = excluded.encoded_dependencies, \
                  dependency_checksum = excluded.dependency_checksum",
             params![
                 sidecar.command_checksum as i64,
                 sidecar.dependencies.len() as i64,
-                dependency_0.map(|dependency| dependency.cluster_epoch.get() as i64),
-                dependency_0.map(|dependency| dependency.bucket_route_hash as i64),
-                dependency_1.map(|dependency| dependency.cluster_epoch.get() as i64),
-                dependency_1.map(|dependency| dependency.bucket_route_hash as i64),
+                encoded,
                 sidecar.checksum as i64,
             ],
             "replace pending metadata command route dependency sidecar",
@@ -1500,11 +1556,26 @@ impl PgStore {
         &self,
         operation: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, PendingMetadataCommandSlotInsertError> {
-        if !self.conn.is_autocommit() {
-            return operation().map_err(PendingMetadataCommandSlotInsertError::definitive);
-        }
+        self.require_usable_connection()
+            .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)?;
+        let nested = !self.conn.is_autocommit();
+        let begin = if nested {
+            "SAVEPOINT pending_slot_insert"
+        } else {
+            "BEGIN IMMEDIATE"
+        };
+        let commit = if nested {
+            "RELEASE pending_slot_insert"
+        } else {
+            "COMMIT"
+        };
+        let rollback = if nested {
+            "ROLLBACK TO pending_slot_insert; RELEASE pending_slot_insert"
+        } else {
+            "ROLLBACK"
+        };
         self.conn
-            .execute_batch("BEGIN IMMEDIATE")
+            .execute_batch(begin)
             .map_err(|source| StoreError::Db {
                 context: "begin pending metadata command slot transaction",
                 source: source.into(),
@@ -1513,20 +1584,70 @@ impl PgStore {
         match operation() {
             Ok(value) => self
                 .conn
-                .execute_batch("COMMIT")
+                .execute_batch(commit)
                 .map(|()| value)
                 .map_err(|source| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    PendingMetadataCommandSlotInsertError::may_have_applied(StoreError::Db {
+                    let error = StoreError::Db {
                         context: "commit pending metadata command slot transaction",
                         source: source.into(),
-                    })
+                    };
+                    let error = self
+                        .rollback_pending_slot_insert(rollback, error)
+                        .unwrap_or_else(|error| error);
+                    PendingMetadataCommandSlotInsertError::may_have_applied(error)
                 }),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(PendingMetadataCommandSlotInsertError::definitive(error))
-            }
+            Err(error) => Err(match self.rollback_pending_slot_insert(rollback, error) {
+                Ok(error) => PendingMetadataCommandSlotInsertError::definitive(error),
+                Err(error) => PendingMetadataCommandSlotInsertError::may_have_applied(error),
+            }),
         }
+    }
+
+    /// Ok preserves the operation error only after rollback is confirmed. Err
+    /// means rollback itself failed and must keep uncertain installation custody,
+    /// even if the bounded connection-recovery attempt subsequently succeeds.
+    fn rollback_pending_slot_insert(
+        &self,
+        rollback: &str,
+        operation: StoreError,
+    ) -> Result<StoreError, StoreError> {
+        let Err(rollback_error) = self.execute_pending_slot_rollback(rollback) else {
+            return Ok(operation);
+        };
+        // A failed ROLLBACK TO/RELEASE cannot leave the enclosing transaction
+        // usable either. Recover the entire connection, not just the savepoint.
+        let recovery = if self.conn.is_autocommit() {
+            Ok(())
+        } else {
+            self.execute_pending_slot_rollback("ROLLBACK")
+        };
+        let retired = !self.conn.is_autocommit();
+        if retired {
+            self.retire_connection();
+        }
+        Err(StoreError::Db {
+            context: "recover failed pending metadata command rollback",
+            source: crate::error::DatabaseError::new(format!(
+                "operation: {operation}; rollback: {rollback_error}; recovery: {recovery:?}; connection retired: {retired}"
+            )),
+        })
+    }
+
+    fn execute_pending_slot_rollback(&self, sql: &str) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = self.fail_pending_slot_rollbacks.get().checked_sub(1) {
+            self.fail_pending_slot_rollbacks.set(remaining);
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                Some("injected pending-slot rollback failure".into()),
+            ));
+        }
+        self.conn.execute_batch(sql)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_fail_pending_slot_rollbacks(&self, count: u8) {
+        self.fail_pending_slot_rollbacks.set(count);
     }
 
     fn replace_pending_placed_reference_pages(
@@ -1824,14 +1945,14 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<(), StoreError> {
-        let PendingShardScavengerReferencePages {
-            placed_reference_count,
-            placed_pages,
-            reclaim_reference_count,
-            reclaim_pages,
-        } = self.encode_pending_shard_scavenger_reference_pages(command)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_transaction(|| {
+            let PendingShardScavengerReferencePages {
+                placed_reference_count,
+                placed_pages,
+                reclaim_reference_count,
+                reclaim_pages,
+            } = self.encode_pending_shard_scavenger_reference_pages(command)?;
             self.execute_cached(
                 "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, placed_segment_reference_count, reclaim_reference_count, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, publication_started = 0, placed_segment_reference_count = excluded.placed_segment_reference_count, reclaim_reference_count = excluded.reclaim_reference_count, scope_bucket = excluded.scope_bucket",
                 params![
@@ -1854,7 +1975,8 @@ impl PgStore {
                 reclaim_reference_count,
                 &reclaim_pages,
             )?;
-            self.replace_pending_metadata_command_route_dependency_sidecar(&route_dependencies)
+            self.replace_pending_metadata_command_route_dependency_sidecar(&route_dependencies)?;
+            self.initialize_pending_staging_index(command.id(), command.checksum_crc64())
         })
     }
 
@@ -1885,7 +2007,8 @@ impl PgStore {
                 "insert raw pending metadata command slot for test",
             )?;
             Self::test_require_one_changed(changed)?;
-            self.replace_pending_metadata_command_route_dependency_sidecar(&route_dependencies)
+            self.replace_pending_metadata_command_route_dependency_sidecar(&route_dependencies)?;
+            self.initialize_pending_staging_index(id, checksum)
         })
     }
 
@@ -3739,10 +3862,10 @@ impl PgStore {
         let raw = self.query_row_cached_optional(
             "SELECT pending.cluster_epoch, pending.pg_id, pending.log_index, \
                     pending.command_checksum, sidecar.command_checksum, \
-                    sidecar.dependency_count, sidecar.dependency_0_cluster_epoch, \
-                    sidecar.dependency_0_bucket_route_hash, \
-                    sidecar.dependency_1_cluster_epoch, \
-                    sidecar.dependency_1_bucket_route_hash, sidecar.dependency_checksum \
+                    sidecar.dependency_count, \
+                    CASE WHEN length(sidecar.encoded_dependencies) <= 85 \
+                         THEN sidecar.encoded_dependencies ELSE NULL END, \
+                    sidecar.dependency_checksum \
              FROM metadata_command_pending_slot AS pending \
              LEFT JOIN metadata_command_pending_route_dependencies AS sidecar \
                ON sidecar.singleton = pending.singleton \
@@ -3757,11 +3880,8 @@ impl PgStore {
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<i64>>(10)?,
                 ))
             },
         )?;
@@ -3772,10 +3892,7 @@ impl PgStore {
             raw_command_checksum,
             raw_sidecar_command_checksum,
             raw_dependency_count,
-            raw_dependency_0_epoch,
-            raw_dependency_0_hash,
-            raw_dependency_1_epoch,
-            raw_dependency_1_hash,
+            encoded_dependencies,
             raw_dependency_checksum,
         )) = raw
         else {
@@ -3826,25 +3943,36 @@ impl PgStore {
         {
             return Err(conflict());
         }
-        let raw_dependencies = [
-            (raw_dependency_0_epoch, raw_dependency_0_hash),
-            (raw_dependency_1_epoch, raw_dependency_1_hash),
-        ];
+        let encoded = encoded_dependencies.ok_or_else(conflict)?;
+        if encoded.len() != dependency_count * PENDING_ROUTE_DEPENDENCY_RECORD_LEN {
+            return Err(conflict());
+        }
         let mut dependencies = Vec::with_capacity(dependency_count);
-        for (index, (raw_epoch, raw_hash)) in raw_dependencies.into_iter().enumerate() {
-            if index < dependency_count {
-                let (Some(raw_epoch), Some(raw_hash)) = (raw_epoch, raw_hash) else {
-                    return Err(conflict());
-                };
-                let epoch = ClusterEpoch::new(u64::try_from(raw_epoch).map_err(|_| conflict())?)
-                    .ok_or_else(conflict)?;
-                dependencies.push(PendingMetadataCommandRouteDependency {
-                    cluster_epoch: epoch,
-                    bucket_route_hash: raw_hash as u64,
-                });
-            } else if raw_epoch.is_some() || raw_hash.is_some() {
+        for record in encoded.as_chunks::<PENDING_ROUTE_DEPENDENCY_RECORD_LEN>().0 {
+            let epoch = u64::from_be_bytes(record[..8].try_into().expect("fixed record"));
+            if epoch > i64::MAX as u64 {
                 return Err(conflict());
             }
+            let cluster_epoch = ClusterEpoch::new(epoch).ok_or_else(conflict)?;
+            let value = u64::from_be_bytes(record[9..].try_into().expect("fixed record"));
+            let target = match record[8] {
+                0 => PendingRouteTarget::BucketHash(value),
+                1 => PendingRouteTarget::ExactPg(PgId::new(
+                    value.try_into().map_err(|_| conflict())?,
+                )),
+                _ => return Err(conflict()),
+            };
+            let dependency = PendingMetadataCommandRouteDependency {
+                cluster_epoch,
+                target,
+            };
+            if dependencies
+                .last()
+                .is_some_and(|previous| previous >= &dependency)
+            {
+                return Err(conflict());
+            }
+            dependencies.push(dependency);
         }
         let Some(raw_dependency_checksum) = raw_dependency_checksum else {
             return Err(conflict());
@@ -3977,6 +4105,48 @@ impl PgStore {
         effect_fence: AdmittedRouteEffectFence,
         operation_deadline: Option<Instant>,
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        self.try_insert_projected_pending_metadata_command_slot(
+            node_id,
+            PendingSlotProjection::current(command),
+            scope_bucket,
+            effect_fence,
+            operation_deadline,
+        )
+    }
+
+    /// Owner-local integration boundary, not a new RPC or an optional command
+    /// field. No independently supplied command can be paired with this view.
+    pub(super) fn try_insert_bound_staging_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        protection: &super::payload_staging::PendingStagingProtection<'_>,
+        topology: &crate::PgTopology,
+        scope_bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        let projection = PendingSlotProjection::from_bound(protection, topology)
+            .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
+        self.try_insert_projected_pending_metadata_command_slot(
+            node_id,
+            projection,
+            scope_bucket,
+            effect_fence,
+            operation_deadline,
+        )
+    }
+
+    fn try_insert_projected_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        projection: PendingSlotProjection<'_>,
+        scope_bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        operation_deadline: Option<Instant>,
+    ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        self.require_usable_connection()
+            .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)?;
+        let command = projection.command();
         if command.payload().is_bucket_control_pending_slot_payload() {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -4020,16 +4190,35 @@ impl PgStore {
                 self.metadata_command_log_conflict(node_id, command),
             ));
         }
-        let PendingShardScavengerReferencePages {
-            placed_reference_count,
-            placed_pages,
-            reclaim_reference_count,
-            reclaim_pages,
-        } = self
-            .encode_pending_shard_scavenger_reference_pages(command)
-            .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
-        let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_insert_transaction(|| {
+            // Session-backed geometry must come from the same SQLite view as
+            // the slot and its indexes, not a cached pre-transaction projection.
+            let pages = match self.encode_pending_shard_scavenger_reference_pages(command) {
+                Ok(pages) => pages,
+                Err(error) => {
+                    // Incomplete geometry rejects a fresh installation, but
+                    // cannot establish nonacceptance of an exact existing slot.
+                    // Keep that distinction under this same write transaction.
+                    return match self
+                        .pending_metadata_command_slot(node_id, command.id().cluster_epoch())
+                    {
+                        Ok(Some(slot))
+                            if slot.command_checksum == command.checksum_crc64()
+                                && slot.command_bytes == command.command_bytes() =>
+                        {
+                            Ok(Err(error))
+                        }
+                        Ok(_) => Err(error),
+                        Err(inspection) => Ok(Err(inspection)),
+                    };
+                }
+            };
+            let PendingShardScavengerReferencePages {
+                placed_reference_count,
+                placed_pages,
+                reclaim_reference_count,
+                reclaim_pages,
+            } = pages;
             // Drain clearing performs the inverse check under the same SQLite
             // write serialization: either the mark slot protects its drain,
             // or a clear that linearized first makes this insert impossible.
@@ -4065,10 +4254,8 @@ impl PgStore {
                     reclaim_reference_count,
                     &reclaim_pages,
                 )?;
-                self.replace_pending_metadata_command_route_dependency_sidecar(
-                    &route_dependencies,
-                )?;
-                return Ok(());
+                projection.install(self)?;
+                return Ok(Ok(()));
             }
             let existing = self
                 .pending_metadata_command_slot(node_id, command.id().cluster_epoch())?
@@ -4081,7 +4268,9 @@ impl PgStore {
             if existing.command_checksum == command.checksum_crc64()
                 && existing.command_bytes == command.command_bytes()
             {
-                return Ok(());
+                // An exact slot already owns this command. A damaged/mismatched
+                // projection cannot be classified as definitive nonacceptance.
+                return Ok(projection.require_existing(self, node_id));
             }
             Err(StoreError::MetadataCommandPendingConflict {
                 pg_id: self.pg_id,
@@ -4089,7 +4278,8 @@ impl PgStore {
                 existing_log_index: existing.id.log_index().get(),
                 candidate_log_index: command.id().log_index().get(),
             })
-        })
+        })?
+        .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)
     }
 
     fn require_mark_bucket_deleting_install_authorization(
@@ -4223,14 +4413,14 @@ impl PgStore {
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
 
-        let PendingShardScavengerReferencePages {
-            placed_reference_count,
-            placed_pages,
-            reclaim_reference_count,
-            reclaim_pages,
-        } = self.encode_pending_shard_scavenger_reference_pages(command)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_transaction(|| {
+            let PendingShardScavengerReferencePages {
+                placed_reference_count,
+                placed_pages,
+                reclaim_reference_count,
+                reclaim_pages,
+            } = self.encode_pending_shard_scavenger_reference_pages(command)?;
             let inserted = self.execute_pending_slot_insert_with_effect_fence(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
@@ -4265,6 +4455,7 @@ impl PgStore {
                 self.replace_pending_metadata_command_route_dependency_sidecar(
                     &route_dependencies,
                 )?;
+                self.initialize_pending_staging_index(command.id(), command.checksum_crc64())?;
             }
             Ok(inserted == 1)
         })
@@ -4436,6 +4627,32 @@ impl PgStore {
         }
         self.replace_pending_metadata_command_slot_for_reissue_inner(
             node_id,
+            PendingSlotProjection::current(expected),
+            PendingSlotProjection::current(replacement),
+            scope_bucket,
+        )
+    }
+
+    /// Owner-local integration for a same-payload reissue. Derive the successor
+    /// projection from the already-bound description, never another descriptor.
+    /// Mandatory command carriers and recovery dispatch are not activated here.
+    pub(super) fn replace_bound_staging_pending_metadata_command_slot_for_reissue(
+        &self,
+        node_id: u32,
+        expected: &super::payload_staging::PendingStagingProtection<'_>,
+        replacement: &MetadataCommandEnvelope,
+        topology: &crate::PgTopology,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
+        let reissued = expected
+            .reissue(replacement)
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
+        let expected = PendingSlotProjection::from_bound(expected, topology)
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
+        let replacement = PendingSlotProjection::from_bound(&reissued, topology)
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
+        self.replace_pending_metadata_command_slot_for_reissue_inner(
+            node_id,
             expected,
             replacement,
             scope_bucket,
@@ -4489,8 +4706,8 @@ impl PgStore {
         }
         self.replace_pending_metadata_command_slot_for_reissue_inner(
             node_id,
-            expected,
-            replacement,
+            PendingSlotProjection::current(expected),
+            PendingSlotProjection::current(replacement),
             scope_bucket,
         )
     }
@@ -4498,10 +4715,14 @@ impl PgStore {
     fn replace_pending_metadata_command_slot_for_reissue_inner(
         &self,
         node_id: u32,
-        expected: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
+        expected_projection: PendingSlotProjection<'_>,
+        replacement_projection: PendingSlotProjection<'_>,
         scope_bucket: Option<&BucketName>,
     ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
+        self.require_usable_connection()
+            .map_err(PendingMetadataCommandSlotReplaceError::may_have_applied)?;
+        let expected = expected_projection.command();
+        let replacement = replacement_projection.command();
         let Some(scope_bucket) = scope_bucket.filter(|scope| *scope == replacement.bucket_name())
         else {
             return Err(PendingMetadataCommandSlotReplaceError::definitive(
@@ -4575,7 +4796,19 @@ impl PgStore {
             && slot.command_checksum == replacement.checksum_crc64()
             && slot.command_bytes == replacement.command_bytes()
         {
-            return Ok(true);
+            return self
+                .with_pending_slot_insert_transaction(|| {
+                    if self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
+                        != Some(slot)
+                    {
+                        return Ok(false);
+                    }
+                    replacement_projection.require_existing(self, node_id)?;
+                    Ok(true)
+                })
+                .map_err(|error| {
+                    PendingMetadataCommandSlotReplaceError::may_have_applied(error.into_source())
+                });
         }
         if slot.id != expected.id()
             || slot.command_checksum != expected.checksum_crc64()
@@ -4588,16 +4821,6 @@ impl PgStore {
         }
         let expected_bytes = expected.command_bytes();
         let replacement_bytes = replacement.command_bytes();
-        let PendingShardScavengerReferencePages {
-            placed_reference_count,
-            placed_pages,
-            reclaim_reference_count,
-            reclaim_pages,
-        } = self
-            .encode_pending_shard_scavenger_reference_pages(replacement)
-            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
-        let route_dependencies =
-            Self::pending_metadata_command_route_dependency_sidecar(replacement);
         #[cfg(test)]
         if self
             .fail_next_pending_slot_replace_definitively_with_fatal_error
@@ -4632,7 +4855,25 @@ impl PgStore {
             ));
         }
         let replaced = self
-            .with_pending_slot_transaction(|| {
+            .with_pending_slot_insert_transaction(|| {
+                // Recheck the exact observed source and its indexes under the
+                // same SQL write serialization as the replacement. In particular,
+                // an ordinary projection must not erase retained window scope.
+                if self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
+                    != Some(slot)
+                {
+                    return Ok(false);
+                }
+                expected_projection.require_existing(self, node_id)?;
+                // Never carry session-derived pages across transaction entry.
+                // Reinspect after validating the exact source under write
+                // serialization, before replacing either slot or sidecars.
+                let PendingShardScavengerReferencePages {
+                    placed_reference_count,
+                    placed_pages,
+                    reclaim_reference_count,
+                    reclaim_pages,
+                } = self.encode_pending_shard_scavenger_reference_pages(replacement)?;
                 let updated = self.execute_cached(
                     "UPDATE metadata_command_pending_slot \
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
@@ -4646,7 +4887,8 @@ impl PgStore {
                    AND log_index = ?10 \
                    AND command_checksum = ?11 \
                    AND command_bytes = ?12 \
-                   AND scope_bucket = ?13",
+                   AND scope_bucket = ?13 \
+                   AND publication_started = 0",
                     params![
                         replacement.id().cluster_epoch().get() as i64,
                         replacement.id().pg_id().get() as i64,
@@ -4673,13 +4915,15 @@ impl PgStore {
                         reclaim_reference_count,
                         &reclaim_pages,
                     )?;
-                    self.replace_pending_metadata_command_route_dependency_sidecar(
-                        &route_dependencies,
-                    )?;
+                    replacement_projection.install(self)?;
                 }
                 Ok(updated == 1)
             })
-            .map_err(PendingMetadataCommandSlotReplaceError::may_have_applied)?;
+            // Preserve replacement's conservative uncertainty classification;
+            // the shared helper additionally rolls back nested insertion prefixes.
+            .map_err(|error| {
+                PendingMetadataCommandSlotReplaceError::may_have_applied(error.into_source())
+            })?;
         #[cfg(test)]
         if replaced
             && self

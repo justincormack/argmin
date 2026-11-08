@@ -755,7 +755,23 @@ pub(crate) fn decode_shard_scavenger_reference_page_response(
     Ok(ShardScavengerReferencePage { items, complete })
 }
 
-fn validate_staging_cursor(cursor: &ShardScavengerReferenceCursor, pg: Option<PgId>) -> Result<(), StorageRpcPayloadError> {
+fn validate_staging_cursor(
+    cursor: &ShardScavengerReferenceCursor,
+    pg: Option<PgId>,
+) -> Result<(), StorageRpcPayloadError> {
+    if let ShardScavengerReferenceCursor::PendingStagingWindow {
+        pg_id, cluster_epoch, log_index, ..
+    } = cursor {
+        if *log_index == 0
+            || *log_index > i64::MAX as u64
+            || cluster_epoch.get() > i64::MAX as u64
+            || pg.is_some_and(|pg| pg != *pg_id)
+        {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid pending staging cursor subject",
+            ));
+        }
+    }
     if let ShardScavengerReferenceCursor::StagingWindow { pg_id, introduction_index, .. } = cursor {
         if *introduction_index == 0 || pg.is_some_and(|pg| pg != *pg_id) {
             return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid staging protection cursor subject"));
@@ -777,8 +793,23 @@ fn validate_staging_protection(protection: &crate::types::ShardScavengerStagingP
 fn validate_scavenger_page_item(item: &ShardScavengerReferencePageItem) -> Result<(), StorageRpcPayloadError> {
     validate_staging_cursor(&item.cursor, None)?;
     match (&item.cursor, &item.reference) {
-        (ShardScavengerReferenceCursor::StagingWindow { .. }, ShardScavengerPayloadReference::StagingProtection(protection)) => validate_staging_protection(protection),
-        (ShardScavengerReferenceCursor::StagingWindow { .. }, _) | (_, ShardScavengerPayloadReference::StagingProtection(_)) => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("crossed staging protection page item")),
+        (
+            ShardScavengerReferenceCursor::PendingStagingWindow { cluster_epoch, .. },
+            ShardScavengerPayloadReference::StagingProtection(protection),
+        ) if protection.placement_epoch > *cluster_epoch => {
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("future pending staging placement"))
+        }
+        (
+            ShardScavengerReferenceCursor::StagingWindow { .. }
+                | ShardScavengerReferenceCursor::PendingStagingWindow { .. },
+            ShardScavengerPayloadReference::StagingProtection(protection),
+        ) => validate_staging_protection(protection),
+        (
+            ShardScavengerReferenceCursor::StagingWindow { .. }
+                | ShardScavengerReferenceCursor::PendingStagingWindow { .. }, _,
+        ) | (_, ShardScavengerPayloadReference::StagingProtection(_)) => {
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest("crossed staging protection page item"))
+        }
         _ => Ok(()),
     }
 }

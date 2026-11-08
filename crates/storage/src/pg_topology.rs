@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
@@ -53,7 +54,9 @@ fn decimal_u64_bytes(value: u64, out: &mut [u8; 20]) -> &[u8] {
 // compares topology identity, not allocation identity or just the PG count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgTopology {
-    pg_ids: Box<[u32]>,
+    // Immutable configuration is shared by owned command candidates and route
+    // views; cloning must not copy the complete PG catalogue per request.
+    pg_ids: Arc<[u32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -71,12 +74,16 @@ impl PgTopology {
         canonical.sort_unstable();
         canonical.dedup();
         Ok(Self {
-            pg_ids: canonical.into_boxed_slice(),
+            pg_ids: canonical.into(),
         })
     }
 
     pub fn pg_count(&self) -> u32 {
         self.pg_ids.len() as u32
+    }
+
+    pub(crate) fn contains_pg(&self, pg_id: PgId) -> bool {
+        self.pg_ids.binary_search(&pg_id.get()).is_ok()
     }
 
     /// Derive the object metadata PG for `(bucket, key)`.
@@ -288,6 +295,20 @@ mod tests {
     fn topology_canonicalizes_ids() {
         let topo = PgTopology::new(&[8, 2, 8, 1]).unwrap();
         assert_eq!(topo.pg_count(), 3);
+    }
+
+    #[test]
+    fn topology_clones_share_ids_but_equality_is_canonical_value_identity() {
+        let original = PgTopology::new(&[8, 2, 8, 1]).unwrap();
+        let cloned = original.clone();
+        assert!(std::sync::Arc::ptr_eq(&original.pg_ids, &cloned.pg_ids));
+        let equivalent = PgTopology::new(&[1, 2, 8]).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &original.pg_ids,
+            &equivalent.pg_ids
+        ));
+        assert_eq!(original, equivalent);
+        assert_ne!(original, PgTopology::new(&[1, 2, 9]).unwrap());
     }
 
     #[test]

@@ -1691,6 +1691,22 @@ fn put_shard_scavenger_reference_cursor(
             put_u64(out, *introduction_index);
             put_u32(out, *window_index);
         }
+        ShardScavengerReferenceCursor::PendingStagingWindow {
+            cluster_epoch,
+            pg_id,
+            log_index,
+            command_checksum,
+            protection_checksum,
+            topology_digest,
+        } => {
+            put_u8(out, 8);
+            put_u64(out, cluster_epoch.get());
+            put_u32(out, pg_id.get());
+            put_u64(out, *log_index);
+            put_u64(out, *command_checksum);
+            put_u64(out, *protection_checksum);
+            out.extend_from_slice(topology_digest);
+        }
     }
 }
 

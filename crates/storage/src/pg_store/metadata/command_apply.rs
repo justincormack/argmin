@@ -841,9 +841,18 @@ impl PgStore {
                     context: "delete finalized bucket (delete version counters)",
                     source: source.into(),
                 })?;
+            // A deleted bucket does not retire its payload owners. Their
+            // physical identities must remain fenced even after all live
+            // sessions/reservations/manifests disappear, including across
+            // recreation of the same bucket name. Counters are keyed only by
+            // (bucket, key), so retain them for owners of EVERY incarnation and
+            // lifecycle, not just the incarnation being finalized. The NOT IN
+            // subquery builds the retained key set once (owner keys are NOT
+            // NULL), rather than rescanning all owners for every counter.
             self.conn
                 .execute(
-                    "DELETE FROM object_write_counters WHERE bucket = ?1",
+                    "DELETE FROM object_write_counters WHERE bucket = ?1 \
+                     AND key NOT IN (SELECT key FROM payload_staging_owners WHERE bucket = ?1)",
                     params![name.as_str()],
                 )
                 .map_err(|source| MetadataError::Db {

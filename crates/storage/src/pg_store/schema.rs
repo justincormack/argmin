@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 11;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 12;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -784,27 +784,9 @@ const CREATE_METADATA_COMMAND_PENDING_ROUTE_DEPENDENCIES_TABLE: &str = "\
 CREATE TABLE metadata_command_pending_route_dependencies (
     singleton          INTEGER PRIMARY KEY CHECK (singleton = 0),
     command_checksum   INTEGER NOT NULL,
-    dependency_count   INTEGER NOT NULL CHECK (dependency_count BETWEEN 0 AND 2),
-    dependency_0_cluster_epoch INTEGER CHECK (
-        dependency_0_cluster_epoch IS NULL OR dependency_0_cluster_epoch > 0
-    ),
-    dependency_0_bucket_route_hash INTEGER,
-    dependency_1_cluster_epoch INTEGER CHECK (
-        dependency_1_cluster_epoch IS NULL OR dependency_1_cluster_epoch > 0
-    ),
-    dependency_1_bucket_route_hash INTEGER,
+    dependency_count   INTEGER NOT NULL CHECK (dependency_count BETWEEN 0 AND 5),
+    encoded_dependencies BLOB NOT NULL CHECK (length(encoded_dependencies) = dependency_count * 17),
     dependency_checksum INTEGER NOT NULL,
-    CHECK (
-        (dependency_count = 0 AND
-         dependency_0_cluster_epoch IS NULL AND dependency_0_bucket_route_hash IS NULL AND
-         dependency_1_cluster_epoch IS NULL AND dependency_1_bucket_route_hash IS NULL) OR
-        (dependency_count = 1 AND
-         dependency_0_cluster_epoch IS NOT NULL AND dependency_0_bucket_route_hash IS NOT NULL AND
-         dependency_1_cluster_epoch IS NULL AND dependency_1_bucket_route_hash IS NULL) OR
-        (dependency_count = 2 AND
-         dependency_0_cluster_epoch IS NOT NULL AND dependency_0_bucket_route_hash IS NOT NULL AND
-         dependency_1_cluster_epoch IS NOT NULL AND dependency_1_bucket_route_hash IS NOT NULL)
-    ),
     FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
 ) STRICT";
 
@@ -1049,6 +1031,7 @@ fn create_current_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         [],
     )?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_ROUTE_DEPENDENCIES_TABLE, [])?;
+    conn.execute(super::pending_staging_index::SCHEMA, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX, [])?;
@@ -1319,6 +1302,10 @@ mod tests {
             version: 11,
             catalogue: include_str!("schema_manifests/pg_schema_v11.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 12,
+            catalogue: include_str!("schema_manifests/pg_schema_v12.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1443,7 +1430,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1572,7 +1559,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

@@ -21,7 +21,13 @@ use crate::{MetadataError, VersionId};
 mod terminal_owner;
 
 #[path = "payload_staging_abandonment_source_tests.rs"]
-mod source_carrier;
+pub(super) mod source_carrier;
+
+#[path = "payload_staging_abandonment_candidate_tests.rs"]
+mod candidate;
+
+#[path = "payload_staging_abandonment_routes_tests.rs"]
+mod routes;
 
 #[path = "payload_staging_obligations_tests.rs"]
 mod obligations;
@@ -33,7 +39,7 @@ fn payload(source: &MetadataCommandEnvelope) -> &CommitStreamPartCommand {
     part
 }
 
-fn cleanup(
+pub(super) fn cleanup(
     pg: &PgStore,
     owner: &StagingOwnerRecord,
     source: &MetadataCommandEnvelope,
@@ -48,7 +54,7 @@ fn cleanup(
     )
 }
 
-fn terminal(pg: &PgStore, source: &MetadataCommandEnvelope, abandoned: bool) {
+pub(super) fn terminal(pg: &PgStore, source: &MetadataCommandEnvelope, abandoned: bool) {
     // Component setup materializes the initial owner/session state. Anchor that
     // fixture as the starting digest, then use actual linked terminal recording
     // (not raw tombstone insertion) for the source certificate.
@@ -104,7 +110,19 @@ fn apply(
     };
     let source = PartFinalizationSource::capture(source).unwrap();
     let source = PartFinalizationSource::decode(&source.encode()).unwrap();
-    source.apply_closure_in_open_transaction(pg, &topology(), 0, &decode(follow_up))
+    apply_carrier(pg, &source, &decode(follow_up))
+}
+
+// Test-only construction seam; production application requires an inseparable
+// command/source candidate, never these independently supplied inputs.
+fn apply_carrier(
+    pg: &PgStore,
+    source: &PartFinalizationSource,
+    follow_up: &MetadataCommandEnvelope,
+) -> Result<AbandonmentOutcome, AbandonmentError> {
+    let topology = topology();
+    let candidate = source.clone().bind_cleanup(follow_up.clone(), &topology)?;
+    candidate.bind(&topology)?.apply_in_open_transaction(pg, 0)
 }
 
 fn expected(owner: &StagingOwnerRecord, source: &MetadataCommandEnvelope) -> StagingOwnerRecord {
@@ -121,7 +139,11 @@ fn expected(owner: &StagingOwnerRecord, source: &MetadataCommandEnvelope) -> Sta
     result
 }
 
-fn assert_closed(pg: &PgStore, owner: &StagingOwnerRecord, source: &MetadataCommandEnvelope) {
+pub(super) fn assert_closed(
+    pg: &PgStore,
+    owner: &StagingOwnerRecord,
+    source: &MetadataCommandEnvelope,
+) {
     assert_eq!(append::load(pg, owner), expected(owner, source));
     assert!(matches!(
         pg.get_stream_upload(&owner.subject.id.attempt),

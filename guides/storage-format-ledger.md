@@ -20,15 +20,145 @@ dependencies, and the immutable evidence retained for current and rejected versi
 authorize compatibility readers: the repository currently supports one exact format vector at a
 time.
 
+## Pre-activation Custody Checkpoint — 2026-11-08
+
+The reviewed pending-index, protection-discovery and complete-context custody
+foundations are checkpointed together before production activation. The current
+format vector is PG schema **12**, canonical state **10**, checkpoint **8**,
+applied command **13**, storage RPC **36** and abandoned-command record **2**.
+The schema-12 catalogue, pending-index literals, RPC-36 composites and private
+command-context V1 evidence below are frozen at this checkpoint. Subsequent
+incompatible changes require the affected version advances and append-only evidence;
+these are no longer uncommitted candidate formats.
+
+Production pending-slot indexes and discovery are live, but complete-context
+command encoding, owner-creating application and accepted/uncertain frontend
+custody are not activated. The context preparation APIs grant neither acceptance
+nor physical cleanup authority. Checkpoint size/transfer limits remain the
+separate unresolved dependency recorded in the cleanup plan.
+
+## Pending Route Dependency Index V2 — 2026-11-06
+
+The current PG schema advances **11 → 12** for a bounded tagged pending-route
+index. Its record grammar has no independent version tag: the PG schema owns
+its version, and the checksum domain advances to
+`argmin.metadata.pending-route-dependencies.v2`.
+Each dependency is 17 bytes: big-endian u64 epoch, u8 target tag, big-endian u64
+target value. Tag 0 is the existing bucket-route hash; tag 1 is an exact PG ID
+whose high 32 bits must be zero. Epochs must be positive and fit SQLite's signed
+integer domain. Entries are strictly ordered by epoch, tag and value, without
+duplicates; the count is 0..5 and the blob is at most 85 bytes. The SQL read
+checks the blob size before copying it into Rust, including for corrupted rows.
+
+The checksum binds the literal V2 domain, u64 command epoch/PG/index/checksum,
+u8 count and all ordered dependency records. The literal zero/one/two/five-entry
+specimens in `pending_route_index_tests.rs` pin CRC64 values
+`3cadc84cf5adf472`, `5e5d0ae6504b20df`, `0e3d87b0c93ca8e3` and
+`5ffa78601569518e` respectively. SQL reopen preserves both exact bytes and CRCs.
+Exact PG dependencies are checked against the configured topology when resolved;
+they are never reinterpreted as hashes. Both exact-route and oldest-epoch
+inventory consume the bounded index without decoding the pending envelope.
+
+Ordinary commands still project only their existing bucket reservation.
+Command-bound owner-window components can project exact object/data/release
+routes, but production commands do not yet carry those descriptors or install
+their projections. No new custody path, owner creation or physical cleanup is
+activated. Slot insertion/replacement keeps the index in its existing transaction,
+and slot deletion still cascades it; there is no added transaction or fsync.
+
+`schema_manifests/pg_schema_v12.catalogue` seals the changed route table and the
+pending-window index below (SHA-256
+`8c3c8588a6eaa5e57c106d776f95dcd62f7a14625de970cd1c74c03ca5d52ea9`).
+The schema-11 catalogue and V1 checksum-input/result literals remain immutable;
+a V1 table populated from the old catalogue is rejected at current schema
+admission without changing its rows or version. There is no compatibility reader.
+The placed/reclaim reference grammars remain unchanged. Pending indexes are not
+materialized canonical/checkpoint state. These index changes leave canonical
+state 10, checkpoint 8 and applied command 13 unchanged. The subsequent paging
+integration below advances RPC 35 to 36 and appends its complete composites.
+
+### Pending staging protection index V1 (same schema-12 advance)
+
+`metadata_command_pending_staging_protection` is a singleton child of the
+pending slot, with a required explicit empty record for ordinary commands.
+It is written in the existing insertion/replacement transaction and cascades
+on slot removal; it adds no transaction or fsync. A failed index write rolls
+back the slot and its other indexes together. This table is runtime pending
+coordination, not materialized canonical/checkpoint state.
+
+A nonempty record can be constructed only from a command-bound introduction or
+append projection. Its installer requires an open transaction, the exact pending
+command bytes/identity/checksum, and the same canonical topology used to bind
+the descriptor. A single bounded query reads its integrity-bound evidence
+without decoding the envelope. Missing rows, oversized bytes, crossed identity,
+wrong topology or malformed protection fail closed.
+
+The PG schema owns this grammar (no independent version tag). An empty record
+is zero bytes. A nonempty record consists of a 32-byte topology SHA-256,
+32 ASCII bytes of attempt ID, u64 introduction epoch/index, u32 window index/data
+PG, 16-byte physical hash, u64 VID/placement epoch, u8 EC k/m, u32 acknowledgement
+primary and k+m u32 file participants in shard-index order. Integers are big-endian.
+The fixed prefix is 126 bytes; the EC maximum of 32 bounds the record to 254.
+The checksum domain is `argmin.metadata.pending-staging-protection.v1`, followed
+by u64 command epoch/PG/index/CRC, u64 encoded length and the exact record bytes.
+Topology uses SHA-256 over `pending-staging-protection-topology-v1` and the
+canonical ascending u32 PG list, also big-endian.
+`pending_staging_index_tests.rs` pins the literal empty, three-participant and
+32-participant specimens with CRC64 values `0596286e908ff97a`,
+`8490e8337c3bf695` and `256b7db29ce1cb93`, respectively, including exact SQL
+reopen evidence. These expected values do not use the production checksum helper.
+
+Current command fields remain unchanged and initialize only empty records.
+The paging integration below consumes nonempty indexes, but mandatory descriptor
+dispatch and accepted/uncertain frontend custody remain coordinated integration
+work. No readable payload representation or physical cleanup authority is added.
+
+Schema 12 is frozen by the 2026-11-08 pre-activation checkpoint. Both pending-index
+changes belong to this single schema advance; the schema-11 predecessor remains
+unchanged evidence.
+
+### Pending-window scavenger cursor — RPC 36
+
+RPC **35 → 36** adds `PendingStagingWindow` cursor tag 8. Its exact 69-byte
+encoding is u8 tag, u64 command epoch, u32 object PG, u64 command log index,
+u64 command CRC, u64 protection-index CRC and 32 bytes of topology SHA-256;
+integers are little-endian, as in the enclosing RPC. It pairs only with the
+existing tag-2 staging-protection reference. The receiver rejects invalid index
+ranges, crossed PGs, future placement epochs, malformed participants and crossed
+cursor/reference kinds. The Unix client also rejects incomplete pages that echo
+the requested cursor without progress. The audit pass additionally enforces
+native phase/key ordering across all responses, with bounded pending-slot
+replacement restarts and rejection of retired pending identities. This
+process-local progress validation does not change the cursor grammar.
+
+The cursor identifies the exact pending slot/index, not a row offset into a
+decoded command. Exact resume skips the already emitted window; slot replacement
+or materialization restarts discovery from the beginning within the existing
+read snapshot. Missing or corrupt indexes fail closed. Unused windows stay
+outside readable/backfill discovery, while an append's selected segment remains
+in the existing pending placed-reference index.
+
+`pending_staging_scavenger_rpc_v36_{request,response}.hex` freeze the new cursor
+with unsorted file participants and an independent acknowledgement primary.
+The complete v35 materialized-window, bucket-reservation, shard-ack,
+stream-creation, abandoned-log and checkpoint-transfer specimens remain unchanged
+and are explicitly rejected. Corresponding v36 specimens are appended, including
+both checkpoint-v7 rejection and checkpoint-v8 current request/response composites.
+Authentication-v2 request/response bindings likewise append their v36 frame
+composites and retain exact v35 bindings as rejection evidence; the authentication
+grammar and fixed request-transcript digest do not change.
+Nested canonical/checkpoint/command/encryption versions do not change. No
+compatibility reader, extra write transaction or fsync is introduced.
+
 ## Owner/Window Foundation Checkpoint — 2026-11-06
 
 This checkpoint records reviewed foundations, not activation or completion of
 the coordinated cleanup-ownership protocol. Its schema, checkpoint, RPC and
 abandoned-command formats are live; production commands do not yet create new
-staging owners or switch frontend custody. This is the current frozen format
-vector, superseding the predecessor values below. Later incompatible changes
-require new versions and retained predecessor evidence, even while integration
-remains incomplete.
+staging owners or switch frontend custody. This is the checkpoint's frozen format
+vector; the 2026-11-08 checkpoint above supersedes its current-writer values. Later
+incompatible changes require new versions and retained predecessor evidence, even
+while integration remains incomplete.
 
 | Format | Checkpoint version | Change |
 | --- | --- | --- |
@@ -55,8 +185,11 @@ writer. These deliberately untagged SQLite encodings are owned by `pg_store`:
   `c6cfcd4370d840aa` and `a6a244c4dc1203bd`; both production computation and the
   raw SQL checksum column after reopen must equal these fixed values.
   The schema accepts two dependencies; current command projection emits at most
-  one bucket reservation. SQL restart/readback and corrupted-checksum rejection
-  exercise the production sidecar reader without decoding the command.
+  one bucket reservation. At the foundation checkpoint, SQL restart/readback and
+  corrupted-checksum rejection exercised the V1 production reader without
+  decoding the command. With schema 12, the retained V1 inputs/CRCs and table
+  rows instead pin non-mutating unsupported-schema rejection; V2 tests cover the
+  current production reader.
 - Placed-reference record: 54 bytes, comprising u32 data PG, 16-byte hash, u64
   generation, placement epoch, stored length and CRC64, then u8 `k` and `m`.
 - Reclaim-protection record: 30 bytes, comprising u32 data PG, 16-byte hash, u64
@@ -257,6 +390,45 @@ advance the command grammar, make the relevant field mandatory and covered by
 the command checksum, preserve the predecessor corpus, append complete command
 and RPC composites, and adjust enclosing bounds. The standalone descriptor tests
 do not satisfy that enclosing-format gate.
+
+### Required staging command context (not yet in live envelopes)
+
+`pg_store/payload_staging_command_context.rs` owns a private **V1 context
+field**. Its framing is little-endian u16 version 1 followed by one kind byte:
+0 ordinary, 1 introduction, 2 append, 3 abandoned-part follow-up. Ordinary is
+exactly `01 00 00`; the other kinds add a little-endian u32 byte length and the
+complete existing descriptor or source carrier. There is no omitted-field
+default. Introduction and append commands cannot select ordinary, and other
+commands cannot carry extraneous descriptors or sources. `AbortStreamUpload`
+has two explicitly distinct contexts: ordinary closure and source-bearing
+abandonment. An exhaustive match on the command enum owns that classification.
+
+The descriptor body limit remains 16 KiB; the source body limit remains 22 bytes
+plus the 2 MiB command limit. Version/kind/length/bounds are checked before nested
+decoding, which also validates command correspondence and configured topology.
+The field adds three bytes for ordinary commands or seven framing bytes to a
+nested value. It adds no independent checksum or authentication pass.
+
+Frozen outer bytes are composed with the existing immutable V1 descriptor and
+V1/command-V13 source literals in `payload_staging_command_context_tests.rs` and
+the codec's owner-local source-composite test. Literal headers pin version,
+kind, length and order independently of production constants. Nested format
+advances append new complete version-vector evidence; existing literals remain.
+
+This field is **not embedded in the live V13 command grammar**. The owned decoded
+input exposes only its command ID, not a raw envelope or complete candidate that
+can be reconstructed as ordinary. Application construction is private to a child
+of the context module and derives both command and handler from the complete
+retained variant; there is no parallel raw-envelope application constructor.
+Read-only pending retention requirements are also selected from that variant:
+generic proof routes plus captured window/source dependencies. This projection
+does not install a sidecar or authenticate context with the bare V13 checksum.
+Field decoding remains an ingress seam and does not establish command acceptance,
+custody or source abandonment.
+Activation must authenticate the whole field, including the ordinary versus
+abandonment tag, within the applied command, advance that enclosing grammar,
+and enforce combined command/RPC size bounds. Separate field validation cannot
+establish that bond. Current live format versions and custody are unchanged.
 
 ### Staging abandonment-source carrier (not yet in live envelopes)
 
@@ -652,7 +824,7 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Metadata checkpoint payload | `storage` | private `ARGMCPKT` plus big-endian `u16` checkpoint encoding 7 | Recorded: v7 carries schema-10 stream issuer fields and canonical-state v9. A literal current v7/state-v9/schema-v10/SSE-S3-v5 specimen independently decodes, verifies, installs, and reopens. The complete v6/state-v8/schema-v9/SSE-S3-v5 bytes and earlier evidence remain immutable; retired/newer versions and malformed issuer rows are rejected before import. |
 | Canonical metadata state digest | `storage` | private domain `argmin.metadata.pg-state` and opaque fixed-width `CanonicalStateDigest` carrier version 9 | Recorded: v9 includes both durable stream issuer fields. Prior v8 composites remain immutable; current independently versioned outer carriers append state-v9 evidence without changing their grammar versions. Replica state and every exported proof carry version and value; runtime configuration, control-plane state/commands/RPC, checkpoint, and storage-RPC readers reject noncurrent carriers. |
 | Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v5`; every present PG read route contains both proof-carrier versions and values | Recorded for the coordinated carrier slice: exact v5 text, versions 4/6, incomplete/noncurrent carrier rejection, and restart/publication coverage are owner-local |
-| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 35 | Recorded: v35 adds exact-participant staging protection pages and appends v35 enclosing corpora, retaining v34 rejection evidence. V34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
+| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 36 | Recorded: v36 adds slot/index/topology-bound pending-window cursor tag 8, appending complete v36 composites and preserving v35 rejection evidence. V35 adds exact-participant staging protection pages and appends v35 enclosing corpora, retaining v34 rejection evidence. V34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
 | Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Recorded: exact request/response bytes cover absent and present transcript tags, a fixed production-derived transcript digest seals its domain/length/input grammar, typed framing/version failures are distinct owner-locally, and authenticator-valid versions 0/3 are rejected before server dispatch or mutation |
 | Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Recorded: exact v1 bytes, owner-typed framing/version failures, allocation-ordering evidence, and valid signed inner envelopes in server-facing versions 0/2 fixtures prove rejection before authentication, dispatch, or mutation |
 | Control-plane logical state | `storage` | canonical text with leading `version=32` | Recorded: owner-typed missing/unsupported-version classification and an 11,041-byte representative aggregate sealing unavailable-node observations, proof-bound singleton unavailable-PG transitions, historical-route proof-floor/provenance, destination-route evidence, PG-local metadata log epochs, topology, leases, transfers, prior-primary state, route references, and pending-command branches. Immutable v28 through v31 aggregates remain rejection-only evidence; versions 28/29/30/31/33 are rejected through both single-authority open and replicated snapshot installation without mutation or publication. |

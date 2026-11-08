@@ -40,12 +40,15 @@ pub(in super::super) enum AppendApplied {
     ExactExisting,
 }
 
-fn validate_live(
+// Read-only correspondence shared by replica apply and fresh primary capture.
+// The returned session lets capture enforce its stricter consumed-cursor rule;
+// replicas deliberately need not have performed primary-local preparation.
+pub(super) fn validate_live(
     pg: &PgStore,
     owner: &StagingOwnerRecord,
     command: &AppendStreamSegmentCommand,
     next: &StagingWindow,
-) -> Result<(), AppendError> {
+) -> Result<crate::StreamUploadRecord, AppendError> {
     let subject = &owner.subject;
     let session = pg.get_stream_upload(&subject.id.attempt)?;
     let target_matches = match (&subject.target, &session.target) {
@@ -141,7 +144,7 @@ fn validate_live(
             return Err(AppendError::SelectedPrefix);
         }
     }
-    Ok(())
+    Ok(session)
 }
 
 // The descriptor's private binding is mandatory even for direct sibling calls.

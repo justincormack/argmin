@@ -744,9 +744,16 @@ pub(crate) struct ShardScavengerAuditPass {
     pg_ids: Vec<PgId>,
     next_reference_pg_index: usize,
     reference_after: Option<ShardScavengerReferenceCursor>,
+    reference_progress: scavenger_progress::ReferenceProgress,
     next_pg_index: usize,
     prior_unreferenced: HashSet<ShardScavengerObservationKey>,
     pub(super) current_unreferenced: HashSet<ShardScavengerObservationKey>,
+}
+
+impl ShardScavengerAuditPass {
+    pub(crate) fn reference_scan_invalid(&self) -> bool {
+        self.reference_progress.is_invalid()
+    }
 }
 
 fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {

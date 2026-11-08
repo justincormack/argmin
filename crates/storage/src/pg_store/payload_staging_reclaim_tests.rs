@@ -61,7 +61,7 @@ fn completion_from_delete(envelope: &MetadataCommandEnvelope) -> MetadataCommand
     )
 }
 
-fn setup(
+pub(super) fn setup(
     pg: &PgStore,
     kind: u8,
     version: VersionId,

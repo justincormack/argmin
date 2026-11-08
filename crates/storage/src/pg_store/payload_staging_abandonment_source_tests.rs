@@ -12,7 +12,7 @@ const HEADER_BYTES: usize = 22;
 
 /// Preserve CRC64 while changing the release proof. Eight ETag bytes supply a
 /// full-rank linear compensation; this is not random corruption or a bad CRC.
-fn crossed_proof_with_equal_crc(
+pub(in super::super) fn crossed_proof_with_equal_crc(
     source: &MetadataCommandEnvelope,
     field: &str,
 ) -> MetadataCommandEnvelope {
@@ -104,8 +104,7 @@ fn staging_abandonment_source_rejects_crc_collision_before_and_after_compaction(
                 pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
                 let before = introduction::state(&pg);
                 let changes = pg.conn.total_changes();
-                let result =
-                    carrier.apply_closure_in_open_transaction(&pg, &topology(), 0, &follow_up);
+                let result = apply_carrier(&pg, &carrier, &follow_up);
                 assert!(result.is_err(), "CRC-colliding {field} source acquired custody: {storage}, segments={count}: {result:?}");
                 assert_eq!(pg.conn.total_changes(), changes);
                 assert_eq!(introduction::state(&pg), before);
@@ -274,9 +273,7 @@ fn staging_abandonment_source_decoding_cannot_authorize_absent_or_substituted_to
         let carrier = PartFinalizationSource::decode(&bytes).unwrap();
         let before = introduction::state(&pg);
         let changes = pg.conn.total_changes();
-        assert!(carrier
-            .apply_closure_in_open_transaction(&pg, &topology(), 0, &follow_up)
-            .is_err());
+        assert!(apply_carrier(&pg, &carrier, &follow_up).is_err());
         assert_eq!(pg.conn.total_changes(), changes);
         assert_eq!(introduction::state(&pg), before);
 
@@ -292,15 +289,11 @@ fn staging_abandonment_source_decoding_cannot_authorize_absent_or_substituted_to
         let other = PartFinalizationSource::decode(&framed(&other.command_bytes())).unwrap();
         let before = introduction::state(&pg);
         let changes = pg.conn.total_changes();
-        assert!(other
-            .apply_closure_in_open_transaction(&pg, &topology(), 0, &follow_up)
-            .is_err());
+        assert!(apply_carrier(&pg, &other, &follow_up).is_err());
         assert_eq!(pg.conn.total_changes(), changes);
         assert_eq!(introduction::state(&pg), before);
         assert_eq!(
-            carrier
-                .apply_closure_in_open_transaction(&pg, &topology(), 0, &follow_up)
-                .unwrap(),
+            apply_carrier(&pg, &carrier, &follow_up).unwrap(),
             AbandonmentOutcome::ClosedAndRetained
         );
         assert_closed(&pg, &owner, &source);

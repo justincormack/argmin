@@ -1206,6 +1206,12 @@ impl PgStore {
             .pending_shard_scavenger_cursor_matches_current_slot(
                 after.expect("pending cursor replacement check requires a cursor"),
             )?;
+        let pending_cursor_replaced = pending_cursor_replaced
+            || (matches!(
+                after,
+                Some(ShardScavengerReferenceCursor::PendingStagingWindow { .. })
+            ) && !self
+                .pending_staging_cursor_matches(topology, after.expect("pending cursor"))?);
         let pending_after = if pending_cursor_replaced { None } else { after };
         let start_phase = if pending_cursor_replaced {
             0
@@ -1218,7 +1224,8 @@ impl PgStore {
                 Some(ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }) => 4,
                 Some(ShardScavengerReferenceCursor::PendingPlacedCommand { .. }) => 5,
                 Some(ShardScavengerReferenceCursor::PendingReclaimCommand { .. }) => 6,
-                Some(ShardScavengerReferenceCursor::StagingWindow { .. }) => 7,
+                Some(ShardScavengerReferenceCursor::PendingStagingWindow { .. }) => 7,
+                Some(ShardScavengerReferenceCursor::StagingWindow { .. }) => 8,
             }
         };
 
@@ -1369,6 +1376,25 @@ impl PgStore {
                 });
             }
         }
+        if start_phase <= 7 {
+            // Read/validate even on exact resume: a missing or malformed index
+            // must not become successful completion. One slot has one window.
+            let pending = self.pending_staging_page_item(topology)?;
+            if !matches!(
+                pending_after,
+                Some(ShardScavengerReferenceCursor::PendingStagingWindow { .. })
+            ) {
+                if let Some(item) = pending {
+                    items.push(item);
+                }
+            }
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
         let remaining = std::num::NonZeroU16::new((limit - items.len()) as u16)
             .expect("page has remaining capacity");
         let complete = super::payload_staging::extend_scavenger_protection_page(
@@ -1447,6 +1473,7 @@ impl PgStore {
                     ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
                     | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
                     | ShardScavengerReferenceCursor::PendingReclaimCommand { .. }
+                    | ShardScavengerReferenceCursor::PendingStagingWindow { .. }
                     | ShardScavengerReferenceCursor::StagingWindow { .. },
                 ) => 0,
             }
@@ -1608,6 +1635,7 @@ impl PgStore {
             ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
             | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
             | ShardScavengerReferenceCursor::PendingReclaimCommand { .. }
+            | ShardScavengerReferenceCursor::PendingStagingWindow { .. }
             | ShardScavengerReferenceCursor::StagingWindow { .. } => None,
         };
         Ok(actual.as_ref() == Some(expected))
@@ -2343,8 +2371,91 @@ impl PgStore {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingShardScavengerReferencePages, StoreError> {
+        let references = self.pending_command_payload_references(command.payload())?;
+        Self::encode_pending_payload_reference_pages(&references)
+    }
+
+    /// Fresh pending protection must account for every listed segment. Unlike
+    /// historical discovery, it must retain placed geometry, not just identity.
+    /// The pending installer derives this inside its write transaction; scoped
+    /// context inspection uses its own read snapshot. No cached projection may
+    /// be carried from inspection into installation.
+    pub(super) fn pending_command_payload_references(
+        &self,
+        payload: &MetadataCommandPayload,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let incomplete = |reason: &str| StoreError::ShardScavengerScanIncomplete {
+            context: "derive pending command payload inventory",
+            errors: reason.to_owned(),
+        };
         let mut references = Vec::new();
-        self.extend_scavenger_command_payload_references(&mut references, command.payload())?;
+        // Empty aborts have no payload geometry, including after a previous
+        // closure removed their session. Nonempty aborts must still bind it.
+        if matches!(payload, MetadataCommandPayload::AbortStreamUpload(abort) if abort.staged_segments.is_empty())
+        {
+            return Ok(references);
+        }
+        Self::extend_command_payload_references_with_stream_encryption(
+            &mut references,
+            payload,
+            |bucket, key, session| {
+                self.load_stream_upload_encryption_for_pending_subject(bucket, key, session)?
+                    .map(Some)
+                    .ok_or_else(|| {
+                        incomplete("missing exact stream encryption for pending payload")
+                    })
+            },
+        )?;
+        Ok(references)
+    }
+
+    fn validate_terminal_stream_reference_subjects(
+        payload: &MetadataCommandPayload,
+    ) -> Result<(), StoreError> {
+        let incomplete = |reason: &str| StoreError::ShardScavengerScanIncomplete {
+            context: "derive pending command payload inventory",
+            errors: reason.to_owned(),
+        };
+        let terminal = match payload {
+            MetadataCommandPayload::CommitMultipartObject(command) => Some((
+                &command.object.bucket,
+                &command.object.key,
+                &command.stream_uploads,
+                &command.stream_upload_segments,
+            )),
+            MetadataCommandPayload::AbortMultipartUpload(command) => Some((
+                &command.bucket,
+                &command.key,
+                &command.cleanup.stream_uploads,
+                &command.cleanup.stream_upload_segments,
+            )),
+            _ => None,
+        };
+        if let Some((bucket, key, headers, segments)) = terminal {
+            let mut sessions = std::collections::HashSet::new();
+            for header in headers {
+                if header.bucket != *bucket
+                    || header.key != *key
+                    || !sessions.insert(&header.session_id)
+                {
+                    return Err(incomplete("crossed or duplicate terminal stream header"));
+                }
+            }
+            if segments
+                .iter()
+                .any(|segment| !sessions.contains(&segment.session_id))
+            {
+                return Err(incomplete(
+                    "missing terminal stream encryption for pending payload",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn encode_pending_payload_reference_pages(
+        references: &[ShardScavengerPayloadReference],
+    ) -> Result<PendingShardScavengerReferencePages, StoreError> {
         let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
         let mut placed_reference_count = 0u32;
         let mut placed_pages: Vec<Vec<u8>> = Vec::new();
@@ -2611,6 +2722,14 @@ impl PgStore {
             "list multipart reclaim segment shard scavenger references",
         )?;
         self.extend_scavenger_pending_command_references(&mut references)?;
+        if let Some(window) = self
+            .pending_staging_protection(topology)?
+            .and_then(|read| read.window)
+        {
+            references.push(ShardScavengerPayloadReference::ProtectionOnly(
+                window.protection.identity,
+            ));
+        }
         super::payload_staging::extend_scavenger_protection_references(
             &self.conn,
             PgId::new(self.pg_id()),
@@ -2641,14 +2760,30 @@ impl PgStore {
             context: "decode pending metadata command for shard scavenger references",
             errors: reason.to_string(),
         })?;
-        self.extend_scavenger_command_payload_references(references, command.payload())
+        Self::extend_command_payload_references_with_stream_encryption(
+            references,
+            command.payload(),
+            |bucket, key, session| {
+                self.load_stream_upload_encryption_for_pending_subject(bucket, key, session)
+            },
+        )
     }
 
-    fn extend_scavenger_command_payload_references(
-        &self,
+    /// Shared payload projection. Pending installation and complete contexts
+    /// require exact-subject geometry; source-bearing abandonment supplies its
+    /// retained encryption. Historical discovery may have lost the live session:
+    /// `None` keeps exact identities protected without inventing placed geometry
+    /// or authorizing backfill. Lookup/decoding errors still fail the scan closed.
+    pub(super) fn extend_command_payload_references_with_stream_encryption(
         references: &mut Vec<ShardScavengerPayloadReference>,
         payload: &MetadataCommandPayload,
+        stream_encryption: impl Fn(
+            &BucketName,
+            &ObjectKey,
+            &SessionId,
+        ) -> Result<Option<ObjectEncryption>, StoreError>,
     ) -> Result<(), StoreError> {
+        Self::validate_terminal_stream_reference_subjects(payload)?;
         match payload {
             MetadataCommandPayload::CommitDirectPutObject(command) => {
                 Self::extend_object_segment_references(
@@ -2692,24 +2827,40 @@ impl PgStore {
             }
             MetadataCommandPayload::AppendStreamSegment(command) => {
                 if let Some(encryption) =
-                    self.load_stream_upload_encryption_for_session(&command.segment.session_id)?
+                    stream_encryption(&command.bucket, &command.key, &command.segment.session_id)?
                 {
                     Self::extend_stream_segment_reference(
                         references,
                         &command.segment,
                         &encryption,
                     )?;
+                } else {
+                    Self::extend_stream_segment_protection(
+                        references,
+                        std::slice::from_ref(&command.segment),
+                    );
                 }
             }
             MetadataCommandPayload::AbortStreamUpload(command) => {
+                // Validate the entire set before resolving encryption or
+                // extending the inventory: a valid prefix must not conceal a
+                // later segment belonging to another session.
+                if !command.has_consistent_segment_subjects() {
+                    return Err(StoreError::ShardScavengerScanIncomplete {
+                        context: "derive pending command shard scavenger reference subjects",
+                        errors: "abort segment belongs to another stream session".into(),
+                    });
+                }
                 if let Some(encryption) =
-                    self.load_stream_upload_encryption_for_session(&command.session_id)?
+                    stream_encryption(&command.bucket, &command.key, &command.session_id)?
                 {
                     Self::extend_stream_segment_references(
                         references,
                         &command.staged_segments,
                         &encryption,
                     )?;
+                } else {
+                    Self::extend_stream_segment_protection(references, &command.staged_segments);
                 }
             }
             MetadataCommandPayload::CommitStreamPart(command) => {
@@ -2785,6 +2936,24 @@ impl PgStore {
         Ok(())
     }
 
+    fn extend_stream_segment_protection(
+        references: &mut Vec<ShardScavengerPayloadReference>,
+        segments: &[StreamUploadSegmentRecord],
+    ) {
+        for segment in segments {
+            Self::push_protected_reference(
+                references,
+                segment.data_pg_id,
+                segment.segment_okh,
+                segment.segment_vid,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+        }
+    }
+
     fn extend_stream_segment_references(
         references: &mut Vec<ShardScavengerPayloadReference>,
         segments: &[StreamUploadSegmentRecord],
@@ -2832,7 +3001,10 @@ impl PgStore {
                 .iter()
                 .find(|upload| upload.session_id == segment.session_id)
             else {
-                continue;
+                return Err(StoreError::ShardScavengerScanIncomplete {
+                    context: "derive pending command payload inventory",
+                    errors: "missing terminal stream encryption for pending payload".into(),
+                });
             };
             Self::extend_stream_segment_reference(references, segment, &stream_upload.encryption)?;
         }
@@ -2874,7 +3046,7 @@ impl PgStore {
         match payload {
             ObjectPayloadReclaimCommand::Segments(reclaim) => {
                 for segment in &reclaim.segments {
-                    Self::push_reclaim_reference(
+                    Self::push_protected_reference(
                         references,
                         segment.data_pg_id,
                         segment.segment_okh,
@@ -2886,7 +3058,7 @@ impl PgStore {
             ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                 for part in &reclaim.parts {
                     for segment in &part.segments {
-                        Self::push_reclaim_reference(
+                        Self::push_protected_reference(
                             references,
                             segment.data_pg_id,
                             segment.segment_okh,
@@ -2906,7 +3078,7 @@ impl PgStore {
         references.push(ShardScavengerPayloadReference::Placed(reference));
     }
 
-    fn push_reclaim_reference(
+    fn push_protected_reference(
         references: &mut Vec<ShardScavengerPayloadReference>,
         data_pg_id: u32,
         okh: [u8; 16],
@@ -3046,15 +3218,17 @@ impl PgStore {
         })
     }
 
-    fn load_stream_upload_encryption_for_session(
+    fn load_stream_upload_encryption_for_pending_subject(
         &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<Option<ObjectEncryption>, StoreError> {
         self.query_row_cached_optional(
-            "SELECT encryption_type, encryption_state \
-             FROM stream_uploads WHERE session_id = ?1",
-            params![session_id.as_str()],
-            "load stream upload encryption for shard scavenger pending references",
+            "SELECT encryption_type, encryption_state FROM stream_uploads \
+             WHERE session_id = ?3 AND bucket = ?1 AND key = ?2",
+            params![bucket, key, session_id.as_str()],
+            "load exact stream encryption for pending payload inventory",
             |row| {
                 Self::parse_object_encryption(
                     row.get::<_, u8>(0)?,

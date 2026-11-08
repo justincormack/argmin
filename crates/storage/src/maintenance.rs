@@ -1335,7 +1335,15 @@ impl StorageShardScavengerAuditScanner {
         let complete = match result {
             Ok(step) => step.is_none(),
             Err(error) => {
-                if !Arc::ptr_eq(&storage_cluster, &storage_handle.current()) {
+                if self
+                    .pass
+                    .as_ref()
+                    .is_some_and(|(_, pass)| pass.reference_scan_invalid())
+                    || !Arc::ptr_eq(&storage_cluster, &storage_handle.current())
+                {
+                    // A malformed cycle or exhausted restart budget cannot
+                    // certify a partial inventory. Back off, then start a fresh
+                    // pass, dropping prior absence evidence as well.
                     self.pass = None;
                     self.prior_unreferenced.clear();
                 }
@@ -1358,6 +1366,51 @@ enum ShardScavengerAuditRunOutcome {
     Complete,
     Progress,
     Deferred,
+}
+
+// Called by the authenticated multi-page peer regression with the actual
+// invalidated pass; no raw progress-state setter is exposed for test setup.
+#[cfg(test)]
+pub(crate) fn assert_scavenger_progress_failure_restarts_cleanly(
+    cluster: Arc<crate::StorageCluster>,
+    pass: ShardScavengerAuditPass,
+) {
+    assert!(pass.reference_scan_invalid());
+    let route = StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let key = crate::ShardKey::new(&[9; 16], 1, 0);
+    let mut scanner = StorageShardScavengerAuditScanner {
+        pass: Some((cluster, pass)),
+        prior_unreferenced: HashSet::from([crate::types::ShardScavengerObservationKey {
+            node_id: 0,
+            data_pg_id: 0,
+            shard_index: key.shard_index(),
+            shard_key: key,
+        }]),
+    };
+    assert!(scanner
+        .scan_next(&route)
+        .unwrap_err()
+        .to_string()
+        .contains("requires fresh discovery"));
+    assert!(scanner.pass.is_none());
+    assert!(scanner.prior_unreferenced.is_empty());
+    let tmp = test_util::tempdir();
+    let healthy = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &[crate::NodeId::new(0)],
+        &[0],
+        crate::EcShape { k: 1, m: 0 },
+    )
+    .unwrap();
+    let healthy_route = StorageClusterRouteHandle::from_static_cluster(healthy).unwrap();
+    assert!(!scanner.scan_next(&healthy_route).unwrap());
+    assert!(
+        scanner.pass.is_some(),
+        "fresh reference discovery must happen first"
+    );
+    assert!(!scanner.scan_next(&healthy_route).unwrap());
+    assert!(scanner.scan_next(&healthy_route).unwrap());
+    assert!(scanner.pass.is_none());
 }
 
 fn shard_scavenger_next_interval(
