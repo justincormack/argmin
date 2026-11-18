@@ -34,8 +34,78 @@ mod context_submission;
 #[path = "payload_staging_application_tests.rs"]
 mod application;
 
+#[path = "payload_staging_component_transaction_tests.rs"]
+mod component_transaction;
+
 #[path = "payload_staging_command_context_tests.rs"]
 mod command_context;
+
+#[path = "payload_staging_context_carrier_tests.rs"]
+mod context_carrier;
+
+#[path = "payload_staging_complete_terminal_tests.rs"]
+mod complete_terminal;
+#[path = "payload_staging_terminal_custody_tests.rs"]
+mod terminal_custody;
+
+#[path = "payload_staging_complete_pending_tests.rs"]
+mod complete_pending;
+
+#[path = "payload_staging_complete_reissue_tests.rs"]
+mod complete_reissue;
+
+#[path = "payload_staging_complete_application_tests.rs"]
+mod complete_application;
+
+#[path = "payload_staging_complete_log_range_tests.rs"]
+mod complete_log_range;
+
+#[path = "payload_staging_complete_hash_range_tests.rs"]
+mod complete_hash_range;
+
+#[path = "payload_staging_complete_hash_rpc_tests.rs"]
+mod complete_hash_rpc;
+#[path = "payload_staging_complete_log_rpc_tests.rs"]
+mod complete_log_rpc;
+#[path = "payload_staging_complete_log_transport_tests.rs"]
+mod complete_log_transport;
+#[path = "payload_staging_complete_maintenance_tests.rs"]
+mod complete_maintenance;
+#[path = "payload_staging_complete_maintenance_rpc_tests.rs"]
+mod complete_maintenance_rpc;
+
+#[path = "payload_staging_complete_inspection_tests.rs"]
+mod complete_inspection;
+
+#[path = "payload_staging_complete_recovery_tests.rs"]
+mod complete_recovery;
+
+#[path = "payload_staging_settled_prefix_tests.rs"]
+mod settled_prefix;
+
+#[path = "payload_staging_complete_node_startup_tests.rs"]
+mod complete_node_startup;
+
+#[path = "payload_staging_complete_bootstrap_tests.rs"]
+mod complete_bootstrap;
+
+#[path = "payload_staging_complete_pending_rpc_tests.rs"]
+mod complete_pending_rpc;
+
+#[path = "payload_staging_complete_applied_rpc_tests.rs"]
+mod complete_applied_rpc;
+
+#[path = "payload_staging_complete_abandoned_rpc_tests.rs"]
+mod complete_abandoned_rpc;
+
+#[path = "payload_staging_complete_acceptance_rpc_tests.rs"]
+mod complete_acceptance_rpc;
+
+#[path = "payload_staging_complete_publication_tests.rs"]
+mod complete_publication;
+
+#[path = "payload_staging_terminal_work_tests.rs"]
+mod terminal_work;
 
 #[path = "payload_staging_context_reissue_tests.rs"]
 mod context_reissue;
@@ -103,6 +173,9 @@ mod object;
 #[path = "payload_staging_object_overwrite_tests.rs"]
 mod object_overwrite;
 
+#[path = "payload_staging_displaced_retirement_tests.rs"]
+mod displaced_retirement;
+
 #[path = "payload_staging_completion_tests.rs"]
 mod completion;
 
@@ -130,7 +203,7 @@ mod epoch_order;
 #[path = "payload_staging_abort_tests.rs"]
 mod abort;
 
-fn topology() -> PgTopology {
+pub(super) fn topology() -> PgTopology {
     PgTopology::new(&[0, 1, 2, 3, 4, 5, 6, 7]).unwrap()
 }
 

@@ -5,6 +5,11 @@ use super::*;
 use crate::metadata_command::validate_metadata_command_recovery_certificate;
 use crate::BucketAclSummary;
 
+// Not selected by live recovery until coordinated complete-command activation.
+#[allow(dead_code)]
+#[path = "unix_complete_log.rs"]
+mod complete_log;
+
 struct UnixRetainedPlacedShardRoute<'a> {
     client: &'a UnixStorageNodeClient,
     location: crate::cluster::ShardLocation,
@@ -1866,6 +1871,11 @@ impl ShardScavengerObservationRoute for UnixShardScavengerObservationRoute<'_> {
 
 #[allow(dead_code)]
 impl UnixStorageNodeClient {
+    #[cfg(test)]
+    pub(crate) fn test_execution_endpoint(&self) -> &StorageRpcClientEndpoint {
+        &self.endpoint
+    }
+
     pub(crate) fn new(
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
@@ -1910,6 +1920,7 @@ impl UnixStorageNodeClient {
         rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     ) -> Self {
         Self {
+            instance: Arc::new(UnixStorageNodeClientInstance),
             node_id,
             cluster_epoch,
             endpoint,
@@ -2083,6 +2094,190 @@ impl UnixStorageNodeClient {
             )
             .map_err(StorageRpcRequestDispatchFailure::NotSent)?;
         self.rpc_request_result_with_permit_until(kind, payload, rpc_permit, deadline)
+    }
+
+    /// Closed replica-abandonment attempt. Original primary confirmation and
+    /// serialization remain borrowed until this one authenticated exchange ends.
+    pub(in crate::node_runtime) fn send_complete_replica_abandonment(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteReplicaAbandonmentAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompleteAbandonmentSendError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandRecordAbandoned;
+        if let Err(error) = attempt.require_client(self) {
+            return Err(attempt.not_sent(error));
+        }
+        let payload = match attempt.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        match self.rpc_request_result_until(KIND, payload, attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    /// Closed current-replica operation borrowed from the original owning
+    /// publication holder. There is no automatic replay after a dispatch error.
+    pub(in crate::node_runtime) fn send_complete_application(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        if attempt.node_id() != self.node_id || attempt.id().cluster_epoch() != self.cluster_epoch {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete application client subject",
+                }),
+            );
+        }
+        self.send_admitted_complete_application(attempt)
+    }
+
+    /// Current authenticated clients may address a historical command only
+    /// through the exact admitted cohort and primary-reported complete digest.
+    pub(in crate::node_runtime) fn send_complete_fanout_application(
+        &self,
+        route: &crate::cluster::CompleteFanoutRoute<'_>,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        if let Err(error) = route
+            .require_client(self)
+            .and_then(|()| attempt.require_fanout_route(route))
+        {
+            return Err(attempt.not_sent(error));
+        }
+        if attempt.node_id() != self.node_id || self.node_id == route.primary() {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete fanout replica client subject",
+                }),
+            );
+        }
+        self.send_admitted_complete_application(attempt)
+    }
+
+    fn send_admitted_complete_application(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandApplyAndRecord;
+        let payload = match attempt.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        match self.rpc_request_result_until(KIND, payload, attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    // Owner fixture only: keep the transport wait longer than the deliberately
+    // expiring command cutoff, so the regression observes receiver rejection.
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_complete_application_request_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result_until(
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            payload,
+            deadline,
+        )
+        .map_err(StorageRpcRequestDispatchFailure::into_source)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_staging_file_request_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result_until(StorageRpcMessageKind::StagingShardWrite, payload, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)
+    }
+
+    pub(in crate::node_runtime) fn send_direct_staging_file(
+        &self,
+        attempt: &crate::node_runtime::pg_store::RemoteDirectFileAttempt<'_, '_>,
+    ) -> Result<WriteAck, crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::StagingShardWrite;
+        attempt.require_client(self)?;
+        match self.rpc_request_result_until(KIND, attempt.bytes().to_vec(), attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(self.rpc_response_error(KIND, error).into()),
+            Err(error) => Err(error.into_source().into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_staging_ack_request_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result_until(
+            StorageRpcMessageKind::StagingShardAckRecord,
+            payload,
+            deadline,
+        )
+        .map_err(StorageRpcRequestDispatchFailure::into_source)
+    }
+
+    pub(in crate::node_runtime) fn send_stream_staging_file(
+        &self,
+        attempt: &crate::node_runtime::pg_store::RemoteStreamFileAttempt<'_, '_>,
+    ) -> Result<WriteAck, crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::StagingShardWrite;
+        attempt.require_client(self)?;
+        match self.rpc_request_result_until(KIND, attempt.bytes().to_vec(), attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(self.rpc_response_error(KIND, error).into()),
+            Err(error) => Err(error.into_source().into()),
+        }
+    }
+
+    pub(in crate::node_runtime) fn send_staging_acknowledgements(
+        &self,
+        attempt: &crate::node_runtime::pg_store::RemoteStagingAcknowledgementAttempt<'_, '_>,
+    ) -> Result<(), crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::StagingShardAckRecord;
+        attempt.require_client(self)?;
+        match self.rpc_request_result_until(KIND, attempt.bytes().to_vec(), attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(self.rpc_response_error(KIND, error).into()),
+            Err(error) => Err(error.into_source().into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_replica_abandonment_request_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result_until(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+            deadline,
+        )
+        .map_err(StorageRpcRequestDispatchFailure::into_source)
     }
 
     fn rpc_request_result_with_permit_until(
@@ -4103,7 +4298,63 @@ impl RetainedStreamUploadAbortMetadataRoute for UnixRetainedStreamUploadAbortMet
     }
 }
 
+impl UnixStorageNodeClient {
+    pub(in crate::node_runtime) fn complete_settled_witness_prefix_with_cutoff_until(
+        &self,
+        pg_id: PgId,
+        epoch: ClusterEpoch,
+        deadline: Instant,
+        cutoff: StorageRpcOperationDeadline,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        use crate::storage_rpc::complete_settled_prefix as wire;
+        const OPERATION: &str = "complete settled witness prefix";
+        if epoch != self.cluster_epoch
+            || !self
+                .pg_topology
+                .as_ref()
+                .is_some_and(|t| t.contains_pg(pg_id))
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: OPERATION,
+            });
+        }
+        require_metadata_command_operation_deadline(deadline)?;
+        // The caller already froze and skew-shortened authority. Preserve it
+        // independently of the local IO wait; do not mint a new portable lease.
+        // No automatic retry can turn a raw response into settled evidence.
+        let request = wire::Request {
+            node: self.node_id,
+            pg: pg_id,
+            epoch,
+            deadline: cutoff,
+            topology: wire::topology_digest(self.pg_topology.as_ref().expect("validated topology")),
+        };
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+            wire::encode_request(request),
+            deadline,
+        )?;
+        require_metadata_command_operation_deadline(deadline)?;
+        wire::decode_response(&response, request)
+            .map_err(|error| self.rpc_payload_error(OPERATION, error.to_string()))
+    }
+}
+
 impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
+    fn complete_settled_witness_prefix_until(
+        &self,
+        pg_id: PgId,
+        epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.complete_settled_witness_prefix_with_cutoff_until(
+            pg_id,
+            epoch,
+            deadline,
+            StorageRpcOperationDeadline::from_instant(deadline),
+        )
+    }
+
     fn max_metadata_command_log_index(
         &self,
         pg_id: PgId,

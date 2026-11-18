@@ -131,10 +131,12 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         decoded.clean_len,
         u64::try_from(bytes.len() - header_len).unwrap()
     );
+    let frozen = raft_test_decode_hex(include_str!("wal_v2_command_v20_state_v32.hex"));
+    assert_eq!(bytes, crate::tests::frozen_hex_fixture(include_str!("wal_v2_command_v21_state_v33.hex")));
     assert_eq!(
         (
-            bytes.len(),
-            raft_test_hex(&checksum::sha256::digest(&bytes))
+            frozen.len(),
+            raft_test_hex(&checksum::sha256::digest(&frozen))
         ),
         (
             714,
@@ -629,11 +631,13 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         .decode_file_header(&compacted_bytes)
         .unwrap();
     assert_eq!(compacted_base, checkpoint_offset);
+    let frozen = raft_test_decode_hex(include_str!("compaction_v6_state_v32.hex"));
+    assert_eq!(checkpoint_artifact_bytes, crate::tests::frozen_hex_fixture(include_str!("compaction_v6_state_v33.hex")));
     assert_eq!(
         (
             checkpoint_offset,
-            checkpoint_artifact_bytes.len(),
-            raft_test_hex(&checksum::sha256::digest(&checkpoint_artifact_bytes)),
+            frozen.len(),
+            raft_test_hex(&checksum::sha256::digest(&frozen)),
             compacted_bytes.len(),
             raft_test_hex(&checksum::sha256::digest(&compacted_bytes))
         ),

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 12;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 13;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -787,6 +787,7 @@ CREATE TABLE metadata_command_pending_route_dependencies (
     dependency_count   INTEGER NOT NULL CHECK (dependency_count BETWEEN 0 AND 5),
     encoded_dependencies BLOB NOT NULL CHECK (length(encoded_dependencies) = dependency_count * 17),
     dependency_checksum INTEGER NOT NULL,
+    command_sha256     BLOB NOT NULL CHECK (length(command_sha256) = 32),
     FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
 ) STRICT";
 
@@ -886,7 +887,30 @@ PRAGMA foreign_keys=ON;
 /// Version zero is accepted only while the database has no user schema objects. Any
 /// existing unversioned or differently versioned schema is unsupported and
 /// fails closed; this project does not currently migrate PG databases.
-pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
+/// Consume the unpublished store so failure/unwind also closes its connection.
+/// Schema admission is not complete-command recovery or confirmation eligibility.
+pub(super) fn initialize(store: super::PgStore) -> Result<super::PgStore, StoreError> {
+    #[cfg(test)]
+    let mut store = store;
+    #[cfg(test)]
+    transaction_tests::before_initialize(&mut store)?;
+    let result = initialize_inner(&store);
+    #[cfg(test)]
+    transaction_tests::after_initialize(&store, &result);
+    result?;
+    Ok(store)
+}
+
+fn initialize_inner(store: &super::PgStore) -> Result<(), StoreError> {
+    use super::metadata_transaction::{with_rollback_error, MetadataTransaction};
+
+    store.require_usable_connection()?;
+    if !store.conn.is_autocommit() {
+        return Err(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "schema initialization requires autocommit",
+        });
+    }
+    let conn = &store.conn;
     conn.execute_batch(PG_PRAGMAS)
         .map_err(|source| StoreError::Db {
             context: "configure PG database",
@@ -903,11 +927,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
         });
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|source| StoreError::Db {
-            context: "begin PG schema initialization",
-            source: source.into(),
-        })?;
+    let transaction = MetadataTransaction::begin_outer(store, "begin PG schema initialization")?;
     let result = (|| {
         let version = pg_schema_version(conn)?;
         if version == CURRENT_PG_SCHEMA_VERSION {
@@ -944,20 +964,24 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
             source: source.into(),
         })
     })();
+    #[cfg(test)]
+    let result = result.and_then(|()| transaction_tests::before_commit(store));
     match result {
-        Ok(()) => conn.execute_batch("COMMIT").map_err(|source| {
-            let _ = conn.execute_batch("ROLLBACK");
-            StoreError::Db {
-                context: "commit PG schema initialization",
-                source: source.into(),
-            }
-        }),
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
+        Ok(()) => transaction.commit("commit PG schema initialization"),
+        Err(error) => Err(with_rollback_error(error, transaction.rollback())),
     }
 }
+
+// Owner-local malformed-schema fixtures retain the rejected connection to
+// assert non-mutation. Production initialization always consumes the store.
+#[cfg(test)]
+pub(super) fn test_initialize(store: &super::PgStore) -> Result<(), StoreError> {
+    initialize_inner(store)
+}
+
+#[cfg(test)]
+#[path = "schema_transaction_tests.rs"]
+mod transaction_tests;
 
 pub(crate) fn require_current_pg_schema(conn: &Connection) -> Result<(), StoreError> {
     let version = pg_schema_version(conn)?;
@@ -1306,6 +1330,10 @@ mod tests {
             version: 12,
             catalogue: include_str!("schema_manifests/pg_schema_v12.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 13,
+            catalogue: include_str!("schema_manifests/pg_schema_v13.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1406,19 +1434,28 @@ mod tests {
         );
     }
 
+    fn memory_store() -> super::super::PgStore {
+        super::super::PgStore::uninitialized(
+            0,
+            Default::default(),
+            Default::default(),
+            Connection::open_in_memory().unwrap(),
+        )
+        .unwrap()
+    }
+
     fn in_memory_schema() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        init_pg_schema(&conn).unwrap();
-        conn
+        initialize(memory_store()).unwrap().conn
     }
 
     #[test]
     fn init_pg_schema_records_and_accepts_only_the_current_version() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_pg_schema(&conn).unwrap();
-        assert_eq!(pg_schema_version(&conn).unwrap(), CURRENT_PG_SCHEMA_VERSION);
+        let pg = memory_store();
+        let conn = &pg.conn;
+        initialize_inner(&pg).unwrap();
+        assert_eq!(pg_schema_version(conn).unwrap(), CURRENT_PG_SCHEMA_VERSION);
 
-        init_pg_schema(&conn).unwrap();
+        initialize_inner(&pg).unwrap();
     }
 
     #[test]
@@ -1430,7 +1467,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1496,30 +1533,32 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_existing_unversioned_schema() {
-        let conn = Connection::open_in_memory().unwrap();
+        let pg = memory_store();
+        let conn = &pg.conn;
         conn.execute("CREATE TABLE obsolete_layout (value INTEGER)", [])
             .unwrap();
 
-        let error = init_pg_schema(&conn).unwrap_err();
+        let error = initialize_inner(&pg).unwrap_err();
         assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
         assert!(error
             .to_string()
             .contains("unversioned database contains 1 user schema objects"));
-        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+        assert_eq!(pg_schema_version(conn).unwrap(), 0);
     }
 
     #[test]
     fn init_pg_schema_rejects_an_existing_unversioned_view() {
-        let conn = Connection::open_in_memory().unwrap();
+        let pg = memory_store();
+        let conn = &pg.conn;
         conn.execute("CREATE VIEW legacy_view AS SELECT 1", [])
             .unwrap();
 
-        let error = init_pg_schema(&conn).unwrap_err();
+        let error = initialize_inner(&pg).unwrap_err();
         assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
         assert!(error
             .to_string()
             .contains("unversioned database contains 1 user schema objects"));
-        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+        assert_eq!(pg_schema_version(conn).unwrap(), 0);
         let view_count: u32 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'legacy_view'",
@@ -1532,7 +1571,8 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_and_preserves_unversioned_sqlitex_objects() {
-        let conn = Connection::open_in_memory().unwrap();
+        let pg = memory_store();
+        let conn = &pg.conn;
         conn.execute_batch(
             "CREATE TABLE sqliteX_existing_table (value INTEGER); \
              CREATE VIEW sqliteX_existing_view AS \
@@ -1540,12 +1580,12 @@ mod tests {
         )
         .unwrap();
 
-        let error = init_pg_schema(&conn).unwrap_err();
+        let error = initialize_inner(&pg).unwrap_err();
         assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
         assert!(error
             .to_string()
             .contains("unversioned database contains 2 user schema objects"));
-        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+        assert_eq!(pg_schema_version(conn).unwrap(), 0);
         let object_count: u32 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_schema \
@@ -1559,11 +1599,12 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13] {
-            let conn = Connection::open_in_memory().unwrap();
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14] {
+            let pg = memory_store();
+            let conn = &pg.conn;
             conn.pragma_update(None, "user_version", version).unwrap();
 
-            let error = init_pg_schema(&conn).unwrap_err();
+            let error = initialize_inner(&pg).unwrap_err();
             assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
             assert!(error.to_string().contains(&format!(
                 "unsupported version {version}; expected {CURRENT_PG_SCHEMA_VERSION}"

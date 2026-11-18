@@ -305,9 +305,9 @@ pending commands.
 
 Cross-PG reservation routes are stored in a bounded sidecar in the same
 transaction as the pending slot. Its integrity checksum binds the complete
-command ID, command checksum, and every retained route dependency, so heartbeat
+command ID, command CRC64, command SHA-256, and every retained route dependency, so heartbeat
 construction does not read, allocate, hash, or decode the command envelope.
-Schema 12 uses up to five tagged 17-byte dependency records (bucket-route hash
+Schema 13 additionally stores the mandatory 32-byte command digest and uses up to five tagged 17-byte dependency records (bucket-route hash
 or exact PG), ordered without duplicates. Exact PGs are not rehashed and must
 belong to the configured topology. Current commands still project only their
 ordinary reservation; the new owner-window descriptors and their exact pending
@@ -396,6 +396,442 @@ recapture an old descriptor. Production dispatch is not yet switched to these
 capture components.
 The slot remains the durable cleanup owner: terminal cleanup releases every
 command-owned reservation before removing the exact pending slot.
+
+The candidate complete publication-start component preserves the existing
+trial-and-marker transaction protocol. It validates the exact pending carrier,
+scope and indexes, applies the complete transition under a savepoint, rolls it
+back, then commits the marker. An opaque admitted-primary authority retains the
+command, locked store, serialization section, route lease and work deadline;
+effect/commit checks cannot be replaced with a caller-provided callback. Applied
+replay skips trial effects. Failed rollback retires the connection, and every
+failure leaves publication custody unresolved rather than licensing cleanup.
+Current publication requires the Active primary. Candidate historical publication,
+over Unix/TLS or embedded storage, instead requires the current Peering map's
+exact recovery report and retained Active-primary route. The embedded entry
+authenticates the supplied report snapshot against the dynamic admission's full
+map-content identity and selects the runtime from that admission, not from a
+caller-supplied node or old map. Its shared PG serialization scope retains the
+reported command epoch/index/CRC64/complete-command SHA-256 and a bounded current-map fence. Same-epoch
+renewal cannot extend that captured fence. The report grants admission only:
+the store still checks exact complete command/context bytes or applied evidence.
+Only owner tests select these candidate components; live publisher selection,
+frontend custody and end-to-end recovery handoffs remain gated. No additional
+ordinary-path transaction or fsync is introduced.
+
+The candidate current-replica application receiver similarly requires opaque
+authority bound to the exact complete command, configured topology, locked store,
+Active admission domain and server PG serialization registry. Primary-session
+locks must also match the current PG/epoch. The captured route/work cutoff bounds
+lock waits and is rechecked before the first transactional mutation and before
+commit. Exact replay validates the complete terminal identity without repeating
+owner transfers or log mutations. The raw apply adapter and failure callbacks
+are unit-test-only; production callers cannot substitute independently supplied
+commands or a mutation callback. This component adds no transaction or fsync.
+The installed candidate Unix/TLS receiver also accepts exact report-authorized
+historical application. It binds the report's PG/epoch/index/CRC64/complete-command SHA-256, requires
+its reporter to be the retained Active primary, and validates historical member
+and Peering placement. The reporting primary must hold its exact recovery session;
+replicas serialize locally. A bounded current-map fence, intersected with the
+immutable work cutoff, is rechecked at the existing effect/commit boundaries.
+Lost replies keep the original holder uncertain; exact retry and reopen validate
+complete identity without repeating mutation. Historical embedded selection and
+mixed-cohort fanout and quiescent slot retirement are described below;
+other non-quiescent terminal recovery transfers remain a separate gate; independent
+command/source reservation release is described below.
+The candidate embedded receiver instead borrows an exact current acting-set
+target from its admitted primary section, keeping that section's shared PG guard
+alive through application. It never recursively locks the same PG for a replica.
+The private node owner selects the embedded runtime/store and binds the complete
+identity, topology and original route/section/request cutoffs; the same transaction
+rechecks them before fresh effects and commit, including replay. Nonmembers cannot
+mint targets; historical sections require the separately report-authorized
+selection described below. The owning candidate fanout holder
+now selects this embedded receiver only through a primary section from its exact
+original admission/PG/epoch. It borrows the retained command and first cutoff
+without a wire round-trip or fresh submission, records uncertainty before local
+application, and preserves prior confirmation across failed retries. The same
+ordering rule serves embedded and remote members: witness before primary, primary
+before trailing replicas, with all-member evidence required for terminal handoff.
+Handoff retains the same command and installation/application histories; neither
+failed handoff nor Drop manufactures cleanup or retirement. Current embedded slot
+retirement and historical fanout/quiescent handoff are described below;
+remaining non-quiescent historical terminal work and live frontend selection remain gated.
+An owner-test-selected Unix/TLS receiver now carries the complete context and
+an absolute conservative wall cutoff, rebound once before context decoding.
+It returns an application-specific, exact-command/state confirmation only after
+the admitted apply transaction. Restart and lost-reply retry preserve no-write
+replay. The candidate owning publication holder now sends current-replica
+application through closed Unix/TLS operations, including on its held primary
+session. Application requires confirmed publication; the original complete
+context, installation/publication history and first cutoff remain in that same
+holder. Each target independently retains unconfirmed or confirmed application
+history across explicit retries. Not-sent attempts cannot erase earlier
+uncertainty, and later errors cannot erase exact application evidence. These
+are per-peer observations, not an acting-set completion or retirement capability.
+A consuming pre-publication bind now captures the entire Active acting set from
+the original route admission, narrowing the holder's frozen cutoff if necessary.
+The bound sender accepts only the exact registered clients and the primary's
+own session, not another client with matching node/endpoint fields. It requires
+the lowest-ID non-primary witness confirmation before primary application and
+primary confirmation before trailing application. All-member completion evidence
+borrows this holder and its admission; a quorum or ambiguous reply is insufficient.
+Captured route expiry invalidates that evidence even after same-epoch map renewal.
+This candidate evidence still cannot remove a slot, release resources or delete
+payload. A consuming terminal handoff now retains the same holder and all its
+history, returning that holder on incomplete or expired completion. It derives
+scalar work diagnostics from the exact complete context, separating command-proof
+release, command payload cleanup, durable reclaim handoff and the additional
+retained finalizer proof of a source-bound abort. Those diagnostics are not
+resource authority or evidence of cleanup; an empty observation does not mean
+the durable owner has no outstanding work. Neither handoff nor Drop performs
+effects. Its closed command-proof release operation now retains that context,
+binds release to its complete SHA-256 identity, and derives the exact proof and
+historical bucket route internally. The first local/absolute-wire cutoff cannot
+be renewed on retries. Entered attempts remain unconfirmed after error or unwind;
+only exact success/absence confirms release, and an already confirmed release is
+not dispatched again. Live PUT-stream creation proofs remain retained. This is
+not a release of every durable-owner resource. The additional finalizer in a
+source-bound UploadPart abort now has a separate closed release and observation,
+derived from the authenticated source retained inside the complete context. It
+requires all-member cleanup application, never a tombstone alone or a missing
+session. Ordinary aborts have no such release. The source's original historical
+bucket route and first cutoff survive cleanup reissue and explicit retry; neither
+proof's confirmation changes the other's history. Durable release-due evidence
+remains conservative for later owner transitions. Described Direct PUT and other
+retained resources still need their respective owner protocol.
+The local exact-slot retirement prerequisite now requires both that all-member
+terminal holder and admitted primary authority. Its direct invocation remains
+test-only. It accepts commands with no immediate
+payload/release/reclaim work, and the separately checked UploadPart creation
+handoff below; it validates exact Applied evidence and all pending
+indexes/scope, and retains uncertainty across failed deletion/commit confirmation.
+Slot retirement leaves every materialized owner obligation intact; zero payload
+counts alone never grant it. The closed sender now lends an operation-specific
+retirement attempt to the original registered primary and held session, preserving
+the first cutoff and uncertainty history. Purpose-tagged confirmation binds the
+complete command SHA-256 and exact node/position; later unsent attempts cannot
+erase uncertainty, and confirmed retirement does not redispatch. The candidate
+Unix/TLS receiver now independently validates current Active-primary admission,
+the exact session/lock domain, and complete-context eligibility. Its pre-lock
+captured server route fence and receiver-bound wire/work cutoff are rechecked
+before DELETE and COMMIT. Exact absence with authenticated terminal evidence and
+no orphan indexes confirms without repeated mutation, including after restart and
+compaction. Peer completion remains the owning sender's guarantee, not a certificate
+inferred from wire framing. The same owning terminal holder now selects closed
+embedded retirement using a primary section from its exact original admission,
+PG and epoch. A private node owner locks the selected store and combines its
+publication authority with the stack-only all-member terminal permit; neither is
+sufficient alone. Original route/work and narrower attempt/section cutoffs reach
+the existing pre-DELETE/pre-COMMIT checks, also for absence confirmation. Both
+transports share the owning attempt's uncertainty and confirmed-retirement history;
+errors/unwind cannot detach custody, and confirmed retirement never redispatches
+against a later slot. No new encoding, transaction or fsync is added.
+
+UploadPart creation additionally requires the sender's confirmed exact creation
+reservation release. The receiver independently checks the retained immutable
+introduction, initial window/participants, exact creation `ReleaseDue` proof and
+generation high-water fence inside the same deletion transaction, including an
+absent-slot retry. Bounded indexed reads avoid scanning later append/finalizer
+history. Owner and proof rows survive removal: this is pending-slot retirement,
+not cleanup completion or session continuity. A claimed remote release is not
+accepted as authority to discard durable responsibility. Other non-quiescent
+terminal cases remain gated, as does mandatory live selection.
+
+For introduction/append contexts with a future window, the retired terminal
+holder can now be consumed into a confirmed-window holder through a fresh
+embedded or Unix/TLS primary/witness inspection. It retains the exact complete
+context, all installation/application/release/retirement history and original
+admission. The confirmation attempt cannot extend the publication or immutable
+window cutoff. Failure returns the same terminal custody; a lost reply requires
+explicit fresh confirmation, never a synthesized positive observation. Success
+has no reverse conversion, raw descriptor extraction or physical-effect API.
+Embedded streamed PUT/UploadPart can consume it through the candidate one-slot
+allocator: the existing cursor transaction revalidates the original prefix,
+window, issuer/session/generation and cutoffs under primary/PG serialization.
+The resulting allocation or failure keeps the complete custody and has no
+reset/retry conversion. An ambiguous commit never yields a grant. This adds no
+ordinary transaction/fsync or durable/wire format change. Direct PUT and remote
+allocation, guarded physical effects and mandatory live selection remain gated.
+
+Owner tests
+also exercise this handoff with an embedded primary and simultaneous authenticated
+Unix/TLS peers, including each witness transport, lost peer/primary confirmations,
+no-write exact retries and frozen-route expiry. Remote-primary/embedded-replica
+application now uses a closed target derived from the original admitted cohort,
+exact registered primary client and live borrowed session. The session borrow
+excludes concurrent local transport/shutdown through the replica transaction;
+failed exchanges and peer-declared closure invalidate further use. It is not a
+remote-liveness guarantee
+or a substitute for exact primary confirmation. Both directions retain the same
+command holder, cutoff, ordering and uncertainty evidence. Historical embedded
+application now borrows the report-authorized embedded primary section. Its
+targets require old Active membership and current or retained Peering placement;
+the exact reported complete SHA-256 is rechecked before store acquisition and at
+transactional effect/commit, including replay. It retains the same section,
+admission and bounded cutoffs, with no additional transaction or fsync. A separate
+historical remote-primary route now admits embedded replicas using the same
+authenticated report and placement rules. The exact registered primary client
+and its live historical session are borrowed through the transaction; acquisition
+is deadline-aware and failed exchanges revoke that session. The admitted route
+selects the historical session epoch on the registered current-epoch client;
+the raw epoch-selecting opener is private. Report SHA-256,
+route, target and original work cutoffs are enforced before store access and at
+effect/commit. This receiver-only route cannot mint fanout completion or slot
+retirement.
+
+Historical fanout now binds the owning sender to the
+complete original Active cohort, not merely the subset eligible for individual
+receiver admission. Every original member must have current or retained Peering
+placement; missing members reject before binding or effects. Embedded, Unix and
+TLS endpoints can share a cohort under either an embedded or remote primary.
+Remote sends require the exact clients registered in the admitted map; local
+shadow stores cannot substitute. Historical replica transport additionally checks
+the opaque cohort's exact report before allowing an old command epoch on that
+current authenticated client; ordinary sends keep their epoch equality check.
+Binding checks the report's exact command
+ID, CRC64 and complete SHA-256 and retains the original installation history and
+work cutoff. Application requires the primary section from that exact admission
+and report. The canonical witness precedes primary application, which precedes
+trailing replicas; lost confirmation requires exact retry, including after
+restart. The owning sender opens the historical primary session at its reported
+command epoch through the current registered client, with unchanged current
+authentication. Opening/reopening intersects the attempt, frozen work and
+captured route cutoffs; raw epoch selection remains client-private. Remote-primary
+embedded targets recheck the report's complete identity before store access and
+at effect/commit. Session borrowing and deadline-bearing sends use deadline-aware
+mutex acquisition; immutable PG identity checks cannot block ahead of that wait.
+Not-sent timeout preserves prior uncertainty and does not revoke another holder's
+session. Historical all-member completion can now be consumed into a terminal
+holder for a quiescent complete context or independent command/source reservation
+release. Other commands with immediate payload or reclaim work still return their
+original holder. Exact slot retirement
+uses the original primary section, with no context reconstruction or history
+reset. Remote admission independently binds the exact historical primary/report
+(including complete SHA-256), local Active gate and held lock/domain. The
+pre-wait captured route fence and original work cutoff remain effective at DELETE
+and COMMIT even after raw renewal. Embedded retirement keeps its report-bound
+section through the same checks. Lost replies preserve uncertainty; exact
+absence can confirm without writes, while a confirmed holder never removes a
+later slot. Materialized owners, references and resource obligations survive
+retirement unchanged; it grants no physical cleanup permission.
+The closed releases select either the command's exact proof or the source-bound
+abandoned finalizer's separate proof, through that proof's original bucket-PG/epoch
+route, even when a different node is
+the current bucket primary. Production route-reference discovery supplies that
+exact epoch to storage-node refresh. It retains the original complete context,
+source, uncertainty and cutoffs across loss/retry; SQL rechecks the cutoff beside
+DELETE. Exact absence confirms an uncertain release without further writes,
+including after restart from the retained pending context. PUT stream creation
+keeps its live proof; ordinary UploadPart abort supplies no command proof. Durable resource evidence,
+physical work and pending-slot ownership remain untouched; even successful proof
+release does not make this non-quiescent context eligible for slot retirement.
+Owner tests alone select these paths; live dispatch still rejects this grammar.
+
+The candidate primary also has a consuming unstarted-abandonment holder for
+embedded and authenticated Unix/TLS execution.
+It retains the same complete context/source, installation history, admitted
+cohort and first work/route cutoffs; it cannot be converted back into a fresh
+publication submission. Observed/uncertain publication or application prevents
+this handoff. Under the original primary serialization, the transaction requires
+the exact pending bytes, indexes and bucket scope, an unset publication marker,
+and no applied terminal evidence. It records the SHA-256-bound tombstone without
+applying the command, deleting the pending slot, transferring resource custody
+or deleting payload. A confirmed existing tombstone is a no-write retry; errors,
+unwind and lost confirmation preserve uncertainty. Failed rollback retires the
+connection. Historical admission requires the exact control-plane report and
+original primary, not current-map substitution. This is **primary-only**: it is
+not all-replica abandonment, cleanup/follow-up authority or epoch reissue.
+The closed remote attempt retains that same holder across session reopening,
+not-sent failure, lost reply and exact retry. Its purpose-tagged request carries
+the complete context and the first conservative absolute wall cutoff; the
+receiver binds it to monotonic time before decoding and intersects its pre-wait
+route fence. Receiver-owned authority independently requires Active admission in
+its own domain and the exact held current/historical primary lock/report. That
+authority reaches the common transaction and final INSERT/COMMIT checks. A
+confirmation binds node, command ID and complete SHA-256; even an authenticated
+crossed confirmation cannot resolve uncertainty. Only owner tests select this
+receiver; the live predecessor decoder still rejects the candidate grammar.
+
+After primary tombstone confirmation, that same holder can now record tombstones
+on **embedded** replicas. A private borrowed permit binds the exact complete
+context, replica and original admitted primary section or Unix/TLS primary
+session. It cannot be minted from a raw target or an ordinary publication permit.
+The receiver opens its own PG under this retained serialization and rechecks the
+captured cutoffs beside INSERT and COMMIT. A replica may have no pending slot;
+an existing slot must match exact bytes, scope, indexes and unset publication
+marker. Orphan indexes, crossed terminal identity and applied state fail closed.
+Exact tombstones confirm without writes. Per-replica uncertainty survives errors,
+unwind and lost replies; restart rebuilds confirmation by exact reinspection.
+Neither a single replica confirmation nor the complete set grants cleanup,
+resource release, source extraction or pending-slot retirement. Follow-up
+construction and its durable custody transfer are still gated.
+
+Owner tests now exercise the remote replica **receiver** over authenticated
+Unix/TLS. Its separate `RABD`/`RAOK` V1 purpose binds the configured primary,
+recipient, complete command and mandatory conservative absolute cutoff. It
+requires its own Active admission/domain, a distinct current or exact
+report-authorized historical replica, and locally acquired PG serialization.
+It never borrows a held primary session. The captured server route fence and
+rebound wire cutoff reach the same replica transaction and final INSERT/COMMIT
+checks; renewal cannot extend either. Acknowledgement is emitted only after
+commit and binds both nodes, command ID and complete SHA-256. Replica restart
+replays exact tombstones without writes. Primary confirmation remains a sender
+custody obligation, not a fact certified by these wire fields. Only test-only
+dispatch selects this receiver; live production selection remains disabled.
+
+The same primary-confirmed holder now owns remote replica attempts. Each attempt
+borrows its original context/history and either the exact embedded primary
+section or the exact registered Unix/TLS primary session. The remote session's
+mutex remains held through the replica exchange, with acquisition bounded by
+the attempt, original work and admitted route cutoffs. Encoding requires this
+attempt's own transport, not a separately decoded identical command with a new
+deadline. The recipient must be the exact client registered in the captured
+current/historical cohort. Only an exact purpose/primary/recipient/ID/SHA reply
+confirms that member. Not-sent failures restore its previous observation;
+ambiguous transport, bad replies, remote rejection and unwind leave it uncertain.
+Confirmed members are not redispatched, and other members' history is unchanged.
+Restart reauthenticates the retained primary and independently reconfirms exact
+replica tombstones without replaying writes. This grants no all-member cleanup
+or terminal/follow-up capability and does not select live publication paths.
+
+The holder now has a consuming **all-member abandonment handoff**. It checks the
+original immutable authority and requires primary confirmation plus every exact
+replica in its captured cohort, including historical cohorts. Quorum, duplicated
+confirmation, or a committed tombstone whose reply was lost is insufficient.
+Failure returns the same owning holder with all observations intact. Success
+moves that entire holder into a private, non-cloneable representation; it does
+not reconstruct a submission, expose a source, renew authority, or accept an
+independently supplied command. Only scalar observations remain available. This
+no-effect handoff is the prerequisite for admitted follow-up preparation, not
+permission to delete or release anything.
+
+For an abandoned UploadPart finalizer, the handoff can now consume into an
+owning, unsent cleanup pair under its exact **current embedded-primary** section.
+One read snapshot revalidates the complete source, unstarted pending slot and
+protection indexes, authenticates its tombstone, captures current owner/session
+state, and derives the successor position from that same log prefix. The original
+deadline is checked again after snapshot teardown. Failure returns the unchanged
+handoff; success keeps its source, proof responsibility and installation history
+private beside the source-bearing cleanup candidate. No installable context,
+fresh submission or cleanup right escapes. Historical source authority is
+explicitly insufficient to mint a successor: separately admitted historical
+transfer and remote-primary preparation remain gated.
+
+That same owning pair can now replace its source slot under the original current
+embedded-primary section. One write transaction reauthenticates the unstarted
+source tombstone and all pending indexes, requires the captured log prefix, and
+recaptures the exact owner/session cleanup closure before replacing the slot and
+its protection indexes together. Admission and the immutable work deadline are
+checked immediately before the first write and COMMIT. The private attempt
+borrows the pair's installation history exclusively: an unconfirmed attempt's
+entered error or unwind leaves it unconfirmed, including a lost successful reply;
+failed preflight never resets earlier uncertainty or confirmation. Once confirmed,
+retry validates the supplied authority and returns without redispatching. This
+records past installation, not continued slot ownership; later transitions must
+validate their own prerequisites. Unconfirmed exact cleanup replay validates
+scope and every index without rewriting a started/applied command. The source,
+candidate and proof responsibility remain inseparable. Replacement does not apply
+the cleanup, release resources, authorize shard deletion or select the live
+publisher path.
+
+After confirmed installation, this same pair can publish the cleanup under its
+current embedded-primary section. A private borrowed permit derives the exact
+source-bearing request and **borrows the original source's frozen deadline**;
+the bridge accepts no independently supplied context or original request. The
+lower boundary checks the cleanup identity and deadline-owner identity as well
+as the admitted domain/store/primary. The existing publication transaction
+revalidates the slot/indexes, trial-applies and rolls back cleanup, then commits
+only the publication marker. A lost reply or unwind retains publication
+uncertainty without changing installation confirmation or source history.
+Confirmed publication is not redispatched, but still requires valid supplied
+authority. Uncertain applied replay authenticates the retained complete identity
+without repeating proof/resource transfers. Publication confirmation alone does
+not grant terminal transfer or physical cleanup.
+
+The pair also owns closed application to its original embedded/Unix/TLS cohort,
+under the current embedded primary. The
+supplied section must match the original admission domain; targets come from
+that section, and requests borrow the same source-bearing cleanup and frozen
+deadline. The lowest-ID non-primary witness must confirm before primary apply;
+the primary must confirm before trailing members. Each peer's entered error or
+unwind remains unconfirmed, including a committed lost reply, without changing
+the original source, installation or publication histories. Confirmed application
+cannot regress on failed exact retries. Shared replica apply authenticates the
+source and atomically transfers session/proof responsibility; exact replay does
+not repeat those effects. These per-peer observations are not terminal authority:
+the primary slot remains installed and the pair has no cleanup Drop.
+Remote replica sends validate the original registered client
+identity, retain both commands throughout transport and authenticate the reply's
+node, command ID, complete SHA-256 and applied prefix. A definitive unsent attempt
+restores its prior observation; ambiguous transport, malformed authenticated
+replies and unwind retain uncertainty. No automatic retry or renewed cutoff is
+introduced.
+
+After confirmed installation/publication and exact application on every original
+member, a consuming handoff moves the entire pair into an opaque abandoned-part
+terminal owner. It neither re-encodes a command nor reopens transport. Failure
+returns the same prepared pair with all histories intact. The terminal owner
+retains both source and cleanup, the original cohort/cutoff and the source's
+installation history; scalar work describes outstanding obligations, not cleanup
+success. Even an empty cleanup retains its finalizer-proof responsibility.
+There is no reverse conversion or command/ordinary-sender extraction, and neither
+handoff nor Drop releases a resource or removes a pending slot. The terminal pair
+now has a closed retained-finalizer reservation release: a private borrowed
+permit binds the exact complete cleanup (including its original source), admitted
+route and first local/wire cutoff to the existing proof-release protocol. It
+accepts no caller-selected proof, target, deadline or callback. Errors and unwind
+after entry retain `Unconfirmed`; authenticated success records `Released`, which
+cannot regress or redispatch. An exact absence retry confirms a lost release
+reply without repeating the mutation. This releases only the source finalizer's
+bucket reservation, not the retained owner-resource row, payload, generation or
+pending slot; the pair remains non-quiescent. Non-quiescent retirement for this
+pair, remote-primary/historical cleanup preparation/publication and live selection
+remain gated.
+
+The terminal pair can inspect local retained custody through its exact admitted
+embedded-primary section. One read snapshot authenticates the complete cleanup's
+applied identity and original source abandonment, validates the terminal owner,
+retained windows, generation high-water fence and exact finalizer obligation, and
+rejects surviving live session/generation state. Every unpublished abort manifest
+must bind every selected window plus exactly one unused lookahead; an empty
+manifest therefore permits only one retained window. For proof-only cleanup of an
+already-published owner, the retained window/reference projection must match the
+authenticated source finalizer's complete segment manifest, including cardinality,
+sizes and placement geometry. Legitimate Part/Object/Reclaim destinations remain
+intact; structural agreement between corrupted windows and references is not
+sufficient. The
+result contains scalar counts only, not a cached validation certificate or
+permission to delete, release resources, or retire a pending slot. Original
+authority is rechecked after inspection; no snapshot, raw context, inventory or
+callback escapes. Read-snapshot teardown uses the existing connection-retirement
+protection. The physical-exclusion/retirement gates are unchanged.
+
+The candidate bounded local settled-prefix reader reuses only a connection-local
+entry minted by complete startup validation. It binds the PG/topology, replica
+prefix, live store identity and SQLite local/external/schema change stamps.
+Startup rejects foreign-PG log rows, receipts and checkpoints across all retained
+epochs before minting that entry. This subject validation may scan retained keys;
+database changes invalidate the entry, and hot lookup never repeats that scan.
+Lookup holds a read-only snapshot and rejects pending custody or log, receipt or
+checkpoint evidence beyond the stored epoch/position, including future epochs.
+Cold or changed state requires explicit validation, never implicit repair
+or a checkpoint scan. Closed same-epoch complete apply can advance an existing
+validated entry through its own transaction; cold state and epoch transitions
+still require full validation. The application implementation is nested under
+the private cache owner, with no caller-supplied refresh callback or "mark clean"
+API. It consumes the old entry before effects, captures the successor before
+commit, and retains it only if the original stamp still matches afterward.
+Errors, rollback/unwind, intervening writes and uncertain teardown cannot bless
+transaction-local state. Exact replay never promotes a cold entry. Other SQL
+writes still invalidate validation. Pending-slot/retirement advancement and
+primary/witness admission remain prerequisites before hot-path selection. Its
+local prefix observation is not a write grant, global settlement certificate or
+cleanup authority, and introduces no new ordinary-path transaction/fsync.
+
+Physical cleanup, non-quiescent/owner retirement,
+remaining non-quiescent historical terminal work, reissue and durable follow-up
+custody transfer, frontend payload/proof custody
+and the live switch remain open.
 
 Heartbeat collection observes PGs independently, so a slot insertion and a
 reservation release cannot be captured atomically across PGs. The control plane

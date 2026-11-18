@@ -122,6 +122,13 @@ impl StagingCapture<'_> {
 }
 
 impl DescribedStagingCommand {
+    pub(super) fn introduction_cutoff_ms(&self) -> Result<u64, DescriptorError> {
+        match &self.descriptor {
+            CommandDescriptor::Introduction(descriptor) => Ok(descriptor.cutoff_ms()),
+            CommandDescriptor::Append(_) => Err(DescriptorError::Encoding("not an introduction")),
+        }
+    }
+
     /// Immutable construction context, not a new admission or route lookup.
     /// Submission inspection deliberately does not expose this owning type.
     pub(super) fn captured_topology(&self) -> &PgTopology {
@@ -162,6 +169,15 @@ impl DescribedStagingCommand {
 
     pub(in super::super) fn command(&self) -> &MetadataCommandEnvelope {
         &self.command
+    }
+
+    pub(super) fn matches_remote_direct_request(
+        &self,
+        request: &crate::storage_rpc::complete_direct_introduction::Request,
+        cutoff: u64,
+    ) -> bool {
+        matches!(&self.descriptor, CommandDescriptor::Introduction(descriptor)
+            if descriptor.matches_remote_direct_request(request, self.command.id(), cutoff))
     }
 
     /// Compare retained inputs without lending either candidate or allocating
@@ -226,6 +242,18 @@ impl DescribedStagingCommand {
 }
 
 impl BoundStagingCandidate<'_> {
+    pub(in super::super) fn require_creation_retirement(
+        &self,
+        pg: &PgStore,
+    ) -> Result<(), CandidateBindingError> {
+        match &self.0 {
+            BoundDescriptor::Introduction(bound) => {
+                bound.require_creation_retirement(pg).map_err(Into::into)
+            }
+            BoundDescriptor::Append(_) => Err(CandidateBindingError::CommandKind),
+        }
+    }
+
     pub(in super::super) fn pending_protection(&self) -> PendingStagingProtection<'_> {
         match &self.0 {
             BoundDescriptor::Introduction(bound) => bound.pending_protection(),

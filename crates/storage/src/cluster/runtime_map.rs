@@ -1237,9 +1237,9 @@ impl StorageClusterRouteHandle {
             return Err(
                 PendingMetadataCommandRefreshRecoveryError::AuthorizationChanged {
                     pg_id: pg_id.get(),
-                    expected: expected_recovery,
+                    expected: Box::new(expected_recovery),
                     actual_state: current_route.state(),
-                    actual: actual_recovery,
+                    actual: actual_recovery.map(Box::new),
                 },
             );
         }
@@ -1307,6 +1307,7 @@ impl StorageClusterRouteHandle {
                 && candidate_id.pg_id() == pg_id
                 && candidate_id.log_index().get() == pending.log_index()
                 && candidate.checksum_crc64() == pending.command_checksum()
+                && candidate.command_sha256() == pending.command_sha256()
         };
         let authorized_source = if observation_matches(&command) {
             command.clone()
@@ -1331,9 +1332,11 @@ impl StorageClusterRouteHandle {
                     expected_epoch: pending.cluster_epoch(),
                     expected_index: pending.log_index(),
                     expected_checksum: pending.command_checksum(),
+                    expected_sha256: Box::new(pending.command_sha256()),
                     actual_epoch: command_id.cluster_epoch(),
                     actual_index: command_id.log_index().get(),
                     actual_checksum: command.checksum_crc64(),
+                    actual_sha256: Box::new(command.command_sha256()),
                 },
             );
         };

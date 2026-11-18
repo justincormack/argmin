@@ -288,7 +288,7 @@ fn staging_application_abandoned_part_requires_live_durable_source_evidence() {
         let owner = part::initialize(&pg, 2);
         let source = part::command(&pg, &owner);
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
-        let carrier = PartFinalizationSource::capture(&source).unwrap();
+        let carrier = PartFinalizationSource::capture_for_test(&source).unwrap();
         let topology = topology();
         let candidate = carrier.clone().bind_cleanup(cleanup, &topology).unwrap();
         let context = ContextualCommand::abandoned_part(candidate, &topology).unwrap();

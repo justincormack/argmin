@@ -375,7 +375,7 @@ fn staging_reissue_submission_rejects_invalid_positions_without_consuming_source
 }
 
 #[test]
-fn staging_reissue_submission_rollback_recovery_preserves_pair_and_original_slot() {
+fn staging_reissue_submission_rollback_retirement_preserves_pair_until_reopen() {
     let _clock = test_time_override_guard(2_000);
     for (target, is_append) in candidate::cases() {
         for failures in [1, 2] {
@@ -395,7 +395,7 @@ fn staging_reissue_submission_rollback_recovery_preserves_pair_and_original_slot
             let before = introduction::state(&pg);
             let mut pair = reissue(source);
             pg.conn.execute_batch("CREATE TEMP TRIGGER fail_reissue BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'reissue sidecar failure'); END;").unwrap();
-            pg.test_fail_pending_slot_rollbacks(failures);
+            pg.test_fail_metadata_command_rollbacks(failures);
             let writes = pg.conn.total_changes();
             let error = pair.replace(&pg, 0, &topology()).unwrap_err();
             assert!(
@@ -404,17 +404,19 @@ fn staging_reissue_submission_rollback_recovery_preserves_pair_and_original_slot
             );
             assert!(error
                 .to_string()
-                .contains("injected pending-slot rollback failure"));
+                .contains("injected metadata-command rollback failure"));
             assert!(
                 pg.conn.total_changes() > writes,
                 "failure did not follow replacement writes"
             );
             let mut pair = require_unresolved(pair);
-            if failures == 1 {
-                assert!(pg.conn.is_autocommit());
-                assert_eq!(pending_install::observe(&pg), original);
-            } else {
+            {
                 assert!(!pg.conn.is_autocommit());
+                assert_eq!(
+                    pg.fail_metadata_command_rollbacks.get(),
+                    failures - 1,
+                    "teardown secretly retried rollback"
+                );
                 assert!(matches!(
                     pair.replace(&pg, 0, &topology()),
                     Err(SubmissionError::Unconfirmed(_))

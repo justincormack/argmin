@@ -12,6 +12,14 @@ use crate::tests::metadata_only_test_encryption;
 use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind, PgState};
 use std::sync::mpsc;
 
+fn kept_metadata_session_success(payload: &[u8]) -> Vec<u8> {
+    let mut response = encode_storage_rpc_success_response(payload);
+    // Like the installed server, advertise retention when another operation or
+    // session Drop is expected. The default envelope declares connection close.
+    crate::storage_rpc::set_storage_rpc_response_connection_reusable(&mut response, true).unwrap();
+    response
+}
+
 fn append_stream_segment_command_for_rpc_test(
     session_id: SessionId,
     target: StreamUploadTarget,
@@ -294,7 +302,7 @@ fn metadata_command_session_drop_closes_without_release_round_trip() {
         let acquire_response = StorageRpcFrame {
             request_id: acquire.request_id,
             kind: acquire.kind,
-            payload: encode_storage_rpc_success_response(&[]),
+            payload: kept_metadata_session_success(&[]),
         };
         write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
         let started = Instant::now();
@@ -2689,7 +2697,7 @@ fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
             &StorageRpcFrame {
                 request_id: acquire.request_id,
                 kind: acquire.kind,
-                payload: encode_storage_rpc_success_response(&[]),
+                payload: kept_metadata_session_success(&[]),
             },
         )
         .unwrap();
@@ -2715,7 +2723,7 @@ fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
             &StorageRpcFrame {
                 request_id: frame.request_id,
                 kind: frame.kind,
-                payload: encode_storage_rpc_success_response(&payload),
+                payload: kept_metadata_session_success(&payload),
             },
         )
         .unwrap();
@@ -2741,7 +2749,7 @@ fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
             &StorageRpcFrame {
                 request_id: frame.request_id,
                 kind: frame.kind,
-                payload: encode_storage_rpc_success_response(&payload),
+                payload: kept_metadata_session_success(&payload),
             },
         )
         .unwrap();
@@ -2958,7 +2966,7 @@ fn metadata_command_session_result_from_fake_response<R>(
         let acquire_response = StorageRpcFrame {
             request_id: acquire.request_id,
             kind: acquire.kind,
-            payload: encode_storage_rpc_success_response(&[]),
+            payload: kept_metadata_session_success(&[]),
         };
         write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
 
@@ -2966,7 +2974,7 @@ fn metadata_command_session_result_from_fake_response<R>(
         let response = StorageRpcFrame {
             request_id: request.request_id,
             kind: request.kind,
-            payload: encode_storage_rpc_success_response(&target_payload),
+            payload: kept_metadata_session_success(&target_payload),
         };
         write_storage_rpc_frame_to(&mut stream, &response).unwrap();
 
@@ -3004,7 +3012,7 @@ fn metadata_command_recovery_session_result_from_fake_response<R>(
         let acquire_response = StorageRpcFrame {
             request_id: acquire.request_id,
             kind: acquire.kind,
-            payload: encode_storage_rpc_success_response(&[]),
+            payload: kept_metadata_session_success(&[]),
         };
         write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
 
@@ -3012,7 +3020,7 @@ fn metadata_command_recovery_session_result_from_fake_response<R>(
         let response = StorageRpcFrame {
             request_id: request.request_id,
             kind: request.kind,
-            payload: encode_storage_rpc_success_response(&target_payload),
+            payload: kept_metadata_session_success(&target_payload),
         };
         write_storage_rpc_frame_to(&mut stream, &response).unwrap();
 

@@ -245,7 +245,7 @@ fn staging_object_overwrite_requires_unique_owner_even_for_empty_objects() {
                     };
                     generation.reservation_id = duplicate.subject.id.attempt.clone();
                     sql::insert(
-                        &pg.conn,
+                        &pg,
                         duplicate.subject.object_pg,
                         &topology(),
                         &duplicate.validate(&topology()).unwrap(),

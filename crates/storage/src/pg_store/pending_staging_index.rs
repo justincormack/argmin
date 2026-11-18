@@ -71,17 +71,18 @@ fn checksum(id: MetadataCommandId, command_checksum: u64, bytes: &[u8]) -> u64 {
 
 fn require_existing(
     pg: &PgStore,
-    command: &MetadataCommandEnvelope,
+    id: MetadataCommandId,
+    command_checksum: u64,
     bytes: &[u8],
 ) -> Result<(), StoreError> {
-    if pg.conn.is_autocommit() || pg.pg_id() != command.id().pg_id().get() {
+    if pg.conn.is_autocommit() || pg.pg_id() != id.pg_id().get() {
         return Err(invalid());
     }
     // Equality is checked in SQL: no unbounded malformed blob is loaded. Even
     // an empty index must exist and bind the exact command position/checksum.
     let matches: bool = pg.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM metadata_command_pending_staging_protection WHERE singleton = 0 AND command_checksum = ?1 AND encoded_protection = ?2 AND protection_checksum = ?3)",
-        params![command.checksum_crc64() as i64, bytes, checksum(command.id(), command.checksum_crc64(), bytes) as i64],
+        params![command_checksum as i64, bytes, checksum(id, command_checksum, bytes) as i64],
         "check exact pending staging protection", |row| row.get(0),
     )?;
     if matches {
@@ -101,64 +102,121 @@ pub(super) struct PendingStagingIndex<'a> {
 
 impl<'a> PendingStagingIndex<'a> {
     pub(super) fn require_existing(&self, pg: &PgStore) -> Result<(), StoreError> {
-        require_existing(pg, self.command, &self.bytes)
+        require_existing(
+            pg,
+            self.command.id(),
+            self.command.checksum_crc64(),
+            &self.bytes,
+        )
     }
 
     pub(super) fn from_bound(protection: &'a PendingStagingProtection<'_>) -> Self {
         let (command, topology, subject, window) = protection.index_inputs();
-        let mut bytes = topology_digest(topology).to_vec();
-        bytes.extend_from_slice(subject.id.attempt.as_str().as_bytes());
-        bytes.extend_from_slice(&subject.id.introduction.cluster_epoch().get().to_be_bytes());
-        bytes.extend_from_slice(&subject.id.introduction.log_index().get().to_be_bytes());
-        bytes.extend_from_slice(&window.index.to_be_bytes());
-        bytes.extend_from_slice(&window.participants.data_pg.get().to_be_bytes());
-        bytes.extend_from_slice(&window.segment_hash);
-        bytes.extend_from_slice(&window.start.get().to_be_bytes());
-        bytes.extend_from_slice(&window.participants.placement_epoch.get().to_be_bytes());
-        bytes.extend([window.geometry.ec.k, window.geometry.ec.m]);
-        bytes.extend_from_slice(
-            &window
-                .participants
-                .acknowledgement_primary
-                .as_u32()
-                .to_be_bytes(),
-        );
-        for node in &window.participants.files {
-            bytes.extend_from_slice(&node.as_u32().to_be_bytes());
-        }
-        debug_assert!(bytes.len() <= MAX_BYTES);
         Self {
             command,
             topology,
-            bytes,
+            bytes: encode_window(topology, subject, window),
         }
     }
 
     /// The caller owns the slot transaction. This never opens/commits a new
     /// transaction, and rejects substitution before touching the index.
     pub(super) fn install_in_open_transaction(
-        self,
+        &self,
         pg: &PgStore,
         topology: &PgTopology,
     ) -> Result<(), StoreError> {
-        if pg.conn.is_autocommit()
-            || self.topology != topology
-            || pg.pg_id() != self.command.id().pg_id().get()
-        {
+        if self.topology != topology {
             return Err(invalid());
         }
-        let matches = pg.query_row_cached_optional(
+        pg.install_exact_pending_staging_index(
+            self.command.id(),
+            self.command.checksum_crc64(),
+            &self.command.command_bytes(),
+            &self.bytes,
+        )
+    }
+}
+
+fn encode_window(
+    topology: &PgTopology,
+    subject: &super::payload_staging::StagingSubject,
+    window: &super::payload_staging::StagingWindow,
+) -> Vec<u8> {
+    let mut bytes = topology_digest(topology).to_vec();
+    bytes.extend_from_slice(subject.id.attempt.as_str().as_bytes());
+    bytes.extend_from_slice(&subject.id.introduction.cluster_epoch().get().to_be_bytes());
+    bytes.extend_from_slice(&subject.id.introduction.log_index().get().to_be_bytes());
+    bytes.extend_from_slice(&window.index.to_be_bytes());
+    bytes.extend_from_slice(&window.participants.data_pg.get().to_be_bytes());
+    bytes.extend_from_slice(&window.segment_hash);
+    bytes.extend_from_slice(&window.start.get().to_be_bytes());
+    bytes.extend_from_slice(&window.participants.placement_epoch.get().to_be_bytes());
+    bytes.extend([window.geometry.ec.k, window.geometry.ec.m]);
+    bytes.extend_from_slice(
+        &window
+            .participants
+            .acknowledgement_primary
+            .as_u32()
+            .to_be_bytes(),
+    );
+    for node in &window.participants.files {
+        bytes.extend_from_slice(&node.as_u32().to_be_bytes());
+    }
+    debug_assert!(bytes.len() <= MAX_BYTES);
+    bytes
+}
+
+impl PgStore {
+    fn install_exact_pending_staging_index(
+        &self,
+        id: MetadataCommandId,
+        command_checksum: u64,
+        command_bytes: &[u8],
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if self.conn.is_autocommit() || self.pg_id() != id.pg_id().get() {
+            return Err(invalid());
+        }
+        let matches = self.query_row_cached_optional(
             "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 AND command_checksum = ?4 AND command_bytes = ?5",
-            params![self.command.id().cluster_epoch().get() as i64, i64::from(pg.pg_id()), self.command.id().log_index().get() as i64, self.command.checksum_crc64() as i64, self.command.command_bytes()],
+            params![id.cluster_epoch().get() as i64, i64::from(self.pg_id()), id.log_index().get() as i64, command_checksum as i64, command_bytes],
             "bind pending staging protection to exact slot", |_| Ok(()),
         )?.is_some();
         if !matches {
             return Err(invalid());
         }
-        pg.write_pending_staging_index(
-            self.command.id(),
-            self.command.checksum_crc64(),
-            &self.bytes,
+        self.write_pending_staging_index(id, command_checksum, bytes)
+    }
+
+    pub(super) fn require_complete_pending_staging_index(
+        &self,
+        projection: &super::payload_staging::CompletePendingIndexes<'_>,
+    ) -> Result<(), StoreError> {
+        projection.require_store(self)?;
+        let (topology, window) = projection.index_inputs();
+        let bytes = window.map_or_else(Vec::new, |(subject, window)| {
+            encode_window(topology, subject, window)
+        });
+        let command = projection.command();
+        require_existing(self, command.id(), command.checksum_crc64(), &bytes)
+    }
+
+    pub(super) fn install_complete_pending_staging_index(
+        &self,
+        projection: &super::payload_staging::CompletePendingProjection<'_>,
+    ) -> Result<(), StoreError> {
+        projection.require_store(self)?;
+        let (topology, window) = projection.index_inputs();
+        let bytes = window.map_or_else(Vec::new, |(subject, window)| {
+            encode_window(topology, subject, window)
+        });
+        let command = projection.command();
+        self.install_exact_pending_staging_index(
+            command.id(),
+            command.checksum_crc64(),
+            command.bytes(),
+            &bytes,
         )
     }
 }
@@ -185,7 +243,7 @@ impl PgStore {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), StoreError> {
-        require_existing(self, command, &[])
+        require_existing(self, command.id(), command.checksum_crc64(), &[])
     }
 
     // All calls are made in the enclosing scavenger read snapshot. A cursor

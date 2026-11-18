@@ -558,7 +558,7 @@ fn staging_part_replacement_requires_unique_exact_displaced_owner() {
                 };
                 generation.reservation_id = duplicate.subject.id.attempt.clone();
                 sql::insert(
-                    &pg.conn,
+                    &pg,
                     duplicate.subject.object_pg,
                     &topology(),
                     &duplicate.validate(&topology()).unwrap(),

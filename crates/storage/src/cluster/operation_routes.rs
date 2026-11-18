@@ -203,7 +203,9 @@ enum DirectPutProofCustody {
 /// this scope transfers the exact proof. Earlier failures retain normal release
 /// timing. Unwinding before handoff attempts exact retained proof release;
 /// normal returns leave release/error reporting to the snapshot wrapper.
-/// This is not yet durable generation/owner custody or crash cleanup.
+/// The candidate introduction binding retains accepted/uncertain custody and
+/// blocks legacy entry for that scope. Live generation selection remains on the
+/// existing path until the coordinated switch; this is not crash cleanup.
 /// Generations and staged payloads carry this scope's exact proof and cannot be
 /// passed to another scope, even for the same object on the same admission.
 /// The callback cannot return a live generation reservation:
@@ -229,7 +231,15 @@ pub struct DirectPutWriteScope<'route, 'admission> {
     route: &'route ActivePutObjectRoute<'admission>,
     proof: BucketWriteReservationProof,
     custody: std::cell::Cell<DirectPutProofCustody>,
+    introduction: crate::node_runtime::DirectPutRequestCustody,
 }
+
+type DirectPutIntroductionSubject<'a> = (
+    &'a BucketName,
+    &'a ObjectKey,
+    &'a BucketWriteReservationProof,
+    &'a crate::node_runtime::DirectPutRequestCustody,
+);
 
 impl std::fmt::Debug for DirectPutWriteScope<'_, '_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -240,7 +250,53 @@ impl std::fmt::Debug for DirectPutWriteScope<'_, '_> {
 }
 
 impl DirectPutWriteScope<'_, '_> {
+    /// Read-only projection to the node-runtime owner. The returned custody
+    /// exposes no setter to cluster callers and cannot authorize a write.
+    pub(crate) fn introduction_subject(
+        &self,
+        section: &crate::cluster::EmbeddedPublicationSection<'_>,
+    ) -> Result<DirectPutIntroductionSubject<'_>, StoreError> {
+        if self.custody.get() != DirectPutProofCustody::Frontend || self.introduction.engaged() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "direct PUT request already attempted generation ownership",
+            });
+        }
+        let admission = self.route.admission;
+        let epoch = admission.cluster.operation_epoch();
+        let pg = self.route.object_pg_id.pg_id();
+        let primary = admission.cluster.local_map
+            .metadata_pg_primary_node(epoch, pg)?.node_id();
+        section.require_current_admission(admission, pg, epoch, primary)?;
+        Ok((&self.route.bucket, &self.route.key, &self.proof, &self.introduction))
+    }
+
+    pub(crate) fn introduction_subject_remote(
+        &self,
+        route: &crate::cluster::CompleteFanoutRoute<'_>,
+    ) -> Result<DirectPutIntroductionSubject<'_>, StoreError> {
+        if self.custody.get() != DirectPutProofCustody::Frontend || self.introduction.engaged() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "direct PUT request already attempted generation ownership",
+            });
+        }
+        let admission = self.route.admission;
+        let epoch = admission.cluster.operation_epoch();
+        let pg = self.route.object_pg_id.pg_id();
+        let primary = admission.cluster.local_map
+            .metadata_pg_primary_node(epoch, pg)?.node_id();
+        route.require_current_admission(admission, pg, epoch, primary)?;
+        Ok((&self.route.bucket, &self.route.key, &self.proof, &self.introduction))
+    }
+
     fn finish<T, E>(self, result: Result<T, E>) -> BucketWriteSnapshotAction<T, E> {
+        if self.introduction.engaged() {
+            self.custody.set(DirectPutProofCustody::ReturnedToSnapshotWrapper);
+            return if self.introduction.may_release() {
+                BucketWriteSnapshotAction::release(result)
+            } else {
+                BucketWriteSnapshotAction::transferred_to_command(result)
+            };
+        }
         match self
             .custody
             .replace(DirectPutProofCustody::ReturnedToSnapshotWrapper)
@@ -258,13 +314,13 @@ impl DirectPutWriteScope<'_, '_> {
     }
 
     fn require_frontend_custody(&self) -> Result<(), crate::DirectPutFailure> {
-        if !matches!(
+        if self.introduction.engaged() || !matches!(
             self.custody.get(),
             DirectPutProofCustody::Frontend | DirectPutProofCustody::GenerationAttempted
         ) {
             return Err(crate::DirectPutFailure::from_object_pg_action(
                 ObjectPgActionError::InvalidRequest {
-                    reason: "direct PUT proof already transferred to terminal publication".into(),
+                    reason: "direct PUT proof already bound to introduction or terminal publication".into(),
                 },
             ));
         }
@@ -333,6 +389,7 @@ impl DirectPutWriteScope<'_, '_> {
 
 impl Drop for DirectPutWriteScope<'_, '_> {
     fn drop(&mut self) {
+        if !self.introduction.may_release() { return; }
         if !matches!(
             self.custody.get(),
             DirectPutProofCustody::Frontend | DirectPutProofCustody::GenerationAttempted
@@ -1225,6 +1282,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                         route: self,
                         proof,
                         custody: std::cell::Cell::new(DirectPutProofCustody::Frontend),
+                        introduction: Default::default(),
                     };
                     let result = action(snapshot, &scope);
                     scope.finish(result)

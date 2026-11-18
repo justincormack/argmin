@@ -360,14 +360,16 @@ fn apply_transfers(
             Ok((old.validate(topology)?, retired.validate(topology)?))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    apply_live()?;
-    sql::transfer_multipart_ownership(&pg.conn, PgId::new(pg.pg_id), topology, &checked)?;
-    for (old, retired) in &checked_displaced {
-        sql::retain_object_reclaim(&pg.conn, PgId::new(pg.pg_id), topology, old, retired)?;
-    }
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        apply_live()?;
+        sql::transfer_multipart_ownership(pg, PgId::new(pg.pg_id), topology, &checked)?;
+        for (old, retired) in &checked_displaced {
+            sql::retain_object_reclaim(pg, PgId::new(pg.pg_id), topology, old, retired)?;
+        }
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 fn complete(

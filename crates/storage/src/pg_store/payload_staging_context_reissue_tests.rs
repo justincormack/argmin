@@ -107,7 +107,7 @@ fn abandoned_context(
     cleanup: &MetadataCommandEnvelope,
 ) -> ContextualCommand {
     let topology = topology();
-    let candidate = PartFinalizationSource::capture(source)
+    let candidate = PartFinalizationSource::capture_for_test(source)
         .unwrap()
         .bind_cleanup(cleanup.clone(), &topology)
         .unwrap();

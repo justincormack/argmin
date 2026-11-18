@@ -24,11 +24,110 @@ Its current best-effort cleanup remains unresolved. See the
 [completion cleanup work breakdown](#commitmultipartobject-cleanup-hardening)
 and [priority decision](#critical-path-priority-and-completion-cleanup--2026-11-03).
 
+**Current integration audit — 2026-11-16:** the candidate Direct PUT success
+chain now reaches session-bound reservation release and pending-slot retirement.
+This is not live activation or autonomous owner retirement. The
+[activation audit and ordered work queue](#activation-prerequisite-audit--2026-11-16)
+distinguish the connected candidate paths from remaining production wiring.
+The [embedded introduction builder](#candidate-admitted-direct-put-introduction--2026-11-16)
+now begins that queue, with [owning classified installation](#candidate-owned-direct-put-introduction-installation--2026-11-16).
+Its [owning publication marker](#candidate-direct-put-introduction-publication--2026-11-16)
+is now connected, as is [embedded cohort application](#candidate-direct-put-introduction-embedded-application--2026-11-16).
+The [mixed remote member path](#candidate-direct-put-introduction-mixed-application--2026-11-16)
+is also connected. A [consuming introduction terminal holder](#candidate-direct-put-introduction-terminal-custody--2026-11-16)
+now preserves that entire confirmed owner. Its [section-bound slot retirement](#candidate-direct-put-introduction-slot-retirement--2026-11-16)
+is connected, followed by [section-bound window confirmation](#candidate-direct-put-introduction-window-confirmation--2026-11-16).
+The [consuming physical-writer handoff](#candidate-direct-put-introduction-file-handoff--2026-11-16)
+now binds under that original section and releases it before remote dispatch.
+The [remote builder's read-only receiver admission](#candidate-direct-put-introduction-receiver-capture--2026-11-16)
+now shares the embedded construction algorithm. [Logical framing and held-section
+preparation identity](#candidate-direct-put-introduction-framing--2026-11-17)
+are now available, followed by [exclusive receiver installation custody](#candidate-direct-put-introduction-receiver-installation--2026-11-17).
+The [consuming connection handoff](#candidate-direct-put-introduction-connection-custody--2026-11-17)
+now retains that installation history between receiver calls. The
+[authenticated preparation exchange](#candidate-direct-put-introduction-preparation-transport--2026-11-17)
+is connected through a candidate-only sender/dispatch. Owning socket installation,
+publication, mixed-cohort application, terminal handoff and exact slot retirement
+are now connected, followed by [remote window confirmation](#candidate-remote-direct-put-introduction-window-confirmation).
+The [remote physical-writer handoff](#candidate-remote-direct-put-introduction-file-handoff)
+now preserves that history through confirmed section release. The
+[embedded request-custody binding](#candidate-embedded-direct-put-request-custody)
+now connects preparation and classified installation to the real request scope,
+with the equivalent [held Unix/TLS request binding](#candidate-remote-direct-put-request-custody).
+The [consuming encrypted-payload preparation](#candidate-direct-put-request-encryption-handoff)
+now binds request crypto output to that custody. The
+[encrypted physical dispatch](#candidate-encrypted-direct-put-file-and-acknowledgement-dispatch)
+now uses the existing EC/file/acknowledgement pipeline without detaching the
+buffer or crypto evidence. The [encrypted terminal-preparation handoff](#candidate-encrypted-direct-put-terminal-preparation)
+now preserves those inputs through acknowledgement closure, snapshot inspection,
+reinspection and command preparation. A [single-attempt request decision bridge](#candidate-encrypted-direct-put-request-decision)
+now invokes the existing logical condition callback contract without remapping
+its error. The [encrypted request terminal-chain canaries](#candidate-encrypted-request-terminal-chain)
+now exercise that decision through installation, publication, reservation release
+and slot retirement. The production owner loop remains next; these candidate
+canaries are not live request orchestration. The [terminal-work time bound](#candidate-encrypted-direct-put-terminal-work-bound)
+now starts once at acknowledged-payload handoff and survives later retries. Do not
+confuse that with the complete request loop: the [definitively unaccepted
+terminal retry](#candidate-encrypted-terminal-installation-reinspection) now
+retains encryption evidence and returns custody for fresh inspection, but
+the [admitted read-only prefix validation](#candidate-read-only-prefix-validation-for-direct-reinspection)
+now also handles rollback invalidation without startup recovery. The
+[retained preparation/installation accounting](#candidate-encrypted-terminal-attempt-accounting)
+now carries the same budget through those owning handoffs, followed by
+[publication and terminal accounting](#candidate-encrypted-publication-and-terminal-accounting).
+The [bounded publication step](#candidate-encrypted-direct-put-publication-step)
+now derives the next current-command effect from that retained owner. The
+[embedded contender capture](#candidate-encrypted-direct-put-contender-capture)
+retains one exact competing command with the payload and budget. The
+[quiescent contender drain](#candidate-encrypted-direct-put-quiescent-contender-drain)
+now advances that command through embedded publication and exact retirement;
+non-quiescent contenders, remote draining and live selection remain gated. Do not
+treat the completed physical/terminal chain as permission to switch
+the live publisher in isolation.
+
 **Scope split — 2026-11-06:** checkpoint size/transfer and aggregate-memory fixes
 belong to [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md),
 not this integration. The uncommitted paging experiment is withdrawn. Continue
-cleanup ownership work while keeping transferability an explicit external
-production-activation dependency; the existing limits remain unresolved.
+cleanup ownership independently; the existing limits remain unresolved.
+
+**Scope clarification — 2026-11-17:** checkpoint transferability is pre-existing
+follow-up work scheduled **after this plan is complete**, not a dependency or
+prerequisite for cleanup-ownership production activation or completion. This
+supersedes earlier external-gate wording in the implementation history. Keep
+owner-specific checkpoint representation, validation and round-trip tests here;
+keep general checkpoint size, transfer and aggregate-memory fixes in their own
+plan. Completing this plan does not claim to fix those separate limitations.
+
+**Scope limit — 2026-11-13:** retain the existing settled-prefix validation cache
+and its independently tested [retired-allocation correction](#retired-allocation-cache-miss-correction--2026-11-12).
+Do not make cache removal, exclusive writable PG opening, or a wider
+serialization/ownership redesign prerequisites for the cleanup-ownership work.
+The cache continues checking local changes, external SQLite changes, schema,
+topology and allocation lifetime; unavailable allocation lifetime discards the
+optional apply cache and takes the existing cold apply path. It does not restore
+allocation or confirmation authority.
+
+The per-PG directory-lock experiment and its associated fixture migration are
+withdrawn. Existing storage-node root admission and per-PG operation
+serialization are unchanged. The earlier reviewed transaction/savepoint
+teardown changes remain, including connection retirement after unconfirmed
+rollback; no further transaction or opening redesign is requested here.
+
+The [smaller validation proposal](#settled-prefix-validation-simplification--2026-11-12)
+and [mutation-path audit](#validated-pg-mutation-path-audit--2026-11-12) remain
+design evidence for possible separate work, not this plan's next implementation
+steps. This decision supersedes the cache-removal and opening-closure follow-up
+requirements in the historical entries below. Resume the coordinated
+cleanup-ownership integration using the existing fail-closed cache contract;
+do not waive any command-custody, confirmation or physical-exclusion gate.
+
+**Regression fix retained — 2026-11-13:** the retired-allocator apply defect is
+fixed independently of the deferred structural replacement. A
+missing allocation lifetime invalidates the optional apply cache; it must not
+block convergence of an already-issued command. Passing this regression is not
+evidence that SQL/opening closure or cache removal is complete. See the
+[narrow correction](#retired-allocation-cache-miss-correction--2026-11-12).
+Earlier failure reports below are retained as historical validation evidence.
 
 **Foundation checkpoint decision — 2026-11-06:** commit the reviewed, validated
 intermediate foundations without claiming Milestone 1 activation or completion.
@@ -54,8 +153,8 @@ Three gates are distinct:
    capture, pending protection, accepted/uncertain frontend custody and terminal
    resource/reference transfers must be connected together. Do not expose a
    partially switched custody path or optional-owner compatibility mode.
-3. **Completion:** physical exclusion, autonomous closure/cleanup/retirement,
-   checkpoint-transferability and all end-to-end acceptance requirements pass.
+3. **Completion:** physical exclusion, autonomous closure/cleanup/retirement
+   and all cleanup-ownership end-to-end acceptance requirements pass.
    The six original skipped regressions remain unresolved at this checkpoint.
 
 The checkpoint freezes PG schema 11, canonical state 10, checkpoint 8, applied
@@ -88,7 +187,7 @@ Production command builders/installers/recovery still do not carry mandatory
 complete contexts, dispatch does not activate owner creation/transfers, and
 frontend introduction custody remains unchanged. The owning preparation/reissue
 components are not installation or physical-cleanup authority. The separate
-checkpoint-transferability dependency, physical-authority/worker milestones and
+checkpoint-transferability follow-up, physical-authority/worker milestones and
 all six original skipped regressions remain open. Earlier implementation entries
 calling this work uncommitted describe their state at the time, not a requirement
 to keep the reviewed foundations outside version control.
@@ -103,6 +202,11038 @@ gate in 112.084s and oversized version listing in 64.871s. No other same-user
 Nextest was active at launch and load1 was 0.33. Logs are retained at
 `/tmp/argmin-custody-checkpoint-{fmt,clippy,boundaries,gate,workspace}.log`.
 No production-activation or completion claim is made.
+
+**Coordinated integration started — 2026-11-08:** the first edit connects the
+retained context to a complete canonical command carrier. The candidate applied
+command v14 grammar retains the existing payload grammar and appends the
+mandatory, independently versioned context field. CRC64 and SHA-256 cover both;
+an ordinary abort and the same abort carrying an abandoned finalizer have distinct
+complete identities. The node-runtime decoder validates the context's kind,
+subject and topology and returns only the retained variant, from which the
+owner-aware application dispatcher is selected. It does not return a raw command
+that a caller can downgrade to an ordinary abort. The fragment codec requires a
+separate opaque permit minted only inside the private context-carrier module;
+the broader node-runtime decode authority cannot call it and discard context.
+
+This is **integration work in progress, not a production format switch**. Live
+writers/readers still use command v13 and reject v14; the candidate reader
+rejects v13. There is no runtime format fallback, optional context or
+owner-existence dispatch. This first carrier slice still embedded source V1
+with a v13 original finalizer. The subsequent terminal-identity and source-V2
+steps below replace that draft identity with the **complete v14 identity** in
+the integration components; a draft's v13 checksum/digest is not a valid
+substitute. Production publication/recovery and custody are not yet switched.
+
+Capacity accounts separately for the existing 2 MiB payload and the retained
+source/context overhead: this initial candidate bound was 4 MiB + 29 bytes, with
+per-kind descriptor/source bounds still enforced. This is not an increase to
+live RPC caps. At activation, affected framing/admission caps and complete
+command/source bounds must advance consistently; a maximal supported finalizer
+must not become impossible to abandon merely because its cleanup carries it.
+No checkpoint paging, spool files or checkpoint-limit fix is added here.
+
+Next, connect this identity to the owning submission and transactional pending
+projection, then migrate source authentication, builders, apply/recovery and
+frontend custody together. Do not expose the candidate to production while any
+of those paths can drop its context. The SQL/schema and current format vector
+remain unchanged, as do ordinary-path transaction/fsync cost, physical authority
+and all six original skipped regressions.
+
+Validation for this first carrier slice: formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed. Seven focused tests
+cover descriptor round-trip into apply, explicit ordinary/source-bearing abort
+identity, a CRC-colliding source substitution against a durable tombstone,
+non-mutation, malformed/resealed input, unsupported versions, maximum source and
+complete framing bounds, and literal composite bytes/hashes. The first full run
+stopped on a new test's incorrect `NotAbandoned` expectation: an existing
+tombstone with a different source SHA correctly returns
+`MetadataCommandLogConflict`. The corrected assertion requires that exact error
+and source position, retaining both non-mutation checks; no production behavior
+or existing assertion was relaxed. The final full run passed **9,827 tests**, two
+slow reports, six existing skips, in **275.628s** (run
+`24ea0bcb-5246-423f-916a-ed36c185ec64`). The Raft gate was inspected doing active
+CPU work and passed in 113.342s; oversized version listing passed in 62.300s.
+Logs: `/tmp/argmin-coordinated-carrier-{clippy-final,boundaries,focused-final,workspace-final}.log`.
+
+**Complete terminal-identity integration — 2026-11-08:** the shared durable
+terminal validator now takes an opaque identity derived from either the current
+envelope or the retained complete carrier. Callers cannot independently supply
+its ID, CRC or SHA-256, or substitute the v13 payload draft for the complete v14
+identity. The candidate read-only entry requires an open SQLite snapshot and the
+exact PG. Its result is an observation, not recovery admission, custody transfer
+or permission to delete. Current production callers still supply v13 envelopes;
+their format, transaction and fsync behavior do not change.
+
+Owner-local tests record complete-command abandonment through the same
+transaction/position/log-chain implementation used by production, with a
+test-only complete-command recording adapter. They cover zero/nonzero part
+segments, exact replay, SQLite reopen, log compaction, epoch advancement,
+same-ID/body aborts with different contexts, and a substituted reservation proof
+compensated to preserve the **complete** carrier CRC64. SHA-256 comparison rejects
+that collision for both retained tombstones and compacted receipts. Reduced
+receipt-retention coverage prunes the prefix, authenticates the exact source
+through a later checkpoint, and rejects a missing suffix link. Rejections assert
+unchanged owner state and log position; inspection also asserts no SQL writes.
+
+An append-only abandoned-record-V2 / complete-command-V14 / context-V1 literal
+pins the exact 99-byte tombstone and its CRC64 across reopen. The original v13
+source and tombstone evidence remains unchanged. This step authenticates complete
+**abandonment** identity; it does not enable applied-v14 log decoding, upgrade the
+nested source carrier, or install complete commands in production pending slots.
+Those pieces, mandatory builder/apply/recovery contexts and frontend custody
+must still switch together. SQL/schema/live-format versions, physical authority,
+checkpoint-transfer scope and the six original skipped regressions are unchanged.
+
+Validation: formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and diff checks passed. All seven focused terminal tests also
+passed in the full workspace run: **9,834 passed**, two slow reports, six existing
+skips, in **277.080s** (run `9970f92e-0512-4290-adca-ecb077a3ce15`). The Raft gate
+was inspected doing active CPU work and passed in 110.775s; oversized version
+listing passed in 64.768s. No other same-user Nextest run was active at launch,
+and load1 was below 1. Logs:
+`/tmp/argmin-complete-terminal-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete abandonment-source integration — 2026-11-08:** source carrier V2 now
+retains the complete ordinary V14 finalizer and its context V1, rather than
+minting source identity from a raw V13 payload envelope. Capture lives below the
+private context boundary and copies only the ordinary `CommitStreamPart`
+variant. It exposes no complete context that can be reconstructed as a fresh
+submission; existing submission holders retain their installation observations.
+Raw-draft construction is an explicitly test-only metadata-fixture seam.
+
+Read-only preparation and transactional abandonment application authenticate the
+retained **complete** source using the shared terminal validator. They reject
+even an otherwise valid linked V13 tombstone at the same position, including
+after compaction/reopen. Reissue still retains the original finalizer and its
+release-route dependencies across epochs, not the preceding cleanup command.
+The source is descriptive evidence, not recovery admission or deletion authority.
+
+The independently versioned source grammar advances **V1 → V2**. Its 22-byte
+header retains the complete-command checksum and length, now followed by V14
+bytes with the mandatory three-byte ordinary context. Decoding requires an
+ordinary finalizer **before** interpreting its context, preventing recursive
+source-bearing aborts. The maximum nested finalizer is 2 MiB + 3 bytes, source
+carrier 2 MiB + 25, enclosing source context 2 MiB + 32, and candidate complete
+command 4 MiB + 32. Current live RPC limits are unchanged; they must advance
+with the coordinated production switch. All V1/V13 and original V14/source-V1
+specimens remain immutable rejection/reference evidence; V2/V14 and its complete
+cleanup composite are appended separately. No SQL/state/checkpoint version or
+ordinary-path transaction/fsync change is introduced.
+
+Existing source/preparation/reissue/custody tests now use linked tombstones for
+the complete source identity. CRC-collision canaries preserve both the draft
+and complete CRCs while changing reservation identity; exact source SHA-256 must
+still reject them. New canaries pin the V2 bytes, V13-tombstone rejection and
+bounded non-recursive decoding. The live-V13 applied-command negative remains
+an explicit identity-conflict test; applied-V14 log recording/decoding is still
+part of the pending/apply production integration, not claimed here.
+
+Validation: formatting, strict all-target/all-feature Clippy, the storage boundary
+checker and diff checks passed. The migration-focused run identified stale
+fixture assumptions (draft-identity receipt queries, previous size bounds and
+the source-V1 golden comparison); these now assert the precise complete identity,
+new bounds and appended composite, with predecessor rejection preserved. The new
+recursive-input canary initially selected the wrong corpus kind; its setup was
+corrected to the actual abort specimen. No production failure was remapped or
+existing non-mutation condition relaxed. The final full workspace run passed
+**9,837 tests**, two slow reports, six existing skips, in **276.265s** (run
+`e1bf7e99-b21f-4d81-8846-d2305a4d9235`), including all 457 staging-focused tests.
+The Raft gate was inspected doing active CPU work and passed in 111.967s;
+oversized version listing passed in 63.512s. No other same-user Nextest was active
+and load1 was below 10 at launch. Logs:
+`/tmp/argmin-complete-source-{check,focused-initial,focused-migration,focused-final,clippy,boundaries,workspace}.log`.
+
+At the end of that source slice, pending installation/replacement, applied-command
+recording, builder/RPC/recovery wiring and frontend custody remained the next
+coordinated boundary. The following slice connects fresh/exact-retry installation.
+
+**Complete pending-install integration — 2026-11-08:** the owning complete-context
+submission now installs its V14 bytes through the existing classified pending-slot
+transaction. A closed adapter selects either the current V13 projection or the
+complete carrier; there is no live format fallback. The complete path derives its
+bucket scope from the retained command, and binds the slot, route dependencies,
+empty/future-window protection and selected-payload pages to the complete ID/CRC.
+It rederives inventory and authenticates any abandoned finalizer inside the actual
+write transaction. Earlier read-only preparation is never installation evidence.
+
+The complete projection borrows an opaque transaction scope minted only by the
+command-log installer. It cannot outlive that scope or install into another
+`PgStore`; raw command bytes, cached pages and independently supplied route/window
+records cannot construct it. The submission sets its observation to `Unconfirmed`
+before entering installation and retains the complete context on every return or
+unwind. A definitive rejection restores prior history, not presumed frontend
+ownership. Only a committed installation or exact slot/index verification records
+`Installed`; neither is a global absence/deletion certificate or replica apply.
+
+Both admission and process-local work deadlines reach the final pre-INSERT check.
+The same transaction writes every index, rolls them back together and classifies
+commit/rollback uncertainty conservatively. Exact retry checks every index,
+including the slot's exact bucket scope and the ordinary command's empty staging
+row, without repairing corrupt evidence. A NULL or crossed scope is unconfirmed
+custody, not successful installation: bucket-drain clearing uses that scope
+without decoding the command. Source publication-start inspection is a
+conservative exact-position veto after complete terminal authentication; it does
+not decode an unrelated pending command through the old reader.
+
+Metadata-only regressions cover all three introductions, both appends, ordinary
+commands and source-bearing cleanup: exact complete bytes and indexes, reopen,
+non-mutation of owners/log prefix, exact retry, damaged/missing indexes (including
+NULL and crossed bucket scope with an exact scope-mismatch diagnostic),
+transaction rollback, commit uncertainty, failed rollback, expiry at the effect
+boundary, topology substitution, outer-transaction rejection, unwind and no hidden
+Drop cleanup. Source evidence is checked again after successful preparation.
+The first focused run exposed the source validator's old pending-reader coupling
+on an exact V14 cleanup retry; that dependency was removed without allowing the
+live V13 reader to accept V14 or relaxing the retry assertions.
+
+At the end of that installation slice, production builders/RPC/dispatch and
+frontend custody remained unchanged. Pending replacement/reissue, applied-command
+recording and the remaining coordinated wiring were still required before
+activation. This slice adds no schema, checkpoint,
+RPC version or per-install transaction/fsync. Physical authority, worker milestones,
+checkpoint-transferability and all six original skipped regressions remain open.
+
+Initial validation: formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and diff checks passed. The corrected focused
+installation/abandonment run passed all 37 tests. The final full workspace run passed **9,844 tests**, two
+slow reports, six existing skips, in **272.887s** (run
+`a055a62f-6cf4-437b-a9fc-5c33866a4b73`), including all seven new complete-install
+regressions. The Raft gate was inspected doing active CPU/write work and passed
+in 112.490s; oversized version listing passed in 63.558s. No other same-user
+Nextest was active at launch and load1 was below 1. Logs:
+`/tmp/argmin-complete-pending-{focused,focused-final,clippy-final,boundaries-final,workspace}.log`.
+
+Scope-review correction: the added NULL-scope case reproduced the finding by
+returning `Ok(())` before the fix. Exact-existing validation now receives the
+transaction's loaded slot and compares its scope with the complete command's
+derived bucket before confirming indexes. Both NULL and crossed-scope cases run
+across all seven command/context shapes, assert `Unconfirmed` with the exact
+diagnostic, preserve the damaged slot and indexes without writes, and retain that
+history after a later expired retry. Post-correction formatting, strict
+all-target/all-feature Clippy, boundary checks and diff checks passed, as did all
+seven focused tests and the full workspace run: **9,844 passed**, one slow report,
+six existing skips, in **297.196s** (run
+`aea9fd13-a0ee-44e7-bbdc-c452d3fa1d70`). The Raft gate was inspected doing active
+CPU work and passed in 93.606s. No other same-user Nextest was active at launch;
+load1 was 1.04. Logs:
+`/tmp/argmin-complete-pending-scope-{red,focused,clippy,boundaries,workspace}.log`.
+
+**Complete same-epoch pending replacement — 2026-11-08:** the owning
+`ContextualReissue` now performs one replacement attempt through the same
+pending-slot transaction as the existing current-format reissue/recovery paths.
+The closed installation adapter retains the distinct readers: complete V14 is
+never passed to the live V13 decoder, and this does not enable fallback or live
+builder/RPC/frontend custody. Current-format recovery certificate checks remain
+in their existing wrappers.
+
+Complete replacement validates the exact source/successor context relationship,
+configured topology and next durable log position. It rechecks the observed
+unstarted source, exact bucket scope and all protection indexes inside write
+serialization, rederives the successor inventory and reauthenticates retained
+abandoned-finalizer evidence there, then replaces complete bytes, checksums and
+all side indexes in one transaction. Exact successor replay validates its scope
+and indexes without rewriting them. Missing/corrupt evidence remains uncertain;
+it cannot certify replacement or silently repair protection. An ordinary abort
+cannot replace a source-bearing cleanup merely because their draft payloads
+match, nor may reissue change the captured window cutoff.
+
+The holder keeps both complete commands and their independent histories through
+lost replies, failed commit/rollback, rejected/false retries and unwind. It marks
+the successor unconfirmed before submission; only committed replacement or
+committed exact successor verification permits the consuming successor handoff.
+Neither this observation nor reissue itself grants recovery admission, new
+physical authority, a renewed staging cutoff or permission to clean the source.
+The outer recovery/dispatch integration remains responsible for its leader and
+work-budget authority.
+
+Metadata-only tests cover the three introductions, both appends, ordinary
+commands and source-bearing cleanup: successive reissues/reopen preserving exact
+context and retention, lost-reply and malformed-response fault injection,
+missing/contending/started slots, failed inspection, outer-transaction and
+topology rejection, damaged source and successor scopes/indexes, rollback and
+connection retirement, unwind, original-source reauthentication, crossed context
+and cutoff rejection, and no hidden Drop cleanup. SQL tracing pins one existing
+BEGIN/COMMIT around the slot and indexes, not an extra transaction or fsync.
+
+The first focused run passed 19 tests and exposed a flaw in the new commit-failure
+fixture: an AFTER INSERT trigger did not fire on the index UPSERT's update arm,
+so replacement correctly returned success. The fixture now injects the deferred
+constraint failure AFTER UPDATE and requires the exact commit-failure diagnostic.
+Two tests were not started after that failure; no existing assertion was relaxed.
+
+Final validation: the corrected focused run passed all **119 tests**, including
+the ten complete-replacement regressions and current local/Unix pending-slot
+tests. Formatting, strict all-target/all-feature Clippy, the storage boundary
+checker and diff checks passed. Full workspace Nextest passed **9,854 tests**, one
+slow report, six existing skips, in **290.298s** (run
+`86089ba7-1f9e-457a-ad82-3d8f56e6d852`). The Raft write-amplification gate was
+inspected doing active CPU/WAL work and passed in 99.853s. No other same-user
+Nextest was active at launch and load1 was 2.08. Logs:
+`/tmp/argmin-complete-reissue-{check,focused,focused-final,clippy,boundaries,workspace}.log`.
+
+**Replacement ownership review correction — 2026-11-08:** the initial store
+entry still accepted independently encoded source/successor commands and a
+topology. Although the convenience holder preserved history, another `pg_store`
+caller could bypass it. The production store entry now consumes an opaque
+`CompletePendingReplacement` borrowing the owning `ContextualReissue` mutably.
+Only the private owning submission module can mint that capability; it exposes
+no constructor from command bytes, independent contexts or an observation value.
+The store executes and records the result through this borrow, including the
+connection/outer-transaction checks. False and definitive results restore prior
+history; ambiguity and unwind retain `Unconfirmed`. No store entry taking the
+independent complete pair remains.
+
+The malformed-context/cutoff tests now construct adversarial holders through a
+test-only seam and use the production capability boundary. A new API-shape and
+direct-store regression deliberately bypasses the convenience `replace` method
+but still borrows its owning capability: across all seven context shapes, it
+checks lost-reply history, rejection inside an outer transaction, subsequent
+topology rejection, false results, and successful exact confirmation. The owner
+cannot be consumed while the capability borrows it. The original uncertainty,
+rollback, unwind, scope/index and no-hidden-cleanup tests remain unchanged.
+Returning the owning submission result from this store boundary exposed a
+nested error-visibility mismatch under strict Clippy. `PersistenceError` now
+shares its containing error enums' `pg_store` visibility; it is not a public
+storage API, and no persistence operation or authority constructor was widened.
+Post-correction validation: all **120 focused tests** passed, including the
+direct-store capability/history regression. Formatting, strict all-target/
+all-feature Clippy, the storage boundary checker and diff checks passed. Full
+workspace Nextest passed **9,855 tests**, one slow report, six existing skips, in
+**291.747s** (run `4dd42d5e-c067-4b1b-b5aa-d4bc162a2bec`). The Raft
+write-amplification gate was inspected doing active CPU work and passed in
+98.101s. No other same-user Nextest was active at launch; load1 was 0.96. Logs:
+`/tmp/argmin-reissue-owner-capability-{focused,focused-final,clippy,clippy-final,boundaries,boundaries-final,workspace}.log`.
+
+**Complete local application and recording — 2026-11-08:** the complete
+encoded carrier now supplies both the bound owner application and the terminal
+identity to one local apply/record transaction. Callers cannot supply a payload,
+context and log identity independently at this entry. Acceptance and recording
+reuse the command-log position, digest, checksum, hash-chain and receipt code;
+the closed identity selects either the existing V13 grammar or complete V14
+decoding. The complete terminal inspector also validates applied V14 prefix
+entries without exposing their payload drafts or falling back to V13.
+
+Fresh application commits owner/session/reference/resource mutations with the
+complete applied bytes and prefix state. Exact replay requires the applied
+prefix and authenticated terminal chain, returns its current state and does not
+rerun terminal transfers, recreate sessions, rewrite owners or clear pending
+custody. The encoded command still borrows its exact context. A failed apply or
+commit is not absence or cleanup authority; rollback/unwind restore the
+transaction, and a failed rollback retires the connection until reopen. The
+outer runtime/recovery gate and frontend uncertainty holder remain required at
+dispatch integration; this local operation does not mint either authority.
+
+Metadata-only tests cover all three introductions, both appends, the eleven
+terminal mutation families, an ordinary command and source-bearing cleanup.
+They compare the full materialized state with the reviewed owner dispatcher,
+check exact recorded bytes/CRC, reopen and replay with no writes, and reject
+crossed contexts, topology/PG, tombstones, corrupt records and incomplete
+terminal evidence. Faults cover log insertion, the pre-commit guard, deferred
+commit failure, unwind and injected rollback failure. SQL tracing pins one outer
+BEGIN/COMMIT for owner and log changes; existing nested savepoints do not add
+commits/fsyncs. Setup corrections during development included a missing read
+transaction, a mistakenly identical crossed topology, diagnostic capitalization
+and a trace counter that initially counted savepoints as outer transactions.
+No production assertion was relaxed. The rollback-failure test uses the existing
+metadata-command transaction fault seam (renamed from pending-slot-specific
+terminology); an initial test-only attempt to use SQLite's optional authorizer
+did not compile with the repository's feature set and was replaced without
+adding a dependency or feature.
+
+The first full run stopped after **8,370 passes**, two failures and six existing
+skips: the two obligation tests authenticated complete sources through a prefix
+containing V13 cleanup drafts (PG 4, epoch 6, index 12). Broader staging coverage
+found the same issue in a published-finalizer fixture at index 11. These setups
+now apply and record complete contexts atomically, rather than recording a draft
+after an independent component mutation. The applied-source negatives now pin
+`NotAbandoned`: exact applied evidence authenticates but cannot authorize
+abandonment cleanup, unlike the previous draft-identity conflict.
+
+Checkpoint suffix validation and receipt generation share the closed grammar
+selection too. An owner-local **test-only** entry runs actual checkpoint capture
+and compaction with the complete grammar, allowing all eighteen application
+cases and the repeated-obligation schedule to prove replay after compaction and
+reopen without fabricating receipts or accepting mixed applied formats. Public
+maintenance/replay dispatch remains current-only and is not activated by that
+test seam. This does not add checkpoint paging or change checkpoint formats.
+
+Expanded revalidation passed **534 tests** in **14.229s**, including all staging
+components, command-log and rollback coverage. Formatting, strict all-target/
+all-feature Clippy, the storage boundary checker and diff checks passed again.
+Final workspace revalidation passed **9,865 tests**, two slow reports, six
+existing skips, in **277.669s** (run
+`bdde371e-d2bd-4795-94e3-6d921a81c6c2`). All three migrated ownership schedules
+passed. The Raft write-amplification gate was inspected doing active CPU work
+and passed in 111.315s; oversized version listing passed in 64.040s. No other
+same-user Nextest was active at launch and load1 was 2.76. The first full run had
+load1 3.38; its failure log is `/tmp/argmin-complete-apply-workspace.log`.
+Final logs: `/tmp/argmin-complete-apply-expanded-final-3.log`,
+`/tmp/argmin-complete-apply-clippy-final.log`,
+`/tmp/argmin-complete-apply-boundaries-final.log`, and
+`/tmp/argmin-complete-apply-workspace-final.log`.
+
+**Review correction — callback-free application, 2026-11-08:** the production
+complete apply/record entry no longer accepts a caller-supplied commit callback.
+The private implementation's callback parameter and its fault-injection wrapper
+exist only under `cfg(test)`, and the hook runs only after fresh owner/log
+mutations, never on `AlreadyApplied`. Production callers therefore cannot add
+unrepresented effects through this entry. An eighteen-case regression pins the
+callback-free production function signature, positively observes the fresh hook,
+and supplies a panicking replay hook while checking unchanged materialized state
+and SQLite mutation counts. Existing failure, unwind and rollback-retirement
+tests use the explicit test-only wrapper; ordinary callers use the production
+entry without a no-op callback. The first compile caught insufficient lifetime
+generality in the test's inferred function-pointer type; explicit borrowed
+parameter types corrected that test-only annotation.
+
+Revalidation passed **538 focused tests** in **13.965s**, followed by **9,866
+workspace tests**, two slow reports and six existing skips, in **281.982s**
+(run `5ce0b6ef-18c5-4711-8c02-826460a51ff2`). Formatting, strict all-target/
+all-feature Clippy, the storage boundary checker and diff checks passed. No
+other same-user Nextest was active at full-suite launch; load1 was 2.96. The
+Raft write-amplification gate was inspected doing active CPU work and passed in
+107.572s; oversized version listing passed in 64.908s. Logs:
+`/tmp/argmin-complete-apply-callback-{focused,clippy-final,boundaries,workspace}.log`.
+
+**Complete retained-log inspection — 2026-11-08:** the coordinated local reader
+now loads bounded retained ranges in one read-only SQLite snapshot. Applied rows
+decode into the full `ContextualCommand`, including introduction/append
+descriptors and source-bearing abandonment context; they never return a bare
+payload envelope or an independently selectable context. Tombstones retain the
+complete source checksum and SHA-256. These are observations, not admission,
+convergence or frontend custody authority. Live V13 range/RPC dispatch remains
+unchanged and rejects V14, while the complete reader rejects V13 applied rows.
+
+The reader shares complete applied-row validation with the terminal inspector,
+checks row subject, checksum, context/topology, state-digest presence, hash
+formula and consecutive retained links, and discards the entire page on error.
+It preserves sparse/compacted gaps rather than synthesizing commands from
+receipts. Reversed/oversized or non-SQL-representable ranges and foreign topology
+fail closed; caller transactions are not adopted. The current local count bound
+does not assert that a maximal V14 page fits the existing RPC frame: activation
+must update the complete-byte framing/admission bound together with transport.
+
+Metadata-only regressions cover all eighteen application shapes through reopen,
+exact bytes/digests and mutation-free replay; complete tombstones and compaction;
+resealed crossed PG/epoch/index, retired applied format and malformed context;
+corrupt or missing checksum/hash/digest/kind fields; individually valid hashes
+with a broken adjacent link; and range, topology and transaction rejection.
+The boundary inventory includes only this new private log-owner child alongside
+`command_log.rs` for storage-issued hash/digest observations; it does not exempt
+the wider PG-store namespace.
+
+The first focused run stopped after **146 passes and two failures** in the new
+tests: the all-shapes fixture requested an oversized page (some terminal
+fixtures use index 7,000), and the broken-link assertion guessed the error's
+display text. The former now iterates bounded pages; the latter and other
+negatives assert the typed conflict and exact subject. No production check was
+relaxed. All **six new tests** then passed in **2.405s**, followed by **544
+focused staging/log/rollback tests** in **14.442s**. Formatting, strict
+all-target/all-feature Clippy, the boundary checker, shell syntax and diff
+checks passed. Full workspace Nextest passed **9,872 tests**, two slow reports
+and six existing skips, in **280.543s** (run
+`f7d3c989-1ae6-48f4-a89b-ee88d3caede6`). No other same-user Nextest was active
+at launch and load1 was 5.35. The Raft write-amplification gate was inspected
+doing active CPU work and passed in 110.701s; oversized version listing passed
+in 65.373s. Logs:
+`/tmp/argmin-complete-log-range-{focused,focused-new,focused-final,clippy-final,boundaries-final,workspace}.log`.
+No format evidence, live writer/reader selector, physical authority or
+checkpoint-transfer limit changes in this slice.
+
+**Complete local checkpoint and compaction boundary — 2026-11-08:** the
+coordinated PG-store API now captures a checkpoint from the store's own epoch
+and prefix, in one read-only view, and records/compacts through the shared
+maintenance implementation with an explicitly selected complete grammar. The
+caller supplies configured topology, not a synthetic command merely to select
+an epoch. The earlier test-only maintenance adapter now uses these entries;
+only its reduced receipt-retention bound remains test-specific. Live node/RPC
+and startup dispatch still select the current grammar; this is not activation.
+
+Complete maintenance conservatively blocks on **any** retained pending slot,
+including older-epoch, already-applied and abandoned slots. It validates complete
+carrier identity and bucket scope before reporting that barrier, never removes
+the slot or its indexes, and never projects terminal convergence or cleanup
+custody. This barrier does not claim to validate every side index or prove the
+terminal relationship: startup integration must still do those checks against
+post-apply state. The no-checkpoint compaction outcome cannot hide a pending
+slot. Caller-owned transactions are rejected, and maintenance retires a
+connection left in a transaction after an error or unwind instead of allowing
+later work to adopt it.
+
+Metadata-only tests cover eighteen complete command shapes, exact checkpoint
+capture, default-retention compaction, reopen and mutation-free terminal replay;
+unresolved/applied/abandoned pending custody and older-epoch slots; damaged
+pending identity/scope/flags; damaged uncheckpointed prefix or materialized
+state; SQLite statement/commit failure with rollback and successful retry;
+failed-rollback connection retirement and unchanged durable state after reopen;
+and topology/caller-transaction rejection. The shared rollback executor's
+existing test-only injection covers maintenance too; its production behavior
+is unchanged. The retired-connection diagnostic now names an unconfirmed
+metadata transaction rather than incorrectly assuming every retirement came
+from pending-slot insertion. No owner/resource transition, physical
+authority, ordinary-path metadata write, frozen format evidence or checkpoint
+transport limit changes.
+
+The first two focused runs each passed six new tests and exposed a setup error
+in the damaged-prefix test: first a checkpoint from the prior epoch (correctly
+yielding `NoCheckpoint`), then moving every applied index into occupied rows.
+The corrected fixture checkpoints a real same-epoch predecessor, asserts that
+relationship, and damages only the final suffix row. No production check was
+relaxed. After the additional rollback-retirement canary, all **552 focused
+staging/log/rollback tests** passed in **15.676s**. Formatting, strict all-target/
+all-feature Clippy, storage boundary checks, shell syntax and diff checks passed.
+Full workspace Nextest passed **9,880 tests**, two slow reports and six existing
+skips, in **279.474s** (run `6808598e-b1fc-4cc5-9d61-489c97c4b69f`). No other
+same-user Nextest was active at launch; load1 was 6.04. The Raft write-amplification
+gate was inspected consuming active CPU and passed in 112.403s; oversized version
+listing passed in 62.301s. Logs:
+`/tmp/argmin-complete-maintenance-{new,new-final,focused,focused-final,clippy-final,boundaries,workspace}.log`.
+
+**Complete pending startup inspection — 2026-11-08:** a new PG-store-local,
+read-only entry loads the complete pending command, replica epoch, exact side
+indexes and local terminal evidence in one SQLite snapshot. It returns only
+scalar diagnostics (identity, stored epoch, publication-start flag and local
+terminal observation), never an installable projection, raw command, submission
+or cleanup capability. Local absence of a terminal record is not evidence of
+nonacceptance elsewhere. Older/newer epoch observations do not authorize replay;
+same-epoch unresolved commands must occupy the next prefix position. Full startup
+prefix validation, abandoned-tail advancement and cache repair remain separate
+integration work, and live startup/RPC dispatch is unchanged.
+
+The exact-index comparator is shared with complete installation and checks
+slot identity/bytes/scope, route dependencies, the empty or nonempty staging
+window, both reference counts and every placed/reclaim page. The comparison
+inputs have private constructors and are not installation authority; only the
+original installation projection retains its transaction capability. Fresh
+installation still derives stream geometry from the live session. Read-only
+inspection instead validates the retained stream owner, configured topology,
+generation high-water fence and exact segment/window correspondence, using the
+retained codec for stored lengths. This allows a terminal abort's indexes to be
+validated after its session and stream rows are removed, without reconstructing
+a live session or downgrading readable references to protection-only records.
+Source-bearing aborts continue to use and authenticate their complete original
+finalizer, including its immutable geometry and durable abandonment evidence.
+
+Metadata-only regressions cover all eighteen complete shapes before terminal
+application, after apply/abandonment and after reopen; the removed-session abort
+case; damaged scope, route, window and payload indexes without repair; missing
+owners/counters and damaged retained windows; older-epoch unresolved and terminal
+custody; damaged terminal/source evidence; foreign topology and caller-owned
+transactions; and a second SQLite connection deleting an index between the slot
+read and comparison (the pinned view succeeds, the next view fails closed).
+No schema/format evidence, live dispatch, physical authority or ordinary-path
+transaction/fsync change.
+
+The initial eight-test run passed seven tests and exposed an invalid negative
+fixture: lowering the generation counter to 1 left it equal to the fresh
+owner's generation. The corrected fault derives a value below the retained
+generation (NULL for generation 1) and asserts that the protection fence is
+actually invalidated. No production check was relaxed. All **560 focused
+staging/log/rollback tests** then passed in **16.237s** (run
+`a6b178e4-b8c9-4429-a15b-da8ff3a2248b`). Formatting, strict all-target/all-feature
+Clippy, storage boundary checks and diff checks passed. Full workspace Nextest
+passed **9,888 tests**, two slow reports and six existing skips, in **281.808s**
+(run `5f1074d8-699f-4843-981b-16a67c7f6e0e`). No other same-user Nextest was
+active at launch and load1 was 1.18. The Raft write-amplification gate was
+inspected consuming active CPU and passed in 110.398s; oversized version listing
+passed in 64.332s. Logs:
+`/tmp/argmin-complete-pending-inspection-{focused,clippy-final,workspace}.log`.
+
+**Inspection teardown review correction — 2026-11-08:** the shared
+`MetadataCommandBuildSnapshot` now owns a PG-aware read-transaction guard.
+Explicit finish, early error and unwind all attempt rollback; if SQLite remains
+inside the transaction, the store and its allocation lifetime are retired before
+returning control. There is no hidden Drop retry, and later ending the SQLite
+transaction does not clear retirement. New snapshots also reject retired stores;
+reopen is required. A rollback error with SQLite already in autocommit still
+returns the error but does not invent an unresolved transaction. Healthy
+`BEGIN DEFERRED`/`ROLLBACK` ordering, caller-transaction rejection, and restoration
+of the original read-only mode are unchanged. No new write, fsync or format.
+
+The guard-level and complete-inspection regressions inject a rollback failure on
+finish, error and unwind, require metadata inspection/building and fresh
+allocation to remain blocked, and verify unchanged durable state after reopen.
+Read-snapshot injection is separate from the existing write-transaction fault:
+the first focused run exposed that sharing it moved the maintenance regression's
+failure ahead of its writes (`failure did not follow maintenance writes`). The
+hook was separated without changing that assertion. The corrected focused run
+passed **567 tests** in **16.341s**. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**9,890 tests**, two slow reports and six existing skips, in **279.551s** (run
+`70de7a16-1475-466d-8b2a-c1320b6ffaf3`). No other same-user Nextest was active at
+launch and load1 was 4.62. The Raft write-amplification gate was inspected
+consuming active CPU and passed in 112.566s; oversized version listing passed in
+62.289s.
+Logs: `/tmp/argmin-snapshot-retirement-{focused,focused-final,clippy,workspace}.log`.
+
+**Complete local startup recovery — 2026-11-08:** the PG-store-local complete
+entry now validates and repairs the local prefix using the store's own epoch,
+never a caller-supplied recovery epoch. One owned SQLite transaction links only
+contiguous authenticated V2 abandoned entries, validates the complete applied
+suffix from its checkpoint anchor, rejects later entries across a hole, compares
+the full materialized state digest, and validates exact complete pending custody
+and all its indexes. Only after these checks may it repair per-table digest-cache
+drift. Any later failure rolls back earlier tail/cache repairs; unconfirmed
+rollback or unwind retires the connection, and unsuccessful completion invalidates
+transaction-local clean-cache observations.
+Successful completion publishes only the digest revision captured inside that
+transaction, never a revision reloaded after commit. A second-connection
+post-commit corruption canary proves later command admission still detects the
+new, unvalidated state.
+
+Unlike the current replay helper's abandoned-tail cleanup branch, this entry
+never clears pending commands or side indexes, including locally applied,
+abandoned and historical-epoch custody. A future-epoch pending slot is rejected;
+local recovery cannot supply its missing epoch authority. Pending inspection's
+snapshot comparator is shared inside the startup transaction, without exposing
+commands or installable inventory. Valid settled state performs no metadata
+writes; interrupted-tail linking and cache repair reuse the existing local
+recovery machinery. This is not payload replay, acting-set convergence, cross-PG
+release, physical cleanup or serving admission. Live node startup and RPC
+dispatch remain unchanged, and no format/schema/version evidence changes.
+
+Owner-local metadata-only regressions cover all eighteen complete shapes,
+unresolved/terminal pending preservation, interrupted tombstone linking, reopen,
+damaged indexes/prefix/materialized state with rollback, gaps after the prefix,
+cache-only repair, checkpoint compaction, historical pending custody, future
+epoch/topology/transaction rejection, failed commit/rollback and unwind after
+tail linking. The commit-failure test also damages the cache before recovery and
+proves both its repair and the volatile clean marker cannot survive a failed
+transaction. The initial nine new tests passed; with the additional unwind
+canary, all **578 focused staging/snapshot/log/rollback/recovery tests** passed in
+**17.679s** (run `8bb5858d-bee6-4fed-a114-57482f6cd91e`). Final review tightened the
+validated-revision handoff before the workspace tests started; that build was
+stopped and a dedicated interleaving regression added. The corrected focused run
+passed **579 tests** in **17.612s** (run
+`593c3a73-c593-42b8-8b3e-0a8637acfd64`). Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**9,901 tests**, two slow reports and six existing skips, in **280.546s** (run
+`d3f8ae62-1132-45c6-94f5-c13fb91d7adb`). No other same-user Nextest was active at
+launch and load1 was 6.48. The Raft write-amplification gate was inspected
+consuming active CPU and passed in 113.679s; oversized version listing passed in
+62.652s.
+Logs: `/tmp/argmin-complete-startup-{new,focused,focused-final,clippy-final,workspace}.log`.
+
+**Complete retained-log hash inspection — 2026-11-08:** the PG-store-local
+hash reader now explicitly selects the complete grammar. Hash-only and full-entry
+observations share one private row validator inside an owned read-only snapshot:
+canonical complete context or V2 tombstone, checksum and exact PG/epoch/index,
+required applied-state digests, recomputed row hash, genesis and adjacent retained
+links. A malformed later row fails the entire query. Missing or compacted rows
+remain gaps; neither receipts nor checkpoint hashes synthesize retained entries.
+These scalar observations are not a whole-prefix proof or recovery admission.
+
+The hash projection drops each decoded command before loading the next row,
+retaining only its index and two hashes. Its existing 4,096-position bound does
+not increase the full-payload reader's 31-position bound. Both projections and
+their callback are private to the reader module; callers cannot insert an action
+into its snapshot. Live V13 readers and RPC/startup/recovery dispatch are unchanged.
+No new metadata transaction/fsync on the ordinary path, schema, format version,
+frozen evidence, physical authority or checkpoint-transport change.
+
+The eighteen-shape/reopen and applied/tombstone/compaction matrix now compares
+both projections. Resealed identity/context/old-grammar and damaged-row negatives
+must fail identically in both. Additional regressions cover hash bounds, foreign
+topology, caller transactions, genesis and cross-entry-page hash linkage,
+explicit sparse gaps, a concurrent second-connection deletion during either
+projection's snapshot, and retirement after unconfirmed hash-snapshot teardown.
+The initial focused run passed nine tests and rejected the all-shapes test's
+unbounded request: several existing terminal fixtures contain 5,000–7,000
+retained entries, exceeding the unchanged 4,096-position cap. The comparison
+now pages its hash requests too, exercising dense exact-cap pages without
+weakening production bounds. All **583 focused staging/snapshot/log/rollback/
+recovery tests** passed in **17.633s**. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**9,905 tests**, two slow reports and six existing skips, in **282.234s** (run
+`e41e5be6-e05a-40b2-95db-d31004079833`). No other same-user Nextest was active at
+launch and load1 was 2.14. Both slow reports completed before process inspection:
+the Raft write-amplification gate passed in 112.484s and oversized version listing
+in 62.307s. Logs:
+`/tmp/argmin-complete-hash-{new-final,focused,clippy-final,boundaries,workspace}.log`.
+
+**Hash-reader validation-work review correction — 2026-11-08:** the position
+cap alone bounded response size and sparse lookups, not payload validation work.
+Both complete projections now share an independent **16 MiB cumulative encoded
+command-byte budget**. Before fetching each command BLOB, the reader checks its
+SQLite storage class and length using record metadata in the same owned snapshot;
+oversized/empty/non-BLOB rows are rejected before payload materialization. The
+unchanged individual complete-command format cap also applies before fetching.
+Byte admission includes applied rows and tombstones, not just returned context
+bodies. Keeping size admission and loading in one snapshot prevents a concurrent
+enlargement from bypassing the budget. This bounds encoded input to the checksum/
+canonical-decoding passes, not elapsed time during SQLite contention.
+
+Exhaustion returns a distinct `ValidationBudgetExceeded` error and no partial
+page. Future transport integration must split/reduce the original range and
+revalidate it; the reported first-unread index does not authorize dropping the
+earlier positions or treating the range as absent. Neither callers nor the wire
+can raise the budget. No production dispatch, schema, format or frozen evidence
+changes. Regressions exercise exact-cap success, a one-byte cumulative excess
+with a SQL payload-fetch sentinel, oversized/empty BLOB rejection before loading,
+the existing STRICT schema's non-BLOB rejection without changing the retained
+command, and concurrent row enlargement between admission and fetching, for both
+readers. The initial run passed the budget and interleaving canaries; its third
+test incorrectly tried to persist TEXT in the STRICT BLOB column and failed with
+`cannot store TEXT value in BLOB column metadata_command_log.command_bytes`.
+That case now asserts schema rejection rather than weakening the schema.
+All **586 focused staging/snapshot/log/rollback/recovery tests** passed in
+**17.713s**, followed by formatting, strict all-target/all-feature Clippy,
+storage boundary and diff checks. Full workspace Nextest passed **9,908 tests**,
+two slow reports and six existing skips, in **280.273s** (run
+`8c183e79-8ed3-45c8-be9d-b2e4136633cd`). No other same-user Nextest was active at
+launch and load1 was 2.50. The slow-reported Raft write-amplification gate was
+inspected consuming active CPU and passed in 112.230s; oversized version listing
+passed in 61.921s. Logs:
+`/tmp/argmin-complete-hash-budget-{new,focused,clippy,boundaries,workspace}.log`.
+
+**Complete retained-log response codec — 2026-11-08:** the candidate transport
+now preserves complete contexts through the existing retained-entry response
+grammar. Its wire-owned parser returns bounded borrowed command slices, not
+decoded envelopes or authority. A separate PG-store-owned request scope captures
+the configured topology, PG, epoch and inclusive range. Its decoder validates
+complete context/canonical encoding/checksum, exact subject and applied digest
+presence, row hashes, genesis and adjacent links, strictly increasing indices
+and range membership. Sparse gaps remain observations, not synthesized history.
+Decoded applied records retain the full context; no bare-payload projection or
+fallback to V13 is introduced. These are not recovery-admission certificates or
+permission to apply an authenticated peer's arbitrary command.
+
+Framing keeps the 31-entry count and adds the complete per-command capacity,
+with a shared fixed 16 MiB command-byte budget plus bounded headers. The context
+owner additionally charges canonical tombstone sizes to the same validation
+budget used by local reads. Decoder lengths/counts/budget are checked before
+payload access or context decoding. Encoding consumes its builder on failure,
+so callers cannot finish a successful prefix after a failed push. Encoder scope
+and topology are checked too. No live request/response dispatcher, RPC version,
+schema, recovery admission, ordinary-path write/fsync, physical authority or
+checkpoint-transferability change. The installed RPC/authentication adapters
+and their smaller-range retry policy remain activation work; this slice tests
+framed payloads, not socket-level dispatch.
+
+All eighteen real applied command shapes survive framing, complete decoding and
+mutation-free exact replay. Additional tests cover resealed crossed commands,
+retired/malformed context, tombstone CRC/SHA substitution, order/duplicates/range,
+individually valid but unlinked hashes, sparse/empty results, foreign topology,
+truncation/trailing bytes, unknown tags and bounded count/byte admission. A
+capacity-only source-bearing specimen exceeds the live 2 MiB item limit without
+truncation. The outer framing is compared with the existing writer for every
+digest-option/kind combination; a new exact `(RPC v36, command v14, context v1,
+tombstone v2)` composite is appended without changing predecessor evidence.
+The initial five transport tests passed; the expanded build caught a missing
+test import before execution, which was corrected. All nine new transport tests
+then passed, followed by **595 focused staging/snapshot/log/rollback/recovery/
+transport tests** in **17.933s**. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**9,917 tests**, two slow reports and six existing skips, in **282.127s** (run
+`9457ad06-69bb-45ee-85c0-2351dc9bde77`). No other same-user Nextest was active at
+launch and load1 was 1.63. The slow-reported Raft write-amplification gate was
+inspected consuming active CPU and passed in 112.346s; oversized version listing
+passed in 63.864s. Logs:
+`/tmp/argmin-complete-log-transport-{expanded-final,focused,clippy-final,boundaries-final,workspace}.log`.
+
+**Installed complete retained-entry reads — 2026-11-08:** the candidate entry
+reader now runs through the installed storage-node Unix listener, existing RPC
+authentication/transcript verification, frame admission, current/retained Peering
+route validation and metadata-command serialization. Production compiles the
+adapter, but only an owner-local `cfg(test)` selector chooses it; ordinary
+dispatch remains V13. Neither decoder falls back to the other grammar. Startup,
+recovery and transfer consumers are not switched by this read-only slice.
+
+The node-runtime-facing result is an opaque PG-store-owned page retaining the
+configured topology, PG, epoch, actual covered interval and complete command
+contexts. Only count/range observations are available outside PG storage; raw
+commands and source contexts cannot be detached. Even an empty/sparse page keeps
+the successful request interval. Candidate server entry points perform their own
+route validation and serialization rather than relying on a caller precheck.
+
+The request-bound budget hint (RPC v37, detailed in the review correction below)
+permits one retry of the server's known covered prefix, always retaining the
+original first index. An unstructured error, including
+`RetainedLogValidationBudgetExceeded` (wire code 28) or generic
+`ResourceExhausted`, returns immediately. Diagnostic messages never choose retry
+policy. At most two sends share one captured admission/transport deadline.
+The returned page names the reduced interval, so a future recovery consumer must
+continue after that interval, not the originally requested end. No cross-page
+snapshot, complete-history proof or recovery admission is implied.
+
+Installed regressions cover real ordinary, described-introduction and
+source-bearing abandonment contexts through Active/current Peering/historical
+Peering routes; read non-mutation; a 17 MiB canonical log that reduces to sixteen
+positions and then reads the remaining one without gaps; bounded validation-budget
+errors versus immediate capacity failure, including failure after reduction;
+signed crossed responses and invalid response
+authentication; preflight rejection and deadline exhaustion inside a retry; and
+explicit current/complete grammar rejection. Large rows are owner-local
+read-budget specimens, not claims that an S3 request accepts that body size.
+The earlier 18-shape local/framed matrix remains intact. Adding the distinct
+unversioned error code advances its containing RPC frame **36 → 37**; all v36
+specimens remain immutable with explicit rejection and appended v37 composites.
+Schema, checkpoint, command versions and ordinary-path transactions/fsyncs do
+not change. This does not activate complete-command production dispatch.
+
+The initial build caught a test accessing a private entry field; it now uses a
+consuming owner-local test accessor without changing production privacy. The
+first executed six-test selection, before the review correction below, had three failures: it expected the generic
+RPC error instead of the dedicated resource-exhaustion variant, searched a
+redacted Display for authentication details, and requested epoch 5 for the
+multipart finalizer fixture that intentionally advances to epoch 6. Assertions
+now use the typed/internal diagnostics and exact fixture epoch. All **seven
+installed-RPC tests** passed in **2.245s**, followed by **626 focused staging/
+snapshot/log/rollback/recovery/transport/authentication tests** in **19.019s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff
+checks passed. Full workspace Nextest passed **9,924 tests**, two slow reports
+and six existing skips, in **284.261s** (run
+`4597de82-479d-4567-8f2f-19f3b62dd827`). No other same-user Nextest was active at
+launch and load1 was 4.10. The slow-reported Raft write-amplification gate was
+inspected consuming active CPU and passed in 113.248s; oversized version listing
+passed in 62.012s. Logs:
+`/tmp/argmin-complete-log-installed-{corrected,focused,clippy,boundaries-final,workspace}.log`.
+
+**Review correction — precise validation-budget retry signal, 2026-11-08:**
+the generic resource-exhaustion retry described by the initial implementation
+was too broad. The initial dedicated RPC-v37/code-28 contract distinguished
+validation work from capacity pressure. That initial matrix required one send
+for generic `ResourceExhausted`, six bounded sends for repeated validation-budget
+errors over 31 positions, and exactly two sends when a budget-directed retry is
+followed by generic exhaustion. The later request-bound hint correction below
+supersedes repeated halving, retaining immediate generic-error rejection and the
+original-deadline guarantee.
+
+The first focused run exposed two stale future-version rejection assertions;
+the first full run exposed the same stale v37 expectation in
+`storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch`
+(`test_config.rs`: expected unsupported version 37, received Broken pipe after
+the now-valid request was accepted and the test client closed). That run stopped
+at **9,303 passed, one failed, 624 not run**. All three matrices now explicitly
+reject retired v36 and future v38; no failure was retried unchanged. Exact v36
+frames, composites and checkpoint fingerprints remain unchanged, with appended
+v37 evidence and installed authenticated/unauthenticated non-mutation coverage.
+
+Final validation: **258 focused tests passed** in **3.169s**; formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. A fresh
+full workspace run passed **9,928 tests**, two slow reports and six existing skips,
+in **283.657s**, run `c87978fa-a254-4e33-b631-084eca589b3c`. No other same-user
+Nextest was active at launch; load1 was 3.59. The slow-reported Raft gate was
+inspected doing active CPU work and passed in 113.315s; oversized version listing
+passed in 64.002s. Final logs:
+`/tmp/argmin-retained-log-budget-final-{focused,clippy,boundaries,workspace}.log`.
+The initial full failure remains in
+`/tmp/argmin-retained-log-budget-workspace.log`.
+
+**Installed complete retained-hash reads — 2026-11-08:** the scalar projection now
+has its own PG-store-owned request and opaque result, retaining configured
+topology, PG, epoch and the actual covered interval, including sparse/empty pages.
+The installed handler validates its route and takes metadata-command serialization
+before inspecting complete contexts under the existing owned SQLite snapshot.
+Applied contexts and authenticated abandoned records are validated before scalar
+projection; the handler does not merely copy stored hashes. Only the existing
+owner-local test selector enables it; live/default dispatch remains V13.
+
+The 4,096-position scalar cap does not enlarge the 31-position entry cap or the
+16 MiB cumulative encoded-command validation budget per server attempt. Both
+clients share one private, closed entry/hash retry implementation: only the
+request-bound covered-prefix hint permits one retry; unstructured and generic
+capacity errors stop immediately, including after an earlier reduction.
+At most two hash attempts share one immutable client deadline. Successful
+decoding binds to the reduced interval, not the original end. The remote read
+itself remains work-bounded, not a claim of server-side deadline cancellation.
+
+Clients reject count/range violations, duplicates, non-increasing positions,
+nonzero genesis predecessors and broken adjacent hash links. Interior gaps stay
+gaps: a hash page is an authenticated peer observation, not a complete-prefix,
+cross-page snapshot or recovery-admission proof. Full command validation belongs
+to the server; scalar hashes cannot independently reauthenticate command content
+at the client. No raw rows or independently reusable context escape the opaque
+production page. Successful scalar pages reuse the existing grammar. The typed
+hint adds an outcome to the pending RPC-v37 response grammar, as described below;
+predecessor evidence, transactions and fsyncs are unchanged.
+
+Nine owner-local regressions cover installed authenticated Active/current Peering/
+historical Peering reads for ordinary, described and source-bound contexts;
+the 4,096-position bound, empty/sparse intervals and read non-mutation; actual
+17 MiB budget reduction followed by the exact remaining interval; error-class
+retry counts; malformed signed responses including rows outside a reduced
+interval; bad authentication; preflight and shared-deadline expiry; default V13
+selection, rejected V13 rows under complete selection, correctly checksummed
+malformed contexts, and a crossed physical store PG. The first 16-test run
+exposed an empty-range fixture assumption (range beginning at 10 still contained
+two rows); it now starts after the fixture's actual final index. The corrected
+36-test complete-entry/hash selection passed in 3.698s. Formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. Full
+workspace Nextest passed **9,937 tests**, two slow reports and six existing skips,
+in **284.143s** (run `ed952b9e-6bb0-4476-9805-4b28873aa81b`). No other same-user
+Nextest was active at launch; load1 was 1.40. The slow-reported Raft gate was
+inspected doing active CPU work and passed in 112.931s; oversized version listing
+passed in 65.928s. Logs:
+`/tmp/argmin-complete-hash-rpc-{focused,corrected,clippy,boundaries,workspace}.log`.
+
+**Review correction — bounded covered-prefix retry, 2026-11-08:** halving a
+4,096-position range containing seventeen 1 MiB commands revalidated the same
+16 MiB prefix eight times before success (144 MiB total). The server now returns
+a structured budget outcome containing operation kind, node, epoch, PG, exact
+requested first/last and the safe covered end (`first_unread - 1`). The client
+requires exact request equality and a nonempty strict prefix before retrying
+that prefix once. A second budget hint returns the dedicated error; a malformed
+hint fails with `PayloadDecode`. Neither result is a page, resume cursor or
+authority. Retained rows changing between requests cannot trigger an unbounded
+reduction chain. At most two server passes validate at most 32 MiB total, sharing
+the original client deadline; generic resource failures never trigger retries.
+
+The candidate response grammar reserves the impossible page count `u32::MAX`
+for this fixed-size hint. It is carried as an operation outcome inside the
+authenticated transport's payload, never exposed as a successful page. Existing
+successful page bytes and error-code specimens remain unchanged. This is folded
+into the single pending RPC **36 → 37** transition, not another version bump.
+Independent literal entry/hash hint specimens and crossed-field/truncation/
+trailing tests pin the grammar. Installed malicious-peer cases cover every bound
+request field, prefix bounds, authentication and the two-send cap for both APIs.
+The real hash-budget regression now requests `1..=4096`, counts actual full-row
+loads (32 one-MiB commands across two attempts), obtains exactly `1..=16`, and
+then reads the remaining command without skipping it. No new writes or fsyncs.
+
+Validation: all **18 focused tests passed** in **4.129s**. Formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. Full
+workspace Nextest passed **9,939 tests**, two slow reports and six existing skips,
+in **288.647s**, run `e4df372c-18ad-4c94-9e7a-eae5d8e529ca`. No other same-user
+Nextest was active at launch; load1 was 1.61. The Raft write-amplification gate
+was inspected consuming active CPU and passed in 107.481s; oversized version
+listing passed in 65.583s. Logs:
+`/tmp/argmin-complete-log-hint-{focused,clippy,boundaries,workspace}.log`.
+
+**Installed complete checkpoint/compaction maintenance — 2026-11-08:** the
+candidate maintenance implementation now connects to the installed authenticated
+Unix checkpoint-export, checkpoint-record and log-compaction handlers. A private
+PG-store-owned request binds configured topology, exact PG and requested epoch;
+checkpoint capture validates that epoch inside its read snapshot instead of
+silently selecting the store's newer prefix. Compaction rejects a mismatched
+epoch even before a no-checkpoint or pending-custody early return, and retains
+the existing transactional prefix validation before mutation.
+
+Export uses the existing current/retained Peering inspection admission. Recording
+and compaction require current Active primary authority, metadata-command
+serialization and mutation-route validation, including rechecking after waiting
+for the PG mutex. The shared test selector is now named for complete **log
+operations**, rather than reads alone. It is still private and `cfg(test)`:
+ordinary production dispatch remains V13. Existing request/response codecs,
+checkpoint schema, formats and frozen specimens are unchanged; there is no
+additional ordinary-path metadata command, transaction or fsync. Maintenance's
+existing checkpoint writes and compaction transactions remain explicit effects.
+
+Every pending context blocks maintenance independently of local terminal state.
+Malformed command/slot scope is rejected; damaged side indexes are not repaired
+or treated as absence. A valid pending command with a damaged side index still
+returns the conservative `PendingCommand` compaction barrier. Maintenance is
+not installation-index validation, acting-set convergence or permission to
+remove a pending slot. Unconfirmed rollback retires the SQLite connection at the
+node boundary, preventing further metadata access until reopen.
+
+Seven owner-local regressions exercise ordinary/described/source-bound contexts,
+exact exported checkpoint and recorded state, actual compaction receipts and
+unchanged owner/resource state, all pending terminal dispositions, damaged index
+and bucket scope, Active/Peering/replica/historical/expired admission, crossed
+store/epoch/transaction scopes, corrupt-log non-mutation, and failed-rollback
+retirement. Reopen checks drop the source runtime first and invoke complete
+recovery explicitly at PG storage; they do **not** claim live node startup has
+switched. The initial focused run had **12 passes and two failures in the new
+tests**: it incorrectly expected errors for the damaged-index `PendingCommand`
+barrier and for default compaction's `NoCheckpoint` no-op. Assertions now pin
+those exact non-mutating outcomes, while keeping export/record rejection and
+adding a separately corrupted scope that must error. No production behavior was
+changed to accommodate those expectations.
+
+Validation: the corrected and expanded selection passed **32 focused tests**
+in **8.122s**. Formatting, strict all-target/all-feature Clippy, storage boundary
+and diff checks passed. Full workspace Nextest passed **9,946 tests**, two slow
+reports and six existing skips, in **286.021s**, run
+`c7e01466-e051-4d9e-920c-c6f3d5fd1275`. No other same-user Nextest was active at
+launch; load1 was 2.16. The full build's storage compiler was inspected advancing
+CPU time and output writes before tests began. Both slow-reported tests completed
+before process inspection: the Raft heartbeat gate in 110.665s and oversized
+version listing in 64.418s. Logs:
+`/tmp/argmin-complete-maintenance-rpc-{focused,corrected,clippy,boundaries,workspace}.log`.
+
+Remaining coordinated boundaries include startup, builder/RPC/recovery dispatch
+and frontend custody transfers, plus the coordinated live selection of the
+candidate components. Installed entry/hash transport and maintenance are covered
+under explicit test selection, not live activation.
+Reading historical epochs does not enable cross-epoch/source-derivative recovery
+dispatch. Only RPC advances to v37 for the precise validation-budget outcomes;
+all predecessor frozen evidence remains unchanged. Physical-write authority,
+autonomous cleanup, checkpoint-transferability and the six original skipped
+regressions remain open.
+
+**Maintenance mutation authority correction — 2026-11-09:** the installed
+request scope was subject-bound but constructible throughout node runtime;
+server admission alone did not prevent a sibling from invoking its mutators.
+Recording and compaction now additionally require an opaque authority whose
+constructor is private to the admitted maintenance owner. Minting validates
+Active-primary routing, the captured route lease and live PG serialization.
+The token borrows the exact locked store, handler, session and serialization
+guard, and binds node, PG, epoch, topology and operation. Crossed stores with
+the same PG are not interchangeable. Ordinary request construction still permits
+read-only checkpoint capture; it cannot mint this mutation authority.
+
+The same token reaches the final pre-write check inside SQLite: checkpoint
+recording checks after encoding and transaction admission, and compaction checks
+after prefix/receipt validation but before its first write. Those checks use the
+handler's captured monotonic lease, not a renewed runtime map. Complete grammar
+selection at the shared compactor requires the token; raw complete mutation
+adapters are test-only, and raw checkpoint insertion is private to the log
+owner. V13 routing remains unchanged; there is no format or fsync addition.
+
+Coverage adds independent compiler probes against the actual authority module
+(successful borrowed use, rejected sibling constructor call, rejected struct
+literal), production method-signature checks requiring authority, crossed
+node/PG/epoch/topology/store/operation/transaction cases, and deterministic expiry
+at both final SQLite effect boundaries. The expiry cases assert the hook was
+reached, the exact route-expired error, unchanged log/checkpoint/receipt state
+and SQLite change count, successful rollback and a still-usable connection.
+
+Validation: **18 focused maintenance tests passed** in **6.623s**. Formatting,
+strict all-target/all-feature Clippy, storage boundary and diff checks passed.
+Full workspace Nextest passed **9,949 tests**, two slow reports and six existing
+skips, in **284.573s**, run `ecac1106-d42a-4c9d-8497-a844ac5909b6`.
+No other same-user Nextest was active at launch; load1 was 0.98. The Raft
+write-amplification test was inspected consuming active CPU after its slow
+warning and passed in 112.893s; oversized version listing passed in 64.464s.
+Logs: `/tmp/argmin-maintenance-authority-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete node startup integration — 2026-11-09:** the candidate complete
+decoder now reaches node construction before listener binding. A constructor-only
+PG entry derives its directory from the held exclusive storage-node root guard,
+opens its connection and runs complete local recovery before returning the
+store. The shared node opener uses the existing bounded parallel PG startup
+machinery and exposes no node unless every configured PG succeeds. It never
+adds a complete-recovery mutator to an already published node or widens the
+PG-local recovery mutator's visibility. Recovery uses each store's own epoch;
+the process route epoch cannot replace it.
+
+The prepared-server test entry selects complete startup and the already reviewed
+complete log inspection/maintenance handlers together. Selection remains
+`cfg(test)`, not a configuration field, wire flag, version sniff or fallback.
+Normal prepared/direct bind, managed bootstrap, initialization and local-cluster
+startup retain their current production grammar. Managed/local startup and the
+remaining builder/RPC/recovery/custody dispatch must still switch together at
+activation; this step does not claim those paths are complete.
+
+The exclusive root lock remains held from before open through recovery and the
+server's lifetime. A failed PG causes all startup workers to join and all opened
+stores to close before the lock is released; listeners are not bound. Benign
+repairs are transactional **per PG**, not one all-node transaction: other PGs
+may complete valid local repairs even when one PG prevents serving. Complete
+startup preserves pending slots and their indexes regardless of local terminal
+or historical-epoch disposition, and does not apply payload commands, retire
+owners, release resources or authorize physical cleanup.
+
+Six node-level regressions cover all three context kinds with retained and
+compacted prefixes, authenticated checkpoint inspection after real reopen,
+current/historical pending custody in a newer Peering configuration, mixed stored
+PG epochs, interrupted tombstone/cache repair and a second restart, failed-PG
+non-mutation and listener exclusion for six corruption/future-custody cases,
+exclusive-root rejection of duplicate runtime opening, and both directions of
+V13/V14 applied-log decoder separation. Fixtures close the original node/server
+before reopening; they do not open duplicate SQLite runtimes. No durable/wire
+format, ordinary successful-write transaction or fsync is added.
+
+Validation: **35 focused startup/recovery/maintenance tests passed** in
+**7.538s**. Formatting, strict all-target/all-feature Clippy, storage boundary
+and diff checks passed. Full workspace Nextest passed **9,955 tests**, two slow
+reports and six existing skips, in **284.910s**, run
+`9c98de0e-06fa-48f8-94d7-4eb9fd4e05a7`. No other same-user Nextest was active at
+launch; load1 was 1.72. The workspace rebuild completed in 2m57s. The Raft
+write-amplification test was inspected consuming active CPU after its slow
+warning and passed in 113.941s; oversized version listing passed in 63.425s.
+Logs: `/tmp/argmin-complete-node-startup-{focused,clippy-final,boundaries,workspace}.log`.
+
+**Complete managed-bootstrap integration — 2026-11-09:** the candidate startup
+selection now survives control-plane-managed bootstrap, heartbeat inspection,
+one-shot preparation and ordinary prepared-server bind. Bootstrap and direct
+bind use the same private opener. Preparation retains both the exclusive root
+guard and the selected grammar; bind cannot silently reset a complete bootstrap
+to V13. The complete branch and its bootstrap constructor remain `cfg(test)`:
+there is no public/configuration/wire selector, decoder sniff or fallback.
+
+Managed heartbeat inspection already uses the exact grammar-neutral pending
+identity/route indexes and cached validated prefix proof, so this step reuses
+that path without introducing an alternate command decoder. Bootstrap can
+report a retained command at its original epoch even when the saved current
+acting set no longer includes this node. The exact materialized/pending route
+dependencies feed the existing runtime-refresh retention mechanism. Heartbeat
+inspection neither changes custody nor adds durable writes. Existing node
+incarnation advancement and persisted runtime-configuration writes remain;
+the slice adds no format, successful-write transaction or fsync.
+
+Owner-local managed-startup tests cover all three applied context kinds and
+unresolved/applied/abandoned pending dispositions, exact pending checksum and
+prefix proof reports, unchanged materialized/log/index state through bind and
+a second restart, root-lock exclusion at every handoff, and authenticated complete
+log RPC selection after ordinary bind. Separate cases cover missing saved configuration,
+pending PGs absent from the new acting set with exact historical-route retention,
+and fail-closed startup for damaged route index, bucket scope or materialized
+digest. Original stores are closed before reopening; no duplicate runtime is
+used. Production selection remains current everywhere. Local-cluster startup
+and the remaining builder/apply-RPC/recovery/custody dispatch still require
+coordinated integration before activation.
+
+The installed-RPC fixture gives its worker a separate, worker-owned scoped
+clock override matching the bootstrap's timeline; the initial missing override
+correctly triggered route expiry. Its ordinary successor reserves a distinct
+version from the applied prefix, avoiding a fixture-only reservation conflict.
+Neither correction changes production validation or weakens the assertions.
+
+Validation: **22 focused startup/recovery/bootstrap tests passed** in **6.148s**,
+including the existing production-bootstrap regression. Formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. Full
+workspace Nextest passed **9,959 tests**, two slow reports and six existing
+skips, in **287.567s**, run `18d45a75-a06e-4b77-8935-112f01867b4e`.
+No other same-user Nextest was active at launch; load1 was 2.07. The workspace
+rebuild completed in 2m59s. The Raft write-amplification test passed in 113.285s
+and oversized version listing in 63.984s. Logs:
+`/tmp/argmin-complete-bootstrap-{focused-final,clippy,boundaries,workspace}.log`.
+
+**Complete pending inspection interface — 2026-11-09:** local-cluster startup
+still includes acting-set convergence, reservation release and slot removal
+through V13 APIs. Merely selecting a complete local decoder there would leave
+those terminal custody boundaries incomplete. The next prerequisite instead
+connects complete pending inspection to embedded and installed Unix clients;
+local-cluster startup/convergence remains explicitly open.
+
+One PG-owned request scope validates the actual slot and its complete context,
+scope bucket, retained indexes and local terminal relationship in a pinned
+SQLite snapshot. The transport projection retains that validated context rather
+than rereading the slot afterward. An epoch-specific absent response validates
+any actual other-epoch slot first and does not clear it. Snapshot teardown uses
+the existing rollback/connection-retirement guard. Embedded inspection uses
+deadline-bounded PG locking; Unix admission/transport use the original deadline.
+The server reuses authenticated routing and metadata-command serialization,
+including current Active/Peering and admitted historical inspection routes.
+
+Both clients return an opaque observation which retains scope, topology, complete
+context and publication-start state. Production access cannot extract a raw
+envelope, reissue it or turn it into a fresh submission; the borrowed context
+accessor exists only in owner-local tests. This is a peer/local observation, not
+recovery admission, a proof of global absence or a custody transfer. Subsequent
+recovery must consume observations under its separately admitted owner path.
+
+The pending-envelope outer grammar is unchanged. A bounded borrowed wire parser
+handles complete command capacity; the owner decoder then checks integrity,
+context and exact requested PG/epoch. A frozen RPC-v37/command-v14/context-v1
+response payload is appended without replacing existing evidence. Framing tests
+exercise the maximum complete response and malformed lengths/flags/truncation.
+Installed tests compare embedded/Unix results for all three contexts, unresolved
+and terminal custody, historical routes and real restart, plus damaged-index/
+scope/terminal non-mutation and malicious authenticated response cases. Production
+dispatch remains current-only; only owner-local tests select complete inspection.
+No schema, format version, ordinary-path write or fsync is added.
+
+The initial restart matrix correctly rejected a fixture that installed an
+epoch-5 first command over an epoch-1 durable prefix. Its success cases now use
+the existing empty-state transfer initializer before installation; future-epoch
+pending rejection remains unchanged and covered by the recovery tests.
+
+Validation: **27 focused pending/inspection/recovery tests passed** in **5.990s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff checks
+passed. Full workspace Nextest passed **9,966 tests**, two slow reports and six
+existing skips, in **287.015s**, run
+`0f3f82db-f030-4f64-88ab-432536603d53`. No other same-user Nextest was active at
+launch; load1 was 2.03. The workspace rebuild completed in 2m54s. The Raft
+write-amplification test passed in 113.512s and oversized version listing in
+62.169s. Logs: `/tmp/argmin-complete-pending-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete applied-peer inspection interface — 2026-11-09:** the next candidate
+boundary connects the retained pending observation to exact applied-command
+inspection over embedded and authenticated installed Unix clients. Probes and
+their results borrow that observation; they cannot detach its context, recreate
+a submission, or grant recovery/publication/cleanup authority. Probe construction
+checks the installed topology against the observation's complete topology, not
+only its PG count or selected PG. Empty pending observations cannot mint probes.
+
+The PG owner shares the existing applied-entry/receipt lookup through a private
+complete-identity adapter. A pinned read snapshot checks one exact retained entry
+or compacted receipt, including complete bytes/SHA-256 rather than CRC64 alone,
+and the command-bound previous/current hash link. This is bounded single-record
+evidence, not a scan or proof of the entire historical prefix. Abandoned or
+different records conflict; a missing retained entry/receipt reports only that
+peer's lack of evidence, never permission to abandon or release custody. Failed
+snapshot teardown retains the existing connection-retirement protection.
+
+The server preserves authentication, Active/historical-recovery route admission
+and metadata-command serialization. The response decoder checks its hash link
+against the requested complete identity and binds every conflict field, including
+the responding node, before returning a typed conflict. Malformed replies do not
+trigger retries. Embedded PG-lock acquisition and Unix transport retain their
+original operation deadline. Production dispatch still uses the current decoder;
+only owner-local tests select the complete handler.
+
+The existing request/response grammar is unchanged. The applied-hash request's
+frame cap alone now accommodates the bounded complete carrier plus route/length/
+checksum overhead; its live decoder still rejects candidate V14 commands. The
+wire parser borrows the body, checks lengths before body access, and cannot mint
+a command. An exact RPC-v37/command-v14/context-v1 query fixture is appended;
+previous fixtures remain intact. No schema/version advance, metadata mutation,
+ordinary-path transaction or fsync is added by these observations.
+
+Coverage includes all four context kinds, absent/applied/abandoned outcomes,
+compacted receipts, historical admission and real node restart; equal-CRC but
+different full-command substitutions; same-payload crossed contexts; damaged log
+and receipt records; independently crossed conflict fields; malformed requests
+and authenticated replies; topology/deadline checks before transport; unchanged
+production selection; and exact-at-cap framed admission. The initial append
+fixture needed its required owner-read snapshot, and the collision fixture's
+client epoch was corrected to match its epoch-6 finalizer. Neither correction
+changes production semantics or weakens the rejection assertions.
+
+Applied evidence alone does not finish terminal integration. Complete
+abandonment/acceptance observations, mutation dispatch, admitted recovery and
+frontend custody still require coordinated integration before activation.
+
+Validation: **20 focused applied/pending/terminal tests passed** in **4.180s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff checks
+passed. Full workspace Nextest passed **9,974 tests**, two slow reports and six
+existing skips, in **290.173s**, run
+`d9adbb5a-dbb8-4c57-8032-8c657a0d6e1e`. No other same-user Nextest was active at
+launch; load1 was 2.11. The workspace rebuild completed in 2m47s. The Raft
+write-amplification test passed in 110.125s and oversized version listing in
+65.932s. Logs: `/tmp/argmin-complete-applied-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete abandoned-peer inspection interface — 2026-11-09:** the next candidate
+boundary adds exact abandonment observations over embedded and authenticated
+installed Unix clients. Like the applied probe, it borrows the retained pending
+observation, validates its topology and exposes only a scalar result. Neither the
+probe, server query nor result can yield an installable command or mutation
+authority. Acceptance, publication and cleanup remain separate integration work.
+
+The store compares one exact retained terminal entry or compacted receipt in a
+pinned read snapshot. A matching complete-command tombstone returns true; an
+exact applied command or no retained terminal record returns false. False is
+**not** proof of nonacceptance. Different context/command bytes, substituted
+original-command digests and malformed integrity/hash links fail closed, rather
+than masquerading as absence. Tombstone comparison binds the complete source
+SHA-256, including when an adversary preserves the original CRC64. Historical
+startup validation shares this private exact lookup but retains its separate
+checkpoint/prefix authentication; the bounded probe does not claim that proof.
+
+The server retains recovery-read route admission and command serialization. The
+response validator checks the boolean grammar and every conflict subject field;
+malformed replies do not cause retries. Both transports retain their operation
+deadline. Production dispatch remains current-only; complete dispatch is still
+selected exclusively by owner tests. No schema/version bump, mutation, ordinary
+path transaction or fsync is introduced.
+
+The abandoned-query frame cap now includes the complete carrier and fixed request
+overhead, matching applied-query capacity. The two read-only operations share the
+same existing request grammar and exact frozen RPC-v37/command-v14/context-v1
+query specimen. Literal false/true responses pin the existing boolean grammar;
+no predecessor evidence is replaced. Exact-at-cap/cap-plus-one tests cover both
+message kinds independently of semantic validity.
+
+Coverage includes all four context kinds, missing/applied/abandoned evidence,
+current and historical admission, compaction and real node restart, crossed
+context and equal-CRC source substitutions, damaged log/receipt records,
+malformed requests/authenticated responses, independently crossed conflict
+fields, topology/deadline failures and unchanged production decoder selection.
+Every store/RPC matrix asserts non-mutation.
+
+Validation: **21 focused abandoned/applied/terminal tests passed** in **4.034s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff checks
+passed. Full workspace Nextest passed **9,980 tests**, two slow reports and six
+existing skips, in **290.476s**, run
+`411a7a94-480a-499f-befa-1c4df6642c06`. No other same-user Nextest was active at
+launch; load1 was 1.45. The workspace rebuild completed in 2m26s. The Raft
+write-amplification test was inspected actively using CPU and passed in 111.901s;
+oversized version listing passed in 63.302s. Logs:
+`/tmp/argmin-complete-abandoned-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete acceptance inspection interface — 2026-11-09:** candidate embedded
+and authenticated installed Unix clients now ask both application and abandonment
+acceptance questions using the complete retained pending observation. The probe
+and result retain that observation, responder and question; callers receive only
+`NextPosition` or `ExactTerminal`, not an `Apply` authorization, raw envelope or
+installable submission. This is a time-of-inspection replica observation. It
+does not validate every command effect, prove global nonacceptance, authorize
+abandonment, or replace revalidation at an admitted mutation boundary.
+
+The existing private position/digest classifier is shared by current and complete
+identities for both questions. Abandonment preserves terminal-generation-owner
+validation before inspection. The complete adapter pins one read snapshot across
+materialized-state digest/revision checking, replica epoch/position checks and
+exact entry/receipt comparison. Exact terminal results additionally require the
+matching terminal hash link. The digest check retains its existing revision
+cache and may recompute materialized metadata; this is not advertised as a
+constant-work lookup or historical prefix proof. A stale epoch, gap, crossed
+context, opposite terminal outcome or missing old-position receipt fails closed.
+Admission to inspect a retained historical route does not waive the store's
+stale-epoch check or authorize writing into its old prefix.
+
+Both RPCs use their existing message IDs and request/outcome grammars; per-kind
+framing now admits the bounded complete carrier plus the fixed request overhead.
+The shared exact RPC-v37/command-v14/context-v1 query evidence is retained, and
+independent literal outcome tags and exact-cap tests cover both acceptance
+message kinds. Response validation binds all conflict fields; malformed responses
+do not cause retries. Embedded lock acquisition and Unix transport retain their
+operation deadline. Server authentication, recovery-read route validation and
+command serialization are unchanged. Production dispatch remains current-only;
+owner-local tests alone select the complete handlers. No new schema/version,
+durable mutation or fsync is introduced.
+
+Coverage includes all four context kinds, both questions before and after both
+terminal outcomes, current/historical admission, compacted receipts, real node
+restart, complete-context and equal-CRC substitutions, damaged entries/receipts
+and materialized digest, stale/gapped/new-epoch positions, missing receipts,
+malformed authenticated replies and requests, topology/deadline failures, frozen
+wire evidence, and unchanged production decoder selection. Mutation dispatch,
+publication-start, admitted recovery and frontend custody integration remain open.
+
+Validation: **32 focused acceptance/application/terminal tests passed** in
+**5.232s**. Formatting, strict all-target/all-feature Clippy, storage boundary and
+diff checks passed. Full workspace Nextest passed **9,987 tests**, two slow
+reports and six existing skips, in **290.071s**, run
+`325ad354-1e30-419b-a5f7-ec8aa2847a3a`. No other same-user Nextest was active at
+launch; load1 was 1.88. The workspace rebuild completed in 2m56s. The Raft
+write-amplification test was inspected actively using CPU and passed in 111.703s;
+oversized version listing passed in 64.204s. Logs:
+`/tmp/argmin-complete-acceptance-{focused,clippy,boundaries,workspace}.log`.
+
+**Complete current-primary publication-start store boundary — 2026-11-09:** the
+candidate path now performs complete trial application and publication marking
+inside one `BEGIN IMMEDIATE` transaction. It first validates the exact pending
+carrier, bucket scope and every protection index, then checks replica acceptance.
+A fresh command applies through the real complete application component under a
+savepoint; rollback removes all trial effects before the exact slot is marked.
+An already-applied replay instead authenticates its terminal evidence without
+repeating ownership transfers. The marker is durable intent, not confirmation of
+witness application, serving visibility, or permission to release custody.
+
+The mutator requires an opaque authority mintable only in the server's private
+publication owner. Admission checks that the permit belongs to the handler's
+exact gate and is `Active`, using the shared route-admission validator; retaining
+an unchecked permit is not sufficient. It retains that current Active-primary permit,
+exact primary command section, locked store, complete command SHA-256/topology,
+and immutable work deadline. It revalidates authority after transaction admission,
+immediately before trial application and the marker update, and before commit.
+Caller-open transactions, missing/crossed primary sections, replica/Peering or
+historical admission, substituted commands/stores/topologies, and expired route
+or work authority are rejected. Historical recovery needs its own separately
+admitted integration; this authority deliberately does not authorize it.
+
+Every error preserves uncertain publication custody. Even failure after commit
+can leave the marker present; the API does not classify failure as authoritative
+nonacceptance or grant cleanup. Failed trial/outer rollback and unwind have an
+explicit rollback owner; unconfirmed rollback retires the connection until
+reopen. Failure injection is test-only, not a caller-controlled production commit
+callback. Production dispatch remains unchanged: only owner tests mint and use
+this candidate boundary. Embedded/Unix publication transport, historical recovery
+and frontend custody wiring remain open. There is no new schema/format version or
+extra ordinary-path transaction/fsync; activation will replace the existing
+trial-and-marker transaction, not add one alongside it.
+
+Coverage uses all four complete context kinds, real trial mutations and exact
+restoration, applied replay and node restart, independent slot/index corruption,
+abandoned or damaged terminal evidence, failures before/after marker and commit,
+rollback failure/unwind, and expiry interleavings. Compiler tests include the real
+authority implementation and independently reject sibling constructor and literal
+minting, with a compiling borrowed-use canary.
+
+Review correction: independent regressions reject another server's `Active`
+permit and this server's `RetainedCleanup` permit, both in the open state and
+during a real route drain. Node/epoch/topology, primary section and command remain
+identical so they cannot mask either permit mismatch. Both cases assert the exact
+admission diagnostic, unchanged slot/index/materialized state and no SQL writes.
+A same-domain Active permit acquired before the drain still mints valid authority
+and excludes route publication until dropped; normal publication remains a
+positive canary.
+
+Pre-review validation: **31 focused publication/application/pending tests passed** in
+**5.718s**. The initial focused run exposed an invalid restart fixture: its first
+epoch-5 introduction was pending over an epoch-1 prefix, which startup rejects.
+The rollback/reopen regression now uses an unresolved append after a real applied
+introduction and asserts the established epoch before testing recovery; startup
+validation was not relaxed. Formatting, strict all-target/all-feature Clippy,
+storage boundary and diff checks passed. Full workspace Nextest passed **9,995
+tests**, two slow reports and six existing skips, in **292.150s**, run
+`83e8f0a1-f953-44e8-ba97-5e4449e4eb1e`. No other same-user Nextest was active at
+launch; load1 was 3.19. The workspace rebuild completed in 2m43s. The Raft
+write-amplification test passed in 114.076s and oversized version listing in
+63.633s. Logs: `/tmp/argmin-complete-publication-focused-2.log`,
+`/tmp/argmin-complete-publication-clippy-final.log`,
+`/tmp/argmin-complete-publication-boundaries.log`, and
+`/tmp/argmin-complete-publication-workspace.log`.
+
+Permit-binding review validation: **11 focused publication/drain tests passed**
+in **4.074s**. Formatting, strict all-target/all-feature Clippy, boundary and diff
+checks passed. Full workspace Nextest passed **9,997 tests**, two slow reports and
+six existing skips, in **292.858s**, run
+`1113342a-c27a-4487-9360-0a7a97da5f2b`. No other same-user Nextest was active at
+launch; load1 was 1.15. The workspace rebuild completed in 2m25s. The Raft
+write-amplification test was inspected actively using CPU and passed in 113.010s;
+oversized version listing passed in 67.226s. Logs:
+`/tmp/argmin-complete-publication-permit-{focused,clippy-final,boundaries,workspace}.log`.
+
+**Complete publication payload contract — 2026-11-09:** the next candidate
+component adds a bounded, explicitly versioned publication request and exact
+marker acknowledgement. The existing live publication request has no operation
+deadline, so it cannot be reused unchanged for the admitted complete mutator.
+The new payload V1 carries a mandatory absolute conservative wall-clock cutoff,
+node/epoch/PG and the bounded CRC64/length/complete-command carrier. Sender
+preparation uses the established skew-shortened wall projection once. The first
+local/portable cutoff is retained in the pending-evidence holder, not the request
+or prepared-transport view. Repreparing with an equal/later deadline, or dropping
+and recreating a request from that holder, reuses the cutoff verbatim. A shorter
+per-attempt budget may only intersect it. The receiver binds that cutoff to its
+own monotonic clock once, before context validation, and retains it in every
+borrowed request.
+Forwarding also retains and intersects the original wire cutoff, so later wall
+samples cannot renew authority through another projection.
+
+Publication authority intersects its own work deadline with the decoded request
+cutoff. The deepest effect checks also honor a stricter same-command request;
+neither substituting a longer owner deadline nor projecting the decoded request
+again can extend authority. The existing server route lease remains an
+independent bound. This payload still needs authenticated transport and admitted
+server dispatch before it is reachable by a production caller.
+
+Only successful admitted marker commit produces the typed success response.
+Confirmation V1 binds responder node, command epoch/PG/log index and the complete
+command SHA-256, including context. The sender validates every field before
+returning a scalar observation borrowed from its retained request. A malformed or
+crossed response cannot confirm publication. Exact late confirmation may resolve
+marker uncertainty but grants no renewed effect authority, application, terminal
+convergence, generation release or cleanup. Lost outcomes still require retained
+custody; the owning network-error/history integration is not implemented here.
+
+Frozen literal outer request/confirmation specimens and full
+payload-V1/command-V14/context-V1 composites are appended without replacing any
+previous evidence. The request codec admits exactly complete-command capacity
+plus 38 bytes and rejects one byte more; the acknowledgement is exactly 58 bytes.
+These are **payload codec bounds, not installed per-kind frame-admission tests**.
+No live frame cap, RPC selection, format version, schema or fsync changes in this
+slice. The existing decoder rejects the candidate and the candidate rejects the
+deadline-less predecessor. Selecting the replacement must include the containing
+RPC version/evidence update, strict server dispatch, exact framing cap, Unix/TLS
+deadline integration, embedded equivalent and owning publication history. Do not
+add a current/candidate fallback decoder or call this production activation.
+
+Coverage includes all four complete context kinds through encode/decode and the
+real admitted store transaction, deliberately discarded replies followed by
+exact retry, independent crossed acknowledgement fields/digests, crossed command
+rejection before marking, malformed/truncated/trailing payloads, resealed retired
+command/unknown context versions, immutable sender/receiver cutoffs and expiry
+before admission and before the marker effect. Installed authenticated RPC,
+response-loss classification and historical recovery remain separate gates.
+
+Validation: all 18 focused publication tests passed in 4.280s. The initial
+deadline test incorrectly bounded receiver sampling by the instant before decode;
+it now brackets the receiver's actual sampling interval, without changing the
+production deadline rule. Final review also added original-wire-cutoff retention
+for forwarding; only this session's first workspace build was stopped, before
+tests, to include that correction. After the correction, formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+The admitted full workspace Nextest run passed **10,005 tests** (two slow, six
+skipped) in **292.324s**, run ID
+`e1ba72a4-7e9e-4ebe-a11c-f443526da396`. No other Nextest was active at launch;
+load1 was 5.26. The rebuild completed in 3m11s. The Raft write-amplification gate
+passed in 112.943s and oversized version listing passed in 64.020s. Logs:
+`/tmp/argmin-complete-publication-codec-focused-final.log`,
+`/tmp/argmin-complete-publication-codec-clippy-final.log`,
+`/tmp/argmin-complete-publication-codec-boundaries.log` and
+`/tmp/argmin-complete-publication-codec-workspace-final.log`.
+
+Review correction: the preceding retry test only encoded the same prepared
+transport again. A new regression reproduced renewal through a second
+`prepare_transport(later)` call (wire cutoff 108,999 to 418,999 ms after advancing
+the controlled wall clock). The holder now uses a private one-time deadline cell;
+all local request views borrow it, and decoded views borrow the receiver's
+already-bound cell. First local admission also captures this same bound. Coverage
+additionally recreates request views, moves wall time both forwards/backwards,
+checks shorter attempt budgets and rejects revival of an expired holder after
+its original view is dropped. No format or durable-state change is required.
+Validation of this correction: the new renewal canary failed against the previous
+implementation, then all **20** focused publication tests passed in **4.220s**.
+Formatting, strict all-target/all-feature Clippy, boundary checks and diff checks
+passed. With no other Nextest active and load below 10, the full workspace run
+passed **10,007 tests** (two slow, six skipped) in **292.067s**, run ID
+`4daf4abc-7c4c-4b21-9d8c-f3168ca68d5e`. The rebuild took 2m41s; the Raft gate
+and oversized version-listing tests passed in 112.674s and 65.603s respectively.
+Logs: `/tmp/argmin-publication-reprepare-before.log`,
+`/tmp/argmin-publication-reprepare-focused.log`,
+`/tmp/argmin-publication-reprepare-clippy.log`,
+`/tmp/argmin-publication-reprepare-boundaries.log` and
+`/tmp/argmin-publication-reprepare-workspace.log`.
+
+**Installed candidate publication — 2026-11-09:** the existing owner-local
+complete-protocol selector now dispatches `MetadataCommandPublicationStart` through
+the complete publication handler over authenticated Unix. Production selection
+remains unchanged; there is no decoder fallback. The handler decodes/rebinds the
+immutable cutoff once, validates the Active permit's domain/class, current epoch,
+Active route, primary and exact held current-primary command section, then bounds
+the PG mutex wait by both the received cutoff and server RPC budget. It mints the
+existing private authority only after obtaining that exact store; the transaction
+continues rechecking its captured route and deadline at effects. Historical
+recovery cannot use this current-primary authority.
+
+Successful marker commit returns the exact command/context acknowledgement.
+Typed store diagnostics survive the RPC mapping; trial/rollback failures remain
+internal diagnostics. No error or returned scalar licenses absence, abandonment,
+slot removal or cleanup. The raw session-send adapter exists only in storage's
+unit-test build: an owning production client with uncertain-outcome history is
+still required, rather than promoting this test adapter into the public route.
+
+Installed tests cover all four complete-context forms, repeated marker requests,
+already-applied no-mutation replay and reopen. Independent negatives cover an
+absent/wrong PG section, malformed/trailing/current-only payloads, crossed header
+subjects, non-primary and Peering routes, historical command epochs and an
+unselected server. A deadline regression first asserts that the worker reaches a
+live rebound cutoff, expires it before store access, and requires unchanged
+slot/log/materialized state and SQLite write count. An authenticated peer canary
+changes the confirmation's SHA-256 after marker commit: the sender rejects it,
+retains its evidence and confirms the same marker through a new session without
+repeating durable materialized effects. This is not a socket-disconnect or
+transport-loss classification test.
+
+Publication's per-kind frame admission now accepts exactly the complete payload
+cap and rejects one byte more. This is folded into the already-uncommitted RPC
+36-to-37 transition; it does not invent another intermediate wire version. Exact
+RPC-v37/payload-v1/command-v14/context-v1 request and success-response frames are
+appended, with correctly resealed v36/v38 rejection. Earlier payload specimens
+are unchanged. The connection dispatcher is shared with TLS, but an installed TLS probe,
+embedded admitted equivalent, owning sender/error history, historical recovery
+and the frontend custody switch remain separate gates. No SQL schema, durable
+owner semantics, command count or fsync changes in this slice.
+
+Validation: the first expanded run had five passes and a test-expectation failure:
+the non-primary validator returns `NonActingSetAccess`, not `StaleShardLocation`.
+The new test now pins that existing mapping; no production behavior was changed
+to accommodate it. All **26** focused publication tests then passed in **4.367s**.
+Formatting, strict all-target/all-feature Clippy, boundary checks and diff checks
+passed. No other Nextest was active and load was below 10 before the full run.
+The workspace rebuild took 2m46s, then **10,013 tests passed** (two slow, six
+skipped) in **294.962s**, run ID
+`c3f03ce5-da45-4ce3-9022-ae0ef3095da8`. The Raft gate and oversized version-listing
+tests passed in 113.677s and 63.786s respectively. Logs:
+`/tmp/argmin-publication-installed-expanded.log`,
+`/tmp/argmin-publication-installed-focused-final.log`,
+`/tmp/argmin-publication-installed-clippy.log`,
+`/tmp/argmin-publication-installed-boundaries.log` and
+`/tmp/argmin-publication-installed-workspace.log`.
+
+**Installed TLS and lost-publication-reply evidence — 2026-11-09:** the same
+explicitly test-selected complete publication handler is now exercised through a
+TLS-only listener with certificate validation and authenticated RPC sessions.
+All four context forms cover exact marker retries, application, already-applied
+no-mutation confirmation, and confirmation after closing the original runtime
+and reopening the stores. There is no Unix fallback in the TLS fixture.
+
+The deadline matrix uses different frontend/server wall origins and covers both
+arrival after the absolute cutoff and expiry after live receiver rebinding but
+before store access. It requires unchanged slot, log, materialized state and
+SQLite write count. No new deadline representation or renewal path is introduced.
+
+A worker-local fault closes the actual Unix or TLS connection immediately after
+successful publication dispatch, before any acknowledgement bytes are sent.
+The real session classifier returns `MayHaveApplied`, the publication marker is
+durable, and an explicit exact retry on a fresh connection reuses the original
+holder's complete context and immutable cutoff. All four contexts additionally
+exercise invalid response authentication and authenticated crossed confirmation
+digests over TLS. A pre-send expired attempt is separately `NotSent` with zero
+server publication responses/effects; reply counters exclude hidden retries.
+Successful reinspection preserves materialized state, the command prefix,
+protection indexes and exact pending context. Marker confirmation is not apply
+or cleanup authority.
+
+The raw classified send adapter and disconnect scenario are test-only. This
+closes the installed TLS/transport-loss evidence gate, **not** the owning
+publication-history gate: production sender integration must retain earlier
+uncertainty even if a later attempt is not sent or receives an error. Embedded
+admitted publication, historical recovery admission and frontend custody changes
+also remain open. Production selection, wire/schema versions, ordinary command
+counts and fsync behavior are unchanged.
+
+Validation: all **29** focused publication tests passed in **4.387s**. Formatting,
+strict all-target/all-feature Clippy, storage boundary checks and diff checks
+passed. No other Nextest was active at full-suite launch; load1 was 1.29. The
+workspace rebuild took 2m58s, then **10,019 tests passed** (two slow, six skipped)
+in **291.078s**, run ID `cbd8f24b-6067-4f48-bb3b-d87f5a7b5b52`. The Raft gate was
+observed actively using CPU and passed in 113.056s; oversized version listing
+passed in 63.145s. Logs: `/tmp/argmin-publication-tls-focused.log`,
+`/tmp/argmin-publication-tls-clippy.log`,
+`/tmp/argmin-publication-tls-boundaries.log` and
+`/tmp/argmin-publication-tls-workspace.log`.
+
+**Admitted embedded publication bridge — 2026-11-09:** the candidate now has a
+process-local counterpart to the installed server admission boundary. An opaque
+route borrows the real `StorageClusterRouteAdmission`, derives its current
+Active metadata primary and embedded runtime, captures its route fence once,
+and acquires the existing shared metadata-command PG serialization lock. The
+route rejects non-primary, historical/future epochs, Peering and non-embedded
+execution endpoints. No independently supplied runtime, lock, fence or validation
+closure can replace that admitted scope.
+
+The private node owner opens the exact selected runtime's PG mutex under the
+bounded work deadline and creates an opaque, borrowed authority tied to that
+store, node/PG/epoch, topology and complete command SHA-256. Its constructor and
+callback-bearing bridge are not exposed to sibling modules. A closed internal
+authority enum feeds embedded and installed-server admission into the same
+complete trial/rollback/marker/commit implementation; no arbitrary validator
+closure or extensible authority trait reaches the transaction. Effect checks
+retain the captured route cutoff through same-epoch renewal and the request
+holder's first work cutoff through later retries. The serialization scope also
+bounds lock waits by its captured route cutoff.
+
+Owner tests cover all four complete contexts, exact marker retries, apply and
+already-applied no-mutation confirmation; independent crossed primary, epoch,
+same-ID/different-command and same-PG/different-runtime stores; Peering rejection;
+contention on the actual shared serialization lock; work expiry immediately
+before marker insertion; and captured route expiry at trial, marker and commit
+boundaries while the raw same-epoch map is renewed. Expiry rolls back trial and
+marker effects and cannot be revived by a later request budget. A compiler
+harness includes the actual node bridge source and separately rejects sibling
+authority construction and callback injection, with positive borrowed/use
+controls.
+
+This closes the embedded admitted-store bridge, not production publisher
+selection. Existing embedded publishers still use their current command path.
+The owning sender/history integration, historical recovery admission and
+frontend custody switch remain coordinated activation gates. No durable schema,
+wire format, command count or fsync change is introduced.
+
+Validation: the initial focused matrix had four passes and one fixture-setup
+failure: the bounded-renewal scenario incorrectly requested
+static authority (`StaticRouteAuthorityBoundedValidity`). It now uses the existing
+dynamic-authority fixture; no production rule was relaxed.
+The strengthened **35-test** focused publication suite passed in **5.014s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and diff
+checks passed. No other Nextest was active at full-suite launch and load1 was
+2.26. The rebuild took 3m09s; **10,025 workspace tests passed** (two slow, six
+skipped) in **292.331s**, run ID `3f78b1a8-409e-4928-b870-e997280ab36b`. The Raft
+gate was observed actively using CPU and passed in 111.857s; oversized version
+listing passed in 62.047s. Logs:
+`/tmp/argmin-publication-embedded-focused.log`,
+`/tmp/argmin-publication-embedded-focused-final.log`,
+`/tmp/argmin-publication-embedded-clippy.log`,
+`/tmp/argmin-publication-embedded-boundaries.log` and
+`/tmp/argmin-publication-embedded-workspace.log`.
+
+**Owning publication retry history — 2026-11-09:** the candidate sender now
+consumes complete pending evidence, retains the exact context and fixed target
+node, and captures the first local/portable deadline before any attempt. Its
+private representation exposes only scalar diagnostics and closed embedded or
+authenticated-session sends: no context/encoding extraction, reset, split,
+cleanup Drop, or fresh submission conversion. This is ownership of inspected
+publication evidence, **not** a transfer of frontend payload resources.
+
+Before dispatch the holder records uncertainty, including on unwind. A proven
+unsent remote attempt restores the preceding observation rather than resetting
+it. Every authenticated remote error remains potentially applied; an arbitrary
+`ResourceExhausted` is neither absence nor permission to retry internally.
+Authentication/frame failures and crossed complete-command confirmations cannot
+establish success. Only an exact validated reply or successful admitted embedded
+transaction records `MarkerConfirmed`. That is historical marker evidence,
+never apply, retirement, abandonment or cleanup authority; subsequent failures
+do not erase the observation.
+
+The session send requires an opaque attempt borrowed from the owning sender;
+detached transport or context bytes cannot substitute for that history-bearing
+argument. The typed send checks node, PG and epoch before transport, uses the
+holder's bounded transport deadline, and performs one classified request without
+reconnecting or retrying. Embedded attempts enter the existing opaque admitted
+section and shared transaction; errors before/after COMMIT and unwinding retain
+the original context and uncertainty. Caller-provided callbacks exist only on
+the test seam, not the production send.
+
+All four context forms exercise actual Unix and TLS connection loss after
+commit, a later unsent retry, an authenticated generic error, an authenticated
+crossed digest and exact confirmation on the same holder. Reply counts pin the
+absence of hidden retries. Exact already-applied retries must leave materialized
+state and SQLite write count unchanged. Embedded tests interrupt before COMMIT,
+after COMMIT and by post-COMMIT unwind, then retry through the same holder.
+Independent node/epoch/PG crossings and an originally expired deadline require
+zero publication requests and unchanged durable state.
+
+This closes the candidate sender's local history component, not coordinated
+activation. Owning frontend installation/publication handoff, historical
+recovery admission and live publisher selection remain open. No schema, wire
+format, ordinary command count or fsync change is introduced.
+
+Validation: the five new scenario tests passed in the focused run and again
+after the opaque-attempt interface tightening in the full suite. Formatting,
+strict all-target/all-feature Clippy, storage boundary checks and diff checks
+passed. No other Nextest was active at full-suite launch; load1 was 1.13.
+The rebuild took 3m08s; **10,030 workspace tests passed** (two slow, six skipped)
+in **296.162s**, run ID `908c71c1-9755-465b-95a4-06d7a14cb001`. The Raft gate was
+observed actively using CPU and passed in 112.268s; oversized version listing
+passed in 64.483s. Logs: `/tmp/argmin-publication-sender-focused-final.log`,
+`/tmp/argmin-publication-sender-clippy.log`,
+`/tmp/argmin-publication-sender-boundaries-final.log` and
+`/tmp/argmin-publication-sender-workspace.log`.
+
+**Installation-to-publication ownership handoff — 2026-11-09:** a complete
+`ContextualSubmission` can now transfer directly into the owning publication
+sender. A private child owns the transfer representation; only the consuming
+method constructs it, and the sender never lends or extracts it. It retains the
+whole original submission, including its immutable context/topology and exact
+installation observation. No pending reinspection, input reconstruction,
+caller-selected descriptor/topology/history, or additional durable operation is
+needed for this process-local handoff. The sender captures its first publication
+budget at transfer and continues to use the already-reviewed bounded send paths.
+
+Installation history and publication history remain independent diagnostics.
+An uncertain installation followed by publication confirmation retains the
+uncertain installation result alongside `MarkerConfirmed`; it cannot become a
+fresh submission or infer resource ownership from an error. An inspection-only
+sender has no caller installation history, rather than a fabricated
+`NoAcceptanceObserved` installation. Neither handoff nor Drop releases payload,
+reservation or pending custody. There is no reverse conversion or detachable
+command accessor, and Nextest-compiled negative trait assertions pin the
+non-cloneability of the sender, borrowed attempt and opaque submitted evidence.
+
+The seven-context installation matrix covers fresh input, definitive rejection,
+successful installation, uncertain COMMIT, unwind and damaged exact retry, using
+real SQL outcomes rather than injected history values. It checks exact command
+ID, both observations, materialized state, pending indexes/log/prefix and SQLite
+write count across transfer and Drop. All four complete carrier forms additionally
+exercise installed and uncertain submissions over Unix and TLS: lost committed
+reply, unsent retry, authenticated generic error, crossed confirmation, exact
+confirmation and already-applied replay. An independent exact installer models
+recovery after an uncertain result without rewriting the original holder's
+history. Embedded post-COMMIT interruption and exact retry preserve both
+observations as well.
+
+This closes the process-local command-holder handoff, not the live frontend
+payload/generation/proof handoff or production activation. Admitted historical
+recovery, live publisher selection and the resource-owning frontend switch remain
+open. No schema/wire format, ordinary metadata command or fsync is added.
+
+Validation: the initial focused run had nine passes and
+one new fixture-setup failure: the seven-context matrix omitted the clock origin
+required by the existing append fixture, producing `RouteMapExpired` before
+handoff. It now uses that fixture's established 2,000 ms clock; no production
+validation was relaxed. Initial log: `/tmp/argmin-publication-handoff-focused.log`.
+
+All **10** focused handoff/sender tests then passed in **8.228s**. Formatting,
+strict all-target/all-feature Clippy, storage boundary checks and diff checks
+passed. No other Nextest was active at full-suite launch; load1 was 2.22. The
+rebuild took 2m43s; **10,035 workspace tests passed** (two slow, six skipped) in
+**295.961s**, run ID `9a400186-a697-4035-b168-c91d59e11c66`. The Raft gate was
+observed actively using CPU and passed in 113.176s; oversized version listing
+passed in 63.067s. Final logs: `/tmp/argmin-publication-handoff-focused-final.log`,
+`/tmp/argmin-publication-handoff-clippy.log`,
+`/tmp/argmin-publication-handoff-boundaries.log` and
+`/tmp/argmin-publication-handoff-workspace.log`.
+
+**Installed historical publication admission — 2026-11-09:** the explicitly
+selected candidate Unix/TLS handler now admits old-epoch publication only under
+the current runtime map's exact recovery report: reporting node, PG, command
+epoch/index and complete-carrier CRC64. Historical route validation and the
+historical recovery-primary section remain mandatory. The section alone is
+PG/epoch-scoped and cannot authorize a different reported command. Current
+publication retains its Active-primary checks; future epochs have no fallback.
+
+The opaque server authority retains the exact section binding and immutable
+route fence. Historical mutation requires a bounded, process-bound current-map
+lease even though the command belongs to the old epoch. The same fence and
+receiver-bound work cutoff are checked at the trial, marker and commit
+boundaries. Both paths still require an Active permit from this server's exact
+admission domain. Retained-cleanup permits cannot grant publication authority.
+
+An exact map report is admission, not proof of durable command contents. The
+shared transaction still requires the complete pending bytes/context, scope and
+indexes, or exact applied evidence. The tests deliberately authorize another
+same-ID command in the map while retaining the original slot and require
+non-mutation. There is no CRC-only substitution for the complete SHA-256/context
+identity and no conversion back to an ordinary command.
+
+The installed Unix and TLS matrices reopen the original store at a later
+Peering epoch with retained Active history and explicit recovery authorization.
+All four context forms cover committed reply loss, same-holder exact retry,
+application and already-applied restart with unchanged durable state/write count.
+Independent checksum/index substitutions reach a successfully acquired historical
+section before failing exact publication admission. Missing authorization and a
+different reporting primary fail without effects. Owner-local tests additionally
+expire the captured route before trial/marker/commit, and reject current-primary,
+wrong-PG/epoch, foreign-domain and retained-cleanup permits without mutation.
+
+This slice closed **installed candidate** historical publication admission only.
+The embedded historical bridge was completed in the following slice; live
+publisher selection, frontend resource custody and end-to-end recovery/terminal
+handoffs remain activation gates. No
+format/schema version, ordinary-path command, transaction or fsync is added.
+
+Initial validation caught a new fixture error: position-1 introduction had no
+matching empty durable epoch prefix before installation, so restart correctly
+rejected its future slot. The fixture now establishes that prefix through the
+existing storage operation. New negative assertions were also corrected to use
+the actual server-side diagnostic before RPC redaction, including the earlier
+exact-slot/scope rejection. The existing unadmitted-historical canary now pins
+`InactivePgRoute` and its missing-Peering diagnostic rather than the previous
+blanket stale-epoch rejection; all non-mutation assertions remain. No production
+check was relaxed. Initial/probe logs are retained under
+`/tmp/argmin-publication-historical-{focused,startup-probe,focused-final,focused-verified}.log`.
+
+Final validation: all **51** focused publication tests passed in **11.032s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. No other Nextest was active at full-suite launch; the last
+prelaunch load1 sample was 5.40 and the launch guard rechecked it below 10.
+After a 2m39s rebuild, **10,041 workspace tests passed** (two slow reports, six
+existing skips) in **298.164s**, run ID
+`f008d355-d25f-460e-82e2-c37864cc6221`. The Raft gate was inspected actively using
+95% CPU and passed in 111.290s; oversized version listing passed in 64.034s.
+Final logs: `/tmp/argmin-publication-historical-focused-complete.log`,
+`/tmp/argmin-publication-historical-clippy.log`,
+`/tmp/argmin-publication-historical-boundaries.log` and
+`/tmp/argmin-publication-historical-workspace.log`.
+
+**Embedded historical publication admission — 2026-11-09:** the candidate
+embedded bridge now derives historical authority from a live dynamic admission
+and that admission's exact runtime-map content identity. `LocalPgRoute` does not
+carry recovery reports, so the bridge authenticates the supplied full snapshot
+before deriving the report, command epoch and historical primary. It requires
+current Peering, an older reported command and retained Active-primary history;
+static authority, an absent report or a crossed snapshot/PG cannot substitute.
+No caller-supplied historical epoch, node, raw fence or validation closure mints
+this authority.
+
+The opaque scope retains the actual admitted embedded runtime, exact reported
+command position/checksum, shared PG lock and bounded current-map fence. The
+command's historical epoch is distinct from the map epoch that bounds authority.
+The storage owner checks that exact report at every publication effect boundary,
+alongside the existing store pointer, topology, complete SHA-256 identity and
+immutable work deadline. Same-epoch renewal cannot extend an existing scope.
+The report remains admission rather than durable command authentication: exact
+slot/context/scope/index or applied evidence is still required transactionally.
+
+Owner tests obtain reports through real control-plane bootstrap, heartbeats,
+peering completion and transition, then retain the same embedded runtimes across
+the map change. All four complete context forms cover committed confirmation
+loss, same-holder retry, application and no-mutation applied replay. Independent
+same-epoch checksum/index substitutions test both map-content binding and the
+exact command check; a report for a different same-ID carrier cannot replace the
+durable slot. Static, missing-report and crossed-PG negatives fail closed. A
+shared-lock canary and pre-trial/post-trial/pre-marker/pre-commit expiry matrix
+pin serialization and rollback despite raw same-epoch renewal. The existing
+compiler harness continues to use the real node bridge source.
+
+This is candidate plumbing, not live frontend/recovery selection or physical
+cleanup activation. It adds no persistent format, transaction or fsync. Initial
+fixture validation rejected a zero-incarnation bootstrap node at its Peering
+transition; the test now performs a real incarnation-1 heartbeat. Final fixture
+review also added the existing storage-owned empty-epoch initialization before
+the position-1 introduction, with an assertion that every reported pending epoch
+has a matching durable prefix. The first workspace build was stopped before test
+execution to include that correction. No production check was relaxed.
+
+Final validation: all **56** focused publication tests passed in **12.096s**.
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. No other Nextest was active at workspace launch; load1
+was **6.41**. After a 46.41s rebuild, **10,046 workspace tests passed** (two slow
+reports, six existing skips) in **297.641s**, run ID
+`11e79bde-4fff-4308-b429-ad31831adb24`. The Raft gate was inspected with advancing
+CPU time at approximately 95% utilization and passed in 111.276s; oversized
+version listing passed in 63.564s. Logs:
+`/tmp/argmin-embedded-historical-publication-final.log`,
+`/tmp/argmin-embedded-historical-clippy-final.log`,
+`/tmp/argmin-embedded-historical-boundaries-final.log` and
+`/tmp/argmin-embedded-historical-workspace-final.log`.
+
+**Current-replica complete application admission — 2026-11-09:** the candidate
+receiver now exposes a closed operation rather than a raw apply function. A
+private server owner validates Active admission-domain identity, current epoch,
+Active acting-set membership and the server's exact PG serialization registry.
+Replicas acquire that serialization locally; a retained primary-session lock
+must additionally match the current PG/epoch. Foreign lock domains and historical
+sections cannot substitute. Opaque authority retains the actual locked store,
+target node, complete-command SHA-256, configured topology, captured route fence
+and immutable receiver work cutoff. Both serialization and store waits are
+bounded by the intersected cutoff.
+
+The existing complete apply-and-record transaction now requires this authority
+and rechecks it after transaction admission, immediately before fresh effects,
+and before commit. The last check also applies to exact replay, which does not
+repeat owner/session transfers or log writes. Rollback uncertainty retires the
+connection. Error or unwind before commit rolls back; interruption after commit
+retains the applied state for exact retry and never grants cleanup. The complete
+apply-and-record entry requires that authority; its independent-command/topology
+adapter and caller-selected mutation callbacks remain unit-test-only. The complete
+encoded representation stays private to the storage owner, exposed only through
+an opaque receiver request view and scalar observations.
+
+Coverage includes all four complete context forms on the primary and a distinct
+replica, exact no-write replay, independent command/store/node/topology
+substitutions,
+foreign/retained-cleanup permits, crossed primary sections and lock registries,
+non-Active/nonmember/old/future routes, bounded lock waits, effect/commit expiry,
+error/unwind on both sides of commit and sticky retirement after failed rollback.
+A Nextest-executed compiler harness uses the real receiver source to reject
+authority struct literals and sibling mutation callbacks while accepting the
+closed operation.
+
+This is **receiver-side candidate plumbing only**. It does not install a complete
+application RPC, provide sender custody/portable deadline binding, admit embedded
+or historical replica application, or select live publishers. Those boundaries
+must retain the original complete context and immutable absolute wire cutoff
+when connected. No format/schema version, transaction, ordinary command or fsync
+is added.
+
+Validation: all **77** focused application/publication tests passed in **15.968s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. No other Nextest was active at workspace launch; load1 was
+**5.90**. After a 3m10s rebuild, **10,056 workspace tests passed** (two slow
+reports, six existing skips) in **299.327s**, run ID
+`e3d4e4b0-19ee-499d-9766-bee29af05716`. The Raft gate was inspected with CPU time
+advancing from 1m16s to 1m45s and passed in 113.727s; oversized version listing
+passed in 62.610s. Logs:
+`/tmp/argmin-complete-application-admission-focused-verified.log`,
+`/tmp/argmin-complete-application-admission-clippy.log`,
+`/tmp/argmin-complete-application-admission-boundaries.log` and
+`/tmp/argmin-complete-application-admission-workspace.log`.
+
+**Installed complete application receiver — 2026-11-09:** owner tests now select
+the current-replica complete apply boundary through authenticated Unix and TLS
+RPC. The new purpose-tagged application payload carries the complete V14/context
+V1 bytes and a mandatory conservative absolute wall cutoff. The receiver binds
+that cutoff once to its monotonic clock before context decoding. Its opaque query
+lends only a scoped request view; repeated projections cannot reset the deadline
+or expose an independently installable context. The local constructor is now
+unit-test-only. The server work budget is captured before decoding and can only
+shorten the wire cutoff; the existing admission owner additionally intersects
+the captured route fence and checks authority at effects/commit.
+
+Successful application returns node, exact command ID, complete SHA-256 and the
+replica state, under an application-specific response purpose tag. Matching
+requires the complete identity and a same-epoch prefix covering the command.
+This is response validation, not a substitute for an owning fanout holder,
+publication-start authority or cleanup permission. The production dispatcher
+still rejects the candidate grammar; the test selector has no current-format
+fallback. Historical application remains explicitly rejected.
+
+The installed Unix/TLS matrix covers all four context forms on both primary and
+replica: committed reply loss, exact retry without owner/log writes, and reopen
+with the same exact replay. Primary pending custody remains retained after apply.
+Independent malformed subject, checksum, command/context version and purpose
+cases fail before effects. Unselected, non-Active, nonmember and historical
+routes fail closed. Expiry tests cover arrival after cutoff and a pause after
+receiver rebinding, with the server work budget still live. A separate query
+canary proves wall-clock changes/new projections cannot renew the captured
+monotonic bound. Authenticated crossed confirmations and bad response
+authentication leave the committed state intact; the test counts one response
+per explicit attempt and confirms no-write retry. Literal payload and complete
+RPC-v37 composites are appended; exact-cap/cap-plus-one framing is tested. No
+predecessor evidence, schema or ordinary-path command/fsync is changed.
+
+This closes the **installed candidate current-replica receiver**, not live
+activation. An owning application sender/fanout handoff must next retain the
+original publication/installation history, complete context and first cutoff
+across dispatch/retry. Embedded and historical application admission and frontend
+payload/proof custody also remain open. No stateless production sending API was
+added; raw frame submission is confined to owner tests.
+
+Initial validation exposed two new fixture issues: a crossed outer epoch was
+incorrectly expected to reach route validation rather than fail context decoding,
+and the deliberate expiry delay consumed the default client transport timeout.
+The former now pins `PayloadDecode`; the latter uses a longer test-only transport
+wait and an independently earlier wire cutoff, asserting the receiver work budget
+has not expired. Production validation and timeout policy were not relaxed.
+All **87** focused application/publication tests passed in **22.357s**. Final
+evidence review strengthened the frozen confirmation test to assert independent
+node/command/digest and replica-state field values, not only decode/re-encode
+symmetry. The first workspace run was interrupted to include that assertion;
+test execution had just begun (1,538 passes, 16 SIGINT interruptions, no assertion
+failure). Its log is retained at
+`/tmp/argmin-complete-application-rpc-workspace-interrupted.log`.
+
+Final validation repeated formatting, strict all-target/all-feature Clippy and
+storage boundary checks successfully. No other Nextest was active at launch;
+load1 was **8.43**. After a 21.38s rebuild, **10,066 workspace tests passed**
+(two slow reports, six existing skips) in **300.386s**, run ID
+`14f5607e-e743-4c58-beed-833b07f7bb76`. The Raft gate was inspected with CPU time
+advancing from 1m11s to 1m38s and passed in 113.399s; oversized version listing
+passed in 64.770s. Diff checks passed. Final logs:
+`/tmp/argmin-complete-application-rpc-focused-complete.log`,
+`/tmp/argmin-complete-application-rpc-clippy-final.log`,
+`/tmp/argmin-complete-application-rpc-boundaries-final.log` and
+`/tmp/argmin-complete-application-rpc-workspace-final.log`.
+
+**Owning current-replica application sender — 2026-11-09:** the original
+`CompletePublicationSender` now lends application attempts to closed Unix/TLS
+client operations. It never exports a separate command, application context or
+new submission. Application requires this holder's exact publication marker
+confirmation. Both inspected and submitted origins retain their original
+installation/publication history; application observations are stored separately
+per target node. The first local/portable cutoff captured before publication is
+also the application cutoff, even across newly encoded attempts and wall-clock
+changes. Individual shorter work budgets cannot renew that captured authority.
+
+The primary can apply on its retained serialization session, while a replica
+uses an ordinary authenticated connection. Node/epoch and, for sessions, PG
+crossings fail before transport. The receiver independently admits current
+acting-set membership. Every attempt starts as uncertain before entering the
+closed transport, including unwind. Only a classified not-sent result restores
+the previous observation; it cannot clear earlier uncertainty. Generic remote
+errors, lost replies, bad response authentication and crossed confirmations
+preserve uncertainty. An exact application-purpose confirmation records that
+peer's applied outcome; later failures cannot erase it or another peer's state.
+There are no hidden retries, cleanup-on-Drop or pending-slot removal.
+
+Installed Unix/TLS tests cover all four complete context forms and partial
+fanout: a replica commits but loses its reply, the primary confirms independently,
+and replica retries see not-sent, resource error, crossed confirmation and exact
+success outcomes without repeating durable writes. Existing inspected, installed
+and unconfirmed-installation matrices now proceed through real primary application
+and assert the original histories are unchanged. Additional tests pin bad-auth
+uncertainty, crossed primary sections, one request per explicit attempt, original
+deadline reuse across wall-clock changes, unwind before/after confirmation,
+non-cloneable holders/attempts and no cleanup on holder drop.
+
+This is **owning per-peer sender integration**, not live activation or an
+acting-set completion proof. No API here claims all replicas are applied or
+permits retirement. The next slice must bind the required acting set to the
+owning fanout/terminal handoff; embedded/historical application admission and
+frontend payload/proof custody also remain gated. The existing candidate payload
+and response grammar is unchanged; no format bump, extra transaction or ordinary
+path fsync is added.
+
+Initial focused validation exposed a new fixture mismatch: independent primary
+and replica setup minted different random staging identities, so the exact-byte
+canary failed. The replica fixture now starts from one consistent SQLite image
+of the primary's materialized state and preceding log/receipt history, omitting
+only the primary pending slot. This is owner-local metadata-only fixture setup,
+not a production transfer mechanism.
+
+The corrected matrix then exposed a test-server lifetime bug on TLS: joining a
+one-connection worker waited for its idle timeout, leaving a closed connection
+in the client pool. The following explicit attempt returned unconfirmed
+`TransportClosed` / `Broken pipe`, while the fixture joined another worker stuck
+in `accept`. GDB pinned that exact schedule; the run was interrupted after 88
+passes, rather than treating the hang as acceptable. The replica now runs for
+the whole retry sequence with explicit scoped shutdown, preserving ordinary
+connection reuse and the one-response-per-explicit-attempt assertions. The
+sender's production uncertainty classification was unchanged. Diagnostic logs:
+`/tmp/argmin-complete-application-sender-focused.log`,
+`/tmp/argmin-complete-application-sender-focused-v3.log` and
+`/tmp/argmin-application-sender-blocked-bt.log`.
+
+Final validation: **92 focused tests passed** in **22.294s**, including the
+corrected two-node matrix in 4.677s. Formatting, strict all-target/all-feature
+Clippy, storage boundary checks and diff checks passed. No other Nextest was
+active at workspace launch; load1 was **5.08**. After a 2m46s rebuild,
+**10,071 workspace tests passed** (two slow reports, six existing skips) in
+**301.430s**, run ID `ccebd6e9-f4d1-437b-bc96-42e86f15bc10`. The Raft gate was
+inspected at 80s with 1m17s of accumulated CPU and passed in 111.163s; oversized
+version listing passed in 62.489s. The new two-node matrix passed in 5.002s in
+the workspace run. Final logs:
+`/tmp/argmin-complete-application-sender-focused-v4.log`,
+`/tmp/argmin-complete-application-sender-clippy.log`,
+`/tmp/argmin-complete-application-sender-boundaries-final.log` and
+`/tmp/argmin-complete-application-sender-workspace.log`.
+
+**Admission-bound current acting-set completion — 2026-11-09:** a consuming
+pre-publication bind now moves the original publication sender into an opaque
+fanout holder. Its cohort is derived from the borrowed current Active route
+admission, never a caller-supplied list. Binding checks exact PG, epoch, primary
+and topology and refuses pre-existing publication/application observations;
+failed binding returns the original owner with installation history intact.
+The holder permanently intersects its first local/portable work cutoff with the
+captured route cutoff. Neither another retry nor same-epoch raw-map renewal can
+replace that cohort or extend its authority.
+
+Closed Unix/TLS sends require the actual registered client allocation, not just
+matching node, epoch or endpoint. Primary operations additionally require a
+session opened by that exact client instance; shared RPC admission pools are not
+client identity. The lowest-ID non-primary witness must confirm before primary
+application; primary confirmation must precede trailing application. There is
+no implicit retry or network loop. Per-peer uncertainty and all original custody
+history remain in the same holder.
+
+Completion now requires exact publication confirmation and every captured
+member's exact application confirmation. It returns borrowed, non-cloneable
+evidence tied to the holder and admission, and validates the original route/work
+fence. A quorum, lost successful reply, foreign client/session, renewed route or
+fresh smaller-cohort reconstruction cannot supply that proof. Completion and
+Drop do not remove the pending slot, release a proof/generation, or delete a
+payload. This is **candidate all-member evidence**, not terminal-effect handoff,
+automatic fanout orchestration, embedded/historical application or live frontend
+selection. Those and frontend payload custody remain the next integration gates.
+No format, durable transaction or ordinary-path fsync is added.
+
+Owner-local Unix/TLS tests exercise all four complete context forms with five
+members in non-sorted acting order, a committed-but-lost replica reply, four-of-
+five rejection and exact retry without repeated durable writes. They also pin
+witness ordering, distinct same-endpoint clients/sessions, crossed subjects,
+Peering rejection, refusal to rebind old observations, non-cloneable types,
+deadline intersection/reprojection and expired evidence after raw-map renewal.
+The original pending slot remains present after completion and holder drop.
+
+Validation: all **16 focused sender/fanout tests passed** in **16.600s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. No other Nextest was active at workspace launch; load1 was
+**1.66**. After a 2m58s rebuild, all **10,077 workspace tests passed** (two slow
+reports, six existing skips) in **304.091s**, run ID
+`0ec210ea-eb99-416a-a957-1dbb271d393c`. The Raft gate was inspected at 1m40s with
+1m34s of accumulated CPU and passed in 113.480s; oversized version listing
+passed in 61.864s. The new five-member Unix/TLS matrix passed in 24.032s. Logs:
+`/tmp/argmin-complete-fanout-focused-v3.log`,
+`/tmp/argmin-complete-fanout-clippy-final.log`,
+`/tmp/argmin-complete-fanout-boundaries.log` and
+`/tmp/argmin-complete-fanout-workspace.log`.
+
+**Consuming terminal custody and work classification — 2026-11-09:** the
+all-member fanout holder can now be consumed into an opaque terminal holder.
+The transition rechecks exact all-member completion and the original route/work
+fence. Failure owns and returns the same fanout holder, including earlier
+unconfirmed installation/application history; success retains that holder
+without reconstructing a submission, decoding another command, or admitting a
+new cohort. There is no reverse conversion, caller-supplied completion result,
+production callback or raw context/resource projection. Drop and unwind perform
+no effects. Terminal diagnostics can survive expiry, but validity cannot.
+
+The complete context derives a scalar terminal-work observation. It reuses the
+central reservation disposition and exhaustively classifies payload work:
+stream abort, multipart abort, displaced-part cleanup, and multipart completion
+remain distinct. Displaced live-object reclaim is a separate durable handoff,
+not immediate command-owned physical deletion. A source-bound UploadPart abort
+also reports its retained finalizer obligation, even when its ordinary abort
+payload has no creation proof. The source/context and exact resource identities
+remain inside the owning holder; copied counts/flags are not authority.
+
+These observations describe **this command's terminal work**, not the whole
+retained owner's inventory or evidence that cleanup completed. In particular,
+`NoCommandProof` does not mean a described Direct PUT owner has no bucket-proof
+responsibility, and zero payload counts do not prove unused issued windows are
+clean. No API in this slice removes a pending slot, releases a reservation,
+deletes payloads or retires an owner, even when the observation is empty.
+Admitted closed effect operations and exact slot retirement are the next
+terminal integration work. Physical exclusion/autonomous cleanup,
+embedded/historical application and live frontend custody remain gated. No
+format or ordinary-path transaction/fsync changes.
+
+The installed five-member Unix/TLS matrix now crosses all four complete context
+forms with inspected, installed and uncertain-installation origins. A failed
+COMMIT followed by another installer's recovery must stay unconfirmed in this
+holder even after exact replica convergence and terminal handoff. Four-of-five
+handoff rejection preserves the lost-reply history and permits exact retry;
+expired handoff returns the same holder. Successful handoff retains all peer
+confirmations and original installation history, cannot renew the cutoff, and
+leaves the durable slot/materialized state unchanged on Drop or unwind.
+Metadata-only owner tests independently pin creation/finalization release
+classes, ordinary versus source-bound aborts, selected versus displaced parts,
+omitted versus selected MPU parts, active sessions, and stale-live versus
+delete-marker reclaim. They do not claim physical cleanup coverage.
+
+Validation: all **19 focused tests passed** in **29.900s**, including the expanded
+Unix/TLS handoff matrices (17.853s/29.897s). Formatting, strict all-target/all-
+feature Clippy, storage boundary checks and diff checks passed. No other Nextest
+was active at workspace launch; load1 was **2.62**. After a 3m02s rebuild, all
+**10,085 workspace tests passed** (two slow reports, six existing skips) in
+**309.212s**, run ID `941d03be-84d1-46c1-b2ea-26731a403444`. The Raft gate was
+inspected at 1m36s with 1m31s accumulated CPU and passed in 111.800s; oversized
+version listing passed in 64.180s. The expanded Unix/TLS matrices passed in
+27.872s/38.731s. Logs: `/tmp/argmin-complete-terminal-focused-v2.log`,
+`/tmp/argmin-complete-terminal-clippy.log`,
+`/tmp/argmin-complete-terminal-boundaries.log` and
+`/tmp/argmin-complete-terminal-workspace.log`.
+
+**Terminal release prerequisite: deadline at SQLite effect — 2026-11-10:**
+inspection before wiring the consuming terminal holder found that the existing
+retained proof-release route checked the operation deadline before starting its
+SQLite transaction. Writer admission, reservation inspection or statement
+preparation could therefore outlive that check and still delete the row. The
+embedded route now carries the same monotonic cutoff into the release
+transaction; authenticated Unix/TLS dispatch already rebinds its absolute wire
+cutoff and reaches that same implementation. The final check is after those
+reads and preparation, immediately before DELETE. An expired absent-proof
+inspection also cannot return a successful release confirmation.
+
+This reuses the existing exact stable-proof compare-and-delete transaction:
+renewable lease changes do not change proof identity, crossed proofs remain
+conflicts, exact absence remains idempotent, and unrelated reservations are
+untouched. Errors and unwind roll back the owned transaction; unconfirmed
+rollback retires the connection. No extra ordinary-path transaction/fsync,
+schema or wire-format change. This is a prerequisite hardening of the existing
+retained release service, **not** activation of candidate terminal execution.
+The terminal holder still has no release operation, and the command/owner
+custody history, frozen retry cutoff, physical cleanup and exact slot-retirement
+integration remain the next work.
+
+The new embedded expiry matrix includes both present and already-absent proofs,
+with a sentinel at the post-inspection/pre-effect boundary and SQLite mutation
+counter checks proving that expiry precedes DELETE rather than merely rolling
+it back. Installed authenticated Unix/TLS tests reach that same boundary,
+observe its specific deadline rejection, retain the exact row and unrelated
+canary, then perform successful exact release and no-write absence replay.
+An unwind/failed-COMMIT/reopen test pins retryable durable state. Separate
+rollback-failure injections cover error and unwind, require retirement without
+a hidden rollback retry, and preserve the reservation through reopen. Existing
+immutable-field/renewal and lost-reply release tests remain applicable.
+
+Validation: all **18 focused tests passed** in **4.058s**. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+The first Unix/TLS fixture run stalled after its explicit reconnect reused an
+endpoint pool containing the single-connection worker's closed socket. Thread
+stacks identified the idle accept; the fixture now constructs a fresh endpoint
+pool for that explicit reconnect. No production retry behavior was changed.
+The corrected installed expiry cases passed in 4.049s/4.054s.
+
+No other Nextest was active at workspace launch; load1 was **0.96**. After a
+2m52s rebuild, all **10,090 workspace tests passed** (two slow reports, six
+existing skips) in **309.910s**, run ID
+`1ed5d190-a0ac-4c36-9f1a-27ec3c428bf3`. The Raft gate was inspected at 1m08s
+with 1m05s CPU and passed in 111.279s; oversized version listing passed in
+64.914s. Both new installed expiry cases also passed under the workspace load.
+Logs: `/tmp/argmin-proof-release-focused-final.log`,
+`/tmp/argmin-proof-release-clippy-final.log`,
+`/tmp/argmin-proof-release-boundaries.log` and
+`/tmp/argmin-proof-release-workspace.log`.
+
+**Closed terminal command-proof release — 2026-11-10:** the all-member terminal
+holder now exposes its first closed effect operation, without extracting a draft
+command, proof, context, installable inventory or independently reusable authority.
+Its private stack-bound permit binds the exact complete command ID/SHA-256,
+original admitted map and first local/absolute-wire cutoff. The context derives
+its proof from the central reservation disposition and validates the canonical
+operation/subject, including historical PUT-stream creation release on abort.
+The same original map selects the proof's retained bucket-PG primary; it is not
+the current object primary or a caller-supplied peer.
+
+The holder records `Unconfirmed` before entering release. Errors, lost replies
+and unwind retain the context and previous installation/publication/application
+history. Only an exact successful release/absence response marks `Released`;
+conflicts do not count as confirmation. Explicit retry uses the same proof and
+the original absolute wire cutoff, rather than projecting a later cutoff from
+new sender clock samples. Confirmed release is not resent. The existing
+retained service supplies the final SQLite pre-effect deadline check; this adds
+no new transaction, fsync, wire grammar or schema.
+
+`NotRequired` means only that this command has no immediate proof release or
+retains its proof for a live stream. It does **not** discharge a described Direct
+PUT owner's creation resource, a source-bound abandoned finalizer resource, or
+other durable-owner responsibilities. The holder still cannot remove the slot,
+delete physical payloads or retire an owner. Those closed operations, retained
+resource acknowledgement and the live frontend switch remain separate gates.
+
+Installed five-member Unix/TLS tests cross inspected, installed and uncertain
+installation histories with UploadPart creation, part finalization, historical
+PUT-stream abort and live PUT-stream retention. They pin same-ID/different-context
+rejection, renewed-map expiry without mutation, unwind custody, response loss
+after DELETE, exact absence retry, backward sender wall-clock movement, an
+unrelated reservation canary, and unchanged complete slot/owner state. Historical
+abort releases through a different bucket primary at the proof's older epoch.
+The no-command-proof fanout matrix also exercises its no-dispatch branch.
+
+Validation: both focused Unix/TLS matrices passed in **29.174s** (individual
+17.075s/29.171s). Their initial fixture failures were corrected: fresh creation
+must use the initial command position, and the wall-shift canary must preserve
+monotonic time and remain inside RPC authentication's freshness window. The
+final canary independently observes the encoded release deadlines and requires
+exact equality across retry; success alone would not pin that property.
+
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. No other Nextest was active at workspace launch; load1 was
+**1.53**. After a 3m28s rebuild, all **10,092 workspace tests passed** (two slow
+reports, six existing skips) in **315.374s**, run ID
+`efd6bd46-788d-4503-8b32-82e4fc8333e5`. The Raft gate was inspected at 1m15s
+with 1m12s CPU and passed in 112.979s; oversized version listing passed in
+62.264s. The new Unix/TLS release matrices passed in 27.946s/38.850s, and the
+expanded no-command-proof handoff matrices passed in 29.729s/40.464s.
+Logs: `/tmp/argmin-terminal-release-focused-v6.log`,
+`/tmp/argmin-terminal-release-clippy.log`,
+`/tmp/argmin-terminal-release-boundaries-final.log` and
+`/tmp/argmin-terminal-release-workspace.log`.
+
+**Closed retained-finalizer release — 2026-11-10:** extend the terminal holder's
+closed release protocol to the additional finalization reservation carried by a
+source-bound UploadPart abort. This is independent of the abort's own command
+proof: it has separate `NotRequired`/unattempted/unconfirmed/released observations,
+and successful or failed work on one cannot reset the other. Only all-member
+application of the complete source-bearing cleanup enables the operation. An
+ordinary abort, missing session, decoded source or tombstone alone cannot mint
+release authority.
+
+The private operation derives the finalizer from the exact retained context,
+rechecks its canonical source/cleanup correspondence and proof subject, then
+uses the original source epoch's bucket route. The complete context digest binds
+the original source even when two outer abort payloads are identical. Source
+inspection remains below the private source module; no new raw source/proof
+getter is exposed to the store or frontend. The existing frozen cutoff,
+pre-dispatch uncertainty, final SQLite deadline check and exact retry behavior
+are reused through the existing bucket-release transaction. There is no new
+bookkeeping command/transaction/fsync or format change.
+
+The operation releases only this source's exact reservation. Conservative
+`ReleaseDue` owner evidence remains durable; physical cleanup, other retained
+owner resources, slot/owner retirement and live activation remain gated.
+Installed five-member Unix/TLS coverage crosses inspected, installed and
+uncertain-installation histories with epoch-6 finalizer evidence and epoch-7
+cleanup, using a different historical bucket primary. It tests source-only
+substitution, independent no-work behavior, custody through expiry/unwind/lost
+reply, exact absence retry, frozen encoded deadlines, unchanged owner/slot state
+and an unrelated reservation canary. Both an unpublished retiring owner and a
+published part with a different winning finalizer are covered: release of the
+abandoned source preserves the winner's exact reservation, part metadata and
+primary finalization responsibility, as well as the conservative abandoned-proof
+row. These are metadata-only fixtures, not physical deletion tests.
+Existing ordinary release matrices also
+pin that they cannot acquire a finalizer release merely from their target.
+
+Validation: all **four focused matrices passed** in **30.920s**, including both
+retiring and published-owner cases for the new Unix/TLS operation. The expanded
+fixture initially attempted its durable-owner assertion outside the required
+snapshot (`TransactionRequired`); the assertion now uses the storage-owned read
+snapshot. No production check was relaxed.
+
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. No other Nextest was active at workspace launch; load1 was
+**2.58**. After a 3m37s rebuild, all **10,094 workspace tests passed** (two slow
+reports, six existing skips) in **318.938s**, run ID
+`cc740291-e307-4a64-b574-a338494d1990`. The Raft gate was inspected at 1m20s
+with 1m16s CPU and passed in 114.064s; oversized version listing passed in
+62.390s. The new Unix/TLS finalizer-release matrices passed in 14.457s/21.342s;
+the existing command-proof release matrices passed in 28.888s/39.823s.
+Logs: `/tmp/argmin-finalizer-release-focused-v4.log`,
+`/tmp/argmin-finalizer-release-clippy-final.log`,
+`/tmp/argmin-finalizer-release-boundaries.log` and
+`/tmp/argmin-finalizer-release-workspace.log`.
+
+**Closed quiescent-slot retirement transaction — 2026-11-10:** add the local
+transaction prerequisite, not the retirement RPC or live publisher switch. Only
+the unchanged all-member terminal holder can mint its stack-borrowed permit.
+The transaction also requires the storage node's admitted exact-primary authority,
+including store identity, topology, session, route gate/class and captured fence.
+There is no production invocation of the owning operation yet; the owner-local
+test seam supplies the real admitted authority, not a fabricated permit.
+
+Eligibility is deliberately narrow: no immediate command payload work, no
+command/source reservation release and no displaced reclaim handoff. A retained
+live PUT-stream proof is allowed; it is not released. Zero segment counts in an
+abort/completion/replacement are not equivalent to no work. Commands requiring
+those protocols remain gated even if some resource release already succeeded.
+This does not infer that an owner has no outstanding windows or resources.
+
+The transaction requires exact authenticated Applied evidence, the current
+command epoch, exact complete pending bytes/checksum, publication-start marker,
+bucket scope and all route/window/reference indexes. A crossed/newer pending
+slot is never removed. Exact absence can confirm a previous lost result only
+with the same Applied evidence and no orphan pending sidecars. Authority is
+rechecked immediately before DELETE and COMMIT; same-epoch raw renewal cannot
+extend the terminal holder's original cutoff. Slot/index removal is atomic and
+does not change the log, prefix or materialized owner/window/reference/resource
+records. No new command, schema, wire encoding or ordinary-path fsync is added.
+
+The holder records uncertainty before entering the transaction. Errors, failed
+COMMIT, lost post-COMMIT confirmation and unwind do not reset it. Exact retry
+confirms absence without another mutation; an already confirmed retirement does
+not dispatch again or lose its historical observation. Failed rollback retires the connection;
+there is no Drop retry. This operation retires only pending custody, not the
+durable cleanup owner. Transport integration must preserve both admitted
+authority and the owning history rather than expose independent command inputs.
+
+The tests obtain terminal custody through actual five-member Unix application;
+retirement itself uses the explicit local test seam, not a claimed end-to-end
+retirement RPC. Coverage includes ordinary/Direct PUT introduction, stream
+creation/append; inspected/installed/uncertain custody; wrong scope, checksum,
+marker, route/staging indexes and placed-reference counts; missing terminal/orphan
+sidecars; newer slots and crossed primary authority; original sender and shorter receiver expiry
+at the post-preparation boundary; genuine deferred-FK COMMIT failure; rollback
+failure/reopen; unwind and lost post-COMMIT confirmation, including compacted
+receipts and exact retry. Owner, resource, prefix and log non-mutation are pinned.
+
+The initial focused iterations exposed test-fixture/expectation errors: a helper
+selected another UploadPart PG, the test attempted access after deliberate
+connection retirement, and corruption diagnostics use distinct checksum/index
+error variants. Checkpoint export also correctly refuses an occupied pending
+slot; the receipt test now compacts after successful deletion with lost
+confirmation. These checks were not relaxed. Ten focused tests then passed in
+**39.214s**. Final workspace validation below includes the subsequent tightening
+that checks authority after SQL statement preparation.
+
+Final formatting, strict all-target/all-feature Clippy, storage boundary checks
+and diff checks passed. No other same-user Nextest was active at launch; load1
+was **2.68**. After a 3m08s rebuild, **10,104 workspace tests passed** (two slow
+reports, six existing skips) in **329.560s**, run
+`10c87110-7099-4c8e-98be-07ffb6a0f191`. The Raft test was inspected at 1m50s
+elapsed with 1m49s CPU and passed in 112.564s; oversized version listing passed
+in 65.941s. All ten retirement tests passed, including the post-preparation
+authority checks; the full damaged-slot matrix took 56.303s. Logs:
+`/tmp/argmin-slot-retirement-focused-v5.log`,
+`/tmp/argmin-slot-retirement-clippy.log`,
+`/tmp/argmin-slot-retirement-boundaries.log` and
+`/tmp/argmin-slot-retirement-workspace.log`.
+
+**Closed retirement sender and wire contract — 2026-11-10:** the all-member
+terminal holder now lends a closed retirement attempt to its exact registered
+primary client and held PG/epoch session. Only its private, stack-borrowed terminal
+permit can encode the request. The sender exposes no detached command, resettable
+history or production send callback. Eligibility remains the preceding quiescent
+subset: no immediate payload deletion, command-proof release, retained-finalizer
+release or reclaim handoff. Retained owner obligations are not retired.
+
+The attempt reuses the first publication's local and absolute conservative wire
+cutoffs; shorter attempt budgets only narrow them. It rechecks authority before
+encoding, records uncertainty before dispatch, and preserves earlier uncertainty
+across a later `NotSent`. Unwind/Drop never retry. An exact late acknowledgement
+can confirm past retirement, but grants no renewed authority; a confirmed holder
+does not dispatch retirement again. Independent confirmation fields bind node,
+epoch, PG, log position and the complete command SHA-256. Distinct `RTIR`/`RTOK`
+purpose tags reject publication/application acknowledgements and legacy Boolean
+responses. Wrong-PG sessions and independent clients fail before transport.
+
+The bounded borrowed wire codec and four literal payload/frame specimens are
+appended without replacing earlier evidence. ID 19 admission now allows the
+maximum complete command plus 42 framing bytes, with exact-cap/+1 coverage. This
+belongs to the already-pending RPC 36-to-37 transition; it is not another version
+bump within that transition.
+
+This slice deliberately stops before receiver integration. The installed server
+still uses legacy pending-removal decoding and rejects the candidate request
+without mutation; the authenticated Unix regression proves one dispatch, rejection,
+unchanged custody and no hidden retry. Positive confirmation tests use explicit
+acknowledgement fixtures after real five-member application: they test sender
+history/identity, **not** remote deletion or receiver proof of all-member completion.
+The framing parser itself supplies no terminal authority. Next integrate receiver
+admission and exact retirement using this closed sender, preserving receiver-local
+route/session/eligibility/evidence and deadline validation without an independent
+raw-command mutation seam. Physical cleanup, owner retirement, embedded/historical
+application, frontend payload/proof custody and live publisher selection remain
+gated.
+
+Validation: all **eight focused tests passed** in 17.327s. The initial late-reply
+canary incorrectly equated a wall-clock jump with expiration of the independent
+monotonic route deadline; it now proves that an expired-wire-cutoff acknowledgement
+confirms only past work and cannot redispatch. The separate unconfirmed-attempt
+canary still requires expiry rejection before encoding. Formatting, strict
+all-target/all-feature Clippy, the storage-boundary checker and diff checks passed.
+No other same-user Nextest run was active and load1 was **1.01** before the full
+run. After a 3m07s rebuild, **10,112 workspace tests passed** (two slow reports,
+six existing skips) in **332.710s**, run
+`e1d9c156-291b-4747-8ae0-8e034f324ade`. The Raft test was inspected at 1m26s
+elapsed/1m21s CPU and passed in 112.487s; oversized version listing passed in
+62.313s. The full uncertainty/confirmation matrix passed in 33.441s and the
+previous damaged-slot matrix in 56.058s. Logs:
+`/tmp/argmin-retirement-transport-focused-v3.log`,
+`/tmp/argmin-retirement-transport-clippy.log`,
+`/tmp/argmin-retirement-transport-boundaries.log` and
+`/tmp/argmin-retirement-transport-workspace.log`.
+
+**Admitted quiescent retirement receiver — 2026-11-10:** integrate the closed
+sender with the current-primary Unix/TLS receiver, selected only by owner tests.
+This reuses the existing exact-slot transaction and unchanged V1 payload/RPC 37
+specimens. Live dispatch remains on the preceding grammar and rejects the candidate.
+
+The decoded query retains the complete context and binds the absolute conservative
+wire cutoff once, before context validation. It rejects commands with immediate
+payload/release/reclaim work, including empty source-bound aborts. A separate
+receiver authority is mintable only inside its private admitted owner; decoded
+queries and publication authority cannot substitute. Admission requires the exact
+server's Active permit, current primary, exact PG/epoch session and that server's
+lock registry. Historical sections, replicas, Peering and crossed domains fail
+closed. The server captures its route fence before waiting for the PG and narrows
+the work deadline by both that fence and the immutable received cutoff. The
+transaction independently rechecks exact local Applied evidence, slot bytes/scope,
+publication marker and all side indexes before removal, then rechecks authority
+after statement preparation and before commit. It removes pending custody only;
+retained owners, sessions, reservations, log and materialized prefix remain intact.
+
+Only the terminal holder supplies the production sender, retaining its all-member
+handoff. The receiver's authenticated operation independently proves local
+admission/eligibility/terminal state; it does **not** derive a cryptographic
+all-peer-completion certificate from the request bytes. No raw-command mutation
+adapter or production callback is exposed. Compile-fail tests include the actual
+authority source and reject sibling constructor/struct-literal minting.
+
+Real five-member Unix/TLS tests now retire through that holder, lose the committed
+reply, retain uncertainty, and confirm exact absence on retry without rewriting
+state. Reinspection after restart and compaction also authenticates the same
+absence. Separate installed tests cover expiry within the transaction and
+malformed/ineligible/unapplied/crossed commands, damaged indexes/scope/marker and
+orphan sidecars. Admission tests independently cross the permit, lock domain,
+section, role and epoch. Before-delete/before-commit tests independently expire
+wire, server-work and server-route cutoffs; same-epoch route renewal cannot replace
+the captured fence. Shared transaction rollback/unwind/connection-retirement
+coverage remains in the preceding local matrix. No physical cleanup, retained
+owner retirement, non-quiescent terminal retirement, embedded/historical
+application or live frontend activation is enabled. These remain subsequent
+integration gates.
+
+Validation: **23 focused retirement tests passed** in 43.258s. The initial new
+RPC expiry assertion incorrectly expected contention; the established deadline
+mapping is `TransportTimeout`, and the corrected test pins that code plus no
+mutation. Formatting, strict all-target/all-feature Clippy, the storage-boundary
+checker and diff checks passed. No other same-user Nextest was active and load1
+was **2.38** before the full run. After a 3m03s rebuild, **10,119 workspace tests
+passed** (two slow reports, six existing skips) in **337.412s**, run
+`199f2f11-7eae-4bee-bbdd-490de170b632`. This includes the final expired-at-arrival
+case. The Raft test was inspected at 1m15s elapsed/1m11s CPU and passed in
+112.769s; oversized version listing passed in 62.285s. The owning Unix/TLS
+lost-reply matrix passed in 27.510s and the shared damaged-slot matrix in 56.505s.
+Logs: `/tmp/argmin-retirement-receiver-focused-v3.log`,
+`/tmp/argmin-retirement-receiver-clippy.log`,
+`/tmp/argmin-retirement-receiver-boundaries.log` and
+`/tmp/argmin-retirement-receiver-workspace.log`.
+
+**Embedded current-replica application admission — 2026-11-10:** the candidate
+embedded receiver now derives a target from the real admitted current-primary
+section. It selects only embedded members of that exact Active acting set and
+borrows the section, so the shared PG serialization guard cannot be dropped or
+reacquired underneath replica application. Historical sections fail closed.
+The private target representation lives below the route owner; a separate private
+node owner mints exact-command application authority only after locking the
+selected runtime's PG. Surrounding modules cannot substitute a raw node/store,
+fence, callback or independently supplied topology.
+
+The same complete apply-and-record transaction now accepts either remote or
+embedded opaque authority. Embedded validation binds store identity, member,
+PG/epoch, complete SHA-256 and actual runtime topology. The original route fence
+and section/request monotonic cutoffs bound the PG wait and are rechecked before
+fresh effects and before commit, including replay. Same-epoch renewal cannot
+extend authority. Exact replay writes nothing; failed rollback retires the
+connection; errors and unwind, including after commit, confer no cleanup right.
+There is no new transaction, fsync, wire grammar or format version.
+
+Owner tests use coherent copies of the same preceding metadata/log history,
+created before opening the runtimes, then apply the four complete-context forms
+to five members in witness/primary/trailing order under the actual shared guard.
+This proves the receiver works under the lock, not that it enforces the sender's
+ordering. Tests compare materialized state, log and prefix, and pin no-write
+replay, independently crossed identities/topology/store, historical/nonmember/
+Peering rejection, bounded PG waiting, expiry within effects/commit and replay,
+failure/unwind/lost confirmation and unconfirmed rollback. Compiler probes include
+the actual target and node-owner sources, rejecting literal minting, callback
+access and dropping the borrowed section.
+
+The existing deadline-bound request projection is reused without exposing its
+raw constructor in production. This slice is **receiver admission**, not owning
+embedded sender/cohort integration, historical apply, physical/proof/reclaim
+handoff, owner retirement or live publisher selection. Those activation gates and
+the original six ignored end-to-end cleanup regressions remain open.
+
+Validation: **ten focused tests passed** in 10.522s. The first build needed an
+explicit replica-state import; the initial compiler-privacy probe supplied its
+section by value and failed with a type mismatch before reaching privacy
+validation. The corrected probe borrows the section and pins the private-field
+diagnostic; the independent borrow-lifetime probe also passes. No runtime
+assertion was relaxed. Formatting, strict all-target/all-feature Clippy, the
+storage-boundary checker and diff checks passed.
+
+No other same-user Nextest was active at full-suite launch and load1 was **2.27**.
+After a 3m04s rebuild, **10,129 workspace tests passed** (two slow reports, six
+existing skips) in **341.398s**, run
+`350e27d8-7840-4976-809a-3c7ea1c469fc`. The Raft gate was inspected at 1m10s
+elapsed/1m06s CPU and passed in 114.090s; oversized version listing passed in
+62.497s. All ten new tests passed in the full suite, including the six-way
+transaction/replay deadline matrix in 13.494s. Logs:
+`/tmp/argmin-embedded-apply-focused-v3.log`,
+`/tmp/argmin-embedded-apply-clippy.log`,
+`/tmp/argmin-embedded-apply-boundaries.log` and
+`/tmp/argmin-embedded-apply-workspace.log`.
+
+**Owning embedded current fanout — 2026-11-10:** extend the existing publication/
+fanout holder, rather than introducing a separate embedded submission or retry
+history. Its closed embedded publication/apply calls require a current-primary
+section derived from the **same original admission**, exact PG and epoch as the
+captured cohort. An independently admitted view, even of the same cluster, cannot
+substitute. The section selects the embedded member internally; no raw runtime,
+caller-selected cohort or independent mutation callback is accepted. A singleton
+cohort needs no witness. Other cohorts use the same ordering predicate as remote
+fanout: lowest-ID non-primary witness confirmation before primary application,
+then primary confirmation before trailing members.
+
+An internal typed projection borrows the original encoded command and already
+frozen deadline into the embedded application request. It adds no encode/decode
+round-trip, raw request constructor, transaction, fsync or wire-format change.
+The original retained context, installation observation and first local/portable
+cutoff remain in the owning sender. The attempt can narrow the cutoff, never
+replace it. Uncertainty is recorded before the node call, including lock waits,
+effects, commit and unwind. A lost post-commit confirmation requires exact replay;
+a later expired attempt cannot erase uncertainty or earlier confirmed application.
+Reacquiring serialization cannot renew the holder's work budget. Publication
+confirmation loss blocks all application until exact publication retry confirms
+the marker. All-member completion and consuming terminal handoff reuse the same
+holder and histories; quorum alone is insufficient, failed handoff returns the
+original holder, and Drop performs no cleanup/slot retirement.
+
+The owner-local matrix covers all four complete-context forms and inspected,
+installed and uncertain installation origins across five coherent embedded
+replicas. It checks identical materialized/log/prefix state, no-write exact
+replay, ordering and incomplete-handoff failures, singleton/nonmember behavior,
+crossed domain/admission/PG rejection before effects, publication and application
+confirmation loss, failure/unwind across transaction stages, original cutoff
+expiry before effects/commit, and raw-route renewal after all-member confirmation.
+The existing remote fanout tests also exercise the shared ordering predicate.
+
+This remains candidate orchestration, selected by owner tests. Embedded
+quiescent slot retirement, mixed-transport end-to-end coverage, historical
+application/recovery, non-quiescent physical/proof/reclaim terminal work,
+frontend payload custody and live publisher selection remain activation gates.
+The original six cleanup regressions and the separate checkpoint-transfer
+follow-up remain unresolved.
+
+Validation: **24 focused tests passed** in 32.304s, including all seven new
+embedded-fanout tests, the prior embedded receiver matrix and the existing
+Unix/TLS fanout tests. Formatting, strict all-target/all-feature Clippy, the
+storage-boundary checker and diff checks passed. Another session's earlier
+Nextest run was left untouched; it had finished before these test runs.
+
+No other same-user Nextest was active at full-suite launch and load1 was **3.92**.
+After a 2m52s rebuild, **10,136 workspace tests passed** (two slow reports, six
+existing skips) in **344.256s**, run
+`84d584ba-6da7-4c17-b2d6-63f8b8f4f97c`. The Raft gate was inspected at 1m11s
+elapsed/1m08s CPU and passed in 112.966s; oversized version listing passed in
+63.478s. All seven new tests passed in the full suite; the complete
+context/custody matrix took 16.927s. Logs:
+`/tmp/argmin-embedded-fanout-focused-v2.log`,
+`/tmp/argmin-embedded-fanout-clippy.log`,
+`/tmp/argmin-embedded-fanout-boundaries.log` and
+`/tmp/argmin-embedded-fanout-workspace.log`.
+
+**Owning embedded quiescent retirement — 2026-11-10:** the existing terminal
+holder now drives a closed embedded operation using the same retirement attempt
+and uncertainty history as its remote path. It requires a current-primary section
+from the **exact original admission**, PG and epoch; independently admitted views
+cannot substitute. Its stack-only all-member terminal permit is also checked
+against that section at the private node bridge. The node selects and locks its
+own store, then supplies opaque publication authority to the existing retirement
+transaction. Both authorities are mandatory; raw store/callback retirement remains
+test-only. No detached context, new submission, resettable history, wire round-trip,
+schema change, extra transaction or fsync is introduced.
+
+The first local/absolute work cutoff, captured route fence, and narrower attempt
+and section cutoffs remain effective at lock acquisition and immediately before
+DELETE and COMMIT, including absent-slot confirmation. Entered attempts record
+uncertainty before the node call. Failure, unwind and lost post-commit confirmation
+retain custody; rollback uncertainty retires the connection. Exact retry validates
+terminal identity, scope/marker and all sidecars, including after log compaction.
+Confirmed retirement does not redispatch against a later slot, and Drop never
+retries. Only pending-slot custody and its cascading indexes are removed; owners,
+resources, materialized state, prefix and command evidence remain intact.
+
+The new matrix exercises owning five-member embedded fanout through retirement
+for ordinary commands, Direct PUT introduction and stream append, with inspected,
+installed and uncertain origins. It covers crossed domain/admission/PG and
+non-quiescent rejection, damaged scope/marker/indexes/terminal evidence, real
+SQLite commit failure, post-commit loss and compaction, unwind, bounded store-lock
+wait, unconfirmed rollback, effect/commit expiry, raw same-epoch route renewal,
+and refusal to confirm absence after the original cutoff. The node API compiler
+fixture also rejects substituting publication authority for the terminal permit.
+
+This remains candidate orchestration, not live activation. Mixed-transport
+end-to-end coverage, historical application/recovery, non-quiescent physical/proof/
+reclaim work, frontend custody and live publisher selection remain gated. The
+original six cleanup regressions and separate checkpoint-transfer follow-up
+remain unresolved.
+
+Validation: **33 focused tests passed** in 48.499s, including all nine new
+embedded tests and the existing Unix/TLS retirement and compiler-boundary tests.
+The first build caught a test helper naming the intentionally hidden route type;
+the helper now uses inferred routes without changing visibility. An initial
+canary tried reinstalling an already-applied command and correctly received a
+log conflict. It now installs a genuinely later command before proving that the
+confirmed holder never redispatches. No production assertion was relaxed.
+Formatting, strict all-target/all-feature Clippy, the storage-boundary checker
+and diff checks passed. No other same-user Nextest was active at full-suite
+launch; load1 was **9.24**. After a 2m59s rebuild, **10,145 workspace tests passed**
+(two slow reports, six existing skips) in **352.111s**, run
+`118fb5fd-c3c6-4925-b6c8-5fcdbf9ad7a1`. The Raft gate was inspected at 1m29s
+elapsed/1m23s CPU and passed in 114.488s; oversized version listing passed in
+65.375s. All nine new embedded tests passed in the full suite, including the
+effect/commit cutoff matrix in 14.628s. Logs:
+`/tmp/argmin-embedded-retirement-focused-v3.log`,
+`/tmp/argmin-embedded-retirement-clippy.log`,
+`/tmp/argmin-embedded-retirement-boundaries.log` and
+`/tmp/argmin-embedded-retirement-workspace.log`.
+
+**Mixed transport, embedded-primary evidence — 2026-11-10:** owner-local
+end-to-end fixtures now combine three embedded members with one authenticated
+Unix peer and one authenticated TLS peer. The lowest-ID witness is rotated among
+all three transports; acting-set order remains deliberately noncanonical. Each
+layout exercises all four complete-context forms and inspected, installed and
+uncertain installation origins. One original admission and owning holder drive
+publication, witness-before-primary/primary-before-trailing application,
+all-member completion and quiescent embedded retirement. Source-bearing cleanup
+still rejects quiescent retirement rather than inferring that its work is done.
+
+Every member's materialized state, command log and prefix must agree; exact
+replay must perform no writes. Incomplete terminal conversion returns the same
+holder. Fault cases lose an authenticated Unix/TLS witness or trailing-member
+reply **after commit**, and separately interrupt embedded-primary confirmation.
+They require explicit exact retry, retain installation/per-peer uncertainty,
+block primary or trailing sends as appropriate, and never infer completion from
+four of five confirmations. A subsequent lost retirement confirmation converges
+through no-write absence validation. Raw same-epoch renewal cannot revive either
+transport after the captured admission expires.
+
+The fixture registration seam now records the concrete client's actual execution
+endpoint before route authority is minted. Remote-target selection must reject
+embedded access, and the otherwise-unused local fixture stores remain unchanged.
+Remote replicas use coherent SQLite images copied into distinct directories
+before opening their runtime; no second runtime opens an embedded node's files.
+This is metadata fixture construction, not a new checkpoint-transfer protocol.
+The change adds tests and owner-test helpers only: no production behavior,
+wire/schema format, transaction or fsync changes.
+
+**Gate at this slice (addressed by the following bridge slice):** these
+embedded-primary tests alone did not cover a remote primary with embedded
+replicas. The required bridge must bind the exact original primary client/session
+to the admitted cohort, without constructing a raw target/store authority. Historical
+application/recovery, non-quiescent terminal work, frontend custody/live selection,
+the six original cleanup regressions and the separate checkpoint-transfer
+follow-up also remain open.
+
+Validation: **six focused tests passed** in 27.076s, including the 36
+context/custody/layout combinations and the separate interruption/expiry cases.
+Formatting, strict all-target/all-feature Clippy, the storage-boundary checker
+and diff checks passed. Another checkout started a full Nextest run between the
+initial preflight and launch. Only this slice's compiling process group was
+interrupted; the other session was left untouched. After it finished and load1
+fell to **8.00**, the launch command rechecked both conditions and restarted the
+suite. No tests had run in the interrupted attempt.
+
+After a 2m06s rebuild, **10,151 workspace tests passed** (two slow tests, six
+existing skips) in **367.287s**, run
+`7a8a8ab6-7913-464a-8e04-0de1ced0445e`. The Raft gate was inspected at 1m50s
+elapsed/1m38s CPU and passed in 121.621s; oversized version listing passed in
+75.911s. All six new tests passed, including the three full mixed-layout matrices
+in 35.687s, 36.610s and 37.115s. Logs:
+`/tmp/argmin-mixed-fanout-focused.log`,
+`/tmp/argmin-mixed-fanout-clippy.log`,
+`/tmp/argmin-mixed-fanout-boundaries.log` and
+`/tmp/argmin-mixed-fanout-workspace-v2.log`.
+
+**Remote-primary / embedded-replica bridge — 2026-11-10:** the candidate fanout
+holder now selects embedded nonprimary members from its original admitted cohort
+while borrowing the exact registered Unix/TLS primary session. A private target
+owns that session borrow and the admitted-route borrow; callers cannot supply a
+runtime, fence, callback, independent cohort or replacement admission. Session
+origin, node, PG, epoch and open state are checked before local effects. The
+session mutex remains held through the existing local PG transaction, excluding
+concurrent transport/shutdown. Lock order is session mutex then local PG mutex;
+the operation performs no network IO while holding the local PG mutex and adds
+no ordinary transaction or fsync.
+
+**Review correction — bounded session acquisition:** borrowing the session now
+uses deadline-aware `try_lock` acquisition, checking before each probe and again
+while retaining the acquired guard. Requested contention sleeps are capped at
+1ms and the remaining budget. The owning fanout intersects the caller's attempt
+deadline with its original frozen work cutoff **before** target preparation; the target
+factory also intersects its captured route cutoff. A failed acquisition neither
+records an application attempt nor closes the other RPC's session. This replaces
+the initial blocking mutex acquisition, whose later effect check prevented stale
+mutation but could retain route admission beyond expiry.
+
+An installed Unix/TLS regression holds the exact session mutex on another thread
+past each independently selected attempt/work/route cutoff. It requires return
+while that holder is still blocked, the acquisition-time deadline diagnostic,
+unchanged installation and application history (both untouched and already
+confirmed), and no replica writes. A bounded fallback release makes a regression
+fail rather than hang. Subsequent borrowing and a valid short-attempt retry prove
+the timeout did not poison/close the retained session or erase prior confirmation.
+
+A failed transport/framing exchange now closes the metadata-command session and
+prevents reuse, including borrowing it for local application. This shared session
+protection applies to both command grammars. The authenticated connection
+disposition is also honored: a peer-declared close revokes the session even on
+success; semantic errors retain it only when the peer keeps the connection.
+The borrow does **not** prove remote process liveness
+or guarantee the server cannot lose its lock: exact primary confirmation and
+all-member completion remain required, with uncertain results retained by the
+original owner. Explicit session reacquisition does not renew that owner's
+captured deadline or reset publication/installation/application history.
+
+Owner tests exercise Unix and TLS primaries, embedded and remote witnesses,
+all four context forms and all three installation origins. Every required
+member must agree on materialized state and prefix; exact retry is no-write,
+and failed terminal conversion returns the original holder. Quiescent retirement
+uses the original remote primary session; source-bearing cleanup remains blocked.
+Adversarial tests cover foreign same-endpoint sessions, wrong PG, nonmember and
+remote-as-embedded targets, post-commit reply loss, successful replies declaring
+closure, embedded unwind, work/route expiry at the local effect and commit
+boundaries, and retry after reacquisition. A private session canary additionally
+pins the held transport mutex, exact epoch and closed/expired rejection.
+Actual-source compiler probes cover private construction and inability to detach
+the target from either the session or original admitted route.
+
+This closes the current-route mixed execution bridge, not live activation.
+Historical application/recovery, non-quiescent terminal work, frontend custody,
+the original six skipped cleanup regressions and the separate checkpoint-transfer
+follow-up remain open.
+
+Validation: **69 focused tests passed** in 48.124s, including the Unix metadata
+session suite, all eight new tests and the actual-source compiler probes. The
+first executing workspace run stopped at
+`unix_metadata_session_pending_slot_uses_portable_operation_deadline` after
+7,902 passes: its fake lock-acquisition response declared connection close while
+expecting two later requests. The new client correctly closed it, producing
+`UnexpectedEof` at the fake peer and a closed-session error at the caller. The
+mock and sibling retained-session helpers now explicitly set the same retained
+connection disposition as the installed server; deadline, malformed-response
+and Drop assertions are unchanged. The exact failing test passed in the focused
+run. Its failure log is `/tmp/argmin-remote-primary-workspace-v2.log`; this was
+not treated as an unrelated failure or retried without correction.
+
+The subsequent full run exposed the same connection-disposition mistake in the
+publication-history fault injector: replacing a semantic error/crossed-response
+envelope silently declared connection close, so its same-session retry observed
+two replies instead of three. It now preserves the installed server's original
+disposition while changing only the intended error/identity. The original
+history, reply-count and no-write assertions remain intact. The expanded focused
+run passed **213 tests** in **91.219s**, covering the entire complete-publication
+group and Unix metadata/session suites; the 24-combination Unix-primary matrix
+was reported slow and passed in 64.196s. Logs:
+`/tmp/argmin-remote-primary-workspace-v3.log` (failure evidence) and
+`/tmp/argmin-remote-primary-focused-v4.log` (corrected expanded validation).
+
+Final formatting, strict all-target/all-feature Clippy, storage-boundary and
+diff checks passed. No other same-user Nextest was active at launch; load1 was
+**8.08**. After a 24.03s rebuild, **10,159 workspace tests passed** (three slow
+reports, six existing skips) in **363.699s**, run
+`654684ea-88b9-4f6e-9934-5ec7982f78db`. The Raft gate was inspected at 1m28s
+elapsed / 1m23s CPU and passed in 112.945s; oversized version listing passed in
+64.031s. The new 24-combination Unix-primary matrix passed in 68.832s after a
+slow report; its TLS counterpart passed in 49.271s. All eight new tests and both
+corrected fixture families passed. Final logs:
+`/tmp/argmin-remote-primary-clippy-final.log`,
+`/tmp/argmin-remote-primary-boundaries-final.log` and
+`/tmp/argmin-remote-primary-workspace-final.log`.
+
+**Bounded-acquisition review validation:** all four focused tests passed in
+15.824s. Formatting, strict all-target/all-feature Clippy, the boundary checker
+and diff checks passed. With no other Nextest active and load1 below 10, the
+full run passed **10,160 tests** (three slow reports, six existing skips) in
+**372.427s**, run `b12a2959-c6a2-4f78-8ad5-254d5bde807c`, after a 2m22s rebuild.
+The held-session cutoff regression passed in 17.226s. The Raft gate was inspected
+at 1m40s elapsed / 1m42s CPU and passed in 104.531s; oversized version listing
+passed in 63.128s and the 24-combination Unix-primary matrix in 67.985s. Logs:
+`/tmp/argmin-primary-borrow-deadline-{focused,clippy,boundaries,workspace}.log`.
+
+**Historical application receiver — 2026-11-10:** the installed candidate
+Unix/TLS apply-and-record entry now admits the exact pending command reported by
+the current control-plane map. The command's PG/epoch/index/CRC64 and complete-command SHA-256 must match
+the report, and its reporter must be the primary in the retained Active route.
+The receiving node must belong to that historical acting set and have current
+or retained Peering placement. Missing, crossed, future or unbounded authority
+cannot fall back to an ordinary apply route.
+
+The reporting primary must retain the exact historical-recovery PG/epoch session;
+replicas acquire their own local serialization and cannot substitute a held
+primary section. The Active permit must still belong to the exact server domain.
+The receiver's bounded current-map fence and immutable decoded work cutoff bound
+both lock waits and are checked again immediately before transactional effects
+and commit. The opaque application authority still binds the complete-command
+SHA-256, topology and locked store. No raw command/mutation callback or renewed
+deadline is introduced. The review correction below advances the recovery-report
+formats, without an additional transaction or fsync.
+
+Installed Unix/TLS tests cover primary and replica application of all four
+context forms, committed-reply loss, exact retry and reopen. The primary uses
+the original publication holder, retaining unconfirmed application evidence and
+the pending slot through recovery; replay performs no owner/log writes. Independent
+report/placement negatives reject without mutation, and owner canaries test
+wrong held-section class/epoch/PG, cleanup permits, work and route expiry at
+effect/commit, and portable cutoff expiry after RPC decoding.
+
+This is historical **receiver** admission, not end-to-end recovery activation.
+Historical embedded targets, admission-owned historical fanout, reissue/abandonment
+handoffs, non-quiescent terminal work, frontend custody/live selection, the six
+original skipped cleanup regressions and the external checkpoint-transfer follow-up
+remain open.
+
+Focused validation: **159 complete-publication tests passed** in **94.771s**,
+including all seven new historical-application tests. The Unix-primary matrix
+was inspected at 58s elapsed/59s CPU and passed in 65.001s after a slow report.
+The first rejection-matrix run failed during setup because it tried to start a
+server with an inconsistent recovery report. The corrected matrix explicitly
+requires startup rejection for those configurations and sends valid-but-crossed
+reports to the installed authenticated receiver; it does not bypass configuration
+validation. Logs: `/tmp/argmin-historical-application-focused-v2.log` (failure)
+and `/tmp/argmin-historical-application-focused-v3.log` (expanded passing run).
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+
+Final validation: no other same-user Nextest was active and load1 was **7.96**
+before launch. After a **2m35s** rebuild, **10,167 workspace tests passed**
+(three slow reports, six existing skips) in **367.033s**, run
+`0a5f1cfe-8afd-4099-8062-51005009fce1`. All seven new regressions and the
+actual-source private-authority/compiler probes passed. The Raft gate was
+inspected at 1m42s elapsed/1m38s CPU and passed in 111.549s; oversized version
+listing passed in 62.340s. The Unix-primary matrix was inspected at 1m07s
+elapsed/1m03s CPU and passed in 69.028s. Logs:
+`/tmp/argmin-historical-application-{clippy,boundaries,workspace}.log`.
+
+### Historical recovery report authentication correction — 2026-11-10
+
+CRC64 is an integrity check, not authorization for an exact command. Recovery
+observations now mandatorily carry the SHA-256 of the actual encoded pending
+command, including required context for complete V14 commands. Ordinary live
+V13 commands use their exact V13 bytes. Neither a missing digest nor a local
+pending-slot digest can substitute for the digest reported by the historical
+primary and carried by authenticated control-plane authority.
+
+Slot insertion and replacement derive and persist the digest in their existing
+route-dependency sidecar transaction. Heartbeat reads that bounded fixed-width
+identity, without loading the full command or performing another write. Exact
+retries validate it against their command. The digest survives control-plane
+heartbeat commands, logical state/restart, recovery listings, runtime-map content
+and current-state identities, and persisted storage-node configuration. Historical
+application, remote/embedded publication and live recovery selection all compare
+it before effects.
+
+This requires PG schema **13**, pending-route checksum domain **V3**,
+control-plane command **21**, logical state **33**, RPC **19**, runtime-map digest
+domains **V4**, and storage-node runtime configuration **6**. Existing enclosing
+journal/snapshot/Raft grammars retain their versions with appended composite
+evidence. All predecessor specimens and schema catalogues are retained; no
+compatibility reader, checkpoint/materialized-state bump, new transaction or
+fsync is introduced. The format ledger records the exact vector.
+
+The installed Unix/TLS regression constructs valid finalizers A and B with the
+same command ID and compensated CRC64, but different complete SHA-256. A replica
+holding exact B rejects A's report without any SQLite changes, then successfully
+applies B with B's report after reopening. Independent SHA-only negatives cover
+historical publication and embedded map/command admission. Complete-slot tests
+also assert that heartbeat reports the complete encoding, not its V13 draft.
+
+This correction does not close the remaining activation gates listed above.
+Focused validation: **1,206 tests passed** in **101.233s**, including installed
+Unix/TLS equal-CRC rejection and positive application, both publication paths,
+control-plane codecs and the versioned evidence. Formatting, boundary checks
+and strict all-target/all-feature Clippy passed. Growing the observation exposed
+two oversized diagnostic error variants; their observation payloads are boxed,
+without changing authorization or wire errors.
+
+The first full run passed 8,230 tests, then failed the current checksum-tag
+fixture's hardcoded schema assertion at `metadata/tests.rs:101` (actual 13,
+expected 12). That current-version assertion/name now selects 13; its frozen
+checksum tags remain unchanged. This was a direct consequence of this slice,
+not an unrelated failure or a blind retry. The corrected fixture, damaged-index
+matrix and runtime-configuration tests passed **33 tests** in **1.068s**. The
+added V6 configuration canary pins the exact digest field, preserves it through
+durable reload, and rejects absent, short, oversized and non-hex digests.
+Logs: `/tmp/argmin-recovery-sha-focused-v3.log`,
+`/tmp/argmin-recovery-sha-workspace.log` (failure), and
+`/tmp/argmin-recovery-sha-final-focused.log`.
+
+Final validation repeated the prescribed order: formatting check, strict
+all-target/all-feature Clippy, then the full Nextest suite. All **10,171 tests
+passed**, with six existing skips, in **368.212s** (run
+`99fcfea2-4161-47b3-b58b-039cfe0c41de`). The suite started with no other same-user
+Nextest run and a one-minute load of 2.99. The three tests exceeding 60 seconds
+completed successfully: the production-shaped Raft heartbeat gate (117.274s),
+oversized version-listing case (65.536s), and 24-case Unix remote-primary fanout
+matrix (68.967s); the Raft and fanout processes were observed doing CPU work.
+Boundary checks and `git diff --check` also passed. Final logs:
+`/tmp/argmin-recovery-sha-workspace-final.log`,
+`/tmp/argmin-recovery-sha-clippy-final.log`, and
+`/tmp/argmin-recovery-sha-boundaries-final.log`.
+
+Review follow-up: the recovery identity diagnostic now retains and renders both
+expected and actual complete-command SHA-256 values. A SHA-only mismatch through
+the historical recovery entry point asserts identical epoch/index/CRC64 but
+distinct displayed digests, with replica positions and the pending slot unchanged.
+The runtime-config corpus also preserves a literal V5 configuration with a
+present five-field recovery row, rather than only the unchanged empty branch.
+Its byte length and SHA-256 are pinned independently; both decoding and durable
+loading reject it specifically as version 5 without modifying the file. A V6
+header alone still rejects the missing digest, while adding exactly that field
+produces a valid configuration. No additional format advance is required for
+these diagnostic/evidence corrections.
+
+Follow-up validation: **39 focused tests passed** in **0.156s**. Formatting,
+strict all-target/all-feature Clippy, boundary checks and diff checks passed.
+The subsequent full Nextest run passed **10,173 tests**, with six existing skips,
+in **369.145s** (run `3341a35e-af19-4ab3-8108-5bb4509f4cf0`). It started with no
+other same-user Nextest run and a one-minute load of 1.65. All three tests marked
+slow completed successfully. Logs: `/tmp/argmin-recovery-sha-review-focused.log`,
+`/tmp/argmin-recovery-sha-review-clippy.log`,
+`/tmp/argmin-recovery-sha-review-boundaries.log`, and
+`/tmp/argmin-recovery-sha-review-workspace.log`.
+
+### Historical application under embedded primary custody — 2026-11-10
+
+The candidate embedded application target now borrows a historical publication
+section, retaining its original admission, shared primary serialization, complete
+command report and bounded route/work authority. Eligible targets are derived
+from the authenticated runtime-map content: they must belong to the reported
+epoch's Active acting set and have current or retained Peering placement at or
+after that epoch. The reporting primary must satisfy the same placement rule.
+Current-only members and old members without Peering placement cannot acquire a
+target. No caller supplies a replacement cohort, runtime, fence or authority
+callback; targets cannot outlive their section.
+
+The reported epoch/index/CRC64/**complete SHA-256** is checked before the local
+store wait and again inside the opaque application authority at effect/commit
+boundaries, including exact replay. Checking only the request against the local
+pending slot is insufficient. Existing captured deadlines govern the shared
+section and local PG wait; raw same-epoch renewal or a later request deadline
+does not renew them. Replicas reuse the primary's existing process-local PG
+serialization, then acquire only their own store mutex. There is no network IO
+under the store mutex, added transaction/fsync, schema or encoding change.
+
+Owner-local tests cover all four context forms on an embedded historical primary
+and replica, lost post-commit confirmation with retained sender uncertainty,
+no-write exact retry, coherent member state, and replay after explicitly dropping
+all original runtimes before reopening. Independent placement negatives isolate
+current-only membership and missing Peering placement; a retained-Peering positive
+applies after the member leaves the current acting set. Index-, CRC- and SHA-only
+report mismatches reject before acquiring a deliberately held store mutex, while
+the original report succeeds. Route/work/section expiry is injected immediately
+before effects or commit, including replay, and a contended-store test proves
+bounded failure without mutation. Existing actual-source compiler probes retain
+the private-authority and borrowed-target guarantees.
+
+This closes historical embedded **receiver** admission under an embedded primary,
+not historical fanout or live activation. The remote-primary/historical embedded
+replica bridge, admission-owned historical cohort and ordering, reissue/abandonment
+handoffs, non-quiescent terminal work, frontend custody/live selection, six skipped
+cleanup regressions and the external checkpoint-transfer follow-up remain open.
+Focused validation passed **19 tests** in **14.094s**, including the five new
+tests and the existing embedded receiver, historical publication and actual-source
+compiler probes. Initial fixture failures were corrected, not retried blindly:
+registering a second member plus an unnecessary placement transition reached
+epoch 6 instead of the command fixtures' epoch 5; the cohort now bootstraps
+directly and nonmembers register afterward. A later placement test correctly hit
+`PgMetadataMigrationRequiresTransfer` when adding a peer after reporting pending
+metadata. Its history is now established while empty, before populating and
+reporting the owner-local command fixture; transfer validation is unchanged.
+Failure logs are `/tmp/argmin-embedded-historical-focused.log` and
+`/tmp/argmin-embedded-historical-focused-v2.log`; the passing run is
+`/tmp/argmin-embedded-historical-focused-v3.log`. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and `git diff --check`
+passed. The full workspace run passed **10,177 tests**, with **6 existing skips**,
+in **380.767s** (run `523795ce-6f61-4cc9-847e-9f3557e9173f`;
+`/tmp/argmin-embedded-historical-workspace.log`). It began with no other same-user
+Nextest run and a one-minute load of 3.86. Three tests crossed the slow threshold
+and completed successfully: the Raft heartbeat amplification gate (107.064s),
+oversized version listing (63.242s), and the all-context/all-origin Unix
+remote-primary fanout matrix (68.660s).
+
+### Historical remote-primary / embedded-replica receiver — 2026-11-10
+
+The remaining mixed receiver direction now has a separate admission-owned
+historical route. It shares the embedded-primary report/placement validator:
+the supplied runtime-map content must match the original admission, name the
+historical Active primary's exact pending command, and place each eligible
+member in both that Active cohort and current/retained Peering history. Static,
+unbounded or unrelated map authority cannot substitute.
+
+Targets borrow that route and the exact registered primary client's still-open
+historical serialization session. A route-authorized opener selects the reported
+historical epoch using that current-epoch client; the epoch-selecting raw opener
+is private to the client owner. Authentication remains bound to the current
+configuration, not a fabricated historical client/topology credential.
+The session mutex stays held through the
+embedded PG transaction, excluding concurrent local sends/shutdown. Acquisition
+is deadline-aware and a failed exchange invalidates later borrowing. This is
+not a remote-liveness guarantee. The reported epoch/index/CRC64/complete SHA-256
+is checked before local store acquisition and again at transactional effect and
+commit, including replay. Captured route/target cutoffs only narrow the owning
+sender's original work cutoff; same-epoch renewal cannot extend them. No network
+IO runs under the embedded store mutex.
+
+This is deliberately **not** a `CompleteFanoutRoute`: individual application
+observations cannot grant all-member completion, terminal retirement or recovery
+ordering. Historical fanout, reissue/abandonment handoffs, non-quiescent terminal
+work, frontend custody/live selection, six original skipped regressions and the
+external checkpoint-transfer follow-up remain open. There is no schema/encoding
+change or additional transaction/fsync in this slice.
+
+Owner tests use a real authenticated Unix/TLS primary and embedded replica with
+all four context forms, post-commit lost confirmation, exact no-write replay,
+coherent primary/replica state and an untouched primary shadow store. Independent
+index/CRC/SHA-only report mismatches reject before a deliberately held PG lock.
+Placement canaries distinguish current-only members from old Active members
+with/without retained Peering. Exact-client, crossed-session and crossed-PG
+negatives reject before mutation; a held session proves bounded acquisition.
+Route/target/request expiry is injected at effect/commit, including replay;
+lost primary replies preserve uncertainty and require a new valid session.
+Actual-source compiler probes cover private route construction and targets that
+cannot outlive either route or session. Initial focused runs exposed fixture
+errors: a wall timestamp supplied as a lease duration, a missing private Unix
+socket directory, an old-topology authentication credential, and installing a
+test clock after capturing real-clock deadlines. These failed before their
+intended canaries and were corrected; production admission was not relaxed.
+The thread-local clock also failed the receiver's process clock-health check;
+the interleaving now uses real monotonic deadlines across both threads while
+renewing only the raw frontend map. Failure logs are
+`/tmp/argmin-historical-bridge-focused.log`, `-v2.log`, `-v3.log` and `-v4.log`.
+The corrected focused run passed **25 tests** in **26.037s**
+(`/tmp/argmin-historical-bridge-focused-v5.log`). Formatting, strict
+all-target/all-feature Clippy and the boundary checker passed. The full workspace
+run began with no other same-user Nextest process and one-minute load 5.98. It
+passed **10,182 tests**, with **6 existing skips**, in **391.328s** (run
+`d38f70f4-86c9-4360-838d-abd2d7b2e124`;
+`/tmp/argmin-historical-bridge-workspace.log`). The three slow-reported tests
+completed successfully: the Raft heartbeat amplification gate (104.550s),
+oversized version listing (62.992s), and the all-context/all-origin Unix
+remote-primary fanout matrix (67.570s). The Raft gate was inspected doing active
+CPU work, not dismissed or retried. Final diff checks are clean.
+
+### Embedded historical fanout and complete-cohort custody — 2026-11-10
+
+The candidate owning fanout now accepts a historical cohort when its primary and
+every required peer are embedded. An opaque admission-bound subject is minted
+from the same authenticated runtime-map/report validator as receiver admission,
+but retains the **entire original Active acting set**. Individual receivers may
+select eligible members; fanout may not shrink that required set. Every member
+must have current or retained Peering placement and an embedded endpoint. A
+member absent from the current acting set but present in retained Peering remains
+required and can participate. Missing admissible placement or a remote endpoint
+rejects the whole fanout before binding or effects.
+
+Consuming binding verifies the report's exact PG/epoch/index/CRC64/complete
+SHA-256 and the original sender's primary/topology. Failure returns the same
+holder with its installation uncertainty intact. Publication/application borrow
+the historical primary section from the exact admission and report. The existing
+canonical witness-before-primary/primary-before-trailing rule now covers this
+historical cohort; all-member completion requires every original peer. Captured
+route and work cutoffs continue to fence effect, commit, retries and completion.
+There is no new transaction, fsync, schema or wire-format change.
+
+Historical completion remains **observational, not terminal authority**.
+`into_terminal` rejects and returns the same historical holder even after all
+members confirm. Remote historical fanout, reissue/abandonment handoffs,
+historical and non-quiescent terminal integration, frontend custody/live
+selection, the six original skipped cleanup regressions and the external
+checkpoint-transfer follow-up remain open.
+
+Owner tests cover all four contexts and inspected/installed/uncertain origins,
+an unsorted three-member cohort, ordering/nonmember non-mutation, lost witness
+confirmation with no-write exact retry, partial-apply unwind and SQLite reopen,
+and the single-member case. Placement canaries require retained old members and
+reject a filtered incomplete cohort. Independent index/CRC/SHA-only report
+crossings and an otherwise identical foreign admission preserve the original
+owner. Route/work expiry is injected at effect, commit and completion, including
+same-epoch raw-map renewal. Mixed historical endpoint tests pin the still-closed
+remote fanout boundary.
+
+The initial focused run exposed a setup assumption: the real three-member
+bootstrap reaches epoch 6, while reused contexts started at epoch 5. The fixture
+now derives a later complete context through its consuming reissue operation and
+anchors the coherent prefix before opening any runtimes; control-plane admission
+is unchanged. A second run exposed an overly broad SQL write-counter assertion:
+publication reconfirmation trials and rolls back primary effects, which still
+increment SQLite's `total_changes`. The regression now checks unchanged durable
+state across reconfirmation and zero writes across the exact witness replay
+separately. Failure logs are `/tmp/argmin-historical-fanout-focused.log` and
+`/tmp/argmin-historical-fanout-focused-v2.log`.
+
+The expanded focused run passed **29 tests** in **27.167s**, including the shared
+historical receiver fixtures and actual-source API probes
+(`/tmp/argmin-historical-fanout-focused-v3.log`). Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks passed.
+The full workspace run started with no other same-user Nextest process and
+one-minute load 7.02. It passed **10,187 tests**, with **6 existing skips**, in
+**378.908s** (run `1add5c81-3db5-4c4e-840f-5b6cbfc4079f`;
+`/tmp/argmin-historical-fanout-workspace.log`). Three slow-reported tests completed:
+the Raft heartbeat amplification gate (118.128s, inspected doing active CPU work),
+oversized version listing (67.329s), and the all-context/all-origin Unix
+remote-primary fanout matrix (68.665s). No full-suite failure or retry occurred.
+
+### Historical mixed-transport fanout — 2026-11-10
+
+The same admission-owned historical cohort now supports embedded, Unix and TLS
+members under either an embedded or remote primary. It still requires every
+original Active member with current/retained Peering placement; endpoint support
+does not permit filtering the required cohort. Exact registered client identity
+is checked before transport, and remote endpoints cannot fall back to local
+shadow runtimes. The historical command's ID/CRC64/complete SHA-256 remains bound
+at custody acquisition. Remote-primary embedded targets additionally enforce that
+report at their pre-store/effect/commit checks, just like the independent receiver
+bridge; the current-route PG/epoch predicate alone is not sufficient.
+
+The owning sender opens a primary session through its admitted route. The
+client-private opener selects the historical command epoch while retaining the
+current client's authentication/configuration. Acquisition and subsequent
+reopening intersect the attempt cutoff with the original frozen work and route
+cutoffs. They do not create a fresh sender or reset publication/application
+uncertainty. Witness-before-primary/primary-before-trailing application and
+all-original-member completion remain unchanged. Historical terminal handoff
+still rejects and returns the same holder; this slice adds no cleanup, slot
+retirement, live publisher selection, format change, transaction or fsync.
+
+Replica transport also requires the opaque admitted route and exact report
+identity before allowing a historical command on a current-epoch registered
+client. The ordinary unscoped sender keeps its existing client-epoch check; this
+is not a generic caller-selected epoch override. Receiver admission independently
+validates its own authenticated report before application.
+
+Integration also closes the shared session send-side mutex gap. Embedded-target
+borrowing already used a deadline-aware wait, but RPC sends and their PG-identity
+precheck could block without observing their deadline. The PG identity is now
+immutable outside the mutex; deadline-bearing sends and borrowing share the
+bounded acquisition. A timeout is `NotSent`, does not close a session used by
+another operation, and cannot erase earlier uncertainty.
+
+The owner-test matrix covers four complete contexts and three custody origins,
+both remote transports, embedded/remote witness and primary roles, exact no-write
+replay, and untouched remote shadow stores. Other canaries exercise retained
+members absent from the current cohort, missing placement, a receiver's same-ID/
+CRC but different-SHA report, crossed registered clients and target reports,
+lost publication/witness/primary/trailing confirmations, partial-apply restart,
+bounded session acquisition and busy-session sends, and captured route/work
+expiry across effect/commit/completion with raw-map renewal. Historical
+reissue/abandonment and terminal handoffs, non-quiescent terminal work,
+frontend custody/live selection, physical exclusion
+and retirement workers, the six original skipped regressions and the separate
+checkpoint-transfer follow-up remain open.
+
+Initial focused failures exposed two integration/fixture issues: node servers
+need the production refresh projection's exact historical epochs rather than the
+frontend's compact history, and replica sends need the typed historical transport
+admission above. The lost-reply fixtures now wake their one-shot listener even
+on pre-send rejection, avoiding a blocked join. Further fixture corrections leave
+room for the real one-second skew allowance before expiry injection and use the
+production concurrent accept loop for session contention (with a server-side
+PG-lock-wait canary), rather than timing out an unaccepted TLS handshake. Busy
+session tests release their held mutex on a bounded failsafe, so a regression
+fails instead of deadlocking.
+
+The expanded focused matrix passed **57 tests** in **84.675s**
+(`/tmp/argmin-historical-remote-fanout-focused-v5.log`). Its 62.069s Unix-primary
+matrix completed all context/origin cases; no test failure or retry occurred in
+that run. Formatting, strict all-target/all-feature Clippy, the storage boundary
+checker and final diff checks passed. The full workspace run started with no
+other same-user Nextest process and one-minute load 7.24. It passed **10,196
+tests**, with **6 existing skips**, in **393.914s** (run
+`1b4f3aba-01dd-4250-9169-eb9f345e3138`;
+`/tmp/argmin-historical-remote-fanout-workspace.log`). All nine new tests passed.
+The four slow-reported tests also completed: the Raft heartbeat amplification
+gate (115.861s, inspected doing active WAL/test-thread work), oversized version
+listing (66.344s), the new historical Unix-primary matrix (70.984s), and the
+current Unix-primary matrix (69.035s). No full-suite failure or retry occurred.
+Final checker logs are
+`/tmp/argmin-historical-remote-fanout-{clippy,boundaries}-final.log`.
+
+### Historical quiescent terminal handoff and slot retirement — 2026-11-11
+
+The candidate historical fanout holder can now transfer the same complete
+context, all-member confirmations, installation uncertainty and first cutoff into
+terminal custody **only for quiescent command work**. Eligibility is derived
+inside the consuming holder, never supplied by the caller. Historical commands
+with immediate payload/release/reclaim work or an additional abandoned-finalizer
+proof still return the original fanout holder; their integration remains open.
+Handoff itself and Drop perform no effects.
+
+The closed embedded retirement reuses the exact report-authorized primary
+section and all-member terminal permit. Unix/TLS retirement now admits the
+historical primary using the same exact report predicate as publication,
+including complete-command SHA-256, while retaining its distinct private
+retirement effect capability. Both current and historical sections must belong
+to the server's Active admission and serialization domains. Historical authority
+is bounded by the current route lease, captured **before** the store wait; a later
+same-epoch renewal cannot replace it. DELETE and COMMIT recheck that fence and
+the receiver-bound original work cutoff.
+
+The existing transaction requires exact Applied evidence, pending bytes, scope
+and every side index. Removal changes only the pending slot and its sidecars;
+materialized owners/windows/resources/references and log evidence remain intact.
+Exact absence can confirm lost replies after restart/compaction without writes.
+The terminal holder can reopen its original remote primary session without
+resetting history or extending cutoffs. Confirmed retirement never redispatches
+against a later slot. No additional transaction, fsync, schema or wire-format
+change is introduced, and live dispatch still rejects the candidate grammar.
+
+Ten new owner tests cover embedded/Unix/TLS primaries with mixed peers, all
+quiescent context families and inspected/installed/uncertain custody; incomplete
+fanout cannot hand off, and non-quiescent historical contexts retain their gate.
+The matrix checks retained owner/resource/log state, no redispatch against a later
+slot, failure/unwind before and after commit, lost remote replies with the same
+owner reopened, and exact absence after receiver restart/compaction. Receiver
+tests reject a same-ID/CRC but different-SHA control-plane report, crossed lock
+domains and non-Active/foreign permits. Embedded tests expire route, work,
+attempt and section bounds at DELETE and COMMIT; receiver tests independently
+expire the wire and server bounds, including renewal of the raw route while the
+captured fence remains expired. Actual Unix/TLS expiry occurs inside the
+transaction. No test infers owner retirement from slot absence.
+
+Initial focused failures exposed a test-listener lifecycle race: sending a fake
+wake connection during shutdown could leave it queued when the worker exited
+between sessions, poisoning the next TLS start. The shared owner-test listener
+now polls with bounded waits and stops without introducing protocol traffic;
+production acceptance/handling is unchanged. Expiry fixtures also now leave room
+for the required one-second skew allowance and expire inside the target
+transaction, not before it. The expanded focused run passed **79 tests** in
+**84.136s**, including all ten new tests
+(`/tmp/argmin-historical-retirement-expanded-v2.log`). The historical Unix-primary
+matrix took 62.936s, with active test work observed, and completed. The storage
+boundary checker passed (`/tmp/argmin-historical-retirement-boundaries.log`).
+Formatting and strict all-target/all-feature Clippy passed. The full workspace
+run waited for load1 to fall to **8.08**, with no other same-user Nextest active,
+then passed **10,206 tests**, with **6 existing skips**, in **406.044s** (run
+`db752b7a-c488-452b-8c63-1d269e3fb487`;
+`/tmp/argmin-historical-retirement-workspace.log`). All ten new tests passed in
+that run. The four slow-reported tests completed successfully: the Raft heartbeat
+gate (114.406s), oversized version listing (66.371s), historical Unix-primary
+fanout (70.879s) and current Unix-primary fanout (69.000s). No full-suite failure
+or retry occurred. The final damaged-slot matrix was inspected doing active CPU
+work and completed in 57.112s. Checker logs are
+`/tmp/argmin-historical-retirement-{fmt,clippy,boundaries}.log`.
+
+Non-quiescent terminal integration, historical reissue/abandonment custody,
+frontend/live selection, physical exclusion and autonomous owner retirement,
+the six original skipped regressions and the external checkpoint-transfer follow-up
+remain open.
+
+### Historical abandoned-finalizer reservation release — 2026-11-11
+
+The candidate historical all-member holder now also transfers into terminal
+custody for an already-applied, source-bearing UploadPart cleanup. This is a
+narrow exception to the preceding quiescent-only gate: it exposes the existing
+independent retained-finalizer reservation release, not physical cleanup,
+reissue/abandonment derivation or pending-slot retirement. Eligibility comes
+from the retained complete context. No raw proof, independently reconstructed
+command, new sender or reset history is introduced.
+
+Release retains the authenticated abandoned source, complete command identity,
+all-member application evidence and installation uncertainty. It selects the
+proof's original bucket PG and epoch, independently of the object's PG and the
+replacement bucket primary. The exact route is reported by production durable
+reference discovery and delivered by the storage-node refresh projection. The
+first work/route cutoffs remain frozen across session reopening and retry and
+reach the final SQL check beside deletion. Uncertainty is recorded before
+dispatch; exact absence confirms a lost reply without another write, including
+after restarting from the still-pending source. Confirmed release does not
+redispatch. Drop has no effects.
+
+Owner tests cover embedded, Unix and TLS primaries with mixed fanout peers and
+inspected/installed/uncertain origins. The old bucket primary is distinct from
+the new one, which holds a matching reservation as a wrong-route canary. Tests
+also cover stable-proof conflict, renewable-lease changes, missing Active bucket
+history, original work/route expiry despite raw-map renewal, actual expiry inside
+the release transaction, interrupted ownership, corrupt authenticated replies
+after confirmed server success, exact retry and receiver restart. They assert
+unchanged pending indexes, owner/resource rows and command log, and rejection of
+slot retirement after successful release. These are metadata-only fixtures;
+they do not claim physical cleanup or owner retirement coverage.
+
+Initial focused failures exposed fixture setup omissions rather than a relaxed
+admission requirement: the bucket migration needed current peer observations,
+the source-bearing pending index's exact route references needed to be reported
+through heartbeat, and the fixture-created bucket needed its state digest sealed
+before restart. The lost-reply canary now explicitly requires a successful server
+response before corrupting authentication, so an earlier error cannot masquerade
+as an uncertain deletion. The SQL deadline assertion inspects the actual error
+variant rather than the intentionally sanitized Debug label.
+
+No schema, wire-format, transaction-count or fsync change is introduced. Other
+non-quiescent historical terminal work, historical reissue/abandonment custody,
+frontend/live selection, physical exclusion and autonomous owner retirement,
+the six original skipped regressions and the external checkpoint-transfer follow-up
+remain open.
+
+The expanded focused matrix passed **36 tests** in **63.621s**, including all
+eight new historical-finalizer tests
+(`/tmp/argmin-historical-finalizer-expanded.log`). Initial diagnostic runs are
+retained as `/tmp/argmin-historical-finalizer-focused*.log`; failures were
+investigated and corrected as described above, not accepted or blindly retried.
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. The full workspace run started with no other same-user
+Nextest process and one-minute load **9.82**. It passed **10,214 tests**, with
+**6 existing skips**, in **406.005s** (run
+`e07216bc-d0c1-460e-a264-234503cc9a74`;
+`/tmp/argmin-historical-finalizer-workspace.log`). All eight new tests passed.
+The four slow-reported tests completed: the Raft heartbeat amplification gate
+(114.600s), oversized version listing (64.565s), historical Unix-primary fanout
+(70.658s) and current Unix-primary fanout (68.360s). Active CPU work was observed
+while checking the running Raft/fanout tests. No full-suite failure or retry
+occurred. Checker logs are
+`/tmp/argmin-historical-finalizer-{fmt,clippy,boundaries}.log`.
+
+### Historical command-owned reservation release — 2026-11-11
+
+The candidate all-member handoff now also admits independent command-owned
+reservation release on historical routes. The closed terminal-work classification
+distinguishes command-proof release and stream-creation-proof release from a live
+PUT creation proof that must remain held. This extends the preceding source-bound
+finalizer release; it does not turn a scalar observation into caller-supplied
+authority. The same owning context, installed/uncertain history, exact admitted
+cohort and first work/route cutoffs reach the existing closed release operation.
+
+The original bucket PG/epoch determines the release target, including a stream
+abort whose creation proof predates the abort command. The current bucket
+primary is not a substitute. Exact matching release, conflict, lost reply,
+no-write absence confirmation and no redispatch after confirmation use the same
+transaction and transport as the preceding slice. No new transaction, fsync,
+schema, wire format, production dependency or live selection is introduced.
+
+Eight owner tests cover seven write families: standalone/streamed PUT commit,
+UploadPart creation/replacement, PUT stream abort, MPU completion and MPU abort.
+The matrix crosses embedded/Unix/TLS historical primaries with mixed peers and
+inspected/installed/uncertain holders. The real control plane first publishes an
+Active two-peer cohort at epoch 5, then moves the bucket primary while retaining
+the exact proof epochs discovered from durable metadata. Both the old and new
+bucket primary hold a matching proof as a wrong-route canary. Tests exercise
+interruption, authenticated reply loss after successful deletion, restart,
+stable-proof conflict with exact retry after renewable lease changes, work/route
+expiry despite raw renewal and expiry immediately beside the SQL DELETE.
+
+All-member confirmation remains necessary before handoff. Successful release
+leaves pending bytes/indexes, owner/resource records, selected and displaced
+references and log state unchanged. It does not make the original non-quiescent
+work classification eligible for slot retirement. Negative cases retain a live
+PUT creation proof and return the original fanout owner for an ordinary
+payload-only UploadPart abort. Physical cleanup, non-quiescent/owner retirement,
+historical reissue/abandonment custody, frontend/live selection, the six original
+skipped regressions and the separate checkpoint-transfer follow-up remain open.
+
+The initial five-test matrix passed in **44.065s**; after adding the conflict and
+deadline cases, the expanded matrix passed **48 tests** in **71.845s**, including
+all eight new tests (`/tmp/argmin-historical-command-release-expanded.log`). No
+focused test failed or was retried. Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed. Full workspace
+validation started with no other same-user Nextest process and one-minute load
+**6.80**. It passed **10,222 tests**, with **6 existing skips**, in **416.724s**
+(run `03bec4fd-703c-45bd-8eeb-b5d898f331f8`;
+`/tmp/argmin-historical-command-release-workspace.log`). All eight new tests
+passed. The five slow-reported tests completed: Raft heartbeat amplification
+(116.201s), oversized version listing (63.359s), the new 21-case TLS release
+matrix (62.463s), historical Unix-primary fanout (71.199s) and current
+Unix-primary fanout (68.147s). Active CPU work was observed while checking the
+running Raft/fanout tests. No full-suite failure or retry occurred. Checker logs
+are `/tmp/argmin-historical-command-release-{fmt,clippy,boundaries}.log`.
+
+### Owning embedded unstarted abandonment — 2026-11-11
+
+The next candidate recovery boundary consumes the admitted fanout owner into a
+closed unstarted-abandonment holder. It retains the exact complete context and
+source, original installation uncertainty and immutable work/route cutoffs. An
+observed marker, attempted/uncertain publication or application history prevents
+conversion and returns the unchanged fanout owner. There is no raw source export,
+fresh submission conversion, cleanup Drop or scalar permission to abandon.
+
+The original embedded primary section supplies independently admitted authority;
+an additional stack-only permit can be borrowed only from the owning holder.
+Under that same PG serialization and a transaction, the operation validates exact
+pending bytes, source authentication, route/window/page indexes and bucket scope,
+an unset publication marker, and absence of applied terminal evidence. It checks
+the captured authority immediately before the tombstone write and COMMIT. The
+tombstone uses the existing complete-command cryptographic identity. Exact replay
+confirms without a write. Error/unwind/commit-reply loss keeps uncertainty; failed
+rollback retires the connection until reopen. No pending row/index, owner,
+resource obligation or physical payload is removed or transferred.
+
+Both current and control-plane-report-authorized historical embedded primaries
+use this boundary. Historical scope retains the original primary, cohort and
+report's complete identity; another admission domain is rejected even with the
+same stores, topology and command. This only confirms the **primary** tombstone.
+Replica abandonment, remote-primary transport, follow-up custody, reissue and
+terminal/physical cleanup remain gated. It does not solve a fresh old-epoch
+tombstone after the durable log itself has advanced epochs. Live dispatch and
+frontend selection are unchanged, as are schema/wire formats, ordinary-path
+transactions/fsyncs, the six original skipped regressions and the separate
+checkpoint-transfer follow-up.
+
+Owner tests cover ordinary, described introduction/append and source-bearing
+contexts, all three inspected/installed/uncertain origins, restart/no-write
+reinspection, primary-only historical recovery and independent replica canaries.
+Negatives cover already-started/applied commands, damaged bytes/indexes/scope,
+publication ambiguity, crossed admission domains, captured route expiry after
+raw renewal, work expiry beside the effect and COMMIT, unwind/lost replies and
+rollback failure. These are metadata-only fixtures, not physical-cleanup tests.
+The first focused build identified an incorrect test-only enum import; it was
+corrected before execution. The initial nine-test selection passed in **12.630s**
+and the expanded 50-test selection in **58.660s**. Final self-review moved the
+effect check into the shared recorder, after its position/receipt reads and
+tombstone encoding, immediately beside INSERT. Its production complete arm
+requires both typed authorities; only the current-envelope arm and explicit
+test-only complete setup can use the unfenced predecessor behavior. The effect
+hook now exercises that final boundary, not an earlier caller-side check.
+
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed on the final code. Full workspace validation started with
+no other same-user Nextest process and one-minute load **4.11**. All **10,231
+tests passed**, with **6 existing skips**, in **418.908s** (run
+`07d2740f-fd78-485d-9d49-42bd22b46d41`). All nine new tests passed, including the
+SQL-boundary deadline regression. No test failure or retry occurred. The five
+slow-reported tests completed: Raft heartbeat amplification (114.428s), oversized
+version listing (61.995s), historical TLS command-release matrix (61.532s),
+historical Unix-primary fanout (69.885s) and current Unix-primary fanout (69.911s).
+Active CPU work was observed for Raft; the later transport matrices had completed
+when their slow notifications were inspected. Logs are
+`/tmp/argmin-unstarted-abandonment-{focused2,expanded,fmt,clippy,boundaries-final,workspace}.log`.
+
+### Closed remote-primary unstarted abandonment — 2026-11-11
+
+The original owning abandonment holder now sends one closed authenticated
+Unix/TLS attempt through its exact primary session. It retains complete
+context/source, installed/uncertain history, admitted cohort and first work/route
+cutoffs; retry or session reopening cannot reset them. Not-sent failure restores
+the prior observation, including earlier uncertainty. Interrupted dispatch, lost
+reply and malformed/crossed confirmation retain uncertainty. Confirmation binds
+purpose, node, exact command ID and complete SHA-256; a confirmed holder never
+redispatches. No raw request/command escapes into a fresh production submission.
+
+The receiver mints a separate private abandonment authority after checking its
+own Active admission gate, exact held primary serialization and current or
+control-plane-authorized historical report. The report's complete digest is
+required even when ID and CRC match. It captures the server route fence before
+waiting for SQLite and binds the mandatory conservative absolute wire cutoff
+once before context decoding. The same reviewed embedded transaction now accepts
+this independent receiver authority; both paths revalidate beside the first
+tombstone INSERT and at COMMIT. Pending bytes/indexes/scope, unset publication
+marker and absent/applied/abandoned evidence are checked transactionally. Exact
+tombstone retry is read-only; failed rollback retires the connection.
+
+The new `ABND`/`ABOK` payload V1 and exact request/confirmation/frame composites
+are appended in the format ledger. Existing evidence is unchanged. The frame
+ID 28 cap includes the complete context and mandatory deadline, with exact-cap
+tests, within the existing pending RPC 36-to-37 transition. Live dispatch still
+uses and tests rejection by the predecessor decoder; no production selector,
+schema, ordinary-path transaction/fsync, physical authority or cleanup policy is
+changed. This confirms only the original **primary** tombstone. Replica
+abandonment, follow-up custody, reissue, frontend/live activation, physical
+exclusion/retirement and the separate checkpoint-transfer follow-up remain open.
+
+Coverage includes all four context forms and all three holder origins over
+Unix/TLS; exact retry after reply loss; independently signed wrong-digest
+confirmation; unchanged replica/pending/owner/resource canaries; damaged pending
+indexes, started/applied rejection; restart under historical authorization;
+equal-ID/CRC but crossed-report SHA; wrong lock/permit domains and cleanup-only
+admission; receiver SQL expiry and both server-first/wire-first cutoff ordering
+at INSERT/COMMIT despite raw renewal. Compiler tests reject sibling authority
+construction. Metadata-only fixtures do not claim physical cleanup coverage.
+
+The first focused build caught a test-only use of an internal deadline variant
+as a wire error; the assertion now uses the actual `TransportTimeout` mapping.
+The initial **17-test** selection then passed in **25.923s**. The expanded
+**66-test** selection passed in **29.942s**, including historical restart,
+both receiver deadline orderings and neighboring abandonment/retirement tests.
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. The first full workspace run started with no other
+same-user Nextest process and one-minute load **0.79**. It found an outdated
+`MetadataCommandRecordAbandoned` cap expectation in the shared request-frame
+rejection matrix: the dedicated new exact-cap test covered the new framing,
+but the common matrix still expected the old cap. The matrix now uses the new
+cap and reports the message kind and actual result on failure. This run stopped
+with **9,882 passed, 1 failed, 362 not run and 6 skips** in **426.848s** (run
+`d6a39fc8-d793-423c-97b0-82031d8da58f`). This was investigated and corrected,
+not treated as a transient failure.
+
+The corrected shared cap test and both abandonment wire tests passed (**3 tests,
+0.034s**). Formatting, strict Clippy, boundary and diff checks passed again.
+The final full workspace run started with no other same-user Nextest process
+and one-minute load **9.64**. All **10,245 tests passed**, with **6 existing
+skips**, in **430.291s** (run `82d9bf6b-2c49-4f0b-a075-2399dc76c504`). All
+14 new tests and the corrected shared matrix passed. The five slow-reported
+tests completed: Raft heartbeat amplification (117.278s), oversized version
+listing (64.656s), historical TLS command release (63.103s), historical
+Unix-primary fanout (70.694s) and current Unix-primary fanout (69.986s).
+Raft was actively using CPU when inspected; the other slow-reported tests had
+completed successfully by inspection. Logs are
+`/tmp/argmin-remote-abandonment-{expanded,caps,fmt-final,clippy-final,boundaries-final,workspace,workspace-final}.log`.
+
+### Primary-confirmed embedded replica abandonment — 2026-11-11
+
+The original unstarted-abandonment holder now records per-replica observations
+without detaching context, source, installation uncertainty or first cutoffs.
+Only confirmed primary tombstone custody can select an embedded replica of the
+original cohort. The operation borrows the exact embedded primary section or
+Unix/TLS primary session; it retains that serialization through the replica's
+SQLite transaction. Current and control-plane-report-authorized historical
+routes share this path, not a newly selected current-map substitute.
+
+A private stack-only permit binds the original holder and selected target.
+The node owner derives separate store-bound authority and opens the selected
+runtime's PG with the intersected deadline. The actual production store entry
+requires that authority, not independent command/topology/callback arguments.
+It rejects applied/crossed terminal identity, malformed or started local pending
+state and orphan sidecars. An absent local slot is valid for a replica; a present
+slot must exactly match context, scope and every protection index. The common
+tombstone recorder checks authority after validation/encoding beside INSERT,
+and the transaction checks it again at COMMIT. Exact replay is read-only;
+rollback uncertainty retires the replica connection.
+
+Partial success stays in the holder. Error/unwind/lost confirmation marks only
+the attempted replica uncertain; a later pre-effect failure cannot erase that
+history. Successful replicas are not redispatched. Restart discards process-local
+observations, reauthenticates the retained primary, and independently reinspects
+each replica. No pending bytes/index, owner, reference, proof obligation or
+payload is deleted or transferred. No all-member cleanup capability is exposed.
+Remote replica transport, the consuming abandonment/follow-up handoff, epoch
+reissue, live publisher/frontend activation, physical exclusion/retirement and
+the independent checkpoint-transfer follow-up remain open. This slice changes no
+schema, wire grammar or ordinary-path transaction/fsync.
+
+The initial six-test matrix passed in **9.296s**. An expanded build found two
+test-only calls using the historical fixture's `peer(id)` name on the current
+fixture, whose accessor is `remote(NodeId)`; those were corrected before
+execution. Coverage adds all four contexts and three custody origins, exact
+optional replica slots, lost replies/unwind, partial restart, historical cohort
+and crossed-domain rejection, Unix/TLS-primary-to-embedded-replica binding,
+captured route/work expiry at INSERT/COMMIT, rollback retirement and compiler
+privacy checks using the actual permit and receiver sources. All fixtures are
+metadata-only; they do not claim physical cleanup or production activation.
+The first expanded execution correctly rejected cloning the permit, but its API
+test expected `E0599` rather than Rust's `E0277` trait-bound diagnostic. That
+expectation was corrected after inspecting the full output; the other 16 run
+tests passed and 14 were not run. The corrected **31-test** expanded selection
+passed in **30.511s**. Final review added explicit crossed-terminal and NULL-scope
+non-mutation cases to the damaged-replica matrix. Formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. Full
+workspace validation started with no other same-user Nextest process and
+one-minute load **4.73**. All **10,256 tests passed**, with **6 existing skips**,
+in **434.800s** (run `b2074e55-2997-4aaa-a0af-6a45b9578ae8`), including all 11
+new tests and both final matrix additions. No full-suite failure or retry occurred.
+The five slow-reported tests completed: Raft heartbeat amplification (115.817s),
+oversized version listing (63.856s), historical TLS command release (63.402s),
+historical Unix-primary fanout (70.939s) and current Unix-primary fanout (71.387s).
+The Raft and historical Unix processes were actively using CPU when inspected;
+the other slow-reported tests had completed successfully by inspection. Logs
+are `/tmp/argmin-replica-abandonment-{focused,expanded,expanded2,expanded3,fmt,clippy,boundaries,workspace}.log`.
+
+### Admitted remote replica abandonment receiver — 2026-11-11
+
+This slice adds the receiver half of remote-replica abandonment, separately from
+the still-open owning sender integration. Authenticated Unix/TLS owner tests
+select a distinct `RABD`/`RAOK` V1 purpose on existing RPC ID 28. The request
+binds configured primary, distinct recipient, complete context and a mandatory
+conservative absolute cutoff; it does not certify primary tombstone custody.
+The future sender must retain the original primary-confirmed holder and its
+exact primary section/session through dispatch and per-member confirmation.
+
+Receiver authority has private fields and no sibling constructor or production
+mutation callback. Admission requires the exact Active gate/domain, current or
+report-authorized historical replica, and locally acquired PG serialization,
+never a borrowed primary section. Historical admission compares complete SHA-256
+as well as epoch/index/CRC. The server captures its route fence before waiting
+for serialization/SQLite and intersects it with the once-rebound wire cutoff.
+The embedded and remote receivers share the existing closed replica transaction;
+each passes its own opaque authority to the common recorder's final INSERT
+check and to COMMIT. Exact replay writes nothing, lost replies remain retryable,
+and failed rollback retains the existing connection-retirement behavior.
+No slot/index, owner/reference/resource or payload is removed or transferred.
+
+Four append-only literal payload/frame composites freeze this new family;
+primary-abandonment evidence is untouched. ID 28's frame cap includes the
+additional primary field, and the common admission matrix is updated. This is
+part of the pending uncommitted RPC 36 → 37 transition, not another version
+advance. No schema or ordinary-path transaction/fsync changes. Live dispatch
+still rejects candidate framing. Remote sender history/confirmation, consuming
+follow-up custody, reissue, frontend/live activation and the independent physical
+and checkpoint-transfer follow-ups remain open.
+
+The first focused build caught a test using the internal
+log-conflict name as a wire error; it now checks the actual `Internal` mapping.
+The next selection ran 25 tests: 24 passed and the new orphan-sidecar case failed.
+Its setup had cascaded away the sidecars while deleting the slot, so the receiver
+correctly accepted an absent-slot replica. The fixture now disables foreign keys
+only for the malformed deletion and positively asserts that the orphan sidecar
+exists before testing rejection. This was a fixture defect, not a transient
+failure or a reason to weaken absent-slot replica semantics.
+
+The corrected **26-test** focused selection passed in **28.457s**. Coverage
+includes Unix/TLS current and exact-report historical admission, all four
+complete-context forms, absent/exact/damaged pending custody, lost reply,
+restart/replay, crossed primary/recipient/report/admission, both deadline
+orderings at INSERT/COMMIT despite raw renewal, live-grammar rejection and
+compiler privacy/non-cloneability checks against the actual receiver source.
+These are metadata-only fixtures, not physical-cleanup or remote-sender tests.
+Strict Clippy requested a type alias for the test-only stage hook; that was
+corrected before final validation. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. The primary-abandonment fixture
+hashes still exactly match their earlier ledger entries.
+
+Full workspace validation began with no other same-user Nextest process and
+one-minute load **3.99**. All **10,268 tests passed**, with **6 existing skips**,
+in **444.466s** (run `f5b3927b-6e3f-4dc8-aaf8-bb2a81f79109`), including all
+12 new tests. No full-suite failure or retry occurred. The five slow-reported
+tests completed: Raft heartbeat amplification (116.882s), oversized version
+listing (67.421s), historical TLS command release (62.801s), historical
+Unix-primary fanout (70.757s), and current Unix-primary fanout (71.496s).
+The Raft test was actively using CPU when inspected; both historical tests and
+the version-listing test had completed by inspection. The current Unix-primary
+test was observed actively using CPU before its slow report and subsequently
+passed. Logs are
+`/tmp/argmin-replica-receiver-{focused,focused2,focused3,fmt-final,clippy-final,boundaries,workspace}.log`.
+
+### Owning remote replica abandonment sender — 2026-11-11
+
+The primary-confirmed abandonment holder now supports remote replicas under
+embedded or Unix/TLS primaries, including exact report-authorized historical
+cohorts. A private one-use attempt borrows the original complete context,
+installation history and primary serialization. For remote primaries it owns
+the exact session mutex borrow through the replica exchange. The session must
+belong to the registered primary client and captured PG/epoch; acquisition is
+bounded by the attempt deadline intersected with original holder work/route
+authority before waiting. Embedded primary sections must belong to the exact
+admission domain. The selected replica is the exact registered cohort client,
+never a same-NodeId substitute or frontend shadow store.
+
+Encoding requires both the original source identity and this exact attempt's
+transport. A separately decoded identical context cannot substitute a new
+deadline. The existing `RABD`/`RAOK` V1 framing is unchanged. Exact replies bind
+purpose, primary, recipient, command ID and complete SHA-256. An attempt marks
+only its member uncertain before possible dispatch; a definitive not-sent result
+restores that member's prior observation, while remote rejection, ambiguous
+transport, bad confirmation and unwind retain uncertainty. A prior uncertain
+attempt cannot be erased by a later pre-send failure. Confirmed members are not
+redispatched, and partial progress remains inside the same holder. No new
+all-member cleanup, source extraction, slot-retirement or follow-up capability
+is created. Live selection, consuming abandonment/follow-up transfer, reissue,
+frontend custody and physical authority/retirement remain gated.
+Checkpoint-transfer work is separate follow-up after cleanup ownership completes.
+This slice changes no format or ordinary-path transaction/fsync.
+
+The initial seven tests passed in **26.968s**; the expanded 14-test matrix passed
+in **28.713s**. Coverage includes all four context forms and all three origins
+under both current primary transports, historical remote/embedded primaries,
+lost-reply partial progress and restart, exact no-write retries, signed crossed
+confirmations, foreign client/admission rejection, immutable encoding and
+crossed-transport rejection. A receiver reply hook proves the exact primary
+mutex remains held during the exchange; contention tests prove attempt, work
+and route deadlines stop waiting before another session user releases it, with
+no replica request or mutation. Compiler checks compile the actual sender with
+dependency stubs, accepting closed holder/client calls and rejecting attempt
+construction, private primary-serialization construction, callback injection,
+cloning and reuse. The broader abandonment/session-borrow regression set passed
+**143 tests** in **52.946s** (run
+`1886ce7e-1afb-49f0-b8e2-9f702c024ad5`). Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. Full-workspace validation passed **10,283 tests**, five slow reports,
+six unchanged skips, in **458.351s** (run
+`e474a9ac-0394-461b-b717-d236fea6a48b`), including all 15 new sender tests.
+No other same-user Nextest was active at launch and load1 was below 4.
+All five slow-reported tests passed: the Raft write-amplification gate in
+116.790s, oversized version listing in 65.884s, historical TLS command release
+in 62.257s, historical Unix-primary fanout in 69.268s and current Unix-primary
+fanout in 70.563s. The current Unix-primary process had accumulated 56 seconds
+of CPU at inspection and completed before the next sample; the other slow
+tests had completed by inspection. Logs are
+`/tmp/argmin-replica-sender-{focused,expanded,regression,fmt-final,clippy-final,boundaries,workspace}.log`.
+Fixtures are metadata-only and do not claim physical cleanup or production
+activation.
+
+### Consuming all-member abandonment custody — 2026-11-11
+
+The primary/replica abandonment holder now consumes into a private
+`CompleteAbandonmentHandoff` only after revalidating its original authority and
+confirming every member of its exact admitted cohort. The primary is counted
+from its own tombstone observation, independently of replica observations.
+Quorum, repeated confirmation of one member, or an unconfirmed successful commit
+cannot substitute for a missing member. Historical recovery uses the retained
+cohort, not the replacement route's members. A singleton still requires exact
+primary confirmation.
+
+This moves the complete original holder, not decoded/reconstructed context or a
+fresh submission. Source-bearing cleanup context, inspected/submitted origin,
+installation history, per-member observations, admission and immutable cutoff
+remain together. Failure returns that same owner for retry without resetting
+uncertainty. Success exposes only scalar diagnostics and validity inspection;
+its representation is owned by a private child module, with no constructor,
+Clone, reverse conversion, raw-command extraction, callback or cleanup-on-Drop.
+This slice performs no SQL/network mutation and changes no format or fsync path.
+
+This is the **no-effect custody gate**, not the complete follow-up protocol.
+Next, derive the required follow-up inside this owner under admitted primary
+serialization, retain original source/proof responsibility through uncertain
+installation and convergence, and only then enable the appropriate terminal
+transfer. Do not reuse the applied-command terminal handoff for abandonment or
+infer cleanup permission from all-member tombstones. Live publisher selection,
+frontend custody, reissue, physical-authority/worker milestones, the six original
+skips and checkpoint-transferability remain unresolved.
+
+The new owner-local matrices cover embedded and
+mixed Unix/TLS cohorts, all four context forms and three installation origins,
+one-member and non-primary-ordered cohorts, each missing replica, lost replies,
+historical replacement membership, restart reinspection and immutable authority
+before/after the handoff. Compiler tests exercise the actual handoff source.
+These are metadata-only tests and make no physical-cleanup claim.
+
+The initial nine focused tests passed in **49.937s**. Strengthening the historical
+canary first exposed an invalid test setup: replacing the entire Peering cohort
+with `[1, 3]` lacked a freshly observed migration source and correctly returned
+`PgMetadataMigrationRequiresTransfer { pg_id: 4 }` before handoff execution
+(eight passed, one failed). The corrected setup retains the observed primary
+and changes current membership to `[4, 1]`, while independently asserting that
+the handoff requires the historical `[4, 2, 0]` cohort. Production admission and
+handoff requirements were not relaxed. All **nine** corrected focused tests
+passed in **49.624s** (run `3de10fd6-42ef-4d0e-875a-ec1943d97c71`), including
+exact complete-context identity assertions after the move. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. The final full workspace run passed **10,292 tests**, six slow reports,
+six unchanged skips, in **472.540s** (run
+`02e4b19e-fc64-4290-b558-41838955371a`), including all nine new tests. No other
+same-user Nextest was active at launch; load1 was **2.22**.
+
+All slow-reported tests completed: the Raft gate in 116.453s, oversized version
+listing in 63.500s, this slice's mixed embedded-primary handoff matrix in
+69.557s, historical TLS command release in 62.399s, historical Unix-primary
+fanout in 70.656s and current Unix-primary fanout in 71.749s. The Raft and
+historical Unix-primary processes were inspected doing active CPU work; the
+other slow-reported tests had completed by inspection. The handoff matrix took
+49.622s in the focused run and covers 24 context/origin/transport combinations.
+Logs are at
+`/tmp/argmin-abandonment-handoff-{focused,focused-final,focused-corrected,fmt-final,clippy-final,boundaries,workspace}.log`.
+
+### Admitted UploadPart abandonment preparation — 2026-11-11
+
+The all-member abandonment handoff now consumes into an owning, unsent UploadPart
+cleanup pair under its exact **current embedded-primary** section. The section
+selects the actual runtime/store and obtains the PG mutex using the original
+work/route deadline. A private borrowed preparation permit binds the handoff,
+complete source identity and admission domain; neither arbitrary encoded input
+nor publication authority alone can construct it. The deepest preparation entry
+also verifies that the supplied publication authority belongs to this permit's
+section. Production callers cannot inject a callback.
+
+One read snapshot revalidates the exact complete pending slot, bucket scope,
+route/staging/payload indexes, unstarted marker and cryptographically bound
+tombstone. It captures the existing owner/session closure and derives the cleanup
+ID from the same current-epoch prefix, with checked arithmetic. The resulting
+AbortStreamUpload retains the complete abandoned finalizer context and its exact
+proof. Only ordinary CommitStreamPart sources are accepted; source-bearing aborts
+cannot be downgraded to ordinary cleanup. Snapshot teardown must succeed and
+the immutable authority must still be valid before the result escapes.
+
+Success moves the original handoff beside the unsent candidate, preserving the
+original inspected/submitted origin, all confirmations, installation uncertainty
+and cutoff. Failure returns that same handoff. Neither result exports a context,
+submission, mutable callback, reverse conversion or cleanup-on-Drop. A temporary
+receiver result borrows its source permit and has no public extraction path.
+The captured prefix is an observation, **not** future installation authority;
+replacement must revalidate it transactionally. No write, command installation,
+release, physical effect, format change or additional fsync occurs here.
+
+Historical source admission is explicitly rejected for successor preparation:
+authorization of the old exact command must not imply permission to mint a new
+one. This read-only slice left separately admitted historical-source/current-successor
+transfer, remote-primary preparation, owning replacement, uncertain installation/
+convergence and terminal custody transfer open. The next entry implements current
+embedded replacement before broadening preparation to those other routes. Other command
+kinds' abandonment follow-ups, live publisher selection, frontend custody,
+physical authority/worker milestones, the six original skips and checkpoint
+transferability remain unresolved.
+
+The first focused run passed **six tests** in **4.867s** (run
+`fb85ff45-f470-4534-a96c-44484db8637b`). The matrix covers empty/two-segment parts
+and all three holder origins, exact source-bearing cleanup bytes, unchanged
+SQLite state/change counters including Drop, damaged scope/slot/routes/tombstone
+and publication markers, unrelated command kinds, crossed admission domains,
+and deadline expiry after snapshot capture. Compiler tests compile the actual
+handoff/preparation and embedded bridge with dependency stubs, allowing closed
+consuming/scalar operations and rejecting permit construction, cloning, reuse,
+private-source/candidate extraction and submission reconstruction. The historical
+cohort matrix additionally rejects minting a successor under historical-only
+authority and checks retained history/nonmutation. These fixtures are
+metadata-only, not physical-cleanup or live-activation evidence. The expanded
+**21-test** regression set passed in **50.331s** (run
+`ad847bd2-3959-4d6f-8f69-f93b3aa699b2`). Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. Full-workspace validation passed **10,296 tests**, six slow reports and
+six unchanged skips, in **473.062s** (run
+`f1c476cf-d4ee-4182-b5bc-780788205368`). No other same-user Nextest was active at
+launch and load1 was **4.55**. All four new runtime regressions and the expanded
+compiler/historical canaries passed in that run.
+
+All slow-reported tests completed successfully: the Raft gate in 116.038s,
+oversized version listing in 64.158s, mixed embedded-primary abandonment handoff
+in 68.429s, historical TLS command release in 62.199s, historical Unix-primary
+fanout in 70.599s and current Unix-primary fanout in 72.323s. Process inspection
+showed active CPU work for the Raft and historical Unix-primary cases; the other
+slow-reported processes had finished by inspection. Logs are retained at
+`/tmp/argmin-abandonment-preparation-{focused,regression,fmt,clippy,boundaries,workspace}.log`.
+
+### Owning current-primary UploadPart cleanup replacement — 2026-11-11
+
+This slice completes pending replacement for the already prepared **current
+embedded-primary** lane before broadening preparation to remote or historical
+sources. `PreparedAbandonedPart` retains the original all-member handoff and
+candidate and lends an unconstructible, exclusive installation attempt. The
+bridge selects the original admitted runtime/store and bounds PG-lock acquisition
+by its frozen work/route cutoff. Independently supplied source/successor contexts,
+publication authority alone, callbacks and resettable detached history cannot
+enter this replacement path.
+
+One `BEGIN IMMEDIATE` transaction authenticates the exact original pending
+context, scope, route/staging/payload indexes and unstarted tombstone. It requires
+the captured replica prefix and an absent cleanup terminal identity, then
+recaptures the current session/owner closure and requires exact prepared cleanup
+bytes. It derives replacement indexes in that same transaction. The slot,
+source-bearing command, scope and all protection indexes change atomically;
+immutable authority is checked after statement preparation immediately before
+the first write, and again before COMMIT. No independently committed handoff
+record, new format or ordinary-write fsync is added.
+
+Before an unconfirmed storage attempt, the exclusive attempt records
+`Unconfirmed`. Every entered error or unwind preserves that observation beside
+the original source and cleanup, including commit-success/reply-loss. Failed admission leaves the
+previous observation unchanged; it cannot reset uncertainty. Successful
+replacement or exact replay records `Installed`, which is **not** publication,
+application or all-member convergence. An already `Installed` holder validates
+the supplied section/request authority and returns without redispatching; errors
+cannot downgrade that confirmation. This is evidence of past installation, not
+continued slot ownership or authority for a later transition. Unconfirmed replay
+revalidates scope and all retained indexes without repairing damage, rewriting
+the publication-start marker or replaying an applied cleanup. Unconfirmed rollback retires the connection until
+reopen. Neither Drop nor any failure releases resources or deletes payloads.
+
+Owner-local metadata-only regressions cover all three original holder origins,
+empty/two-segment cleanup, transaction errors/unwind at four boundaries, lost
+successful replies, exact replay after publication/application, damaged indexes
+and scope, changed prefix, coherently changed cleanup closure, foreign admission,
+immutable deadline expiry before write/commit, and failed rollback/reopen.
+Compiler probes exercise the real owner/bridge and reject installation-permit
+construction, observation reset and mutation without owning custody. The first
+focused run found two test-setup errors (a missing dependency-stub import and
+attempting fresh lookahead allocation under a revoked pre-reopen issuer); those
+setups were corrected without relaxing production checks. The interleaving
+canary now captures the valid append before reopen, then applies its deterministic
+component between preparation and replacement while holding the log prefix fixed.
+The expanded run passed ten tests and exposed one further assertion error: PG
+access already rejects a retired connection, before the test's attempted inner
+usability check. The corrected test requires that access rejection itself before
+dropping all original runtimes and checking rollback recovery on reopen.
+
+Historical-source/current-successor admission and remote-primary preparation and
+replacement remain open, as do cleanup publication/convergence and terminal
+custody transfer. Other command follow-ups, live publisher selection, frontend
+custody, physical-authority/worker milestones, the six original skips and
+checkpoint-transferability remain unresolved. All **23** corrected focused
+regressions passed in **53.926s** (run
+`a6eb24ec-d188-48de-aeea-d56cfa53bd0f`). Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. Full-workspace validation passed **10,305 tests**, six slow reports and
+six unchanged skips, in **476.399s** (run
+`6a12ecd7-4cb6-43a7-86b2-bf495f66aa58`), including all nine new runtime tests.
+No other same-user Nextest was active at launch and load1 was **8.10**.
+All slow-reported tests completed: the Raft gate in 116.993s, oversized version
+listing in 65.201s, mixed embedded-primary abandonment handoff in 68.918s,
+historical TLS command release in 62.902s, historical Unix-primary fanout in
+70.327s and current Unix-primary fanout in 71.783s. The Raft process was inspected
+doing active CPU work; the other slow-reported processes had completed by
+inspection. Logs are retained at
+`/tmp/argmin-abandonment-install-{focused,focused-corrected,regression,fmt,clippy,boundaries,workspace}.log`.
+
+Review correction: an unconditional pre-attempt assignment could previously
+downgrade `Installed` on a later retry failure. The closed installation owner now
+short-circuits confirmed attempts after section/request/effect validation. New
+canaries install successfully, then introduce a failing retry hook, damaged
+scope/indexes or a removed slot, and require `Installed`, no redispatch and no
+mutations. Expired and foreign sections still return errors while preserving
+confirmation. The started/applied replay canary now begins from a lost successful
+reply in each case and positively requires storage inspection, so this change
+does not weaken validation coverage for `Unconfirmed`. All **13** focused tests
+passed in **6.999s** (run `7a824947-d087-409f-98b8-6e8697f4a96d`).
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. Full-workspace validation of the corrected slice passed
+**10,307 tests**, six slow reports and six unchanged skips, in **475.446s**
+(run `c62b4d0d-145a-4e40-a15c-db6e80810c1d`), including both new confirmation
+regressions and the strengthened uncertain-replay and crossed-admission tests.
+No other same-user Nextest was active at launch and load1 was **2.93**.
+All slow-reported tests passed: the Raft gate in 112.579s, oversized version
+listing in 64.371s, mixed embedded-primary handoff in 67.880s, historical TLS
+command release in 61.882s, historical Unix-primary fanout in 69.154s and current
+Unix-primary fanout in 70.839s. The Raft process was inspected doing active CPU
+work; the other slow cases had completed by inspection. Logs are retained at
+`/tmp/argmin-abandonment-confirmation-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+### Owning current-primary UploadPart cleanup publication — 2026-11-11
+
+The installed `PreparedAbandonedPart` now publishes its exact source-bearing
+cleanup under the original **current embedded-primary** section, while retaining
+the all-member source handoff, original installation history, candidate and
+cleanup installation confirmation. A lost installation reply is not enough:
+the pair must first confirm replacement through the existing exact retry.
+
+The owning pair exports no context/submission, cloned authority, history reset
+or production callback. It lends an unconstructible, non-Clone internal permit
+only to the closed bridge. The bridge derives the original request directly
+from this permit, then borrows its frozen deadline
+for the cleanup request. It cannot accept an independently supplied source view
+or recapture a later cutoff. The deepest publication boundary validates the
+exact admission domain, primary/store, complete cleanup identity and the
+identity of that retained deadline owner. A byte-identical cleanup request with
+a separately captured deadline is rejected before SQL.
+
+This uses the existing complete publication transaction, not a new format,
+command or ordinary-write fsync. Under the actual PG lock, one transaction
+revalidates the exact pending slot, scope and indexes, authenticates the embedded
+source tombstone, trial-applies cleanup and rolls back those effects, then checks
+the captured fence before marker mutation and COMMIT. Only publication-start is
+made durable; owner/session/resource transfers are not committed here.
+
+Publication has its own non-regressing observation. Preflight failures preserve
+the previous observation; any entered failure/unwind leaves an unconfirmed
+publication beside the original custody, including commit-success/reply-loss.
+Installation remains confirmed throughout. A confirmed publication validates
+the supplied authority and returns without redispatch. Uncertain replay of an
+already-applied cleanup verifies the exact retained identity without repeating
+proof/resource transfers. None of these scalar observations grants terminal
+handoff, resource release or physical-cleanup authority.
+
+Eight owner-local metadata-only regressions cover empty/two-segment cleanup and
+all three source origins; unsent/uncertain installation gating; five publication
+fault boundaries with returned errors and unwind; source/slot/index damage;
+original work expiry at marker/COMMIT and renewed-section retry; foreign
+admission across all three publication states; already-applied lost-reply replay;
+and an identical command carrying a detached deadline. Compiler probes compile
+the real owner/bridge and reject permit construction, history reset, fresh sender
+extraction and publication using admission authority alone. The trial canary
+requires the real application hook and verifies all persisted state except the
+marker is unchanged. These tests do not claim replica cleanup convergence.
+
+The first nine focused tests passed in **7.789s** (run
+`039f6338-b9e2-464c-9f8d-ed0c1c1ee2ce`). API review then removed the unnecessary
+independent source-request input; the expanded 24-test set passed in **10.273s**
+(run `270cb498-8148-42b6-8d2e-76c91e48421d`). With the additional lower-boundary
+deadline-owner canary, all **25** focused regressions passed in **10.356s** (run
+`55f74c52-ef5c-4ed6-8add-aec418d431e8`). Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed. Full-workspace
+Nextest passed **10,315/10,315** tests in **481.423s**, with **six slow reports**
+and **six unchanged skips** (run `17e8737b-56a3-408b-a4ac-31383e680ce3`). No
+other same-user Nextest was active at launch and load1 was **2.05**. The slow
+reports all completed: heartbeat write-amplification **117.254s**, oversized
+version listing **66.253s**, mixed embedded-primary abandonment handoff
+**68.866s**, historical TLS command release **63.446s**, historical Unix-primary
+fanout **70.991s**, and current Unix-primary fanout **72.370s**. No failed test
+was retried. Evidence is in
+`/tmp/argmin-abandoned-part-publish-{check,focused,regression,regression-final,fmt,clippy,boundaries,workspace}.log`.
+
+Next, retain this same pair through closed cleanup application on the original
+cohort and its terminal transfer; do not reconstruct an ordinary publication
+sender and lose source/installation history. Historical-source/current-successor
+admission and remote preparation/replacement/publication remain open. Other
+command follow-ups, live selection, frontend custody, physical-authority/worker
+milestones and the six original skips are unchanged unresolved gates.
+Checkpoint transferability is separate follow-up after this plan completes.
+
+### Owning embedded-cohort UploadPart cleanup application — 2026-11-11
+
+The installed/published `PreparedAbandonedPart` now applies its source-bearing
+cleanup through the original **current embedded cohort**, without converting
+it into an ordinary sender or releasing the abandoned source holder. The API
+takes only the supplied primary section and member identity; it derives the
+target, complete request and immutable cutoff internally. Exact section/domain
+and original membership validation precede dispatch. The canonical lowest-ID
+non-primary witness confirms before primary application, and the primary
+confirms before any trailing replica. Acting-set vector order does not select
+the witness.
+
+Per-member application observations live inside the same opaque pair. They are
+set to unconfirmed before the closed node operation, including PG-lock waits
+and unwind. An earlier confirmed application never regresses after a failed
+exact retry. Installation/publication observations and original installation
+history are unchanged; failures neither detach a context nor reconstruct a
+submission/deadline. The request borrows the original deadline owner, and the
+existing receiver rechecks it immediately before mutation and COMMIT. There is
+no new wire/schema version, additional transaction/command or ordinary-write
+fsync.
+
+The shared application transaction authenticates the original finalizer
+tombstone and atomically closes the session into retained cleanup/proof
+responsibility. Commit-success/reply-loss converges through exact replay without
+repeating these transfers. All embedded members converge on the same
+materialized state, complete log and prefix. The pending slot remains on the
+primary: scalar peer confirmations cannot authorize terminal transfer, resource
+release or shard deletion, and dropping the pair has no cleanup effects.
+
+Six owner-local regressions cover empty/two-segment cleanup and all three source
+origins; publication/order/member gates; returned errors and unwind at four
+application boundaries on witness and primary; failed confirmed retries;
+original-cutoff expiry at effect/COMMIT; foreign runtime sections in every
+application-history state; and one damaged replica amid otherwise converged
+members. Compiler probes compile the real owning implementation and reject
+application-history reset, detached application requests and terminal extraction.
+The metadata-only fixture assertions retain generation, creation and finalizer
+release obligations; these are not physical-payload tests.
+
+Initial focused validation caught a new test-setup error: its post-commit
+inspection called the transactional owner loader without a read snapshot
+(`TransactionRequired`, run `bb8fc391-a153-4065-9a55-0c60ec5bf66c`: six passed,
+one failed). The assertion now opens and finishes the required read snapshot;
+no production behavior or assertion was weakened. The expanded **33-test** set
+passed in **17.104s** (run `717382d2-8e63-4a3f-bf26-c1ffe43a76f5`). Formatting,
+strict all-target/all-feature Clippy, the boundary checker and diff checks passed.
+Full-workspace Nextest passed **10,321/10,321** tests in **481.909s**, with **six
+slow reports** and **six unchanged skips** (run
+`a2a50d81-0f1b-4ff9-a707-cdd92d9695e6`). No other same-user Nextest was active at
+launch and load1 was **5.68**. The slow reports all completed: heartbeat
+write-amplification **116.454s**, oversized version listing **64.289s**, mixed
+embedded-primary abandonment handoff **69.083s**, historical TLS command release
+**62.120s**, historical Unix-primary fanout **70.664s**, and current Unix-primary
+fanout **71.375s**. All six new regressions passed in the full run. Evidence is in
+`/tmp/argmin-abandoned-part-apply-{check,focused,regression,fmt,clippy,boundaries,workspace}.log`.
+
+Next: carry this same pair through mixed embedded/Unix/TLS cleanup application
+and a consuming all-member terminal handoff, without dropping the original
+source/custody history. Historical-source/current-successor admission and remote
+preparation/replacement/publication, other command follow-ups, live selection,
+frontend custody, physical-authority/worker milestones and the six original skips
+remain open gates. Checkpoint transferability is separate follow-up work.
+
+### Owning mixed-transport UploadPart cleanup application — 2026-11-11
+
+`PreparedAbandonedPart` now applies its installed/published source-bearing
+cleanup to genuine Unix/TLS replicas alongside embedded members, under its
+original current embedded primary. The closed API takes the original primary
+section and registered replica client, not a command, successor, deadline or
+callback. It derives the complete cleanup request from the retained pair and
+borrows the original frozen deadline. Admission-domain/client identity and
+witness/primary/trailing-member ordering are checked before transport. Remote
+targets cannot silently use embedded shadows.
+
+The existing complete-application RPC/receiver validates the exact source and
+cleanup and performs the shared atomic custody transfer. Transport attempts
+borrow the pair's per-peer history: definitive unsent restores the preceding
+observation, ambiguous sends or unwind retain uncertainty, and failed exact
+retries never erase confirmed application. Replies bind node, exact command ID,
+complete SHA-256 and applied prefix. Lost committed replies converge through
+exact replay without repeating SQL writes. No automatic transport retry, new
+wire/schema version, command, transaction or ordinary-write fsync is added.
+
+Nine new owner-local regressions cover Unix, TLS and embedded witnesses across
+all three source origins and empty/two-segment cleanup; genuine mixed-cohort
+convergence and unchanged embedded shadows; lost replies with ordering gates;
+authenticated crossed node/PG/digest/index replies with explicit one-request
+counts; invalid response authentication; unchanged frozen requests and all
+history states through unsent/error/unwind; foreign clients/sections; and
+receiver expiry after decode, plus an already-expired retry. Compiler probes
+reject detached attempts and caller-selected replacement deadlines. These are
+metadata-only tests: no physical shard cleanup or live writer selection occurs.
+
+Initial focused validation reported three passes and seven failures (run
+`c86d61c3-1db0-42ac-8448-e7f37424fd73`). Fixture setup stopped replica listeners
+while retaining cached TLS connections; later first sends consequently reached
+closed connections rather than the intended receiver. Setup now closes idle
+request connections explicitly before stopping the workers, retaining the same
+registered client identity. The expiry fixture also incorrectly placed the
+wire cutoff after the independent server work budget. It now advances controlled
+wall clocks around the captured wire cutoff and proves expiry after successful
+decode within that separate budget. Neither correction adds production retries
+or relaxes the assertions.
+
+Corrected focused validation passed **10/10** tests in **13.947s** (run
+`3b2c4a98-432d-42ab-b2af-95e47a2096c3`). The expanded regression set passed
+**35/35** tests in **34.204s** (run
+`db747c53-703a-43d6-9a96-1cb5bb43ede3`). Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed. Full-workspace
+Nextest passed **10,330/10,330** tests in **487.949s**, with **six slow reports**
+and **six unchanged skips** (run `96ad7b00-7c91-46c0-861f-5040fa429de7`). No
+other same-user Nextest was active at launch and load1 was **5.03**. All nine new
+regressions passed in the full run. The slow reports all completed: heartbeat
+write-amplification **116.090s**, oversized version listing **65.070s**, mixed
+embedded-primary abandonment handoff **69.042s**, historical TLS command release
+**61.539s**, historical Unix-primary fanout **69.877s**, and current Unix-primary
+fanout **71.043s**. The Raft process and historical Unix-primary matrix were
+inspected doing active CPU work; the other slow cases had completed by process
+inspection. Evidence is in
+`/tmp/argmin-abandoned-part-remote-{check,focused,focused-fixed,regression,fmt,clippy,boundaries,workspace}.log`.
+
+Next is the consuming all-member terminal
+handoff retaining source/custody history. Historical-source/current-successor
+admission, remote-primary preparation/replacement/publication, other command
+follow-ups, live selection, frontend custody, physical-authority/worker
+milestones, the six original skips and checkpoint-transferability remain open.
+
+### Consuming all-member abandoned-part terminal handoff — 2026-11-11
+
+The installed/published `PreparedAbandonedPart` now moves into an opaque
+`AbandonedPartTerminalHandoff` only after every member of its original cohort
+has confirmed exact cleanup application. The transition checks the original
+route/work authority and installation/publication confirmations; missing or
+ambiguous member observations cannot count as success. A failure returns the
+same owning pair, not a reconstructed submission or a refreshed deadline.
+
+The private child module owns the terminal representation. It retains the whole
+prepared pair: original finalizer, source-bearing cleanup, original source
+installation history, cleanup installation/publication/application histories,
+cohort and immutable cutoff. At this slice, the only production projections were
+scalar identities, peer observations, validity and diagnostic terminal work.
+There was no reverse conversion, clone, raw command/request projection, ordinary
+sender conversion, release, slot retirement or cleanup-on-Drop. Even a zero-segment
+cleanup retains non-quiescent finalizer-proof responsibility. Handoff introduces
+no new SQL/RPC, command, format version, transaction or ordinary-write fsync.
+
+Eight metadata-only regressions cover every cohort prefix across all three
+source origins and empty/two-segment cleanup; unattempted/uncertain installation
+and publication; committed reply loss on each member followed by exact retry;
+genuine mixed Unix/TLS/embedded cohorts with each witness transport; expiry of
+the original work cutoff before and after handoff; and same-epoch raw route
+renewal that cannot revive the captured authority. Handoff and Drop must leave
+all member snapshots and SQL change counts unchanged. Compiler probes compile
+the actual owner and reject fabricated/cloned terminal owners, double consumption,
+history/source extraction, reversal, ordinary-sender conversion and premature
+release/retirement APIs. The pending slot and durable resource responsibilities
+remain intact; these tests do not claim physical cleanup or live activation.
+
+Focused validation passed **9/9** tests in **8.488s** (run
+`532078a0-0137-4ccc-8978-fa5a6c40cce8`). The expanded predecessor/application
+regression set passed **43/43** tests in **39.213s** (run
+`45af824e-88fd-4351-ae6a-7e07602ffbaf`). Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed. Full-workspace
+Nextest passed **10,338/10,338** tests in **492.872s**, with **six slow reports**
+and **six unchanged skips** (run `5a5888ed-266d-4f8d-a553-246afc51ce31`). No
+other same-user Nextest was active at launch and load1 was **5.72**. All eight
+new regressions passed in the full run. The slow reports all completed:
+heartbeat write-amplification **115.951s**, oversized version listing **65.964s**,
+mixed embedded-primary abandonment handoff **69.316s**, historical TLS command
+release **62.635s**, historical Unix-primary fanout **70.311s**, and current
+Unix-primary fanout **71.643s**. The Raft, oversized-listing and historical
+Unix-primary processes were observed doing active CPU work; the other slow cases
+had completed by process inspection. No test failure was retried. Evidence is in
+`/tmp/argmin-abandoned-part-terminal-{check,check-fixed,focused,regression,fmt,clippy,boundaries,workspace}.log`.
+
+Next at that slice: closed, admitted terminal resource release while
+retaining this same pair, followed by its non-quiescent retirement protocol.
+Historical-source/current-successor admission, remote-primary
+preparation/replacement/publication, other command follow-ups, live selection,
+frontend custody, physical-authority/worker milestones, the six original skips
+and checkpoint-transferability remain open.
+
+### Closed abandoned-finalizer reservation release — 2026-11-11
+
+The all-member `AbandonedPartTerminalHandoff` now owns a closed operation for
+releasing the original finalizer's exact bucket reservation. It borrows its
+retained source/cleanup pair through a privately constructed permit; the shared
+release boundary derives complete-command identity and the original local/wire
+cutoff from that permit. There is no independently selected proof, context,
+endpoint, deadline or callback, and no capability or command escapes the owning
+operation. The existing admitted retained-bucket route selects the primary using
+the proof's exact bucket and epoch.
+
+Release history is independent of source/cleanup installation, publication and
+per-member application history. It starts `NoAttemptObserved`, becomes
+`Unconfirmed` before dispatch and stays uncertain on entered errors or unwind.
+Only successful exact release/absence confirmation records `Released`;
+subsequent calls still validate original authority but cannot erase confirmation
+or dispatch again. The pair's source, complete cleanup, cohort, first deadline
+and earlier histories remain intact throughout. Handoff/Drop still perform no
+cleanup. This uses the existing bucket release transaction, not a new command,
+format version or ordinary-write fsync.
+
+This confirmation is deliberately **not** owner-resource retirement: the durable
+finalizer obligation row, other retained resources, payload/generation ownership
+and primary pending slot are unchanged. Even an empty cleanup remains
+non-quiescent. Its physical cleanup and non-quiescent retirement protocol remain
+the next gate, along with historical-source/current-successor admission,
+remote-primary preparation/replacement/publication, other command follow-ups,
+live selection, frontend custody, physical-authority/worker milestones, six
+original skips and the separate checkpoint-transferability workstream.
+
+Three metadata-only matrices exercise embedded, Unix and TLS bucket primaries
+across all three source origins and empty/two-segment cleanup (18 cases). The
+remote cases deliberately put the bucket primary on a different node from the
+object primary. Independent reservation and embedded-shadow canaries pin exact
+target selection. Coverage includes crossed-owner conflicts without mutation,
+unwind before send, committed reply loss without hidden retry, exact absence
+retry with identical encoded cutoff, raw same-epoch renewal/expiry, confirmed
+retry suppression and non-regressing history after expiry. Object-PG snapshots,
+pending slots and durable owner-resource rows remain unchanged, as do all earlier
+source/cleanup observations; Drop has no effects. Compiler probes reject early
+release from the prepared pair, forged/extracted permits, externally reset
+observations and caller-selected release arguments.
+
+The first focused run reached the injected reservation conflict but all three
+new matrices failed an incorrect display-string assertion: this error deliberately
+renders only `bucket snapshot load failed`. The assertion now checks the exact
+typed `BucketWriteReservationConflict`. After that correction, focused validation
+passed **4/4** in **7.593s** (run
+`3ba21a14-3d4b-4001-9893-accd70030571`). The expanded abandonment/terminal-release
+set passed **47/47** in **68.355s** (run
+`f5b5dd75-4fc2-4b72-b1b5-b06a731a9b51`). Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker and diff checks passed.
+
+Full-workspace Nextest passed **10,341/10,341** in **493.850s**, with **six slow
+reports** and **six unchanged skips** (run
+`0240a44a-d5dc-47a5-8bd8-0bdea92458cb`). No other same-user Nextest was active at
+launch; after waiting for load to fall, load1 was **8.04**. All new matrices passed
+in the full run. The slow cases all completed: heartbeat write amplification
+**117.009s**, oversized version listing **63.063s**, mixed embedded-primary
+abandonment handoff **68.075s**, historical TLS command release **62.265s**,
+historical Unix-primary fanout **69.033s** and current Unix-primary fanout
+**70.972s**. The Raft and historical/current release/fanout processes were observed
+doing active CPU work; listing and abandonment handoff had completed by process
+inspection. Evidence is retained in
+`/tmp/argmin-abandoned-part-release-{check,check-fixed,focused,focused-fixed,regression,fmt,clippy,boundaries,workspace}.log`.
+
+### Admitted abandoned-part terminal custody inspection — 2026-11-11
+
+The next non-quiescent prerequisite is a fresh retained-custody check, not pending
+slot removal. `AbandonedPartTerminalHandoff::inspect_retained_custody` uses the
+existing private installed-pair publication permit and admitted embedded-primary
+bridge. It accepts no caller-selected store, context, topology, deadline or
+callback. The bridge binds the complete source-bearing request and original
+deadline, acquires the actual PG with that bound and rechecks authority after
+inspection.
+
+Within one owned read snapshot the component authenticates the cleanup's exact
+complete `Applied` identity and original source's `Abandoned` identity. It loads
+the exact UploadPart owner, checks terminal lifecycle, current topology and window
+structure, generation high-water fence, live-session/generation absence and the
+source finalizer's stable proof/release-route obligation. A missing obligation
+is rejected, never treated as already released or silently reinserted. Every
+`Retiring(Unpublished)` owner must bind the abort manifest's complete consecutive
+window prefix plus exactly one unused lookahead, including an empty manifest.
+Proof-only cleanup may inspect an already-published owner while
+preserving its selected references and independent winning finalizer obligation.
+Its retained window/reference projection is compared against the authenticated
+source finalizer's entire segment manifest, including cardinality, indices,
+physical identities, logical/stored sizes, placement epoch/PG and EC/codec
+geometry. Later Part-to-Object-to-Reclaim destinations remain valid without
+weakening that original payload binding.
+
+Only scalar window/reference/additional-finalizer counts return. They are local
+diagnostics, neither all-replica durability/exclusion evidence nor a cached
+certificate for future mutation. Every call reinspects; caller-owned transactions
+are rejected, and the existing read-snapshot teardown retires the connection if
+rollback cannot be established. No file/acknowledgement effect, release, row
+repair, slot/owner retirement, format change or write transaction is introduced.
+The release operation from the preceding slice leaves this retained-custody
+observation unchanged. This inspection does not activate live publisher selection
+or loosen the current non-quiescent retirement gate.
+
+Coverage includes zero/two-segment unpublished and already-published owners,
+restart and complete-log compaction, independently altered complete source and
+cleanup evidence, missing/crossed resources and windows, missing/lowered generation
+fences, reappearing session/segment/generation rows, crossed PG/admission domain,
+expiry, reinspection after owner damage and unchanged custody after reservation
+release. Failed read-snapshot teardown on both success and validation-error exits
+blocks metadata access until reopen, with no durable mutation. API-shape canaries
+reject a substituted authority and any attempt to retire through the observation.
+
+The focused matrix passed all 41 tests. Initial fixture failures were diagnosed
+and corrected: compaction must use complete-command maintenance; generation
+corruption must remain SQL-valid; orphan segment injection explicitly bypasses
+the normal foreign key; and reservation restoration must select only the removed
+session reservation, not the still-live enclosing MPU reservation. Final
+validation passed formatting, strict all-target/all-feature Clippy, the storage
+boundary checker and `git diff --check`. The workspace run
+`8145cfe4-3389-480d-a1d4-2a74fb626577` passed **10,346 tests** in 492.311 seconds
+(six slow results, six unchanged skips). The slow tests were inspected: the
+Raft write-amplification test was actively using CPU before passing; the listing
+and transport matrices had completed successfully by process inspection. Logs
+are retained at `/tmp/argmin-abandoned-part-custody-{regression-fixed,fmt,clippy,boundaries,workspace}.log`.
+
+Review hardening: published proof-only cleanup previously relied on structural
+owner validation. The proposed co-crossed hash corruption already fails the
+session-derived window-hash invariant, now explicitly covered. However, coherent
+reference-size changes were accepted; the new regression reproduced that failure
+before the source-manifest comparison was added. The published corruption matrix
+also covers a changed placement epoch and coherently truncated window/reference
+prefix, proves structural validity independently where applicable, and checks
+rejection without repair or log changes. Positive complete-command application
+tests exercise completion and deletion destination transfers for empty/two-segment
+parts. Both first- and later-segment size changes are rejected. The focused
+matrix passed 43 tests; final formatting, strict all-target/all-feature Clippy,
+storage boundary and diff checks passed. Workspace run
+`c9f64819-e293-424a-8d83-b7550f0d6d0a` passed **10,348 tests** in 511.024 seconds
+(six slow results inspected, six unchanged skips). Review evidence is retained
+at `/tmp/argmin-custody-published-manifest-{before,red,regression,fmt,clippy,boundaries,workspace}.log`;
+the first probe's missing read snapshot was corrected before the red manifest
+regression, which demonstrated acceptance of coherently changed reference sizes.
+
+Empty-unpublished review correction — 2026-11-12: the window-count check is now
+selected by `Retiring(Unpublished)` lifecycle, not by whether the abort manifest
+is nonempty. A zero-segment cleanup must retain exactly its one lookahead window.
+The owner-local regression adds a canonical extra window with matching placement,
+participants, `reserved_end` and `maximum_cutoff_ms`, independently proves
+structural validity, and reproduced the previous successful two-window
+observation. It now requires rejection without repair or prefix changes both
+before and after reopen. Published source-manifest validation and rejection of
+nonempty aborts against published owners are unchanged. All 44 focused tests
+passed, followed by formatting, strict all-target/all-feature Clippy, storage
+boundary and diff checks. Workspace run `72dad7cd-78e4-4892-b9de-74b5d8518a44`
+passed **10,349 tests** in 492.893 seconds (six slow results inspected, six
+unchanged skips). Evidence is retained at
+`/tmp/argmin-custody-empty-unpublished-{red,focused,fmt,clippy,boundaries,workspace}.log`.
+
+Next is the remaining non-quiescent protocol: establish finite physical-write exclusion
+and confirmed cleanup/retirement or an independently reviewed durable handoff,
+without interpreting owner rows or these counts as sufficient deletion authority.
+
+### Settled-prefix confirmation prerequisite — 2026-11-12
+
+The next physical-authority boundary needs the
+[settled-prefix confirmation decision](#settled-prefix-confirmation-decision--2026-10-30),
+not just the terminal custody counts above. The existing physical confirmation
+model assumes a usable publication fact; it does not establish that fact from
+primary/witness observations. The owner-local
+[`settled_prefix.rs`](../crates/storage/src/cleanup_ownership_model/settled_prefix.rs)
+model now explores this prerequisite separately, before implementing the bounded
+lookup. This is model evidence, **not production confirmation or activation**.
+
+The model includes one requested immutable window, primary and designated-witness
+prefix observations, singleton publication, and an already-certified imported
+prefix whose old introducing receipt is unavailable. It requires independent
+equality of epoch, applied index, log hash and state digest, and rejects pending
+commands, unapplied tails, crossed windows and a foreign witness. An unrelated
+primary command can advance the prefix without changing the window; identical
+owner rows do not justify confirmation. Primary serialization stays held from
+prefix selection through the bounded witness observation and final descriptor
+capture. Explicit schedules reject route withdrawal or cutoff expiry after the
+witness reply. Releasing serialization early admits the unchanged-window/stale-
+prefix counterexample. Eleven independent omitted-check variants must each fail
+its own property; positive confirmation and rejection states are required so
+fail-closed-everywhere cannot pass the safe model.
+
+Bounds and assumptions are explicit: one lookup and at most one concurrent
+disturbance, independently validated local prefixes, authenticated witness
+observations, abstract exact descriptor equality and a healthy immutable cutoff.
+This does not prove SQLite cache validity, cryptographic hash integrity, route
+certificate validation, transfer correctness, clock rebinding, bounded lock/RPC
+waits or physical file/acknowledgement exclusion. The earlier physical admission
+model still covers delayed positive responses and guarded effects after cutoff;
+the two models are not claimed to be a composed production proof.
+
+Source review confirms that
+`validate_metadata_command_checkpoint_state_read_only` scans the retained log
+suffix and materialized metadata, so it is not the per-write lookup. The existing
+cached-digest helpers can refresh missing cache rows and therefore are not an
+unconditionally read-only substitute either. The production slice must establish
+a bounded, owner-local validated-prefix observation under the
+[validated-PG lifecycle contract](#settled-prefix-validation-simplification--2026-11-12):
+closed transactions preserve validity, while reopen/import and uncertain
+transaction teardown require explicit validation or connection retirement.
+Bind the observation to the admitted primary and designated witness and capture
+the exact window under the same serialization. It must not generate a checkpoint,
+repair caches, drain commands or add an ordinary-path transaction/fsync during
+confirmation. Cold/unverifiable
+state fails closed to explicit recovery. No new production API, wire/schema
+format, physical authority, cleanup worker or live publisher selection is added
+in this model slice. The six original skipped regressions remain open.
+
+Validation: the four new focused tests and all **67 cleanup-ownership model
+tests** passed. The safe prefix model exhausted **309 states / 358 transitions**;
+each of the eleven independent unsafe variants produced its required violation.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff
+checks passed. Workspace run `d5804a0a-b19c-4af3-8f5b-30cd580fa5ac` passed
+**10,353 tests** in **493.001 seconds**, with six slow results and six unchanged
+skips. The Raft and mixed-abandonment processes were inspected doing active CPU
+work; listing, historical TLS release and both Unix fanout matrices had passed
+by inspection. No other same-user Nextest was active at launch; load1 was 1.04.
+Logs are retained at
+`/tmp/argmin-settled-prefix-{focused,models,fmt,clippy,boundaries,workspace}.log`.
+
+### Bounded local settled-prefix read scope — 2026-11-12
+
+**Provisional implementation history:** the cache described here remains in the
+worktree, but extending its stamp/invalidation machinery is no longer the chosen
+next step. The [smaller design below](#settled-prefix-validation-simplification--2026-11-12)
+requires a mutation-path audit before replacing it.
+
+The first implementation component is now a connection-local validation cache
+and owned read snapshot in `pg_store/complete_settled_prefix.rs`. The existing
+complete startup recovery is nested under that private owner: only successful
+full prefix/materialized-digest validation can construct its private cache entry.
+The entry is captured inside the existing recovery transaction and retained only
+if its original stamp still matches after commit. A writer between commit and
+volatile publication leaves it cold rather than blessing a new observation.
+This adds no transaction or durability barrier to recovery.
+
+The stamp binds the actual PG, canonical topology, exact replica prefix, local
+allocation lifetime, connection-local SQLite change count, external-connection
+`data_version`, and schema version. Moving the store preserves its own identity;
+moving the cache to another otherwise-identical store does not. Reopen starts
+cold; import/replacement changes or retires the lifetime. Rollback uncertainty
+and connection retirement explicitly invalidate the entry. All local writes,
+including rollback-only writes and noncanonical-table changes, conservatively
+invalidate reuse; external database changes and local DDL are separately detected.
+Full startup validation also rejects every foreign-PG log row, terminal receipt
+and checkpoint before retaining the cache, regardless of epoch or PG ordering.
+This may scan retained index keys during full validation; hot lookup does not
+repeat that scan and cannot reuse the validation after a database change.
+
+`inspect_complete_settled_prefix` owns a read-only SQLite view, pins that view
+before testing the stamp, and checks the requested epoch/topology. Any pending
+slot, including already-applied custody, blocks settlement. Indexed boundary
+checks explicitly select this store's PG and reject log rows, terminal receipts
+and checkpoints beyond the stored epoch/position, including future epochs.
+Lookup returns a scoped local prefix
+observation, never a primary/witness certificate or physical-effect authority.
+Its SQL work is fixed scalar/point/index inspection: no retained command decode,
+full prefix scan, materialized-table scan, checkpoint creation, cache repair,
+command drain or write transaction. Missing validation returns a distinct
+`ValidationRequired` result. Snapshot finish/error/unwind retains the existing
+sticky connection-retirement behavior if rollback cannot be established.
+
+This is **not hot-path confirmation activation**. This initial conservative cache
+could not survive any SQL write. The closed complete-apply advancement below
+now preserves already-validated same-epoch prefixes; pending-slot installation/
+retirement and other SQL writes still invalidate it. Before selecting a live
+confirmation path, the smaller design must establish validity preservation across
+the remaining closed transitions, without a generic caller-supplied "mark clean"
+escape or full startup recovery after each write. This does not require extending
+the current cache. Primary/witness admission and exact prefix matching, immutable
+deadline checks, descriptor capture under held serialization, and
+file/acknowledgement effect consumption
+remain separate integration gates. The existing active format, frontend custody,
+physical cleanup and six original skipped regressions are unchanged.
+
+Validation: **21 focused cache/startup checks** passed across the focused matrix
+and the application/compaction canary. Ten new regressions cover all eighteen
+complete command fixture families, repeated no-write lookup, a fixed SQL trace,
+local/rollback/schema changes, real external changes and post-validation races,
+crossed topology/epoch/store, snapshot isolation, pending/tail rejection,
+replacement/import/reopen, compaction and failed snapshot teardown. Initial test
+fixtures were corrected after diagnosing their failures: SQLite may elide an
+external no-op update; independently minted commands have different identities;
+pending custody must be installed before apply; and rusqlite's query-only guard
+also validates names through SQLite's fixed pragma list. That initial trace pinned
+at most sixteen scalar/control statements and rejects any materialized-table or
+command-payload query. No production assertion was relaxed.
+
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. Workspace run `f50474f6-3a68-481b-81eb-6c957d5afd41`
+passed **10,363 tests** in **494.491 seconds** (six slow results, six unchanged
+skips), after a 3m53s build. The Raft and historical TLS-release processes were
+observed doing active CPU work; the other slow cases had passed by inspection.
+No other same-user Nextest was active at launch and load1 was 0.83. Evidence is
+retained in `/tmp/argmin-prefix-cache-{check,focused,focused-fixed,regression,regression-fixed,advancement,fmt,clippy,boundaries,workspace}.log`.
+
+Future-evidence review correction — 2026-11-12: epoch-scoped log-tail checks
+ignored durable future-epoch commands, allowing startup to seed the local cache.
+The red regression reproduced successful epoch-5 recovery with a canonical
+unapplied epoch-6 command. Startup and bounded lookup now share three ordered
+primary-key seeks over log rows, terminal receipts and checkpoint anchors. Any
+position beyond the stored prefix is a conflict reported at that evidence's
+actual epoch/index. This also rejects same-epoch compacted receipts/checkpoints
+ahead of the replica state, rather than overlooking them after log pruning.
+Current-epoch contiguous abandonment recovery still runs before the boundary
+check inside its existing transaction; historical evidence remains intact.
+
+Seven regressions isolate future unapplied commands, abandonment tombstones,
+compacted receipts and checkpoints, plus same-epoch receipt/checkpoint overrun,
+both before and after reopen. They require exact conflict diagnostics, a cold
+cache and unchanged materialized state, prefix and retained evidence. A positive
+coherent epoch-advance case retains older receipts/checkpoints and still permits
+local inspection after restart. The read-query budget is now at most eighteen
+scalar/control statements, including the existing pragma-name validation; no
+payload scan, extra write transaction or format change is introduced.
+
+Validation: **28 focused cache/startup tests** passed. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. Workspace run `0944bdd7-9802-40fb-8f4c-2d955a66b205` passed **10,370
+tests** in **493.692 seconds**, with six slow results and six unchanged skips,
+after a 3m10s build. The Raft process was inspected doing active CPU work; the
+other slow cases had passed by inspection. No other same-user Nextest was active
+at launch and load1 was 0.80. Evidence is retained in
+`/tmp/argmin-prefix-future-{red,focused,fmt,clippy,boundaries,workspace}.log`.
+
+Cross-PG review correction — 2026-11-12: lexicographic ordering of PG IDs is not
+subject validation. Full startup recovery now checks all three retained carrier
+tables for `pg_id != self.pg_id` before any tail repair or cache creation. The
+bounded prefix queries also explicitly require the store's PG. Foreign evidence
+returns a table-specific subject mismatch, rather than accepting a smaller PG or
+accidentally reporting a larger one as later local evidence. No schema/index or
+format changes are needed; the existing change-stamp proof keeps the hot lookup
+at eighteen scalar/control statements without a repeated retained-key scan.
+
+Four new regressions use nonzero store PG 5, foreign PGs 4 and 6, and older,
+current and future epochs. Each independently isolates unapplied log, abandoned
+log, receipt or checkpoint evidence. They require rejection before and after
+reopen, a cold cache, and unchanged replica/materialized/retained state. Each
+case first accepts healthy log, receipt and checkpoint evidence together for PG
+5. The red regression reproduced successful recovery with foreign PG 4 evidence.
+Existing positive reuse and historical-retention canaries remain in the matrix.
+
+Validation: **32 focused cache/startup tests** passed after strengthening the
+nonzero-PG positive canary. Formatting, strict all-target/all-feature Clippy,
+storage boundary and diff checks passed. Workspace run
+`c24177ca-3ee7-4501-9920-6188937db34d` passed **10,374 tests** in **495.337
+seconds**, with six slow results and six unchanged skips, after a 3m01s build.
+The Raft process was inspected doing active CPU work; the other slow cases had
+passed by inspection. No other same-user Nextest was active at launch and load1
+was 0.90. Logs are retained at
+`/tmp/argmin-prefix-pg-{red,focused,focused-final,fmt,clippy,boundaries,workspace}.log`.
+
+### Validated prefix advancement through complete apply — 2026-11-12
+
+**Provisional implementation history:** the validation results below precede the
+allocation-retirement finding recorded in the
+[superseding design decision](#settled-prefix-validation-simplification--2026-11-12).
+They do not establish that the current tree is green or activation-ready.
+
+The next local prerequisite carries an already-validated prefix through the
+closed complete-command application transaction. The application implementation
+is now a private child of the cache owner, alongside full startup validation.
+There is no general cache refresh/advancement constructor or mutation callback
+available to sibling storage code. The existing admitted embedded/remote entry
+points and test-only fixture seam still invoke the same closed transaction.
+
+After `BEGIN IMMEDIATE`, command acceptance and any pre-effect test hook, apply
+consumes the prior entry and compares its store lifetime, PG, topology, complete
+replica state and SQLite stamps. Only the immediate same-epoch successor can
+carry it forward. Cold or changed evidence is intended to be discarded without
+running recovery or blocking an otherwise valid application; the retired-lifetime
+case originally violated this requirement and is addressed by the
+[later narrow correction](#retired-allocation-cache-miss-correction--2026-11-12). Admission is
+rechecked after those reads immediately before the existing mutation. The complete recorder remains
+responsible for the exact command link and new materialized digest.
+
+The successor stamp is captured after apply/record but before commit hooks and
+`COMMIT`; successful commit retains it only if the captured stamp still matches.
+Local/external writes between these points cannot be blessed by sampling a new
+stamp. Commit failure, rollback uncertainty and unwind leave no new validated
+entry. An injected error between commit and volatile publication likewise leaves
+the cache cold; losing a later RPC reply does not undo valid local evidence or
+settle the sender's uncertain custody. Exact applied replay changes no metadata
+and may retain unchanged validation, but never warms a cold cache. Epoch resets
+remain conservative explicit-validation boundaries. This adds scalar checks and
+volatile state only, not a transaction, checkpoint, command, format change or
+ordinary-path fsync.
+
+This is **not** live confirmation or physical authority. Pending custody still
+blocks a settled observation even after application. Pending-slot installation,
+replacement/retirement, abandonment and maintenance still invalidate the cache.
+The next step is to audit these transitions under the smaller validated-PG
+design, not add a cache-advancement hook to each. Admitted primary/witness matching
+and exact descriptor capture remain separate gates. Frontend custody, physical
+cleanup, live format selection, the six original skips and checkpoint-transferability
+are unchanged.
+
+Seven focused regressions cover all eighteen command fixture shapes, warm/cold
+apply and replay, equal durable write/replay-validation work, local writes at
+every effect/commit boundary, external changes before application and after
+commit, failure/unwind before and after commit, real deferred-constraint commit
+failure and denied rollback/reopen, epoch reset, pending barriers and a SQL trace
+requiring exactly the existing one `BEGIN`/`COMMIT`. The same-epoch application
+canary now requires immediate warm reuse; compaction still requires validation.
+
+Validation: **99 focused apply/cache/startup tests** passed, including admitted
+embedded, Unix and TLS application/replay and existing API-shape coverage.
+Formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and diff checks passed. Workspace run `8b8afbfa-18c8-4e79-bc7a-a6cb44408979`
+passed **10,381 tests** in **492.799 seconds**, with six slow results and six
+unchanged skips, after a 3m21s build. The Raft process was inspected doing active
+CPU work; the other slow cases had passed by inspection. No other same-user
+Nextest was active at launch and load1 was 1.91. Logs are retained at
+`/tmp/argmin-prefix-apply-{check,focused,fmt,clippy,boundaries,workspace}.log`.
+
+### Settled-prefix validation simplification — 2026-11-12
+
+**Deferred — 2026-11-13:** this proposal is not part of the current integration.
+Retain the existing cache and its narrow allocation-retirement fix. The
+following design and prerequisites are historical, not instructions to expand
+this workstream.
+
+**Selected direction; audit before implementation.** Correctness requires a
+trustworthy, bounded settled-prefix observation, not an independently maintained
+cache of the answer. The current prototype avoids rescanning retained commands
+and materialized state, but adds a second state machine for write stamps,
+invalidation and advancement. Do not extend that machinery merely to make every
+transaction keep the cache warm. Prefer the following smaller contract, subject
+to proving that the storage mutation boundary is closed.
+
+1. **Validate before eligibility.** Storage-owned open/recovery and checkpoint
+   import/replacement validate the canonical prefix, materialized state and
+   retained evidence before the PG becomes eligible for confirmation. This
+   includes rejecting foreign-PG evidence and future/unapplied terminal evidence;
+   an imported digest or stored prefix alone is not sufficient. A consistent PG
+   may still have pending custody and therefore be ineligible for settlement.
+2. **Preserve validity in the existing transactions.** Closed command apply,
+   replay and other admitted mutations must preserve their documented invariant
+   atomically. Successful apply updates the durable prefix and canonical state in
+   the existing transaction. No additional validation command, checkpoint,
+   transaction or successful-write fsync is introduced. There is no generic
+   caller-supplied callback or "mark valid" operation that can bless arbitrary
+   changes. Exact replay must retain its existing no-mutation guarantee.
+3. **Read settlement, rather than refresh an answer cache.** Under the existing
+   primary serialization, read the stored prefix and bounded pending/tail status
+   from one coherent view, then compare the designated witness's exact
+   epoch/index/log-hash/state-digest or certified imported-prefix evidence and
+   capture the exact window. Local validity is not global settlement or physical
+   authority. Preserve the current held-primary witness-inspection lock order,
+   immutable deadlines and downstream file/ack exclusion; no data-PG/physical
+   lock spans the network call. Confirmation must not rescan full command bodies
+   or materialized tables, repair state, drain commands or perform writes.
+4. **Fail closed on uncertain connection state.** A confirmed rollback may
+   preserve the previously validated state only if the complete transaction
+   contract establishes that no effects escaped. Unconfirmed commit/rollback or
+   snapshot teardown must make the connection unavailable until reopen/recovery
+   resolves it; neither a cached answer nor a generic retry restores validity.
+   Committed effects and sender reply uncertainty remain distinct: a lost reply
+   does not undo a valid durable transition or settle frontend custody.
+5. **Separate metadata validity from allocation lifetime.** Retiring the local
+   allocation lifetime prevents new allocation under that issuer; it does not by
+   itself corrupt metadata or prohibit convergence of already-issued commands.
+   Fresh apply and exact replay must work identically with or without prior
+   confirmation reads, subject to their existing admission. This is not permission
+   to use a retired metadata connection, mint new allocation authority, or bypass
+   current route/physical-effect fences.
+
+A minimal process-local indication that this store has completed validation may
+still be necessary. Its representation is not decided yet. It must express the
+store's validated lifecycle, not independently cache a prefix answer with its own
+advancement protocol. Do not remove the prototype's guards until the audit proves
+the replacement invariant, including access by other SQLite connections.
+
+**Next implementation prerequisite: mutation-path inventory.** Enumerate every
+production writer to replica state, command log/tombstones/receipts/checkpoints,
+pending slots and side indexes, materialized tables and digest metadata. Cover
+ordinary and complete command paths, exact replay, abandonment, reissue,
+installation/retirement, recovery, compaction, checkpoint import/replacement and
+direct storage helpers. For each, record its owning API, serialization and
+transaction boundary, and classify it as preserving validity, requiring explicit
+revalidation before eligibility, or retiring the connection on uncertainty.
+
+The inventory must also identify caller-owned transactions, callbacks,
+post-commit/unwind windows, raw mutation escape paths and external connections.
+Test-only corruption seams must be explicitly separate from production writers.
+If another connection can change the database after validation, either establish
+owner-enforced exclusive mutation access or retain an explicit change-detection
+and revalidation boundary. A boolean on `PgStore` alone is not proof of exclusive
+ownership. Record any unclosed path as a blocker rather than assuming every write
+uses the command stream. Only then choose the minimal lifecycle representation
+and replace the cache coherently.
+
+**Acceptance evidence for that implementation:**
+
+- Invalid open/import state, foreign-PG and future/unapplied evidence cannot gain
+  confirmation eligibility; valid startup/import and closed transitions have
+  positive canaries, not only fail-closed tests.
+- Each preserving mutation, exact replay and pending-custody transition retains
+  the expected prefix and settlement behavior. Failure, rollback, unwind,
+  uncertain commit/teardown and restart cannot bless unvalidated state.
+- Allocation retirement with and without prior prefix inspection permits
+  already-issued apply/replay, while new allocation remains rejected. Sticky
+  connection retirement still rejects metadata access until reopen.
+- Pending/unapplied state, crossed witness/prefix/window and expired admission
+  continue to reject confirmation. Closed API coverage prevents bypassing
+  validation through a generic mark-valid or raw mutation entry.
+- SQL/work and transaction-count canaries prove bounded confirmation without
+  repeated full validation, extra writes or an extra ordinary-path durability
+  barrier. Measure contention separately from fsync cost.
+
+**Original reproduction (historical; correction recorded below):**
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`
+reproduces the prototype defect: after allocation-lifetime retirement, warm
+apply fails with `PgAllocationLifetimeUnavailable { pg_id: 4 }` in case 0.
+`take_apply_prefix` propagates the stamp's lifetime lookup failure instead of
+discarding the optimization. The focused reproduction failed as expected (run
+`64d1ef17-d35d-4f4d-834e-d7c6ad7b01f5`,
+`/tmp/argmin-prefix-retired-red.log`); later matrix assertions were not reached.
+At that checkpoint only the reproducing regression had been added; no production
+fix had landed. The 10,381-pass run above was the preceding baseline, not validation
+of the changed tree. The [narrow correction](#retired-allocation-cache-miss-correction--2026-11-12)
+is independent of cache removal and does not relax this design's closure criteria.
+
+The [following audit](#validated-pg-mutation-path-audit--2026-11-12) supplies the
+initial inventory and selects transaction ownership as the next implementation
+step. Cache removal, production confirmation, frontend custody activation, the
+physical worker and the six original skipped regressions remain outstanding;
+checkpoint transferability remains in its separate workstream.
+
+### Validated-PG mutation-path audit — 2026-11-12
+
+**Historical audit; follow-up deferred — 2026-11-13.** Completed transaction
+teardown changes remain. SQL/opening closure and cache replacement are not
+current integration prerequisites; the existing cache's guards remain enabled.
+
+**Conclusion:** the smaller design remains the target. The existing transactions
+already contain the durable state changes needed to preserve prefix validity;
+there is no identified need for a new durable validity record, command or fsync.
+However, the current APIs do not yet justify replacing the cache with an unchecked
+boolean. Close the connection/transaction boundary first. This is a source audit,
+not proof that the replacement is implemented or that the current tree passes.
+
+The inventory follows SQL writers in `pg_store.rs` and its child modules, the
+canonical `METADATA_DIGEST_TABLES` registry, checkpoint columns, and their
+node/client/server entry points. It distinguishes actual production paths,
+candidate complete-command paths and methods compiled in production but currently
+called only by tests. A production-visible helper is not evidence of a current
+runtime call, but it is still an escape from a claimed closed mutation boundary.
+
+#### Mutation families and required disposition
+
+Here **preserve** means preserve validated local consistency, not prove settlement
+or grant physical authority. Pending custody can remain perfectly consistent and
+still block confirmation. **Establish** requires full validation before eligibility;
+**retire** means the connection cannot be reused until reopen/recovery.
+
+| Mutation family / owning implementation | Existing boundary and evidence | Disposition for the smaller design |
+| --- | --- | --- |
+| Open and startup recovery — [`complete_command_recovery.rs`](../crates/storage/src/pg_store/complete_command_recovery.rs), `PgStore::open` | The complete startup constructor validates before returning the store; bare open initializes schema/bootstrap state but does not perform complete recovery. Recovery authenticates retained evidence, links abandoned tails, compares materialized digest and checks pending indexes in one transaction. | **Establish** on the exact store/configured topology. Bare open must not mint confirmation eligibility. Full validation remains startup/recovery work, not a per-write operation. |
+| Fresh complete apply and exact replay — [`complete_command_application.rs`](../crates/storage/src/pg_store/complete_command_application.rs) | Admission, acceptance, context-selected mutation, command recording and prefix/digest advance share one `BEGIN IMMEDIATE`/`COMMIT`. Exact applied replay authenticates terminal evidence without reapplying payload effects. | **Preserve** after the closed transaction. Remove the allocation-stamp dependency, not admission or command validation. Keep confirmation eligibility separate from the ability to converge already-issued commands. |
+| Pending installation and reissue — [`command_log.rs`](../crates/storage/src/pg_store/command_log.rs), `try_insert_projected_pending_metadata_command_slot` / `replace_pending_metadata_command_slot_for_reissue_inner` | Exact command, bucket scope, route/window indexes and payload pages are validated/replaced atomically. Installation can join an outer transaction through a savepoint. | **Preserve** consistency; the pending row blocks settlement. Savepoint release must not publish outer-transaction success or restore eligibility independently. Preserve owning submission's ambiguous-outcome history. |
+| Publication start — [`complete_publication_start.rs`](../crates/storage/src/pg_store/complete_publication_start.rs) | Trial application runs in a savepoint, is explicitly rolled back, and only then may the publication marker commit. The trial currently invalidates the cache even after successful rollback. | **Preserve** the old canonical state after confirmed trial rollback and the pending barrier after marker commit. A successful trial is not applied state; failed savepoint rollback must poison the outer operation. |
+| Primary/replica abandonment — [`complete_unstarted_abandonment.rs`](../crates/storage/src/pg_store/complete_unstarted_abandonment.rs), [`complete_replica_abandonment.rs`](../crates/storage/src/pg_store/complete_replica_abandonment.rs) | Closed admitted transactions record exact-source tombstones and advance the log without changing materialized ownership. Source pending custody remains until its separate handoff. | **Preserve** the resulting prefix; do not treat an abandoned command as physical-cleanup permission or change owner state in the tombstone transaction. |
+| Abandoned-part replacement and terminal retirement — [`complete_part_cleanup_installation.rs`](../crates/storage/src/pg_store/complete_part_cleanup_installation.rs), [`complete_pending_retirement.rs`](../crates/storage/src/pg_store/complete_pending_retirement.rs) | Owning all-member evidence and receiver admission gate exact slot replacement/removal, with scope/index checks and transactional sidecar changes. | **Preserve**; removal changes whether a subsequent bounded read can settle. It does not need full prefix revalidation or erase durable owner obligations. |
+| Checkpoint recording and compaction — [`complete_command_log_maintenance.rs`](../crates/storage/src/pg_store/complete_command_log_maintenance.rs) | Admitted maintenance validates the complete grammar; compaction creates retained receipts and prunes checkpoint-covered log entries in its existing transaction. A wrapper retires connections left in transactions. | **Preserve** only through the validated maintenance operation. Do not expose a raw prune/record path that can retain eligibility. Maintenance's existing full checks are not moved onto confirmation. |
+| Empty/matching transfer initialization, checkpoint-base install and rebased-command adoption — `command_log.rs` | These reset replica state, replace canonical rows or install a new log base, and replace allocation lifetime. They have live embedded and RPC callers; several error branches discard rollback results. | **Establish** before confirmation becomes available again. Retirement of allocation authority is not sufficient recovery from an uncertain SQLite transaction. Harden failure/unwind handling and authenticate the selected complete grammar/topology before restoring eligibility. Checkpoint paging/size remains out of scope. |
+| Local stream cursor and renewed lease deadline — [`metadata/segment_vid_window.rs`](../crates/storage/src/pg_store/metadata/segment_vid_window.rs), [`metadata/reservation_heartbeat.rs`](../crates/storage/src/pg_store/metadata/reservation_heartbeat.rs), [`payload_staging_preparation.rs`](../crates/storage/src/pg_store/payload_staging_preparation.rs) | `next_segment_vid` and renewable reservation fields are checkpointed but excluded from the canonical stream-row digest. The live allocator and candidate retained-window preparation constrain cursor changes under write serialization and their effect fences. | **Preserve** through those narrow operations; exclusion from the digest does not authorize arbitrary writes to `stream_uploads`. Retain issuer/window, subject and cutoff validation. Do not require a full scan just because a local cursor changed. |
+| Bucket reservations/drains, claims, shard acknowledgements, repair/backfill and scavenger bookkeeping — `metadata/{bucket_reservation_acquire,bucket_drain_begin,reservation_proof_release,metadata_store}.rs`, [`shards.rs`](../crates/storage/src/pg_store/shards.rs), [`scavenger.rs`](../crates/storage/src/pg_store/scavenger.rs) | These operational tables are outside the canonical state registry; their own effects still require scoped authority, reference/exclusion checks and successful transaction teardown. | **Preserve** canonical-prefix validity only for their reviewed effects, including triggers/cascades. Never treat all methods in these files as operational: the combined shard/stream helper below also changes canonical rows. Connection uncertainty still requires **retirement**, irrespective of which table was written. |
+| Digest/bootstrap machinery — `command_log.rs` (`ensure_metadata_digest_bootstrap`, generated triggers, `refresh_metadata_command_state_digest`) | Triggers update table digests/revision in the same transaction; the existing volatile clean-revision optimization is distinct from the new prefix cache. Refresh can rewrite the stored replica digest, and missing digest rows can cause nominal digest reads to repair state. | Bootstrap/repair is **establish** work, not a generic way to bless changed state. Keep digest-maintenance optimization separate; confirmation uses read-only access and never calls a repairing accessor. |
+| Raw/current-command and fixture seams — [`metadata/command_apply.rs`](../crates/storage/src/pg_store/metadata/command_apply.rs), `metadata/command_mutations.rs`, `shards.rs` | V13 application remains live and exposes a crate-visible commit callback. Raw payload handlers/recorders are reachable within `pg_store`. `register_written_shards_and_append_stream_segment` is compiled in production although its only discovered caller is a storage test; it changes canonical segment rows without recording a command. Many other raw fixture mutations already have `cfg(test)` or `test-hooks`. | Complete confirmation cannot inherit validity across an unrestricted current/raw mutation path. At coordinated activation select the closed complete path; narrow fixture-only helpers and make in-transaction payload mutations require the owning operation. Tests must not obtain production eligibility merely by refreshing a digest. |
+
+#### Concrete boundary gaps
+
+1. **The SQLite connection is not structurally isolated.** `PgStore::conn` is
+   private in the parent `pg_store` module, so its descendants can still execute
+   arbitrary SQL. The generic cached-query helpers also permit `UPDATE … RETURNING`;
+   restricting only methods named `execute` would miss writes. An `&Connection`
+   is not read-only access. Put connection representation and validity control
+   behind a genuinely private owner boundary, exposing closed operation entries
+   and read-only inspection rather than a raw connection, `Deref`, generic SQL or
+   mutation callback to sibling implementation modules. Merely relocating a
+   validation flag does not close this gap.
+2. **Transaction completion is not uniform.** At audit time, `with_immediate_txn`,
+   `commit_immediate_txn`, `with_pending_slot_transaction` and
+   `with_metadata_command_checkpoint_transaction` can discard rollback errors;
+   some adopt an existing transaction, and they do not all own unwind recovery.
+   Complete apply/publication, maintenance and read snapshots already provide
+   stronger enclosing guards, but those guards do not protect every caller.
+   `CommandApplySavepoint`/`InsertionSavepoint` own only a connection and their
+   Drop rollback cannot retire its `PgStore`. A shared store-owned transaction
+   lifetime must distinguish outer commit from child savepoint release, propagate
+   uncertain teardown to the outer owner and prevent a caller catching an inner
+   error then committing partial state. This is especially important for trial
+   apply and caller-owned transaction adapters.
+   The [shared-helper migration below](#shared-metadata-transaction-ownership--2026-11-12)
+   closes part of this gap, not the remaining manual transactions or raw
+   owner-component savepoints.
+3. **Root locking is not a one-connection type guarantee.** The server's
+   `StorageNodeDataDirGuard` holds an exclusive directory lock, and
+   `SharedStorageNode` serializes each published store with a PG mutex. However,
+   `open_complete_for_startup` borrows the root guard and bare `PgStore::open`
+   remains independently callable: the same holder can open the same PG twice.
+   Bootstrap also temporarily opens stores for durable identity setup. Establish
+   one admitted writable store per PG database in the owning runtime, with
+   bootstrap connections closed before publication and an explicit replacement
+   handoff. Do not remove external-change detection until duplicate opens are
+   excluded or safely revoke eligibility. Read-only inspectors may remain, but
+   cannot be promoted into writers. This does not promise detection of arbitrary
+   offline file corruption; normal reopen validation remains required.
+
+These are closure requirements, not claims that production currently calls every
+raw helper or that complete confirmation is already live. In particular, the
+many metadata fixture setters are mostly test-gated; do not migrate them into a
+new replicated protocol. Likewise, digest triggers increment revision even when
+an UPDATE changes only an excluded stream field. Reusing that revision as a
+universal "state changed" stamp would reproduce unnecessary invalidation rather
+than establish the smaller contract.
+
+#### Implementation order and stopping condition
+
+1. **Unify transaction ownership first.** Introduce one private store-owned
+   transaction/savepoint teardown mechanism and migrate the shared helpers plus
+   complete/current apply, publication, maintenance and transfer boundaries.
+   Operation bodies remain closed; callers do not gain a generic mutation
+   callback. Preserve definitive versus ambiguous submission outcomes. Test
+   error/unwind, failed inner rollback followed by attempted outer commit, and
+   uncertain transfer rollback requiring reopen. Keep the existing number of
+   outer transactions and commits. This step can land without removing the
+   prototype or activating confirmation.
+2. **Close the remaining SQL/opening escapes.** Narrow test-only helpers; bind
+   payload handlers/recording to their owning transaction; enforce the private
+   connection boundary and one admitted writer per PG. Audit canonical and
+   noncanonical columns, triggers and cascades using the schema/digest registries,
+   not a method-name allowlist. Add compile-fail API checks for connection/SQL and
+   callback escape, and duplicate-open/replacement canaries. If a path remains
+   unclosed, retain fail-closed protection and record that blocker explicitly.
+3. **Replace the prototype as one coherent change.** Validation eligibility is
+   connection-owned, starts unavailable, and is established only by validated
+   open/import/recovery. Reviewed transactions preserve it; uncertainty revokes
+   it. It stores no independent prefix answer or allocation-lifetime stamp.
+   Bounded confirmation reads the actual stored prefix/pending/tail state and
+   still requires witness/route/descriptor checks. Replace cache-specific tests
+   with invariant tests, retaining future/foreign evidence, external-writer and
+   no-extra-write coverage. Preserve the existing warm/cold allocation-retirement
+   regression without weakening apply admission or allowing new allocation; its
+   separate bug fix is not the acceptance measure for structural cache removal.
+
+The audit is sufficient to select this sequence, **not** to authorize deleting
+the existing guards today. Stop adding validation machinery once closed
+transactions preserve a validated store: no extra per-operation answer cache,
+no new durable validity journal and no new schema/RPC format for this local
+invariant. At audit time the preceding red allocation-retirement reproduction
+remained pending; that audit changed documentation only and did not rerun or
+waive the failure. The later narrow fix does not close these remaining boundaries.
+
+### Shared metadata transaction ownership — 2026-11-12
+
+**Partial implementation of audit step 1, not validation-cache replacement or
+production activation.** A private `MetadataTransaction` now owns teardown for
+`with_immediate_txn`, `with_metadata_command_checkpoint_transaction` and
+`with_pending_slot_transaction`. The guard retains its `PgStore`, its unique
+scope identity and enclosing managed scope. It exposes no connection, generic
+SQL entry or validation-eligibility setter.
+
+- An outer operation uses the existing `BEGIN IMMEDIATE` / `COMMIT`. Nested
+  operations own unique savepoints instead of silently adopting their caller's
+  transaction. Child release does not establish outer commit or terminal custody.
+  This adds nested savepoint SQL, not an outer transaction, durable record or
+  fsync. A trace canary pins one outer begin/commit around a successful child.
+- Operation errors and unwind roll back only the owned scope. A confirmed child
+  rollback leaves earlier parent work intact. Explicit failures retain both the
+  operation error and any teardown error; unwind preserves the original panic.
+- Uncertain rollback or lost scope ownership retires the connection and its
+  allocation lifetime. A managed parent cannot commit after an uncertain child
+  rollback; catching the child error, a later raw rollback or Drop cannot restore
+  eligibility.
+  The legacy `commit_immediate_txn` adapter rejects retired stores and outstanding
+  managed scopes. No hidden teardown retry is performed by the new guard.
+- Complete startup recovery now also unwinds through this guard: confirmed
+  rollback restores the prior prefix, pending indexes and materialized state;
+  failed rollback requires reopen. Its regression covers both outcomes and
+  verifies the retained command can subsequently converge.
+
+The owner-local guard tests additionally cover real deferred-constraint COMMIT
+failure, nested error/panic (including a child inside a legacy manual transaction),
+failed rollback with attempted parent/legacy commit, out-of-order scope
+completion, sticky retirement and reopen. These are local transaction tests,
+not proof that all PgStore mutation paths are closed.
+
+**Remaining at this checkpoint within step 1:** the specialized classified pending-insertion path
+retains its existing bounded rollback recovery and `MayHaveApplied` rules; it is
+not silently converted to the new sticky-first-failure teardown policy. Migrate
+that outcome boundary together with its owning custody semantics (subsequently
+implemented by the [classified migration](#classified-pending-transaction-ownership--2026-11-12)). Manual
+complete/current apply, publication, maintenance/transfer boundaries and raw
+`InsertionSavepoint` / `CommandApplySavepoint` still require migration. The manual
+`commit_immediate_txn` body still has legacy rollback handling; its new admission
+checks do not make that whole boundary owned. SQL/opening isolation and the
+allocation-retirement cache failure remain subsequent work. No schema, wire
+version, ignored-regression status or production custody selector changes here.
+
+Validation: the focused transaction/checkpoint/recovery/pending-slot/rollback set
+passed **303 tests**. Formatting, strict all-target/all-feature Clippy, storage
+boundary checks and `git diff --check` passed. The full workspace run
+`cbbb4f71-7299-430b-89af-189da446b9b7` completed **10,389 tests: 10,388 passed
+(six slow), one failed, six skipped**, in **500.237 seconds**. It includes all
+seven new transaction tests and the expanded recovery-unwind matrix, all passing.
+The single failure is the preserved
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`
+reproducer: `case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+The tree is **not green**; this slice does not resolve or waive that cache flaw.
+No retry or exclusion was used. Logs:
+`/tmp/argmin-metadata-transaction-{broader,clippy,boundaries,workspace}.log`.
+
+### Complete-command transaction ownership — 2026-11-12
+
+**Audit step 1 continues; no production custody activation or cache replacement.**
+The shared `MetadataTransaction` now owns the six complete-command transaction
+boundaries: apply/replay, primary publication, unstarted primary abandonment,
+replica abandonment, abandoned-part pending replacement and terminal slot
+retirement. Their duplicated `active`/Drop/rollback implementations are removed.
+Operation-specific admission, immutable fences, exact context/index validation
+and sender custody classification remain at the existing boundaries. They still
+reject execution inside an independently supplied caller transaction.
+
+Publication's trial apply is now an owned child savepoint. Successful trial
+rollback restores the pre-trial state before the publication marker can change.
+A failed child rollback retires the store immediately; the parent cannot hide
+the uncertainty with another rollback or commit. This intentionally replaces the
+previous trial-error fallback that could recover the outer transaction and leave
+the connection usable. Explicit errors preserve both operation and teardown
+diagnostics; unwind still rolls back or retires through the shared guard.
+
+The owning SQL scope is consumed before any post-commit reply-loss/error/unwind
+hook. Such a failure retains sender uncertainty, not a live local transaction
+that could undo accepted work. Abandonment invalidates its volatile digest/prefix
+observations before that post-commit seam. No public callback, SQL handle or new
+effect authority is introduced. Existing outer commit counts and format
+versions are unchanged; this slice adds no durable record or fsync boundary.
+
+The publication matrix independently covers failed trial rollback, simultaneous
+operation/trial-rollback failures, failed outer rollback after marker mutation,
+ordinary unwind and unwind with failed teardown. Retired stores cannot retry or
+publish; reopen restores the durable pre-attempt state and exact retry converges.
+Existing apply/replay, lost-reply, per-member custody and terminal-retirement
+matrices remain required evidence, not replaced with guard-only tests.
+An additional all-18-context apply canary and the publication trial/marker
+canary reject legacy commit attempts while the shared owner is live, require
+autocommit only after completion, and preserve exact replay without rewriting
+materialized state. The existing apply SQL trace still requires one outer
+begin/commit.
+
+**Remaining at this checkpoint:** migrate current/V13 apply, classified pending insertion/reissue,
+manual maintenance/transfer transactions and raw owner-component savepoints;
+then close raw SQL/duplicate-writer escapes and replace the prototype as the
+audit specifies. The preserved warm-cache/allocation-retirement failure is not
+fixed by this teardown migration and remains a validation blocker.
+
+Validation: the initial 13 focused tests and the broader **184-test** complete
+application/publication/abandonment/retirement matrix passed. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+Full workspace run `263a0790-c584-4be5-b2e8-f0490cc5ca26` completed **10,390 tests:
+10,389 passed (six slow), one failed, six skipped**, in **495.443 seconds**.
+The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`, at
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+It was not retried, excluded or weakened; the tree remains **not green** until
+the outstanding validation design is implemented. Logs:
+`/tmp/argmin-complete-transaction-{focused,matrix,clippy,boundaries,workspace}.log`.
+
+### Current-format application transaction ownership — 2026-11-12
+
+The live V13 `apply_metadata_command_and_record_with_commit_guard` now uses the
+shared store-owned transaction guard. Admission rejects a retired connection or
+an already-open caller transaction before beginning work. Fresh materialization,
+command recording, applied-prefix/digest updates and existing `AlreadyApplied`
+terminal-staging cleanup stay in the same outer transaction. The existing server
+route-fence callback still runs before commit for both fresh apply and replay.
+This does not turn replay into an early return or skip its cleanup/fence checks.
+
+Operation errors and unwind roll back the owned transaction. Failed rollback
+retires the store and its allocation lifetime, preserving both owner-internal
+diagnostics rather than returning the original semantic rejection as though
+teardown succeeded. Successful rollback preserves the original `Store` versus
+`Metadata` error variant, including route expiry and bucket conflicts. Begin and
+commit database failures retain their existing metadata-error context. No hidden
+Drop retry or later manual rollback can restore a retired connection.
+
+Owner-local tests cover fresh/replayed fence rejection, unwind, real deferred
+COMMIT failure, failed rollback, reopen/convergence, log-insertion failure after
+materialized writes, metadata-error plus rollback failure, caller-transaction
+rejection and exclusion of legacy commit attempts. A second connection verifies
+fresh metadata remains invisible before commit; the SQL trace pins one outer
+begin/commit per successful attempt. A retired **allocation** lifetime, without
+connection retirement, still permits current-format apply and replay.
+
+This is transaction teardown migration, not closure of the current command API:
+the production route-fence callback remains crate-visible, and raw SQL/opening
+escapes remain audit step 2 work. Current publication, other manual maintenance/
+transfer transactions, classified pending insertion/reissue and raw owner
+savepoints still need migration. No schema/encoding, fsync boundary, custody
+selector, ignored-test status or independent-cache behavior changes. The complete
+warm-cache allocation-retirement regression remains unresolved.
+
+Validation: all **nine** initial focused tests and the broader **321-test**
+current command/fanout/stream/release selection passed. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+Full workspace run `711f8c28-30bc-4c2c-a0af-2c0645766e3e` completed **10,396 tests:
+10,395 passed (six slow), one failed, six skipped**, in **496.370 seconds**.
+All six new transaction regressions passed. The sole failure is still
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`, at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+No retry, exclusion or weakening was used. The tree remains **not green**; this
+transaction migration is not a fix or waiver for the pending cache replacement.
+Logs: `/tmp/argmin-current-apply-{focused,broader,clippy,boundaries,workspace}.log`.
+
+### Current-format publication transaction ownership — 2026-11-12
+
+The live V13 publication-start boundary now uses the shared `MetadataTransaction`
+for both its outer marker transaction and its trial-apply savepoint. It rejects
+retired connections and already-open caller transactions before starting work.
+The existing acceptance checks, fresh trial application, already-applied branch
+and exact pending-command marker match are preserved. This does not select the
+candidate complete-command publisher or add a production mutation callback;
+interleaving hooks are private and compiled only for storage unit tests.
+
+Successful trial rollback removes temporary materialization before the marker
+can change. Trial error/unwind rolls back its child scope and then the parent.
+Any uncertain rollback retires the store and its allocation lifetime; the parent
+cannot rescue a failed child with another SQL rollback or commit. Confirmed
+teardown preserves the original semantic error; failed teardown retains both
+owner-internal diagnostics. The outer owner is consumed before the test-only
+post-commit error/unwind seam, so a lost confirmation cannot undo a committed
+publication marker. Existing sender uncertainty/reinspection rules are unchanged.
+In particular, the live embedded adapters still map returned store failures to
+`MetadataCommandApplyError::Definitive`, and the current Unix state-result path
+also treats authenticated RPC errors as definitive. This migration does **not**
+establish an end-to-end classified publication outcome: failed COMMIT/uncertain
+teardown must retain conservative custody at the owning submission/transport
+boundary. Preserve that requirement when replacing the live path with the
+complete-command protocol; local connection retirement alone is not a proof of
+definitive non-publication.
+
+Owner-local evidence covers fresh and already-applied commands, exact marker
+retry/reopen, private real reservation writes during trial, rollback before
+marker update, exclusion of legacy commit attempts and one outer commit per
+successful call. A separate connection observes neither trial effects nor an
+uncommitted marker. Failure cases cover child rollback, operation plus rollback,
+trial/marker unwind, real deferred-constraint COMMIT failure, sticky retirement,
+reopen/convergence and post-commit confirmation loss. Missing/crossed pending
+slots reject after trial effects and leave no temporary reservation behind.
+
+This is another part of audit step 1, not its completion. Manual maintenance/
+transfer/bootstrap boundaries, classified pending insertion/reissue and raw
+owner savepoints remain to migrate; SQL/opening closure and prototype replacement
+still follow. No schema/encoding, ordinary-path command/fsync, frontend custody
+selector or ignored-regression status changes. The complete warm-cache
+allocation-retirement regression remains unresolved and must stay in validation.
+
+Validation: the first focused run failed four new fixtures before publication:
+the test helper hex-encoded the seed into an invalid 38-character session ID.
+After shortening that seed, all **six** focused tests passed, followed by the
+broader **332-test** current-command/fanout/stream/publication selection,
+including installed Unix/TLS publication-start regressions. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+Full workspace run `3e7edc7a-7abe-4f0e-91d5-86da6f5c889a` completed **10,401 tests:
+10,400 passed (six slow), one failed, six skipped**, in **498.380 seconds**.
+All five new publication tests passed. The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache` at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+That reproducer was not retried, excluded or weakened; the tree remains
+**not green**. Logs:
+`/tmp/argmin-current-publication-{focused,focused-fixed,broader,clippy,boundaries,workspace}.log`.
+
+### Metadata-transfer transaction ownership — 2026-11-12
+
+The existing empty-state initialization, matching-state initialization,
+checkpoint-base installation and rebased-command adoption now use the shared
+store-owned SQL guard. A private transfer wrapper owns that guard together with
+the allocation replacement lifetime; it does not duplicate rollback machinery or
+expose a production mutation callback. It preserves the current order: retire
+the old allocation identity and mint its candidate before SQL effects, commit
+the replacement, refresh the local clean-digest observation, then activate the
+candidate. Failed replacement never revives the old identity, even when SQL
+rollback succeeds. An already-open caller transaction remains rejected, not
+adopted or completed by transfer.
+
+Operation errors and unwind now have owned teardown. Confirmed rollback returns
+the original typed error; failed rollback preserves both diagnostics and retires
+the connection as well as allocation. Later transfer attempts cannot revive or
+use that connection; reopen is required. The checkpoint foreign-key deferral is
+inside the owned result boundary, so errors there receive the same teardown.
+After COMMIT the SQL owner is consumed: a digest-refresh or reply failure cannot
+roll back accepted state, and an incomplete replacement still cannot allocate.
+These are local transaction/lifetime guarantees, not a new sender outcome or
+proof that destination acting-set transfer is complete.
+
+Owner-local tests exercise all four production entries with real metadata/log
+changes. They pin one outer commit, exclusion of a legacy commit, no externally
+visible replacement before commit, no new allocation before completion,
+error/unwind/real deferred COMMIT failure, failed rollback, reopen and durable
+post-commit state despite lost confirmation. Actual body failures include bad
+digests, checkpoint insertion after destination clearing, and a broken rebased
+log sequence after the first new row has been written. Raw setup and hooks are
+test-only; the fixtures contain bucket metadata, not synthetic shard payloads.
+
+This continues audit step 1. Bootstrap, maintenance compaction, current
+abandonment, classified pending insertion/reissue and owner-component raw
+savepoints remain; connection/opening closure and prototype replacement follow.
+It adds no schema, version, persistent transfer file, paging interface, command
+or fsync. Checkpoint-size/aggregate-memory work remains in its separate plan.
+Production retained-owner selection is unchanged; the warm-cache allocation-
+retirement reproducer remains an unresolved validation blocker.
+
+Validation: the initial 15-test selection had 13 passes, one assertion that used
+the wrong log-conflict diagnostic wording, and one interrupted test. Inspection
+identified a self-deadlock in the new test: it held the trace collector mutex
+while issuing another traced query. Only this session's run was stopped, and the
+test was corrected to release that guard before further SQL. The expected
+diagnostic was corrected to the actual index-3 conflict. No production behavior
+was changed to accommodate either test issue. The corrected broader selection
+passed all **356 tests**, including all five new matrices, existing allocation-
+lifetime tests, populated owner checkpoint import and installed transfer paths.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed.
+
+Full workspace run `1d86dfd3-c221-4d3b-9fe0-4f35a161d999` completed **10,406 tests:
+10,405 passed (six slow), one failed, six skipped**, in **500.359 seconds**.
+The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache` at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+All new tests passed. That existing reproducer was not retried, excluded or
+weakened; the tree remains **not green**. Logs:
+`/tmp/argmin-transfer-transaction-{focused,broader,clippy,boundaries,workspace}.log`.
+
+### Bootstrap and compaction transaction ownership — 2026-11-12
+
+Digest bootstrap and log compaction now use the shared metadata transaction
+owner instead of hand-written COMMIT and ignored ROLLBACK results. Compaction
+keeps its explicit current/complete grammar and complete mutation authority;
+checkpoint recording already uses the shared transaction helper. The change
+does not add a maintenance capability or weaken admission. Completed bootstrap
+still validates its catalogue without writing; incomplete bootstrap and an
+actual compaction reject caller-owned transactions rather than reporting a
+savepoint release as durable success. Existing no-checkpoint/pending-command
+early returns are unchanged.
+
+Operation failure and unwind roll back the owned scope. Successful rollback
+preserves the original error and leaves the connection usable; uncertain
+rollback preserves the teardown diagnostic and retires both connection and
+allocation lifetime. Drop does not silently retry failed teardown. A raw later
+rollback cannot revive the retired store. Reopen re-establishes usable state and
+resumes incomplete bootstrap or permits compaction retry. Successful operations
+retain one outer commit, with no additional command, fsync, format or schema
+change. The test callbacks are private and absent from production builds.
+
+Owner-local regression matrices cover bootstrap and current/complete compaction:
+real effects remain invisible to another connection before commit, legacy commit
+attempts cannot bypass the owner, success survives reopen, and operation errors,
+unwind and real deferred-constraint COMMIT failures either restore the original
+state or retire the connection. Separate SQLite-trigger failures exercise the
+actual mutation body after digest-trigger creation or receipt insertion, not
+only a synthetic return at the end. Caller-owned transactions remain open and
+unchanged on rejection. Fixtures contain bucket metadata, not payloads.
+
+This is still audit step 1. Current abandonment and pending-slot removal,
+classified pending insertion/reissue and raw owner-component savepoints remain;
+SQL/opening closure and replacement of the prototype prefix cache follow.
+Production cleanup-owner activation remains gated. The warm-cache allocator-
+retirement regression stays in validation and remains a blocker until the
+smaller validated-PG design replaces the prototype.
+
+Validation: the initial focused build found a temporary-topology borrow in the
+new test helper; retaining the topology for the call corrected it. All four new
+regression matrices then passed. The first broader run passed 142 of 143 tests:
+the existing nested-transaction trace test hardcoded savepoint suffix `_2`,
+while bootstrap's newly owned scope correctly advanced it to `_3`. Its assertion
+now pins the exact BEGIN/SAVEPOINT/matching RELEASE/COMMIT sequence rather than
+the number of startup scopes. No production change was made for either test
+issue. Corrected broader, cheap-check and full-workspace results follow below.
+
+The corrected broader selection passed **143 tests**, including installed
+maintenance admission/deadline/rollback tests, digest bootstrap validation,
+receipt compaction and restart/recovery. Formatting, strict all-target/all-
+feature Clippy, boundary checks and diff checks passed.
+
+Full workspace run `9790aa3f-c878-49ab-aba8-ed25c1e5c9b9` completed **10,410 tests:
+10,409 passed (six slow), one failed, six skipped**, in **499.275 seconds**.
+The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache` at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+All new tests passed. The unresolved reproducer was not retried, excluded or
+weakened; the tree remains **not green**. Logs:
+`/tmp/argmin-maintenance-transaction-{focused,focused-fixed,broader,broader-fixed,clippy,boundaries,workspace}.log`.
+
+### Current-format terminal transaction ownership — 2026-11-12
+
+Current-format abandonment recording and terminal pending-slot removal now own
+their SQL teardown through the shared metadata guard. Abandonment still requires
+an outer transaction; it does not adopt caller-owned work. Slot removal retains
+its existing nested use, but now owns a child savepoint rather than leaving
+partial failure effects in the caller's transaction. Child release is only local
+completion: the caller still owns the durable commit and may roll back removal.
+No new public mutation callback or authority is introduced. The existing complete-
+command fixture recorder shares abandonment teardown; production complete
+abandonment continues through its separate admitted owner.
+
+The command-subject, terminal-record, exact-slot and generation-owner checks,
+side-index cascades, tombstone/hash advancement and successful abandonment
+digest invalidation remain unchanged. Errors preserve their original diagnostic
+after confirmed rollback, or include rollback failure and retire the connection
+when teardown is uncertain. Unwind uses the same owner. A failed child prevents
+parent commit through the managed guard or legacy commit helper; neither helper
+nor Drop silently retries the failed rollback. Raw SQL closure remains a later
+audit step, not a guarantee supplied by this guard alone. Reopen is required to
+restore use. The owner is consumed before the private test-only post-finish seam, so a failure
+after a durable commit cannot undo the terminal result. This does not change
+sender classification or provide new end-to-end custody evidence.
+
+Owner-local matrices cover fresh abandonment, applied/abandoned slot removal,
+exact retry and reopen, one outer commit, private pre-commit changes, real
+pending side-index deletion, operation failure/unwind, deferred-constraint
+COMMIT failure, failed rollback, actual SQLite mutation-body failure, and lost
+post-commit confirmation. Nested tests cover raw and managed parents, parent
+commit/rollback, preservation of unrelated parent writes, and refusal to commit
+after failed child teardown. Missing terminal evidence rejects removal without
+changing the slot; abandonment rejects an existing parent without ending it.
+All raw fixtures/hooks are owner-local tests and contain no payload data.
+
+This advances audit step 1 without adding a command, fsync, schema or wire-format
+change. Classified pending insertion/reissue and raw owner-component savepoints
+remain, followed by SQL/opening closure and replacement of the prototype prefix
+cache. Production cleanup-owner activation remains gated, and the warm-cache
+allocation-retirement reproducer remains an unresolved validation blocker.
+
+Validation: the initial focused build found that a new nested-failure test kept
+an optional parent guard borrowed through store teardown. Explicitly consuming
+and dropping that test holder before reopen corrected the fixture; no production
+change was needed. All **seven** new matrices then passed. The broader pending-
+slot/abandonment/replay/fanout selection passed **182 tests**. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+
+Full workspace run `098688a1-5f12-4532-98a1-16f519d39199` completed **10,417 tests:
+10,416 passed (six slow), one failed, six skipped**, in **496.638 seconds**.
+The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache` at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+All seven new tests passed. That unresolved reproducer was not retried, excluded
+or weakened; the tree remains **not green**. Logs:
+`/tmp/argmin-terminal-transaction-{focused,focused-fixed,broader,clippy,boundaries,workspace}.log`.
+
+### Classified pending transaction ownership — 2026-11-12
+
+Classified pending insertion and the shared current/bound/complete reissue
+transaction now use the store-owned guard. The classification boundary remains
+explicit: a normal BEGIN/SAVEPOINT failure is a per-attempt definitive rejection;
+lost managed-scope ownership or an already-retired connection is uncertain.
+Operation failure becomes definitive only after confirmed rollback. Any failed
+COMMIT/RELEASE remains `MayHaveApplied`, even if its subsequent local rollback
+succeeds. Reissue retains its existing conservative mapping of transaction
+errors to `MayHaveApplied`; a fresh attempt's rejection never clears earlier
+uncertainty in the owning holder. Exact-existing validation, effect/work
+deadlines, command/context binding and transactionally derived indexes are
+unchanged.
+
+**Deliberate teardown-policy change:** the old insertion-specific second rollback
+of the whole connection is removed. Like the other migrated owners, the first
+unconfirmed rollback now retires the connection and allocation lifetime until
+reopen. This trades an immediate local retry for a single fail-closed rule and
+does not silently discard a managed parent's work behind its back. A later raw
+rollback cannot revive the store, and neither Drop nor parent commit retries
+teardown. Confirmed child rollback preserves unrelated parent work. Child release
+is not durable installation; the complete/bound owning submissions continue to
+reject caller transactions. Successful standalone calls keep one outer commit;
+nested calls use unique child savepoints without extra commits or fsyncs.
+
+Owning submission and reissue regressions now retain their exact descriptions,
+both candidate commands and `Unconfirmed` history through failed rollback and
+reopen. Unwind is handled by the SQL owner, not manual rollback in the test or
+cleanup-on-Drop in the holder. Additional all-context cases interrupt **after**
+the slot and its indexes have been written, test both successful and failed
+unwind rollback, then prove the same retained holder/pair converges after reopen.
+The private before-finish hook is storage-unit-test-only. Separate lower-boundary
+canaries cover one-commit insertion/replacement/exact retry, unique nested scopes,
+non-publication before parent commit, managed-parent commit exclusion, preserved
+parent writes, and busy BEGIN versus lost managed-scope classification. Existing
+real COMMIT failures, side-index errors, node-access retirement and response-loss
+tests remain in the selection.
+
+This is local transaction/outcome integration, not production cleanup-owner
+activation or a new recovery authorization. No schema, wire encoding, ordinary
+command or persistence boundary changes. Raw owner-component savepoints and
+the legacy commit adapter remain in audit step 1; connection/SQL/opening closure
+and the smaller validated-PG design follow. The warm-cache allocation-retirement
+regression remains an unresolved blocker, not an excluded test.
+
+Validation: the first focused selection passed **123 tests**. The expanded test
+build found three imports using the test facade instead of the private store
+owner; correcting those test-only imports required no production change. The
+expanded selection then passed **135 tests**, including all five new ownership
+regressions and the updated retained-holder/reopen matrices. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+
+The first full run `f4d4d2d3-2956-4619-be47-c94a0cf9afcb` completed **10,422 tests:
+10,398 passed (six slow), 24 failed, six skipped**, in **497.635 seconds**.
+Twenty-three failures came from two remaining test-only unwind helpers: the
+publication handoff helper attempted a manual rollback after automatic teardown,
+and the shared context-submission helper expected the transaction to remain
+open. Both now assert automatic teardown, usable connection, unchanged stored
+state and retained `Unconfirmed` history. All **90** context/handoff tests then
+passed. The other failure is the unchanged warm-cache allocation-retirement
+reproducer. No failing test was excluded or weakened. Logs:
+`/tmp/argmin-classified-transaction-{focused,broader,broader-fixed,handoff-fixed,clippy,boundaries,workspace}.log`.
+
+After those corrections, formatting, strict all-target/all-feature Clippy,
+storage boundary checks and diff checks passed again. Final full workspace run
+`ef2e328f-689d-4f8c-91ac-c7a357fef9ba` completed **10,422 tests: 10,421 passed
+(seven slow), one failed, six skipped**, in **500.114 seconds**. All five new
+ownership regressions and the corrected handoff/context matrices passed. The
+sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache` at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+This remains a blocker for the smaller validated-PG follow-up; the tree is
+**not green**. Final logs:
+`/tmp/argmin-classified-transaction-{clippy,boundaries,workspace}-final.log`.
+
+### Owner-component savepoint ownership — 2026-11-12
+
+The retained-owner SQL writers and command components now use the shared
+store-owned transaction guard rather than raw-connection savepoints with fixed
+names. The nine SQL mutation entries take their `PgStore`, validate its actual
+PG and usable-connection state, and still require an existing outer transaction.
+The command components preserve the enclosing scope across live metadata changes
+and ownership transfer. A child owns a unique savepoint; successful release
+neither commits the parent nor adds a transaction/fsync.
+
+Explicit operation failure rolls back the exact child and retains both the
+operation and any rollback diagnostic. Unwind uses the same owning guard. If
+teardown is unconfirmed, the store and allocation lifetime are retired: an
+enclosing component or managed parent cannot commit, the legacy commit adapter
+rejects, and neither Drop nor another parent scope retries the failed rollback.
+Confirmed rollback preserves unrelated parent writes. Raw SQL remains a later
+closure task; this is not a claim that every arbitrary SQL caller is isolated.
+
+The relational fixtures now insert through actual stores, not a parallel
+raw-connection writer. A schema-only in-memory fixture still checks the exact
+table/column inventory. New matrices exercise all seventeen reserve/create,
+append, terminal and source-bearing abandonment cases, with real state changes
+before private test-only failure/unwind injection. They cover raw and managed
+parents, confirmed and failed child rollback, unchanged state after reopen,
+same-command convergence, allocation retirement, no hidden teardown retry,
+unique scope identities, read-only observation before outer commit and exactly
+one successful outer commit. A crossed-store canary keeps the supplied owner/PG
+consistent while changing the actual store, so subject validation alone cannot
+make the negative pass.
+
+This advances audit step 1 only. The legacy commit adapter and its manual callers
+remain; SQL/opening isolation and replacement of the prototype prefix cache
+follow. There is no schema, wire-format, production-custody or cleanup-authority
+activation. The warm-cache allocation-retirement regression is still a blocker.
+
+Validation: the first focused selection passed **157 tests**. The new ownership
+matrix initially failed to compile because an optional parent guard's borrow
+survived until store teardown; explicitly consuming and dropping that test holder
+before reopen corrected the fixture. All **22** ownership/SQL tests then passed,
+including the three new matrices. Strict Clippy found that carrying the new
+rollback cause inline enlarged enclosing error types; boxing that diagnostic
+at the staging boundary preserves both causes without widening those results.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks then passed. The initial full-workspace compilation was interrupted
+only in this session after another checkout started a full suite at launch;
+that other session was left untouched. The restart waited for that run to exit
+and one-minute host load to fall below ten. Logs:
+`/tmp/argmin-component-transaction-{focused,ownership,ownership-fixed,clippy,clippy-fixed,boundaries,boundaries-final}.log`.
+
+The final full workspace run `5e5ece6a-8041-452d-a700-31b9353a09a2` completed
+**10,425 tests: 10,424 passed (seven slow), one failed, six skipped**, in
+**502.678 seconds**. All three new component matrices passed. The sole failure
+remains `staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`
+at `payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+It was not retried, excluded or weakened. The tree remains **not green**; the
+smaller validated-PG replacement is still required after boundary closure.
+Full-run log: `/tmp/argmin-component-transaction-workspace-final.log`.
+
+### Standalone metadata transaction ownership — 2026-11-12
+
+All sixteen manual users of the legacy commit adapter now retain and consume the
+shared `MetadataTransaction`. This covers the three live bucket-drain clear,
+expiry and heartbeat operations, exact bucket-reservation proof release, and
+twelve test/test-support object, generation, reclaim and multipart mutations.
+Their standalone contract is preserved: an existing raw or managed transaction
+is rejected before effects, not silently adopted as a parent savepoint. The
+nestable shared helper continues to create a unique child scope as before.
+
+Operation failure and unwind roll back the owned scope; an unconfirmed rollback
+retires the connection and allocation lifetime until reopen. Commit failures
+preserve both commit and teardown diagnostics. Proof release no longer has a
+separate guard that can retry a failed rollback after the legacy adapter has
+already attempted it. Its exact immutable-proof comparison, renewable-lease
+handling and final pre-DELETE deadline check are unchanged. No ownership or
+acceptance outcome is inferred from local teardown. The former unowned COMMIT
+entry is removed from production; an explicitly test-only adapter remains for
+adversarial raw-parent fixtures and still rejects managed scopes or retired
+connections.
+
+New owner-local matrices exercise all four live operations after their real
+mutations, with operation errors, unwind and commit failure, each with successful
+or failed rollback. They require unchanged durable state after reopen, exact
+retry convergence, sticky retirement and no hidden teardown retry. Independent
+raw/managed-parent cases preserve the parent's writes and transaction. SQL traces
+pin exactly one outer begin/commit for each successful standalone operation, with
+no savepoint or extra fsync boundary. Existing proof-release expiry, absence,
+identity and renewal tests remain applicable. The mutation-interruption hook is
+private and storage-unit-test-only.
+
+This closes the inventoried legacy adapter callers, not every transaction in the
+store. The audit still finds three manual batch transactions in `shards.rs` and
+`with_durable_repair_txn` in `scavenger.rs`, including operational-table teardown
+and the fixture-only combined shard/stream writer. These require the same
+ownership review before SQL closure; schema bootstrap and the separately owned
+read-snapshot boundary must also be accounted for during opening isolation.
+Then close arbitrary SQL/opening escapes and replace the prototype prefix cache
+with the smaller validated-PG design. No schema, encoding,
+production-custody or cleanup-authority activation changes. The preserved
+warm-cache allocation-retirement regression remains an unresolved blocker.
+
+Validation: all **13** focused transaction/drain/proof-release tests passed,
+including the three new matrices. Formatting, strict all-target/all-feature
+Clippy, storage boundary checks and diff checks passed. The initial full-suite
+build was interrupted only in this session after another checkout started a
+focused Nextest run; the other session was left untouched. During the restart,
+another focused run began; only this session's build was suspended and resumed
+after it exited, preserving compilation progress. Logs:
+`/tmp/argmin-legacy-transaction-{focused,clippy,boundaries,workspace}.log`.
+
+Final full workspace run `a74b56aa-78b6-4346-aa26-3cde4f9435b6` completed
+**10,428 tests: 10,427 passed (six slow), one failed, six skipped**, in
+**496.191 seconds**. All new matrices and the migrated fixture operations passed.
+The sole failure remains
+`staging_prefix_apply_retired_allocator_converges_with_warm_or_cold_cache`, at
+`payload_staging_prefix_apply_tests.rs:58`:
+`case 0, warm=true: CompleteApplicationError(Store(PgAllocationLifetimeUnavailable { pg_id: 4 }))`.
+It was not retried, excluded or weakened. The tree remains **not green** pending
+the smaller validated-PG replacement after boundary closure. Full-run log:
+`/tmp/argmin-legacy-transaction-workspace-final.log`.
+
+### Retired-allocation cache-miss correction — 2026-11-12
+
+The allocation-retirement apply regression is fixed independently of the larger
+cache-removal design. After taking an optional cached prefix, `take_apply_prefix`
+now treats only `PgAllocationLifetimeUnavailable` from its stamp read as a cache
+miss. The entry remains discarded and the already-issued command follows the
+existing cold application path. Connection retirement and database errors still
+propagate, and live-but-changed stamps still invalidate the cache. No recovery,
+new transaction, command, format change or fsync is added.
+
+The existing regression is unchanged: all eighteen command shapes must converge
+with warm and cold caches after allocation retirement, exact replay must not
+rewrite metadata, both paths must perform equal durable work, and retired
+allocation/confirmation must remain blocked. A replacement lifetime must not
+inherit stale validation. Existing mutation, rollback, external-writer,
+future/foreign evidence and no-extra-commit tests remain required.
+
+This removes a correctness defect in the provisional implementation, not a
+structural prerequisite for deleting the cache. The remaining shard/repair
+transaction ownership, private SQL/connection boundary, exclusive writable
+opening and validated-PG replacement remain open. Neither this regression's
+success nor a green suite by itself closes those design obligations or activates
+production cleanup authority.
+
+Validation: all **39** focused apply/cache/allocation-lifetime tests passed,
+including the unchanged eighteen-shape retirement regression. Formatting,
+strict all-target/all-feature Clippy, storage boundary checks and diff checks
+passed. Full workspace run `9281925c-13b8-4c40-9657-efe407b1c08c` passed
+**all 10,428 tests** in **498.493 seconds**, with six slow results and six
+unchanged skips. The previously failing retirement regression passed unchanged
+in the full run as well as the focused selection. No test was retried, excluded
+or weakened. This restores a green validation baseline, not completion of the
+cache-removal design. Logs:
+`/tmp/argmin-prefix-retired-fix-{focused,clippy,boundaries,workspace}.log`.
+
+### Shard and repair transaction ownership — 2026-11-12
+
+Exact shard acknowledgement batches now retain the shared `MetadataTransaction`
+through insertion and commit. They still require standalone admission and reject
+raw or managed caller transactions before effects. Per-row immutable effect
+checks, exact existing-ack matching and the one outer commit are unchanged.
+Operation errors and unwind roll back the batch; an unconfirmed rollback retires
+the store and allocation lifetime until reopen, preserving the original cause
+and rollback diagnostic without a hidden second teardown attempt. These SQL
+rollbacks do not delete the already-durable shard files or grant cleanup authority.
+
+The former overwrite-style `register_written_shards_batch` had no callers and is
+removed, rather than preserving another unused mutation interface. The combined
+shard/stream row writer had only a storage atomic-publication test caller; it is
+now `cfg(test)` and uses the same owned standalone teardown. Its encrypted
+payload fixture and acknowledgement/manifest atomicity remain covered. Production
+stream publication continues through its existing admitted command path.
+
+The private repair transaction helper also owns its scope. Backfill insertion
+and coalescing, repair claims, and backfill claims keep one standalone commit.
+Inside a caller transaction they now own a unique child savepoint instead of
+silently adopting the parent. Confirmed child rollback preserves parent writes;
+uncertain child rollback retires the store and excludes parent commit. Successful
+release is not a durable claim acknowledgement until the parent commits. This
+adds nested savepoint SQL, not an extra outer transaction or fsync. The helper
+remains private; no new production mutation callback is exposed.
+
+Owner-local matrices interrupt real acknowledgement/manifest and operational
+repair/backfill mutations, including errors, unwind, injected commit failure,
+real deferred-constraint commit failure, and failed rollback. They verify exact
+state after reopen, retry convergence, persistent encrypted files, parent-write
+preservation, rejection of further writes on a retired store, and no hidden
+rollback retry. Repair snapshots read all operational columns explicitly, rather
+than relying on canonical checkpoint tables that omit those rows. Independent
+SQLite observers and SQL traces pin pre-commit invisibility, unique child names,
+exact-ack retry without rewriting, and one outer commit. A partial-batch mismatch
+canary exercises an inserted first acknowledgement followed by a crossed second
+acknowledgement and failed rollback. Hooks are private storage-unit-test-only.
+
+The inventoried operational transaction bodies are now owned. Schema bootstrap
+still needs to be accounted for inside the opening boundary, and the separate
+read-snapshot owner must remain fail-closed during that integration. Raw SQL,
+duplicate writable opening and unrestricted internal mutation access remain the
+next structural work; this does not remove the cache or activate cleanup owners.
+The separately corrected allocation-retirement regression remains required.
+
+Validation: the first focused run had four setup failures because the fixture
+seed hex-encoded to an invalid 46-character session ID. After shortening that
+seed, all **65** focused acknowledgement/repair/atomic-publication tests passed.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+diff checks passed. Full workspace run
+`7421248b-7522-4289-972d-a7878f4573c3` completed **10,434 tests: 10,433 passed
+(six slow), one failed, six unchanged skips**, in **498.455 seconds**. All six
+new transaction tests and the unchanged allocation-retirement regression passed.
+
+The failure is
+`node_runtime::pg_store::shard_file_mutations::tests::shard_file_mutations_recheck_deadline_after_waiting_for_delete`,
+at `shard_file_mutations_tests.rs:187`:
+`assertion failed: gate.entries.lock().unwrap().is_empty()`.
+The preceding expired-route, absent-file and empty-temporary-directory assertions
+passed. Inspection identifies a race in the unchanged shard-file registry
+`Entry::drop`: it checks strong-reference cardinality under the registry mutex,
+but releases its own `Arc` only after that mutex is released. Two concurrent
+finishing entries can each observe the other's reference and leave the registry
+entry behind. Neither that implementation nor its regression is changed in this
+transaction slice. The failure has not been rerun, excluded or weakened; the
+full validation baseline is **not green** until this separate teardown defect
+is resolved. Logs:
+`/tmp/argmin-shard-repair-transactions-{focused,clippy,boundaries,workspace}.log`.
+
+At the user's request, after handing off the shard-registry failure for separate
+analysis, the unchanged full suite was rerun. Formatting and strict Clippy passed;
+run `5f5ea4e9-d531-4933-ac1b-17ac594b12e5` passed **all 10,434 tests**, seven slow
+results and six unchanged skips, in **520.147 seconds**. The shard-registry and
+allocation-retirement regressions both passed unchanged. This green rerun is not
+a fix or waiver for the registry teardown race; it remains a separate
+investigation. Log: `/tmp/argmin-shard-repair-transactions-workspace-rerun.log`.
+
+### Schema-opening transaction ownership — 2026-11-12
+
+The remaining schema-initialization transaction now uses `MetadataTransaction`
+on an unpublished store, rather than a raw connection with discarded rollback
+errors. Its production entry consumes that store and returns it only after
+initialization succeeds; any failure or unwind closes the connection. Confirmed
+rollback removes schema effects; failed rollback retains the original and
+teardown diagnostics and retires the store before construction drops it. Existing
+schema-version rejection and the frozen schema catalogue are unchanged.
+
+Initialization rejects caller transactions and retired connections before
+configuring SQLite pragmas. A fresh empty database still has one schema commit;
+an already-current schema adds none. Digest bootstrap and replica-state
+initialization retain their existing subsequent transactions and occur before
+returning the store. Temporary crash residue is removed only after all those
+initialization steps succeed. Failed opening does not clean files as a side
+effect. No schema/version, persistent file, ordinary-path command or fsync is
+added. The raw in-memory schema and predecessor fixtures now use owner-local
+test-only setup; they retain their exact evidence and non-mutation assertions.
+
+Failure matrices use actual schema/table creation and an independent SQLite
+observer. They exercise operation error, unwind, injected and real deferred-
+constraint commit failure, failed rollback, absence of a returned store,
+connection closure/writer-lock release, preserved temporary files and successful
+reopen/retry. Parent-transaction canaries pin rejection before pragmas without
+changing the parent, while trace canaries pin fresh/current commit counts.
+
+This accounts for schema bootstrap within transaction ownership, not exclusive
+database ownership. Duplicate writable opens, raw internal connection/SQL access,
+payload-handler ownership and the private validated-state boundary remain open;
+read-only inspectors and deliberate concurrent-writer test scenarios need an
+explicit split when those openings are closed. Do not add an independently
+detachable lock token or remove external-change detection before that work is
+complete. The existing read-snapshot owner is unchanged. No prefix cache is
+removed and no retained cleanup authority is activated by this slice.
+
+Validation: all **24** focused schema/opening, frozen-schema, predecessor-index,
+read-snapshot and complete-startup tests passed. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and diff checks passed.
+Full workspace run `1d45e7ae-18b3-4df7-8b3c-47e32fa4245b` passed **all 10,437 tests**
+in **500.369 seconds**, with six slow results and six unchanged skips. All three
+new schema transaction tests, the allocation-retirement regression and the
+unchanged shard-registry regression passed. There was no test retry or exclusion
+in this slice. The separate registry investigation is not resolved by this green
+run. Logs: `/tmp/argmin-schema-owned-opening-{focused,clippy,boundaries,workspace}.log`.
+
+### Exclusive writable PG opening — 2026-11-12
+
+**Withdrawn — 2026-11-13.** The per-PG directory lock, connection wrapper,
+new duplicate-opening tests and associated fixture migration have been removed.
+No replacement opening/serialization design is introduced. The description and
+test runs below record the withdrawn experiment, not current behavior. The
+existing prefix cache and its retired-allocation bug fix are retained; the
+storage-node root lock and earlier transaction work are unchanged.
+
+Normal writable opening now acquires a nonblocking exclusive advisory lock on
+the existing PG directory before SQLite initialization or temporary-file cleanup.
+The private `PgConnection` owns both that directory descriptor and SQLite; callers
+cannot extract either, replace the connection through a mutable dereference, or
+clone the owner. SQLite closes before the directory lock is released. Connection
+retirement does not release writer ownership; the old store must be dropped
+before reopening it. Initial opening failure or unwind drops both resources.
+
+The directory is the lock subject rather than a separate `metadata.db` file
+descriptor: closing an independently opened database descriptor can release
+SQLite's process-wide POSIX locks. Canonical directory aliases share writer
+exclusion. Symlink PG roots, symlink/nonregular database files and multiply-linked
+database files are rejected; independent hard-linked SQLite/WAL aliases are not
+supported. The boundary is cooperative process and cross-process exclusion for
+normal PG opens, not protection against arbitrary filesystem replacement or an
+external SQLite writer that ignores admission. No lock file, schema/version,
+command or fsync is added.
+
+Read-only inspectors retain an actual `SQLITE_OPEN_READ_ONLY` connection, do not
+own writer admission, and cannot become writable by changing `query_only`.
+Deliberate simultaneous-writer RPC snapshot/corruption tests use an explicit
+storage-unit-test-only unleased opener. Ordinary restart tests must release their
+previous writer. These exceptions are not production reopening paths.
+
+Owner-local canaries cover simultaneous initial opens, same-process duplicate
+opens through aliases and different claimed PG IDs, cross-process exclusion,
+different-database independence, failed initialization followed by reopening,
+retirement without release, read-only non-promotion, rejected links, preservation
+of the live writer's temporary files, and SQLite close/rollback before admission
+is released. A separate process checks that duplicate rejection leaves an active
+SQLite POSIX transaction lock intact, with unlocked positive controls before and
+after rollback. An actual-source compile-fail fixture pins private representation,
+non-extractability, lack of mutable dereferencing/clone, and exclusion of the
+unleased test constructor from production.
+
+This closes normal duplicate writable opening only. The temporary shared
+`Deref<Target = Connection>` preserves existing internal SQL callers; it is **not**
+the final private mutation interface. Raw internal SQLite opening, unrestricted
+SQL access and payload-handler lifetime closure remain part of the next audit
+slice. Keep external-change detection and the current prefix cache until that
+boundary is closed. No production retained-owner custody or cleanup authority
+is activated here.
+
+Validation: the initial focused build needed an explicit trace-callback lifetime;
+the first focused run also corrected a read-only canary that reached a missing
+digest trigger function before write admission. The broader 1,366-test storage
+run passed 1,356 tests and identified ten intentional simultaneous-writer setups
+rejected by the new lock. Those exact setups now use the explicit unit-test-only
+opener; no behavioral assertion was removed. All **19** corrected focused tests
+passed, including nine new ownership/API tests and all ten identified fixtures.
+Storage boundary and diff checks passed before the first workspace run.
+Logs: `/tmp/argmin-pg-writer-opening-{focused,broader,corrected,boundaries}.log`.
+
+The first full workspace run then passed **10,333** tests and failed **113**, with
+six unchanged skips. The failures exposed further fixtures opening a second live
+writer; this run is not accepted as final validation. The reviewed direction is
+to migrate those fixtures now, keeping exclusive production opening enabled:
+
+- Independent frontends share the existing node runtimes but have separate
+  frontend queues/registries. Route-view clones retain history and allocation
+  lifetime; they do not reopen SQLite. A storage-owned canary checks these
+  distinctions and that the shared runtime remains exclusively owned until the
+  last frontend drops it.
+- Remote-only maps use topology-only construction. RPC assertions inspect the
+  actual served node, not another writable connection over its database.
+- Real restart tests drop every retained owner before reopening, including
+  embedded reservation-client handles. Coordinator payload-restart fixtures
+  disable unrelated background workers and use an owned cache without the
+  detached bucket watcher, so dropping the coordinator actually closes its
+  storage runtime. The state-machine restart transition drops its
+  old map before evaluating the new opening expression.
+- Explicit cross-connection SQLite race/corruption tests alone use the test-only
+  unleased writer seam. The allocation test now checks rejection at the earlier
+  opening boundary and verifies the original allocator remains unchanged.
+
+The migrated reclaim fixture now verifies that a frontend replacement preserves
+the existing node's read lease, then releases it before waiting for terminal
+cleanup. RPC inspection guards end before further RPCs or another acquisition
+of the same PG mutex. Backfill views share every opened node, including the
+spare outside the original acting set.
+
+An intermediate focused run passed 102 and failed 21 (including one confirmed
+self-deadlock stopped after a debugger backtrace). Those remaining fixture
+causes were corrected; all **123** focused tests now pass, including the original
+failures and new opening/shared-runtime canaries. No assertion was waived, and
+the generated restart trace seed is retained. The following workspace run exposed
+one additional fixture race. Logs: `/tmp/argmin-pg-writer-fixtures-{focused,corrected,boundaries}.log`;
+the lock diagnosis is `/tmp/argmin-pg-writer-fixtures-copy-lock.txt`. The initial
+full failed run remains `/tmp/argmin-pg-writer-opening-workspace.log`.
+
+The next workspace run passed **10,446** and failed one additional Unix fixture
+(`remote_shard_ack_rows_on_wrong_node_are_not_publishable`). Its wrong-node
+injection raced listener-thread shutdown before reopening the same database.
+That fixture and its adjacent missing-ack fixture now retain the served nodes
+for injection/inspection; neither relies on thread-exit timing to gain another
+writer. Evidence is `/tmp/argmin-pg-writer-fixtures-workspace.log`.
+
+Final validation after that correction: formatting, strict all-target/all-feature
+Clippy, storage-boundary checks and diff checks pass. Both corrected remote-shard
+fixtures pass independently. The full `cargo nextest run --no-fail-fast` passes
+**10,447/10,447** tests, with six unchanged skips, in **497.620 s** (run
+`669a03b6-7891-4721-9a74-5e216fadef24`). Evidence is
+`/tmp/argmin-pg-writer-fixtures-workspace-final.log`; Clippy evidence is
+`/tmp/argmin-pg-writer-fixtures-clippy-final2.log` and boundary evidence is
+`/tmp/argmin-pg-writer-fixtures-final-boundaries.log`. This validates the opening
+boundary and fixture migration, not the still-open internal SQL closure or
+retained-owner activation.
+
+### Scope rollback validation — 2026-11-13
+
+The exclusive-opening wrapper, its nine ownership tests, the shared-frontend
+opening canary and the associated fixture migration are removed. Existing
+independent-runtime and restart tests are restored. The cache, its narrow
+retired-allocation correction and the earlier reviewed transaction changes are
+retained; no new opening or serialization mechanism replaces the experiment.
+
+Formatting, strict all-target/all-feature Clippy, storage-boundary checks and
+diff checks pass. Full workspace run `f7b9f230-6d85-4c96-a529-27f72c68a2a1`
+passes **10,437/10,437 tests** in **497.777 s**, with six unchanged skips.
+The unchanged warm/cold allocation-retirement regression and restored
+independent-runtime allocator regression both pass. No failed test was retried
+or excluded. Evidence: `/tmp/argmin-cache-scope-revert-{clippy,boundaries,workspace}.log`.
+This closes the scope rollback, not production cleanup-ownership activation.
+
+### Normal publication-to-confirmation regression — 2026-11-13
+
+The next integration probe follows the owning embedded publication path, not
+isolated replica apply: validate the initial prefix on each replica, install the
+complete pending command, run admitted primary publication, apply witness-first
+to every member, and retire the exact pending slot through the terminal holder.
+No recovery or cache warming occurs between installation and the final lookup.
+The fixture covers a Direct PUT introduction and a streamed append; both retain
+a future window. The initial positive observations prevent an already-cold
+fixture from masking the missing transition.
+
+Before the preservation fix,
+`staging_settled_prefix_after_embedded_publication_and_retirement` **failed** on
+its first case, after the witness's final observation succeeded:
+
+```text
+case 1, member 4: complete settled prefix requires explicit local validation
+```
+
+Publication, all replica applies and owning pending-slot retirement succeeded.
+The failure is the primary's subsequent local settled-prefix observation, before
+any window-confirmation or physical-authority API is added. The focused run
+executed one test and failed; it did not reach the append case. Evidence:
+`/tmp/argmin-confirmation-normal-flow.log`. This is the original failure evidence,
+not the outcome of the corrected slice below. The regression is neither ignored
+nor weakened.
+
+Source inspection identifies the missing integration: pending installation,
+publication's rolled-back trial/marker, and pending-slot retirement change the
+SQLite mutation stamp. At that point only closed complete apply advanced an
+already valid prefix entry; it could not restore one invalidated by earlier writes.
+Thus retaining the existing cache is not, by itself, enough to make confirmation
+usable immediately after normal publication.
+
+The bounded follow-up is to preserve **existing** validation through those exact
+closed transitions, with rollback/uncertain-commit and interposed-write tests.
+Cold or invalid entries must remain cold; no caller-supplied state or generic
+"mark clean" operation may mint validation. Keep the existing external-change,
+schema, topology and lifetime checks. Do not call full startup recovery on each
+confirmation, add a checkpoint/fsync, replace the cache, add directory locks,
+or reopen the broader transaction/connection-ownership work. The user approved
+this bounded integration; the implemented preservation below closes this local
+normal-flow prerequisite, not admitted primary/witness window confirmation or
+production activation.
+
+### Existing-prefix preservation through normal publication — 2026-11-13
+
+The three fixed operations now preserve an existing same-PG/epoch/topology
+validation: complete pending installation, admitted publication trial/marker,
+and exact quiescent pending-slot retirement. Their private preservation owner
+takes the old entry before dispatch. Only those operations can construct or
+finish it; effect implementations borrow the observer, without a generic public
+"mark valid" operation, caller-supplied prefix or production callback.
+
+Each effect block checks the old state/stamp under the existing transaction.
+Publication separately checks the trial and marker blocks so a write between
+trial rollback and marker publication cannot be blessed. The result stamp is
+captured before commit and compared after successful return. Errors, unwind,
+failed commit/rollback, intervening writes and unavailable allocation lifetime
+cannot produce positive validation. Cold entries remain cold even on successful
+exact retry. Retirement of allocation authority does not prevent already-issued
+publication from converging. No cache representation, storage opening, lock,
+format or live publisher selection changed.
+
+The original full-flow regression now passes for both Direct PUT introduction
+and streamed append, with equal primary/witness prefixes after owning retirement
+and no intervening recovery. SQL tracing pins four existing primary commits
+(install, publication, apply, retirement), one apply commit per other replica,
+and no full-startup foreign-PG scan. Separate warm/cold comparisons pin identical
+row-change and replay-validation work for installation, publication and retirement.
+This is evidence of no additional transaction/command path, not a new physical
+fsync benchmark or a remotely usable window-confirmation capability.
+
+The transition matrix covers positive preservation, cold exact retry, local and
+external writes, retired allocation lifetimes, failure/unwind before and after
+commit, and real deferred-constraint commit failures including failed rollback.
+The first focused run exposed four fixture defects (future-epoch commands over
+an epoch-1 prefix); fixtures now establish an authenticated same-epoch
+predecessor rather than relaxing production epoch checks. The corrected focused
+run `f34cc6f3-eada-4cdb-9d95-81e0256150a2` passed **19/19 tests** in **14.081 s**;
+evidence: `/tmp/argmin-prefix-preservation-focused-2.log`.
+
+Final validation passes formatting, strict all-target/all-feature Clippy,
+storage-boundary and diff checks. Full workspace run
+`14787d60-dce4-4ebb-b3ea-5238820065a3` passes **10,448/10,448 tests** in
+**503.841 s**, with six unchanged skips. This includes the new full-flow commit
+counts and all preservation/failure matrices. No test failure was waived,
+excluded or retried unchanged. Two preceding full-suite launches were stopped
+during compilation (one for final deadline-check ordering, one after noticing
+the load gate had not been honored); the recorded run started after the gate
+cleared, with no concurrent Nextest run. Evidence:
+`/tmp/argmin-prefix-preservation-{clippy-final,boundaries-final,workspace-validated}.log`.
+
+This slice supplies local prefix readiness for the admitted confirmation
+integration below; it does not activate the physical-write or cleanup protocol.
+
+### Embedded active-window confirmation — 2026-11-13
+
+The next bounded integration connects the retained, command-bound descriptor to
+the actual admitted embedded primary and its designated embedded publication
+witness. It is a **read-only candidate path**, not a physical grant or live
+publisher switch. The complete context remains borrowed throughout the lookup;
+no owning submission history or installable pending index is extracted.
+
+The primary section must be current/Active, and holds its existing metadata
+serialization throughout primary snapshot selection, witness inspection and
+final checks. Historical recovery sections are rejected. Witness selection is
+internal and matches publication: the lowest non-primary node ID, independent
+of acting-set order. A missing or remote designated witness is an error, not
+permission to substitute another replica or use singleton semantics. A genuine
+singleton preserves the existing single-node contract.
+
+Within the validated primary snapshot, bounded indexed queries compare the exact
+owner subject and last immutable window (issuer, VID interval, cutoff, geometry
+and participants), require Active/unselected-frontier lifecycle, creation and
+generation responsibility, and the durable generation high-water fence. An
+introduction additionally compares its exact captured creation proof; an append
+cannot replace that already-retained obligation. No full upload history or
+unbounded abandoned-finalization collection is loaded. The designated witness
+must independently have a validated settled prefix with identical epoch, index,
+log hash and state digest. Pending slots, cold validation and prefix disagreement
+fail closed without draining, recovery, mutation or checkpoint generation.
+
+Both PG mutex waits use the minimum request/section/window cutoff. The immutable
+route and window fences are rechecked after waits, witness inspection and
+snapshot teardown. No data-PG/file lock is acquired. This embedded slice performs
+no network calls; the later remote implementation must preserve the specified
+bounded metadata-witness call under primary serialization.
+
+The returned scalar prefix/witness observation is deliberately **not authority**:
+no physical consumer accepts it, and it cannot allocate, extend a cutoff, release
+custody or delete payload. This first path confirms only an Active future window;
+already-selected/terminal windows and successor/remote physical authority are not
+silently inferred from its result. The next slice is equivalent Unix/TLS
+confirmation admission/transport, followed by the consuming, immutable
+custody-to-physical-scope handoff and effect-owner checks. Mandatory live command
+selection, frontend custody and all six original skipped regressions remain
+unresolved. No schema, encoding, opening/locking protocol or ordinary fsync is
+added here.
+
+The first focused run compiled after correcting two
+test symbol names, then passed four tests and failed two fixture setups:
+UploadPart creation's reservation-bearing terminal retirement is still explicitly
+gated, including after confirmed reservation release. That gate is unchanged.
+Its confirmation case now uses a genuinely applied, startup-validated replicated
+image; Direct PUT, streamed PUT and both append cases exercise normal owning
+publication/application/retirement without a validation refresh. Completing
+UploadPart creation's terminal-retirement integration remains required before
+using confirmation on its live creation path. A corruption fixture also now uses
+a positive but incorrect cutoff, so it reaches semantic validation instead of
+failing the table's positive-value CHECK constraint during injection.
+The selected-reference corruption likewise uses valid positive stored geometry,
+so it exercises the unselected-frontier requirement rather than a SQLite CHECK.
+
+The corrected focused matrix passes **10/10 tests** in **4.676 s** (run
+`bf84ff4e-932b-4d61-bc6b-355b45be3611`). It covers all five target/append shapes,
+zero writes/commits, held primary serialization, independent subject/window/
+resource mismatches, pending and unvalidated members, designated-witness prefix
+disagreement versus real singleton semantics, bounded witness-lock waits,
+request/window expiry, same-epoch route renewal, historical-section rejection,
+and connection retirement after either member's unconfirmed snapshot teardown.
+Evidence: `/tmp/argmin-window-confirmation-focused-5.log`. Final review additionally
+strengthened the expiry canary to require reaching its selected witness hook
+before expiry and to distinguish window expiry from work-budget expiry. The
+first workspace launch was stopped during compilation for that test change;
+no failing test was retried unchanged or waived.
+
+Final validation passes formatting, strict all-target/all-feature Clippy,
+storage-boundary and diff checks. Full workspace run
+`5210964e-f394-4873-b945-8a38458fce8e` passes **10,458/10,458 tests** in
+**501.973 s**, with seven slow reports and the same six skipped regressions.
+All ten confirmation tests, including the strengthened expiry interleavings,
+pass in that run. It started only after the load gate cleared and with no
+other same-user Nextest process. Evidence:
+`/tmp/argmin-window-confirmation-{clippy-final,boundaries,workspace-final}.log`.
+This validates the read-only embedded candidate, not Unix/TLS confirmation,
+UploadPart creation's live retirement, physical grants or cleanup activation.
+
+### Remote designated-witness inspection — 2026-11-13
+
+The next bounded slice extends the admitted **embedded primary** confirmation to
+its actual Unix/TLS designated witness. The section still selects the lowest-ID
+non-primary member and holds primary serialization/snapshot through inspection.
+The remote endpoint cannot silently use its process-local fixture shadow, raw
+replica-state observation, an agreeing third replica or singleton fallback.
+The result remains a scalar observation, not transferable effect authority.
+
+The candidate witness request binds the exact recipient, epoch, PG, canonical
+topology SHA-256 and a conservative absolute wall-clock cutoff captured once
+from the remaining primary request/section/window budget. The sender shortens
+for inter-host skew; it does not send a renewable remaining duration. The
+receiver binds once to its monotonic clock and intersects its captured route
+deadline and IO limit before waiting for metadata serialization or the PG mutex.
+Same-epoch raw-map renewal cannot extend that captured deadline. The receiver
+requires its own Active admission domain/class, current Active route and
+designated-witness role, then reads only the already-validated settled prefix.
+It rechecks authority after waits and snapshot teardown. Cold or pending state
+does not trigger startup recovery, a drain, checkpoint construction or mutation.
+
+The reply echoes the exact request subject/cutoff/topology and carries the full
+typed epoch/index/log-hash/state-digest prefix. The sender validates that echo,
+then compares the prefix with the still-held primary snapshot and rechecks
+primary authority. Malformed authenticated responses and transport/receiver
+errors cannot confirm the window. There is no automatic retry in this exchange.
+
+Only complete-command owner-test servers select the V1 witness grammar on
+`MetadataCommandReplicaState`; ordinary live dispatch retains its raw grammar
+and rejects candidate requests. The pending RPC **36 → 37** transition raises
+this request's frame cap from 16 to exactly 58 bytes. Literal V37/V1 request and
+V37/V1/state-V10 success frames append evidence; predecessor specimens remain
+unchanged. No durable schema, command, checkpoint or digest changes, extra
+ordinary-path transaction/fsync, directory lock or cache redesign are added.
+
+The first focused run passed three new tests and exposed three test-expectation
+errors: client diagnostics are intentionally redacted, a wrong node maps to
+`UnknownNode`, and an elapsed work deadline maps to `TransportTimeout`. The
+assertions now check the exact typed outcomes rather than expecting diagnostic
+text or broadly accepting errors. A subsequent compile check caught a missing
+borrow in a new owner-test helper; no production predicate was relaxed.
+The pending-barrier expectation was additionally corrected to the existing
+typed contention outcome. The resulting focused run
+`47845263-8f8f-4d19-b909-ee3a1e97e463` passed **21/21 tests** in **17.229 s**
+(`/tmp/argmin-remote-witness-focused-4.log`). Independent index/log-hash/state-
+digest reply substitutions and a literal topology-hash vector were then added
+and validated in the full run below.
+
+Final validation passes formatting, strict all-target/all-feature Clippy, the
+storage-boundary checker and diff checks. Workspace run
+`5ab31a26-3d50-4b11-8749-83b8ab7b81c6` passes **10,468/10,468 tests** in
+**508.230 s**, with seven slow reports and the same six skips. All new Unix/TLS
+cases pass: five target/window shapes, exact response identities and individual
+prefix fields, no mutation or shadow/alternate-witness fallback, pending/cold/
+disagreeing state, lost reply, crossed role/topology/permit, both receiver cutoff
+orderings, same-epoch renewal during serialization wait, and primary expiry after
+a successful reply. The seven slow tests all completed successfully; the Raft
+gate was inspected doing active CPU/WAL work. No other same-user Nextest was
+active at launch, and load1 was 1.64. Evidence:
+`/tmp/argmin-remote-witness-{clippy-final,boundaries,workspace}.log`.
+
+This completes only the remote-witness leg. **Remote-primary confirmation**,
+UploadPart creation's live terminal retirement, consuming custody-to-physical
+grant handoff, physical effect exclusion and mandatory live selection remain
+separate integration gates. All six original skipped regressions remain open.
+
+### Remote-primary active-window inspection — 2026-11-13
+
+The read-only candidate now also supports an authenticated Unix/TLS primary,
+with either an embedded or remote designated witness. It uses the existing
+connection-held current-primary metadata section and does not introduce a
+server-side snapshot/inspection registry, transaction spanning RPCs, durable
+receipt, additional ordinary write/fsync, opening protocol or cache redesign.
+Live dispatch and physical-write/cleanup authority remain unchanged.
+
+The sender binds the admitted primary/client/session and captures the minimum
+request/route/window deadline before inspecting either member. It exclusively
+borrows that session throughout the operation, excluding concurrent use or
+release. While primary serialization remains held, it reads the designated
+witness **first**, then asks that same primary section to open a coherent local
+snapshot and compare the exact active future window and settled prefix. This is
+an alternative ordering to the embedded primary's held-snapshot path: the
+primary section is continuous, but the SQLite snapshot need not cross a network
+call. A changed primary prefix or pending slot after the witness observation
+fails closed, as does changed window/resource state. No data-PG/file lock is
+held across transport. This ordering refines step 3 of the confirmation decision
+without permitting a release/reacquisition gap in primary serialization.
+
+The primary request carries only the existing bounded introduction/append V1
+descriptor, not a complete command or arbitrary owner history. The receiver
+requires its own Active admission domain/class, exact current Active-primary
+route, matching topology and an already-held **current-primary** section on
+that connection. It intersects the once-captured absolute wire cutoff with its
+captured route deadline, local IO limit and immutable window cutoff before PG
+access. The same bounded indexed window and settled-prefix validation is used
+as the embedded path, with post-wait and post-snapshot checks. Cold/pending state
+does not cause recovery, draining or mutation.
+
+The response echoes node/PG/epoch/topology/cutoff, binds the exact descriptor by
+SHA-256 and identifies the actual designated witness (or genuine singleton).
+The sender compares all prefix components with the witness observation and
+rechecks the original admission/window budget. A lost or malformed reply, or
+even a successful reply declaring its connection no longer reusable, cannot
+produce confirmation. There is no automatic retry or local-shadow fallback.
+The returned scalar observation remains **not a physical grant**.
+
+The distinct `WPRI`/`WPOK` purposes share the candidate state-inspection opcode.
+Its frame cap is now **16,450 bytes** (66 bytes plus the 16 KiB descriptor bound),
+while the witness decoder still requires exactly 58 bytes. New literal V37 /
+descriptor-V1 / state-V10 composites append to the pending RPC 36 → 37 change;
+the previously frozen raw and witness specimens remain unchanged. Ordinary live
+dispatch rejects both candidate grammars. No durable format version changes.
+
+The first focused run passed 29/30 tests; its malformed-response hook rebuilt
+the success envelope without preserving connection disposition, so the client
+correctly rejected a closed section before examining the crossed payload. The
+hook now preserves that authenticated field; the separate closed-connection
+canary still requires rejection. Compile checks also caught two owner-test
+helper visibility/access mistakes, corrected without widening production API.
+The corrected run `1583db29-8e72-4acc-b7cc-aaa31284821e` passes **30/30 tests**
+in **28.846 s** (`/tmp/argmin-primary-window-focused-2.log`). Coverage includes
+five target/window shapes with both primary transports and witness modes,
+held/exclusive primary sections, zero durable mutation, no shadow fallback,
+changed window/pending/cold/prefix state after witness inspection, each response
+binding, expiry at every sender boundary, receiver wire and captured-route
+cutoffs, same-epoch renewal, lost/closed reply, crossed section/admission and
+ordinary-live dispatch rejection. Strict Clippy subsequently required boxing
+the differently sized decoded descriptor variants; no wire or behavior changed.
+
+Final validation passes formatting, strict all-target/all-feature Clippy, the
+storage-boundary checker and diff checks. Workspace run
+`de283532-d585-42ea-97ea-d44d3061218e` passes **10,478/10,478 tests** in
+**515.958 s**, with seven slow reports and the same six skips. All new primary
+inspection and codec tests pass in that final run. Slow-reported tests all
+completed successfully; the active recovery matrices were inspected doing CPU
+work, not assumed to be stuck or retried. No other same-user Nextest was active
+at launch, and load1 was 3.04. Evidence:
+`/tmp/argmin-primary-window-{clippy-final,boundaries,workspace}.log`.
+
+Remaining gates are UploadPart creation's live terminal retirement,
+consuming custody-to-physical-grant handoff, guarded physical effects, worker
+closure/retirement and mandatory live selection. All six original skipped
+regressions and the separate checkpoint-transferability follow-up remain open.
+
+### UploadPart creation release and pending-slot retirement — 2026-11-13
+
+The candidate terminal handoff now connects confirmed UploadPart **creation**
+reservation release to pending-slot retirement. Eligibility is derived from the
+retained complete described creation command, not from zero payload counts or a
+caller-selected flag. No-attempt and unconfirmed release block the sender before
+transport. Existing quiescent commands retain their behavior; finalization,
+abort, displaced payload and other non-quiescent work remain gated.
+
+The receiver cannot infer remote release from the frame. Instead, in the existing
+exact-slot deletion transaction it independently verifies the immutable owner
+subject, initial window/participants, exact creation `ReleaseDue` proof and its
+historical bucket release route, plus the generation high-water fence. The same
+check runs on absence/lost-reply retries. These records are not removed or marked
+released; they continue to own exact retry responsibility after the slot is gone.
+A faulty sender cannot use the new eligibility case to discard that custody.
+The check uses bounded indexed queries (one owner, initial window, at most 32
+participants, creation resource and counter), not all append or abandoned-finalizer
+history. Subsequent owner progress does not invalidate the immutable introduction.
+
+This adds no schema/codec change, ordinary command, transaction, fsync, new file,
+opening lock or cache redesign. Client-session continuity is unchanged. The
+candidate active-window fixture now runs actual creation, witness-first/all-member
+apply, exact reservation release and pending retirement for UploadPart too,
+replacing its earlier pre-applied-image exception. Unix/TLS inspected/installed/
+uncertain sender matrices cover the creation handoff, ambiguous release gating,
+independent missing/crossed custody, lost retirement reply, absence validation and
+non-regressing confirmed retry. Materialized state remains unchanged by retirement.
+The historical embedded/Unix/TLS matrices exercise the same creation transition
+under the original report-bound primary while the current bucket primary differs;
+that current primary stays untouched. An owner-local append/reopen canary proves
+the immutable creation check does not require an unchanged active frontier.
+
+The first focused run passed 60/62 tests; both failures were the new lowered-counter
+fixture using zero, rejected by SQLite's positive-counter CHECK before the intended
+validation. It now uses a positive value independently asserted below the retained
+generation. The expanded run `cf90aa21-979c-49cc-b2e8-92c0eae651a7` passes
+**71/71 tests** in **78.209 s** (`/tmp/argmin-creation-retirement-focused-2.log`).
+Formatting, strict all-target/all-feature Clippy and the storage-boundary checker
+pass. Final workspace run `dc14e010-df70-4c3d-a9c1-95b6a3ba8852` passes
+**10,479/10,479 tests** in **514.422 s**, with seven slow reports and the same
+six skips. All slow-reported tests completed successfully; none was retried or
+waived. No other same-user Nextest was active at launch, and load1 was 8.26.
+Evidence: `/tmp/argmin-creation-retirement-{clippy-final,boundaries,workspace}.log`.
+
+Mandatory live publisher/frontend selection, consuming
+custody-to-physical grants, guarded effects, worker closure/owner retirement, all
+six original skipped regressions and the separate checkpoint-transferability
+follow-up remain open. This closes only the candidate creation-retirement gate
+identified in the preceding active-window slices.
+
+### Consuming retired-custody to confirmed-window handoff — 2026-11-13
+
+The candidate now consumes the all-member terminal holder into an opaque
+`ConfirmedStagingWindow` after confirmed exact pending-slot retirement. It
+derives the future window from the retained complete introduction/append context
+and performs fresh primary/designated-witness inspection using the original
+current admission. Embedded, Unix and TLS primaries use the existing closed
+inspection protocols; historical sections cannot mint a new staging window.
+UploadPart creation therefore traverses its exact creation-proof release and
+retirement gate before this handoff, rather than reconstructing fresh custody.
+
+Success moves the original context and installation/application/release/retirement
+histories together with the bounded read. Failure returns that same terminal
+holder; it cannot reset uncertainty or reconstruct a fresh submission. Original
+publication, route and window cutoffs remain limits, and the narrower attempt's
+monotonic and absolute-wall cutoff is captured before I/O and rechecked after
+inspection. The returned holder cannot renew, clone, detach its context/read or
+convert back. Its observational validity check is not fresh prefix confirmation.
+Neither operation nor Drop mutates durable state or attempts cleanup.
+
+This is **not physical-write authority**. The remaining consuming issuer-owned
+one-use allocation (`B = 1`) and guarded physical-effect integration must bind
+this custody to the exact allocation lifetime and write/cleanup exclusion; a
+positive window observation alone cannot authorize file or acknowledgement work.
+Worker closure/retirement, mandatory live selection, all six original skipped
+regressions and the separate checkpoint-transferability follow-up remain open.
+No schema/wire change, extra ordinary command/fsync, opening lock, new durable
+file or cache redesign is included.
+
+Tests run actual publication, witness-first/all-member apply and slot retirement
+for five target/window shapes, three original installation histories and both
+witness placements under each primary transport. They check pre-retirement
+rejection, exact history retention, no durable mutation or Drop effects,
+crossed admission, immutable cutoff expiry during/after inspection, and lost
+Unix/TLS replies followed by explicit fresh confirmation. An executable
+compiler-negative fixture includes the production holder and pins consuming,
+private, non-Clone APIs and the absence of allocator/write/reversal operations.
+
+The first focused run passed 2/6 tests. The four failures exposed raw fixture
+setup invalidating settled-prefix validation: the shared uncertain-installation
+fixture injects a failed transaction through raw SQL/DDL. The fixture now
+explicitly performs local recovery **before publication**; confirmation never
+repairs a cold prefix. The retry canary now uses a genuinely expired attempt
+without unrelated raw state edits. The expanded run passed 32/34; both remaining
+failures were remote fixture session loss. Its serial server loop could not
+serve bucket release on a second connection while the object-PG session stayed
+held, so release waited for that session's timeout. The fixture now uses the
+existing concurrent server runner. The 63.734 s embedded matrix completed; the
+matrix is split by installation history to identify failures independently.
+Corrected run `f380f269-597a-47da-8756-f9d74c08f285` passes **40/40 tests** in
+**48.184 s** (`/tmp/argmin-window-handoff-focused-3.log`). Final formatting,
+strict all-target/all-feature Clippy, storage-boundary and diff checks pass.
+Workspace run `7c4e1979-aedb-46cd-8f61-2512f9523744` passes
+**10,493/10,493 tests** in **528.966 s**, with seven slow reports and the same
+six skips. All new handoff cases pass in the full run. Every slow-reported test
+completed successfully; active recovery/retirement matrices were inspected doing
+CPU work, not waived or retried. No other same-user Nextest was active at launch;
+load1 was initially 11.93, so launch waited until it fell to 5.63. Evidence:
+`/tmp/argmin-window-handoff-{clippy,boundaries,workspace}.log`.
+
+### Consuming embedded stream-window allocation — 2026-11-13
+
+The candidate now consumes `ConfirmedStagingWindow` into an opaque allocated
+stream holder for streamed PUT and UploadPart. It reuses the original admitted
+primary section and PG lock, then enters the existing local allocator write
+transaction. Before the one-slot cursor UPDATE it rechecks the captured settled
+prefix, absence of pending work, exact retained window/session/generation,
+placement participants, original allocation lifetime and immutable deadlines.
+The narrower confirmation cutoff reaches the final pre-UPDATE and pre-COMMIT
+checks; no caller can supply a new allocation deadline. Introduction and append
+lookahead windows use the same closed operation.
+
+Success retains the original context and complete installation/application/
+release/retirement history alongside the allocated segment. Failure also owns
+that original custody, without a grant or conversion back to fresh allocation.
+This includes a committed update with a lost reply: the cursor stays consumed,
+while the caller cannot retry/reset the same holder or obtain the segment.
+Independently confirming the same window twice does not permit a second cursor
+consumption. Drop has no cleanup or reservation-release effects. The raw
+preparation adapter is now test-only; production mutation requires both the
+opaque custody permit and node-owned exact-store/section authority. Test hooks
+remain test-only, not general transaction callbacks.
+
+The existing settled-prefix cache is preserved only through this closed local
+cursor update, which is excluded from the canonical state digest. The write
+transaction compares the old stamp and freezes the successor before commit;
+failure, unwind, intervening writes or cold validation cannot manufacture a
+positive prefix. No cache redesign, extra transaction/fsync, ordinary metadata
+command, durable file, schema or wire change is added.
+
+This is still **not physical-write authority**. Direct PUT allocation, Unix/TLS
+allocation, write/cleanup exclusion and consuming guarded effects remain next
+gates. Mandatory live publisher/frontend selection, autonomous cleanup/owner
+retirement, all six original skipped regressions and the separate checkpoint
+transferability follow-up remain open. Do not use the candidate allocated
+record as an alternative path to raw file or acknowledgement operations.
+
+Owner-local tests use the real primary's allocation lifetime, not a copied
+fixture issuer, and cover both stream targets, initial/lookahead windows and all
+three original installation histories. Canaries pin duplicate confirmed holders,
+pending/prefix changes after confirmation, changed issuer and captured session,
+cold validation, deadline expiry immediately before UPDATE and COMMIT, rollback,
+unwind, and a lost commit reply. A narrower ten-second confirmation expires while
+the publication/route and five-minute window remain valid, independently testing
+the new deadline handoff. Success changes only the local cursor and preserves
+the canonical digest/prefix; failure and Drop do not release durable ownership.
+The compiler-negative fixtures include the production holder and pin one-use
+allocation, opaque success/failure custody and absence of reset, retry, raw
+segment extraction or physical-write methods.
+
+Initial focused validation exposed test setup errors, not waived failures:
+fixture owner reads lacked the required read snapshot, the standalone compiler
+fixture lacked the allocation type reexports, and the first duplicate-holder
+test tried to reinstall a command after its slot had been retired. The corrected
+fixture creates both genuinely confirmed holders from the same pending command
+before retirement. The corrected focused run
+`a69d4bda-7b79-4555-a309-dcf19c3f5fed` passes **9/9 tests** in **9.369 s**
+(`/tmp/argmin-window-allocation-focused-5.log`). Expanded run
+`747d3887-6672-42a4-9bdd-25ee4b182131` passes **74/74 tests** in **55.221 s**,
+including existing preparation, confirmation/handoff and prefix-preservation
+tests (`/tmp/argmin-window-allocation-expanded.log`). Formatting, strict
+all-target/all-feature Clippy, the storage-boundary checker and diff checks pass.
+Final workspace run `5a3bb5d1-9eaf-498d-a05c-8b3fd6f99c6d` passes
+**10,500/10,500 tests** in **533.891 s**, with seven slow reports and the same
+six skips. All new allocation cases pass in that run. Every slow-reported test
+completed successfully; none was retried or waived. No other same-user Nextest
+was active at launch and load1 was 8.06. Evidence:
+`/tmp/argmin-window-allocation-{fmt,clippy,boundaries,workspace}.log`.
+
+### Consuming Unix/TLS stream-window allocation — 2026-11-13
+
+The candidate now consumes the confirmed holder for remote streamed PUT and
+UploadPart allocation on its original held current-primary connection. One
+request carries the bounded existing window descriptor, captured settled prefix
+and exact expected append session; no complete command is retransmitted. It
+reuses the confirmation's conservative absolute wall cutoff, already shortened
+for skew, and binds it once to receiver monotonic time. The receiver intersects
+its own captured route fence and requires Active admission in the same domain,
+the exact held section, configured topology, store, original allocation issuer,
+retained window and captured session. The existing local cursor transaction
+rechecks the prefix, authority at UPDATE and cutoff before COMMIT. It preserves
+the existing validation cache only across that fixed local effect.
+
+The sender retains original publication/application/release/retirement custody
+through success and every failure. The response binds the entire request with
+SHA-256; returned segment identity, slot, geometry, placement, length and CRCs
+must match the request/window. Lost transport replies, forged replies or an
+explicitly closed connection do not return an allocation grant, reconnect,
+renew authority or reset the cursor. A duplicate wire allocation cannot consume
+another slot, even after a successful first response. Drop does not release
+the durable owner or retry. The production mutation requires an opaque
+server-owned authority; independent raw preparation remains test-only.
+
+This adds no allocator transaction/fsync, metadata command, schema, durable file,
+cache redesign or opening lock. It appends nested V1 request/response evidence
+to the pending RPC 36→37 integration transition; prior fixtures remain intact.
+The framing cap includes the descriptor, prefix and existing bounded append
+request. Production dispatch still rejects this candidate grammar.
+
+This remains **not physical-write authority**. Direct PUT allocation, consuming
+physical write/cleanup exclusion, mandatory live publisher/frontend selection,
+autonomous owner closure/retirement, all six original skipped regressions and
+the separate checkpoint-transferability follow-up remain open.
+
+Tests cover Unix/TLS, both stream targets, initial/lookahead windows, all three
+installation histories, duplicate requests, pre-transport crossed inputs,
+receiver prefix/session/topology/route/deadline rejection, admission domain/class
+and held-section requirements, expiry immediately before UPDATE, shorter server
+route expiry despite same-epoch renewal, forged replies, explicit remote error
+after commit and actual post-commit socket disconnect. Success changes only the
+local cursor; failures preserve original custody and exact owner state. The
+compiler-negative holder fixture pins consuming remote allocation and private
+attempt construction. Literal composites and framing-cap canaries cover the
+new codec independently of the installed-server tests.
+
+Initial validation exposed fixture errors: setup's frozen clock extended into
+authenticated traffic; response mutation discarded the connection-retention
+flag; diagnostic assertions used redacted text or the wrong layer's wording.
+These were corrected without weakening allocation or custody assertions.
+Expanded allocation run `3e86f5ea-b5d0-4823-a5d9-8e81c9feaa99` passed
+**17/17 tests** in **17.604 s**
+(`/tmp/argmin-remote-allocation-focused-10.log`). The final full run also includes
+the subsequently added explicit closed-connection case. Formatting, strict
+all-target/all-feature Clippy, storage-boundary and diff checks pass. Clippy's
+first run caught two needless test-helper borrows; both were corrected before
+the successful final checks.
+
+Workspace run `fee4b470-baea-448b-aaa2-13e0148e0dfd` passed
+**10,509/10,509 tests** in **539.790 s**, with seven slow reports and the same
+six skips. All new remote allocation and codec tests pass in that run. Every
+slow-reported test completed successfully; none was waived or retried. No other
+same-user Nextest was active at launch and load1 was 2.15. Evidence:
+`/tmp/argmin-remote-allocation-{fmt,clippy-2,boundaries,workspace}.log`.
+
+### Direct PUT reservation reuse and embedded file gate — 2026-11-13
+
+Decision confirmed by the user: Direct PUT reuses the physical VID already
+chosen by its durable generation reservation. Do not add a second allocation
+registry, cursor, transaction or fsync. Unlike stream preparation, duplicated
+confirmed holders do not consume another slot; duplicate/mismatched file effects
+must be handled at the shared physical gate.
+
+The candidate now consumes confirmed Direct PUT custody into an embedded file
+writer. Before binding, the exact admitted primary rechecks the settled prefix,
+active retained window, generation reservation and live original issuer in a
+read snapshot. The writer keeps the original context/history and captured
+cutoffs; failure also retains custody, with no reset/extraction or cleanup on
+Drop. This is not a replacement frontend encryption authority: connecting the
+existing encrypted-payload subject and terminal witness to this custody remains
+part of the coordinated live selection.
+
+Each attempt derives the fixed hash/VID, data PG, placement epoch and complete
+participant vector from the retained descriptor and admission-pinned map.
+The file receiver verifies its exact runtime identity and bounded codec/shard
+geometry. The original route/work/confirmation/window cutoff intersection is
+passed into the existing write-if-absent primitive, which checks it after file
+exclusion and before temporary/final publication. Exclusion spans final-file
+sync and acknowledgement production; no PG mutex or metadata-network call runs
+under it. Exact existing bytes are required, not merely matching length/CRC64.
+The latter strengthens the shared hard-link retry path, including compensated
+CRC collisions, without adding a normal-path IO or durability barrier.
+
+This slice does **not** register acknowledgement rows, add an allocation
+transaction, change durable/wire formats, add caches/files/opening locks, switch
+live writers, or authorize cleanup. Stream file admission, Unix/TLS file
+confirmation/transport, independently admitted acknowledgement persistence,
+finite-cutoff cleanup/retirement and all six original regressions remain open.
+The checkpoint-transferability follow-up is unchanged.
+
+Tests cover duplicate confirmed holders and all three introduction histories,
+non-origin generation 9, real ciphertext/EC geometry, ordinary and equal-CRC
+conflicting bytes, crossed runtime domains with identical node/PG/epoch,
+invalid bounds/index/length, wrong target/retired issuer, a shorter confirmation
+deadline inside file publication, expiry before final publication and after
+waiting for file exclusion, and
+deletion blocked through file acknowledgement production. Owner/generation
+state survives errors and Drop; file success does not make an acknowledgement
+row visible. Compiler-negative coverage pins consuming binding, non-cloneability,
+private custody and absence of caller-supplied deadlines.
+
+Initial focused execution found two fixture errors: the
+standalone API stub was outside the node-runtime visibility boundary, and the
+exclusion test dropped its completion receiver before the deleting thread's
+notification. Both were corrected; no production assertion was relaxed. The
+expanded run passed **61/61 tests** in **42.891 s**
+(`/tmp/argmin-direct-files-focused-5.log`). An additional deadline canary initially
+used a 500 ms allowance, below the protocol's one-second skew deduction; it
+expired during confirmation rather than exercising file admission. It now uses
+a five-second allowance and deterministically advances time at the file hook,
+while the ten-second window remains valid.
+
+The first workspace run stopped with **8,053 passed, one failed, 2,462 unrun**:
+the second standalone compiler fixture, for the actual embedded publication
+bridge, lacked stubs for the newly referenced file types/methods. The positive
+API canary failed with E0425/E0599 before its negative probes. Updating that
+fixture preserves every existing negative assertion. The corrected final
+focused run `771f78b3-3646-47bd-96dd-fa06e1156301` passed **9/9 tests** in
+**2.737 s** (`/tmp/argmin-direct-files-api-final.log`); the original failed run
+remains at `/tmp/argmin-direct-files-workspace.log`.
+
+Formatting, strict all-target/all-feature Clippy, the storage-boundary checker
+and diff checks pass. Final workspace run
+`1d2f6d97-626a-46b7-9ac6-257a947f9346` passed **10,516/10,516 tests** in
+**543.531 s**, with seven slow reports and the same six skips. Every slow test
+completed successfully; none was waived or retried in isolation. No other
+same-user Nextest was active at launch and load1 was 2.19. Evidence:
+`/tmp/argmin-direct-files-{fmt-final,clippy-final,boundaries-final,workspace-2}.log`.
+
+### Consumed stream allocation to embedded file admission — 2026-11-13
+
+The candidate now consumes `AllocatedStreamWindow` into the embedded stream file
+writer for both streamed PUT and UploadPart. The successful allocation holder
+retains its exact segment and expected session authority alongside original
+complete-command custody. Neither confirmation alone nor an uncertain/failed
+allocation can obtain file admission. Binding and errors are consuming; no
+descriptor extraction, clone, reset or caller-selected deadline is exposed.
+
+Before binding, the same admitted primary opens a bounded read snapshot and
+rechecks the captured settled prefix, active window, original issuer, exact
+session/reservation responsibility and already-consumed cursor. It reuses the
+session validation from allocation, including multipart upload identity and
+generation high-water protection. The original allocation updates no additional
+state during this step. After binding, all physical subjects come from the
+private allocated segment/window; callers select only a shard index and bytes.
+Codec length, placement, participant vector and exact runtime domain are checked
+before IO. The two file bindings share placement derivation, cutoff intersection
+and the existing guarded write-if-absent primitive. No PG mutex or network call
+runs under file exclusion, which spans final publication, sync and file-ack
+production. No new transaction/fsync is added to allocation or file publication;
+the additional validation uses a read snapshot.
+
+This remains candidate-only, without acknowledgement-row publication, remote
+file transport, frontend encryption-subject/witness integration, live publisher
+selection, or cleanup/retirement authority. The checkpoint-transfer follow-up
+and the six original end-to-end acceptance regressions remain open. The next
+physical gates are independently admitted acknowledgement persistence and
+Unix/TLS file transport; neither can be inferred from a file `WriteAck`.
+
+Coverage includes both targets, initial and lookahead windows, all three
+publication histories, duplicate allocation rejection, exact file retries and
+conflicting bytes, invalid index/length, a foreign runtime with identical
+placement identifiers, session/issuer/cursor changes before binding, the shorter
+original confirmation cutoff at final publication, expiry after waiting for file
+exclusion, and deletion waiting through file acknowledgement production. Durable
+custody remains unchanged by file success, rejection and Drop; no acknowledgement
+rows appear. Compiler probes separately pin the consuming transition and reject
+confirmation-without-allocation, failed allocation, reuse, cloning, private
+custody extraction, deadline replacement and failure reset.
+
+The focused run passed **22/22 tests** in **13.056 s**
+(`/tmp/argmin-stream-files-focused-4.log`). Earlier setup failures are retained
+in the preceding build/focused logs: a missing new test module, an incorrect
+checkpoint-observation return type, and a compiler-fixture/source rename made
+during compilation. Two canaries also initially hit prefix invalidation before
+their intended checks. The positive test now binds its successful allocation
+before the deliberately rejected duplicate attempt; the cursor-negative
+explicitly validates the unchanged canonical prefix after its raw noncanonical
+cursor mutation, then requires the consumed-cursor diagnostic. No production
+cache behavior or safety assertion was relaxed.
+
+Formatting, strict all-target/all-feature Clippy, the storage-boundary checker
+and diff checks pass. Final workspace run
+`5da16ebe-dc9e-4729-8958-9219d6500392` passed **10,522/10,522 tests** in
+**543.477 s**, with seven slow reports and the same six skips. Every
+slow-reported test completed successfully; none was waived or retried in
+isolation. No other same-user Nextest was active at launch and load1 was 8.51.
+Evidence: `/tmp/argmin-stream-files-{fmt,clippy,boundaries,workspace}.log`.
+
+### Embedded acknowledgement admission from retained file receipts — 2026-11-13
+
+The candidate Direct PUT and stream file writers now retain their successful
+file acknowledgements privately. They do not accept an independently supplied
+acknowledgement batch. Direct PUT pins logical size before dispatch, including
+an uncertain file outcome, preventing same-padded-length geometry substitution
+between shard attempts. The stream size remains fixed by consumed allocation.
+File retries retain write-if-absent semantics and only actual successful returns
+enter the bounded receipt set.
+
+Embedded acknowledgement publication borrows original custody, requires every
+shard index with exact codec geometry, and derives keys, data PG, placement epoch
+and acknowledgement primary from the retained descriptor. The admitted map must
+still select that exact Active primary and runtime domain. The node receiver
+acquires its existing PG mutex under the captured work deadline and privately
+mints an authority binding the exact store and borrowed batch. No public
+constructor, raw row extraction or caller deadline is added. Registration uses
+the existing single exact-batch transaction with the original intersected fence
+checked after SQLite admission and immediately beside each INSERT/exact retry.
+Cleanup takes the same PG mutex and cannot observe a partial batch. An admitted
+transaction may complete after the cutoff; its mutex remains held through
+commit/rollback. This adds no lock, registry, schema/encoding change or fsync
+beyond the acknowledgement transaction already required by existing writers.
+
+Success and failure both leave the owning writer intact; neither disarms the
+generation nor authorizes terminal publication or cleanup. An ambiguous storage
+failure cannot reset custody or obtain a new cutoff. Repeating registration uses
+the same recorded set and existing exact-row semantics. Independently admitted
+Unix/TLS file/ack transport, frontend encrypted-payload and terminal-witness
+integration, live selection, cutoff cleanup and durable retirement remain open.
+The checkpoint-transfer follow-up and all six original acceptance regressions
+are unchanged.
+
+Tests cover Direct PUT, streamed PUT and UploadPart; missing receipts, complete
+ordered registration, acknowledgement-primary selection distinct from shard
+zero, exact retries without row rewrites, rollback on a later conflicting row,
+original confirmation expiry immediately before INSERT, same-size geometry
+substitution, foreign same-ID runtimes and non-primary receivers, and cleanup
+waiting for the complete committed batch. Compiler probes reject batch/receiver
+authority construction, raw receipt injection/extraction and caller deadlines.
+The first bridge API run found a fixture-only private-module reference; it now
+uses the same opaque authority re-export as production. The six-test selection
+passed, followed by an expanded **53/53** selection in **10.870 s** and the
+final **41/41** acknowledgement/API selection in **5.148 s**, including the
+cleanup/commit exclusion canary. Clippy identified complex tuple signatures and
+a large test-only enum; these became a named internal row-description record
+and boxed test handles, without changing the admission contract.
+
+Formatting, strict all-target/all-feature Clippy, the storage-boundary checker
+and diff checks pass. Workspace run
+`a53ec4df-36d0-4dbf-b71b-84a16acca9e0` passed **10,528/10,528 tests** in
+**543.420 s**, with seven slow reports and the same six skips. Every slow test
+completed successfully; none was waived or retried in isolation. No other
+same-user Nextest was active at launch and load1 was 2.23. Evidence:
+`/tmp/argmin-staging-acks-{focused-2,focused-3,fmt-2,clippy-2,boundaries,workspace}.log`.
+
+### Remote Direct PUT file-binding inspection prerequisite — 2026-11-13
+
+Ordinary primary-window inspection proves retained metadata and a settled
+prefix, not the live issuer and fixed generation reservation needed to bind a
+Direct PUT file writer. A new candidate read-only `DPRI`/`DPOK` purpose uses the
+same bounded state-inspection opcode and unchanged route/descriptor grammar.
+The receiver requires its own Active admission domain, exact current-primary
+route/topology and the already-held connection-local primary section. It checks
+the Direct PUT target, original live issuer and exact generation reservation
+inside the same PG lock/read snapshot as the prefix/window inspection. The
+original absolute conservative wire cutoff is intersected with server route,
+window and IO limits; there is no allocation, metadata write or added fsync.
+
+The response echoes the exact route/cutoff, descriptor SHA-256 and designated
+witness with a distinct reply purpose. It is an observation, not physical
+authority. Ordinary window replies cannot stand in for this inspection. Prior
+window/witness/allocation specimens remain unchanged; new framed composites
+append to the pending RPC 36 → 37 transition.
+
+This slice deliberately ends at the receiver prerequisite. Connecting the
+consuming remote file-writer holder must retain original custody and immutable
+cutoffs, validate the returned prefix, and never reconnect or refresh authority
+on failure. Actual remote shard admission and acknowledgement transport,
+frontend encryption/witness integration, live selection and cleanup remain
+open. The standalone inspection does not relax any of those gates.
+
+The initial three focused tests passed in **12.900 s** after correcting fixture
+setup: raw generation-reservation changes invalidate canonical state/prefix
+validation and cannot be blessed by startup recovery. Those cases separately
+check the exact reservation predicate in a read snapshot and the installed
+receiver's fail-closed rejection. The replaced-issuer case preserves canonical
+state and explicitly revalidates it; ordinary inspection succeeds while the new
+purpose rejects, independently pinning the added live-issuer check. One test
+compilation also caught use of the opaque error type's debug name instead of
+its actual `MetadataCommandContention` code; the assertion now pins the code
+and diagnostic. No production validation was weakened.
+
+The matrix also covers positive Unix/TLS observations, both stream targets,
+crossed node/epoch/topology/descriptor, wrong admission class/domain, a separate
+connection without the held section, expired cutoff, unchanged real/shadow
+stores and live-dispatch rejection. Literal framed evidence pins both purposes
+independently. A subsequent case holds the PG mutex until the receiver times
+out, to pin the new purpose's bounded wait.
+
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff
+checks pass. Workspace run `7a86cd60-2943-4cf9-a689-e713e92019ed` passed
+**10,531/10,531 tests** in **549.742 s**, including both installed-server tests,
+the additional PG-wait case and the frozen codec specimens. All seven
+slow-reported tests completed successfully; the same six skips remain. No other
+same-user Nextest was active at launch and load1 was 2.18. Evidence:
+`/tmp/argmin-direct-primary-{focused-4,fmt,clippy,boundaries-final,workspace}.log`.
+
+### Consuming remote Direct PUT file binding — 2026-11-13
+
+The candidate `ConfirmedStagingWindow` now consumes itself into the existing
+Direct PUT file-writer holder through one inspection on the exact original
+remote primary client/session. It borrows that session with the minimum of
+the retained confirmation/work deadlines; mutex contention cannot inherit
+another request's longer timeout. It sends `DPRI` with the stored absolute
+conservative cutoff and descriptor, checks the exact `DPOK` purpose, echoed
+route/cutoff, descriptor digest and witness, then compares the returned prefix
+with the original captured observation before minting the writer.
+
+Review correction: client-instance plus node/PG/epoch equality did not prove
+that binding reused the section held during confirmation. Each acquired remote
+section now has a private process-local identity; the captured remote window
+retains it, and file binding compares it under the transport mutex before
+sending the inspection RPC. Retaining the identity allocation prevents reuse
+after the original session closes. Embedded confirmation carries no remote
+identity and cannot substitute for remote confirmation. There is no new wire
+field, persistent record or registry. The installed Unix/TLS regression closes
+the original section using its actual Drop/shutdown path, opens another through
+the same client/endpoint, proves the old subject checks accept it, then requires
+the specific identity rejection with zero binding RPCs and unchanged custody
+before/after failure Drop. It covers installed, inspected and uncertain histories.
+
+The writer retains the same complete context/history, fixed generation and
+immutable fences. No supplied descriptor, observation, generation or new
+deadline enters its constructor. Failure consumes custody into the existing
+opaque failure holder; there is no automatic retry, reconnect, reverse
+conversion or cleanup on Drop. The embedded and remote constructors share the
+same private finishing/fence code. This is read-only binding, with no registry,
+allocator change, metadata transaction or fsync. Remote shard IO and remote
+acknowledgement persistence remain unimplemented; the consuming holder does not
+make the old raw shard RPC eligible for use. Streamed PUT/UploadPart remote
+file binding was still separate at this slice; the consuming binding is now
+implemented in the follow-up below. Receiver-side physical admission, frontend
+encryption/witness integration and live cleanup/selection remain separate gates.
+
+Installed Unix/TLS tests cover all original custody
+histories, immutable wire cutoff despite sender wall-clock movement, exact
+prefix/descriptor/witness/purpose validation, error/closed replies without
+retry, foreign clients, expired authority, original-issuer replacement,
+wrong targets and bounded session-mutex waiting. Compiler probes cover
+consumption, private fields, no Clone/reset/caller deadline and absence of a
+remote physical-write API. The first run passed three tests but exposed a
+fixture error in the cutoff canary: the wall-clock-only override also changes
+the test monotonic clock. The corrected test preserves the monotonic value
+while moving wall time and pins identical captured/binding wire cutoffs.
+The expanded **14/14** focused selection passed in **15.658 s**
+(`/tmp/argmin-direct-binding-focused-2.log`), including embedded file and wire
+regressions. The final suite additionally includes a same-node/same-endpoint
+foreign-client-instance rejection.
+
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff
+checks pass. Workspace run `3b5dfe93-4c0d-4792-8d7c-05f2f1433e79` passed
+**10,534/10,534 tests** in **554.788 s**, including all three new Unix/TLS
+binding matrices and the expanded compiler probes. All seven slow-reported
+tests completed successfully; the same six skips remain. No other same-user
+Nextest was active at launch and load1 was 4.23. Evidence:
+`/tmp/argmin-direct-binding-{focused-2,fmt,clippy,boundaries,workspace}.log`.
+
+Session-identity review correction validation: **6/6** focused tests passed in
+**17.601 s**, including Unix/TLS same-client reopen rejection for every custody
+history. Formatting, strict Clippy, boundary and diff checks pass. Workspace run
+`7f205891-8c6e-4b0a-8829-013089859f82` passed **10,535/10,535 tests** in
+**555.584 s**; all seven slow-reported tests completed, with the same six skips.
+No other same-user Nextest was active at launch and load1 was 1.76. Evidence:
+`/tmp/argmin-binding-session-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+Follow-up review found that remote stream allocation still used only the
+client/node/PG/epoch checks. Direct file binding and stream allocation now share
+the captured-window session validator. The opaque allocation attempt invokes it
+at the actual send boundary under the transport mutex, before request-ID
+allocation or network IO. Thus neither remote consumer can replace confirmation's
+section with a reconnected same-client section. No identity getter or renewed
+deadline is exposed, and no wire/durable format changes are needed.
+
+New installed Unix/TLS regressions cover streamed PUT and UploadPart, initial
+and lookahead windows, and installed/inspected/uncertain custody histories.
+They close the original section, reopen through the same client/endpoint and
+prove the old subject checks pass, then require the exact identity error with
+zero allocation RPCs. Cursor, retained owner, full state, shadow runtimes and
+custody history remain unchanged before/after failure Drop.
+
+Stream-session review correction validation: **14/14** focused tests passed in
+**22.460 s**, including the new reopen matrices, existing healthy stream/direct
+binding matrices, and compiler API probes. Formatting, strict Clippy, boundary
+and diff checks pass. Workspace run
+`269e40a2-a4a4-4828-bcb4-5a6b32b35ac6` passed **10,537/10,537 tests** in
+**556.578 s**; all seven slow-reported tests completed, with the same six skips.
+No other same-user Nextest was active at launch and load1 was 3.91. Evidence:
+`/tmp/argmin-stream-session-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+## Remote Stream File Receiver Prerequisite — 2026-11-13
+
+The next candidate slice adds read-only post-allocation inspection for streamed
+PUT and UploadPart, preceding the consuming remote file binding implemented below.
+The receiver shares allocation's current Active-primary/domain admission,
+already-held section check and bounded PG acquisition. It intersects the
+original absolute wire cutoff, retained window cutoff and receiving route
+deadline; same-epoch route renewal cannot extend the captured bound.
+
+The separate `SFPI`/`SFOK` V1 purpose carries the original allocation request
+and its returned segment. A single settled-prefix read snapshot validates the
+exact durable window, expected prefix, live original issuer, session/encryption
+and generation authority, complete segment-to-request/descriptor correspondence,
+and the already-consumed cursor. It performs no allocation, metadata write,
+file IO or acknowledgement publication. The reply's SHA-256 binds the complete
+inspection request. Existing `SALL`/`SALR` bytes remain unchanged; allocation
+cannot accept inspection bytes or mistake its reply for an allocated segment.
+The shared frame cap includes the additional bounded carrier while retaining
+the inner allocation limit. This remains part of the pending RPC 36→37 change.
+
+The receiver is owner-test-selected only. An authenticated descriptive request
+and observational reply are not a physical grant: the next consuming binding
+must derive them from its original opaque allocated holder and enforce its
+captured session identity, custody and immutable deadline. Remote file effects,
+remote acknowledgement persistence, frontend integration and all live
+activation/cleanup gates remain open. No new fsync, registry or storage file is
+introduced.
+
+Installed Unix/TLS coverage spans both targets,
+initial/lookahead windows and installed/inspected/uncertain histories, with
+read-only exact retries, crossed segment fields, session/generation/prefix/
+topology/cutoff rejection, unconsumed/over-consumed cursors, issuer replacement,
+admission-domain/class/held-section rejection and disabled live dispatch. The
+receiving-route deadline also bounds PG-lock waiting despite raw same-epoch
+renewal. Both ordinary allocation and its file inspection retain their own
+strict purpose/size limits and exact new framed specimens.
+
+The first test runs exposed three fixture mistakes, all corrected without
+relaxing production validation: assertions initially inspected a deliberately
+redacted public error rather than its structured RPC detail; raw cursor edits
+needed explicit canonical-state revalidation to isolate the cursor predicate;
+and the route-expiry helper needed the test's original primary section closed
+before acquiring its own. The corrected focused matrix passed **20/20** in
+**22.719 s**, including existing remote allocation and embedded file gates.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks pass.
+Workspace run `6bd2c15d-9d2a-43bf-b8c3-6584a3adfa55` passed
+**10,540/10,540 tests** in **565.094 s**. All seven slow-reported tests
+completed successfully; the same six skips remain. No other same-user Nextest
+was active at launch and load1 was 6.62. Evidence:
+`/tmp/argmin-stream-file-primary-{focused-5,fmt,clippy,boundaries-final,workspace}.log`.
+No completion/activation claim is made. The consuming remote stream file binding
+was the next step and is implemented below. Remote physical writes and
+acknowledgement publication remain separate gates.
+
+## Consuming Remote Stream File Binding — 2026-11-13
+
+The opaque successful stream allocation can now be consumed into the existing
+stream file writer after one read-only inspection on the original remote primary
+section. This covers streamed PUT and UploadPart, initial and lookahead windows.
+No supplied segment, expected session, descriptor, reply or deadline can mint
+that writer. The request is reconstructed from the holder's private allocated
+segment, expected authority and complete context; the captured window retains
+the original absolute cutoff. Inspection validates the exact request digest,
+without a transport retry or reconnect.
+
+The binder verifies the original client/route and private session identity under
+the deadline-bounded transport mutex before sending. The success and failure
+paths share the embedded binder's one-way finishing operation, retaining original
+context/history, consumed cursor and release responsibility. The file fence is
+the intersection of the captured confirmation/window, work and route fences;
+moving wall time cannot renew it. Closed sessions, crossed responses, expiry,
+issuer replacement or consumed-cursor mismatch cannot produce a writer. Failure
+and Drop neither reset allocation nor release resources.
+
+This consumes the receiver prerequisite above; it adds no wire/schema format,
+metadata transaction, fsync or allocation registry. Compiler probes enforce
+one-use consumption, private custody, no Clone/reset/caller deadline or segment,
+and absence of a remote physical-write method. Installed Unix/TLS matrices cover
+both targets/windows and installed/inspected/uncertain histories, unchanged
+state/shadow runtimes, original-cutoff request identity, same-client reopen
+rejection before transport, malformed/error/closed replies with exactly one
+attempt, foreign clients, issuer/cursor rejection and bounded session-mutex
+waiting. The focused **15/15** tests passed in **26.181 s**, including existing
+Direct PUT binding and stream receiver matrices and the expanded compiler
+probes. Formatting, strict all-target/all-feature Clippy, storage-boundary and
+diff checks pass. Workspace run `71f4ab40-80bf-4b97-9b15-36039ace2ad8`
+passed **10,548/10,548 tests** in **577.617 s**. All seven slow-reported
+tests completed successfully; the same six skips remain. No other same-user
+Nextest was active at launch and load1 was 9.25. Evidence:
+`/tmp/argmin-stream-binding-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+Remote physical shard effects and remote acknowledgement persistence remain the
+next gates, followed by frontend encrypted-payload/witness integration and live
+selection/cleanup. This binding alone neither activates the protocol nor permits
+using the old raw shard RPC as an owner-authorized effect.
+
+## Receiver-Owned Confirmation Peer Routing — 2026-11-13
+
+The next remote physical-effect prerequisite is independent receiver-side window
+confirmation. Transport authentication and a frontend's prior observation are
+not evidence that a physical write remains covered. Reuse the existing bounded
+primary-window and settled-witness RPCs; do not introduce signing, a confirmation
+cache, new storage files, or extra persistence barriers. The frontend must release
+its primary section before physical dispatch so the receiver can acquire its own
+section. Confirmation runs before data-PG/file locks; final immutable-cutoff checks
+remain inside physical exclusion.
+
+This first prerequisite slice adds process-local peer routing under the existing
+storage-node runtime-config publication owner. Candidate bootstrap supplies the
+existing typed storage-node credential and resolved Unix/TLS endpoints alongside
+the authoritative runtime map. Storage validates the exact process configuration,
+endpoint set and identities, and local node/authentication domain. No endpoint,
+primary or witness is accepted from a physical request. Complete-map refreshes
+publish the directory with their configuration under the same lock; config-only
+updates clear it. Failed validation publishes neither half. No persisted format
+or startup migration changes.
+
+Long-lived RPC connections reload the directory alongside config and lease under
+the same runtime-state read lock. The refresh regression checks both removal and
+repopulation on an existing connection handler, not only newly accepted handlers.
+
+Selection requires the receiver's own Active admission permit, the exact captured
+configuration generation, a live route fence and an Active object-PG route. It
+chooses that route's primary and lowest-ID non-primary witness, independently of
+acting-set order. This is only a borrowed routing selection, **not** confirmation
+or a physical grant. Bootstrap remains storage-private and candidate-selected.
+The following slice adds the bounded receiver lookup; production bootstrap
+selection, release-before-dispatch, physical RPCs and acknowledgement effects
+remain open. Peer routing alone establishes neither installed confirmation nor
+physical-effect coverage.
+
+Validation: six peer-routing regressions cover exact primary/designated-witness
+selection (including unsorted acting sets and a genuine singleton), unknown PG,
+foreign/retained-cleanup admission, receiver expiry and Peering rejection;
+duplicate/missing/extra/crossed endpoints, crossed config/epoch, and independent
+credential node/cluster/generation/digest mismatches; post-builder auth changes
+before store opening; atomic publication, failed-install preservation and
+long-lived handler refresh. The positive fixture completes actual control-plane
+Peering before selecting an Active route. Formatting, strict all-target/all-feature
+Clippy, storage-boundary and diff checks pass. Workspace run
+`c9605b2a-f413-4224-9ba4-57ef0b0849fc` passed **10,554/10,554 tests** in
+**573.643 s**, including all six new regressions. All seven slow-reported tests
+completed successfully; the same six skips remain. No other same-user Nextest
+was active at launch and load1 was 7.63. Evidence:
+`/tmp/argmin-receiver-peers-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+Review correction — 2026-11-14: domain equality alone did not establish that the
+configured verifier accepted the outbound credential. Bootstrap now uses the
+verifier's shared exact cluster/credential-ID/version/principal lookup and a
+local HMAC sign/verify check with its accepted key. Secrets remain private and
+authenticator comparison uses the existing cryptographic provider. No network
+request, persisted state or wire-format change is introduced. Independent ID,
+version, same-length secret and same-node principal substitutions are rejected
+both during peer preparation and after a later builder option replaces the
+verifier, before opening stores. A retained rotation-key positive canary ensures
+acceptance follows the configured keyring rather than its first/latest entry.
+Validation: **13/13** focused peer-routing/scoped-credential tests pass.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks pass.
+Workspace run `b67a75af-1c1e-4840-9e1c-46b6ed3e9ed7` passed
+**10,556/10,556 tests** in **577.153 s**, with all seven slow-reported tests
+completed successfully and the same six skips. No other same-user Nextest was
+active at launch; load1 was 1.42. Evidence:
+`/tmp/argmin-receiver-peer-credentials-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+## Independent Receiver Window Observation — 2026-11-14
+
+The candidate receiver now uses its captured peer directory for an independent,
+read-only confirmation. It validates the bounded descriptor and topology, freezes
+the intersection of the incoming absolute cutoff, work deadline, captured route
+authority and durable window cutoff, then opens its own primary section. While
+holding that section it reads the designated witness and the exact primary window
+and requires complete-prefix equality. It closes the section and revalidates
+authority before returning only a scalar observation, not a physical grant.
+
+The exchange has no automatic retry, reconnect, fallback witness, new persistence
+or wire grammar. No local PG/file lock spans network IO. Receiver IO waiting is
+bounded separately from portable authority; forwarding the default one-second IO
+limit after a one-second skew deduction would cause immediate expiry. The wire
+cutoff is never later than the inbound bound or captured authority. Authenticated
+peer error classes remain intact rather than being collapsed into Internal.
+
+Installed Unix/TLS candidate tests use actual storage-node credentials and copied
+settled PG images. Only the test receiver endpoint directory is injected; exact
+runtime-map bootstrap and atomic publication retain their separate owner-local
+coverage. This is not evidence of live production bootstrap or physical dispatch.
+The matrices cover all target/window kinds, primary section ownership and release,
+invalid descriptors/expiry before transport, unsettled or disagreeing witnesses,
+changed primary windows, same-epoch renewal, malformed authenticated replies,
+contention, and expiry after each observation and teardown. A separate canary
+pins the same non-extended cutoff at both authenticated peers and obtains the
+receiver's local PG mutex at every exchange boundary.
+
+Validation: **16/16** focused receiver/primary-confirmation tests passed in
+**27.632 s**. Formatting, strict all-target/all-feature Clippy, storage-boundary
+and diff checks pass. Workspace run
+`0c18090d-06cf-4aa3-879b-38be4884d62f` passed **10,564/10,564 tests** in
+**581.197 s**; all seven slow-reported tests completed successfully and the same
+six skips remain. No other same-user Nextest was active at launch; load1 was
+4.34. Evidence: `/tmp/argmin-receiver-window-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+Still open: release-before-dispatch frontend handoff, remote physical file and
+acknowledgement effects with final checks inside exclusion, encrypted-payload/
+witness integration, owner cleanup and live selection. This observation does not
+activate any of those paths.
+
+Release-order correction — 2026-11-14: dropping the client session only shuts down
+its socket; it does not prove that the peer has dropped its PG guard. Successful
+receiver confirmation now consumes the held session through the existing
+authenticated lock-release RPC under the original lookup deadline. The server
+removes its guard before producing the empty success acknowledgement. No retry or
+reconnect follows release failure, and missing, rejected, malformed or late
+acknowledgements cannot yield a positive observation. Socket shutdown remains
+best-effort teardown on failure, not release evidence.
+
+The Unix/TLS regression pauses server release before guard removal, verifies the
+guard remains held and confirmation cannot return, then checks immediate guard
+absence after success without acquiring/waiting for a fresh section. Its expiry
+case returns failure while the guard is still deliberately held. Additional
+authenticated error/nonempty-reply cases require one attempt and no confirmation.
+Validation: **10/10** focused receiver tests passed in **24.611 s**. Formatting,
+strict all-target/all-feature Clippy, storage-boundary and diff checks pass.
+Workspace run `ba4df014-ded3-4dec-8caa-e2682d1e633f` passed
+**10,566/10,566 tests** in **582.303 s**. All seven slow-reported tests completed
+successfully; the same six skips remain. No other same-user Nextest was active
+at launch; load1 was 2.45. Evidence:
+`/tmp/argmin-receiver-release-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+## Frontend File Binding Release Handoff — 2026-11-14
+
+Remote Direct PUT and stream file binding now complete release-before-dispatch
+as part of the consuming constructor, not a caller-managed ordering convention.
+After the exact original-session inspection, the binder captures its existing
+file fence and consumes the held transport borrow through the bounded release
+exchange. Only an authenticated empty success acknowledgement, followed by
+revalidation of the original window/route/work fence, permits writer construction.
+This covers streamed PUT and UploadPart, including lookahead windows.
+
+The caller cannot omit release, substitute a reconnected section, mint a writer
+from an observation, or extend the deadline. A release timeout, rejection or
+malformed acknowledgement retains the complete original command/history (and
+successful stream allocation) in the existing opaque failure holder. It offers
+no retry, reset or reverse conversion. The local session is closed after either
+confirmed or uncertain release; Drop never releases durable ownership. No new
+allocation, registry, durable mutation, fsync or wire grammar is introduced.
+
+The owner-local Unix/TLS matrix pauses remote guard removal and verifies that
+writer construction remains blocked. On success it checks immediate guard
+absence without waiting for another acquisition. Timeout and signed error/
+nonempty-reply cases retain unchanged owner/cursor/history and cannot return a
+writer or reuse the original transport. Existing installed/inspected/uncertain
+binding matrices also check confirmed release. An authentic release-success
+response delayed beyond the captured portable cutoff (but inside the local IO
+bound) independently pins post-release authority revalidation. Compiler probes
+still enforce one-use construction and the absence of a remote physical-effect API.
+
+Validation: **17/17** focused handoff/binding/API-shape tests passed in
+**36.698 s**. Formatting, strict all-target/all-feature Clippy, storage-boundary
+and diff checks pass. Workspace run
+`bf517654-5bec-4912-96fa-8d0d8b46ade1` passed **10,570/10,570 tests** in
+**589.421 s**. All seven slow-reported tests completed successfully; the same
+six skips remain. No other same-user Nextest was active at launch; load1 was
+6.62. Evidence: `/tmp/argmin-file-handoff-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+This is a remote-primary frontend handoff only, not remote shard IO or live
+activation. Remote physical file/acknowledgement operations must still invoke
+receiver-owned confirmation before data/file locks and enforce immutable
+cutoffs inside physical exclusion. The following slice supplies the corresponding
+embedded-primary consuming section-release handoff and separates writer types.
+
+## Typed Dispatch-Ready File Custody — 2026-11-14
+
+Remote and ordinary embedded bindings previously returned the same writer type.
+Adding a remote-write method there would have admitted embedded writers while
+their caller still held primary serialization. Remote-primary binding now returns
+a distinct opaque `RemoteDirectStagingFileWriter` or `RemoteStreamStagingFileWriter`
+only after its bounded release acknowledgement. These retain the existing
+private writer/custody and original cutoffs; they expose neither the inner writer
+nor an embedded or remote physical-effect method.
+
+The embedded-primary counterpart consumes `EmbeddedPublicationSection` by value.
+It validates the exact admitted section/store/window (and successful stream
+allocation), captures the existing file fence, drops that section synchronously,
+then revalidates authority before constructing dispatch-ready custody. A borrowed
+section cannot satisfy this boundary. Failure releases the consumed guard but
+retains the original owner/history and any consumed stream allocation in the
+existing opaque failure holder, without reset, cleanup, or new authority.
+
+Ordinary embedded file/acknowledgement APIs remain on their existing writer types.
+Their private conversion helper is inaccessible to callers; no caller-selected
+release flag, scalar observation, callback, or new deadline can mint a
+dispatch-ready writer. The new wrappers introduce no allocation registry, wire
+grammar, durable write, or fsync. Live selection and remote physical effects
+remain gated.
+
+Owner tests cover all targets/windows and installed/inspected/uncertain histories,
+immediate non-waiting lock availability after successful handoff, crossed-domain
+sections, expiry, unchanged durable state and preserved allocation after failure
+and Drop. Compiler probes require consuming section ownership and distinguish
+the writer types; they reject section reuse, private conversion, inner-writer
+extraction, cloning and effect methods. Existing Unix/TLS release/cutoff matrices
+exercise the new remote-primary return types.
+
+Validation: all 20 focused tests passed. Formatting, strict all-target/all-feature
+Clippy, the storage boundary checker, and `git diff --check` passed. The full
+workspace Nextest run passed all 10,573 tests (7 slow, 6 skipped) in 592.181s,
+after waiting for no other same-user Nextest run and a host load below 10
+(4.58 at admission). Evidence:
+`/tmp/argmin-dispatch-ready-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+## Receiver-Owned Direct PUT File Effect — 2026-11-14
+
+The candidate storage-node receiver now performs a complete Direct PUT file
+effect behind Active admission, without accepting a supplied confirmation or
+file key. Before peer IO it decodes the retained descriptor, checks current
+topology/placement, the exact receiving participant and bounded encrypted shard
+geometry, and captures the intersection of the receiver route, request/work
+cutoff and durable window cutoff. Its primary inspection uses the Direct PUT
+file-binding purpose: the live allocation issuer and exact generation reservation
+must still match, not merely the retained owner/window.
+
+The receiver independently acquires primary serialization, reads the designated
+witness, compares the primary's exact settled prefix/window/reservation, and
+requires acknowledged primary release. Only afterward does it enter the existing
+write-if-absent primitive, which checks the same captured fence inside shared
+file-mutation exclusion and retains exclusion through file acknowledgement.
+Confirmation failure, release failure and expiry cannot authorize a write. Exact
+matching retries retain the existing hard-link durability contract; different
+bytes cannot replace the existing shard.
+
+This is a candidate receiver implementation, not a new live RPC or frontend
+dispatch path. No public scalar observation is a physical grant. The existing
+dispatch-ready frontend writers still expose no remote effect method. Stream
+receiver effects, acknowledgement-row publication, sender/request binding and
+live selection remain separate integration steps. No new durable row, format,
+metadata command, registry or fsync is introduced.
+
+Owner-local tests use real encrypted/EC shard bytes and installed authenticated
+Unix/TLS primary/witness endpoints. They pin exact readback/retry and refusal to
+overwrite different bytes, immediate primary-section absence before the file
+effect, unchanged SQL/acknowledgement rows, rejection of wrong participants and
+geometry before transport, failed primary/witness/release exchanges, and a
+retained-but-old issuer that must not authorize writing. The deadline matrix
+independently expires the durable window, request and receiver route, both before
+writing and at guarded publication. Each expiry test asserts that it reached
+the requested fault boundary; clock overrides start only after authenticated IO.
+
+Validation: all 15 focused receiver tests passed. Formatting, strict
+all-target/all-feature Clippy, the storage boundary checker and diff checks
+passed. The full workspace Nextest run passed all 10,578 tests (7 slow, 6
+skipped) in 595.888s. It started with no other same-user Nextest process and
+host load 2.14. Evidence:
+`/tmp/argmin-receiver-files-{focused,fmt,clippy,boundaries,workspace}.log`.
+
+## Receiver-Owned Stream File Effects — 2026-11-14
+
+The candidate receiver now also covers streamed PUT and UploadPart, for both
+introduction and appended windows. It decodes the existing stream file-inspection
+description, derives the window and physical geometry from that same description,
+and uses the shared receiver file-effect path introduced above. It cannot receive
+an independently supplied file key or confirmation as write permission.
+
+While holding its independently acquired primary section, the receiver compares
+the designated witness with the exact primary prefix/window, requires the
+allocation description's prefix to match, and performs the existing read-only
+stream file inspection. That inspection validates the captured session and
+generation, live issuer, exact allocated segment and consumed one-slot cursor.
+Both inspections use the same held section. Forwarded inspection authority is
+shortened to the captured receiver/request/window bounds, never renewed. Failed
+inspection or failed release acknowledgement prevents physical effects.
+
+Storage peers use the read-only metadata-state RPC kind for the existing `SFPI`
+file-inspection grammar. The frontend allocation kind remains frontend-only;
+its role policy is not broadened. Candidate read dispatch validates the file
+grammar before invoking inspection and rejects raw `SALL` allocation requests.
+The read kind's bounded frame cap now covers the existing stream-inspection
+maximum; exact-at-cap/over-cap tests cover that admission change. Production
+dispatch still rejects these candidate grammars.
+
+Direct and stream entry points now share placement/receiver validation, fence
+intersection, release-before-file ordering and the existing write-if-absent
+primitive. The route fence is captured before decoding. The original fence is
+rechecked inside file-mutation exclusion, which extends through acknowledgement
+production. Stream inspection does not allocate another VID or persist shard
+acknowledgement rows.
+
+This extends the previous receiver-only candidate slice; it does not activate
+live shard RPC dispatch or expose remote effects on frontend writer holders.
+Sender/request custody, acknowledgement-row effects and live selection remain
+gated. No new encoded payload grammar, durable row, metadata command, registry
+or fsync; the candidate read-opcode selection above is explicit.
+
+Validation: 28 focused receiver, window, allocation and frame-admission tests
+passed. The new seven-test stream receiver matrix covers Unix/TLS, streamed PUT
+and UploadPart, initial/appended windows, exact retries, changed-byte refusal,
+crossed segment/prefix/session evidence, consumed cursor and live issuer,
+peer/release failures, and independent request/route expiry before and inside
+the physical effect guard. It also proves the peer read opcode cannot allocate.
+Formatting, strict all-target/all-feature Clippy, storage boundary checks and
+`git diff --check` passed.
+
+The initial full workspace run **failed**: 8,990 passed, one
+failed, six skipped and 1,594 not run (512.769 seconds). The failure was
+`staging_direct_file_binding_remote_keeps_original_cutoff_history_and_state`
+at `payload_staging_direct_file_binding_remote_tests.rs:145`: confirmation
+echoed cutoff bytes `[161, 23, 26, 218, 161, 1, 0, 0]`, while binding echoed
+`[162, 23, 26, 218, 161, 1, 0, 0]`, one millisecond later. Investigation found
+that `CapturedWindowRead` stores one wall-clock projection, whereas remote
+confirmation independently projects and intersects its deadline; later binding
+reuses the former rather than the actual confirmation cutoff. The correction
+below retains that exact cutoff; the original assertion is preserved.
+Logs: `/tmp/argmin-stream-receiver-focused.log` and
+`/tmp/argmin-stream-receiver-workspace.log`. The full run began with no other
+same-user Nextest run and a one-minute load of 3.64.
+
+### Exact Confirmation Cutoff Retention — 2026-11-14
+
+Remote confirmation now returns the exact local deadline and absolute portable
+cutoff used for its successful inspection, after window and route intersection.
+`CapturedWindowRead` retains those values rather than projecting its own second
+cutoff. Direct PUT binding and streamed PUT/UploadPart allocation therefore reuse
+the actual confirmation bound. The observation-only entry still returns just its
+scalar evidence; no new effect authority or wire format is introduced.
+
+The existing Unix/TLS Direct PUT regression now forces a wall-clock change at
+the inspection projection, then restores it before network IO, while preserving
+monotonic time independently. This deterministically distinguishes the old
+caller-side projection from the cutoff actually confirmed. The later binding
+clock-shift check, exact echoed-cutoff equality, all three custody histories,
+unchanged durable state and release-before-return assertions remain intact.
+
+Validation: all 60 focused confirmation/handoff/allocation/receiver tests passed
+(61.325 seconds). Formatting, strict all-target/all-feature Clippy, storage
+boundary checks and `git diff --check` passed. The final full workspace run
+passed **10,585 tests** (seven slow, six skipped; 597.693 seconds), including
+the original failing regression with deterministic clock injection. It began
+with no other same-user Nextest run and one-minute load 8.16. During test
+development, the new clock injection first exposed its own coupled-monotonic
+override, then the new hook exposed existing ordering assertions; the override
+now preserves monotonic time and the hook is private to holder capture, leaving
+the observation-only ordering assertions unchanged. No test failure was waived.
+Logs: `/tmp/argmin-confirmation-cutoff-focused-v4.log` and
+`/tmp/argmin-confirmation-cutoff-workspace.log`.
+
+## Candidate Physical File Request/Reply Grammar — 2026-11-14
+
+The next transport prerequisite is one bounded, independently tagged file-write
+grammar for both existing receiver paths. `storage_rpc/complete_staging_file.rs`
+defines candidate `SWRT`/`SWOK` V1. The request carries the receiver node, object
+PG, epoch, topology digest and absolute cutoff, followed by either a Direct PUT
+descriptor/logical size or the existing stream file-inspection carrier, then a
+shard index and borrowed shard bytes. No caller-selected physical key, data PG,
+endpoint or transferable confirmation is encoded. Stream requests reject a
+crossed PG/epoch/topology or cutoff later than their original allocation carrier.
+
+The decoder bounds provenance independently and borrows the shard payload (up to
+16 MiB, allowing current encrypted-segment overhead). This is a framing ceiling,
+not accepted durable geometry: the receiver still derives and checks exact
+placement, session, issuer, cursor and size from its retained window before any
+effect. Empty payloads, zero cutoffs, unknown tags/versions, trailing bytes
+and oversized nested lengths fail closed. The current raw shard decoder rejects
+the new grammar; neither candidate installed dispatch nor a frontend sender is
+selected by this slice.
+
+The reply contains SHA-256 of the complete request plus actual stored length and
+CRC64. An encoded-request holder computes the outgoing CRC once and validates
+both fields and the request digest on reply. This holder is transport evidence,
+not file authority or publication custody. The eventual consuming sender must
+retain its existing owner/window/history around it and may record only validated
+receipts. No automatic retry, deadline renewal, cleanup, acknowledgment-row
+publication or durable mutation is added here.
+
+Frozen full-frame SHA-256 evidence covers both provenance variants and their
+success replies, with explicit nested version vectors in the format ledger.
+Malformed-input tests cover every truncation and reply-byte mutation, independent
+route/descriptor/size/index/payload substitutions, changed CRC, purpose separation,
+shortened versus extended stream cutoffs and maximum/over-limit payloads. These
+are transport-only specimens, not claims of decryptable payloads or installed
+receiver admission. The previous real-ciphertext receiver tests remain separate.
+An independent equal-length CRC64 collision verifies that complete-request
+SHA-256 rejects changed payload bytes even when both acknowledgement fields
+match; the positive original request succeeds with the same reply.
+
+Next: bind this transport to the released-primary owning sender and installed
+receiver dispatch, preserving uncertainty and exact retry on lost replies;
+then add remote acknowledgement-row effects. Live selection remains gated.
+Validation: **19/19** focused codec and existing Direct PUT/stream receiver tests
+passed in 15.230 seconds. Formatting, strict all-target/all-feature Clippy,
+storage-boundary checks and `git diff --check` passed. The full workspace run
+passed **10,591/10,591 tests** (seven slow, six skipped) in 604.083 seconds,
+including all six new codec tests. No other same-user Nextest run was active at
+launch; one-minute load was 2.74. Evidence:
+`/tmp/argmin-staging-file-codec-focused-final.log`,
+`/tmp/argmin-staging-file-codec-{fmt,clippy,boundaries,workspace}.log`.
+
+## Installed Candidate Physical File Receiver — 2026-11-14
+
+Owner-test-selected Unix/TLS servers now dispatch `SWRT` on distinct message kind
+`StagingShardWrite` (**178**) into the reviewed receiver confirmation/file-effect
+path. Legacy `ShardWrite` (**3**) always uses its original decoder. Live dispatch
+rejects the new kind as `UnsupportedOperation`. No production raw
+sender API is introduced: the installed tests use an explicitly test-only
+adapter pending consuming-writer integration.
+
+Dispatch captures the receiver's route fence before nested decoding, requires
+its own Active permit, validates receiver node/epoch/topology and rejects any
+connection still holding metadata sections before peer inspection. The object
+PG selects the authoritative primary/witness, not a local object-PG store; the
+derived data-PG participant is validated separately. Direct and stream variants
+share physical exclusion and existing durable publication. All peer IO and
+acknowledged primary release finish before file effects.
+
+The outer request may shorten, never extend, stream allocation authority. That
+shorter cutoff remains the common receiver bound and is forwarded conservatively
+to primary inspection; it is not replaced by the nested allocation's longer
+cutoff. The existing final fence check remains inside file publication exclusion.
+Success returns the unchanged complete-request-bound `SWOK`, representing only
+file persistence, not durable acknowledgement-row registration.
+
+Installed coverage includes Unix/TLS Direct PUT and both stream targets/windows,
+actual ciphertext readback, lost success reply followed by an exact retry,
+authenticated crossed reply, pre-peer crossed subject/geometry/expiry rejection,
+held inbound section rejection and disabled live dispatch. File completion after
+a lost/malformed reply is explicitly observed; transport does not silently retry
+or infer absence. Primary/receiver SQL and retained owner state remain unchanged.
+The stream expiry schedule changes the receiver clock inside physical exclusion,
+after successful confirmation, with the window, receiving route and original
+allocation still live. It isolates the shorter outer cutoff on both transports.
+
+The peer directory in these metadata fixtures is installed through the existing
+owner-local test seam; actual runtime-map/credential bootstrap retains its
+separate coverage. This is installed receiver evidence, not live bootstrap or
+frontend custody evidence. Next: consuming remote file attempts which retain
+owner/history and record only exact validated receipts, then remote acknowledgement
+registration. No extra metadata transaction or fsync is added. Kind 178 joins
+the existing coordinated RPC **36 → 37** transition; its frontend-only role,
+`Progress` admission class and exact request cap are explicitly classified.
+
+Review found that the initial four-byte magic selector aliased valid legacy
+epoch **1414682451**, whose little-endian bytes begin `SWRT`. That selector is
+removed, not tightened heuristically: only the outer message kind selects a
+grammar. The installed Unix/TLS collision regression requires a successful legacy
+write with exact file/ack readback while candidate dispatch is enabled, and
+rejects the same legacy payload on kind 178 before file effects. The original
+kind-3 frozen frames remain predecessor evidence; new kind-178 composites are
+appended with unchanged file-request/reply V1 grammar.
+
+The first installed expiry run exposed a fixture error: retaining its injected
+future wall clock through response signing caused authenticated transport to
+reject the reply with `ReplayFreshnessFailure`, hiding the intended file-deadline
+error. The fixture now restores both clocks in the response hook before signing,
+while independently asserting that the final physical-effect hook ran. A second
+run exposed that the first correction still froze the monotonic clock while
+advancing wall time; it therefore did not cross the rebound deadline. A test-only,
+thread-bound paired guard now advances both independently based clocks by the
+same interval, with a restoration canary. The production authentication and
+deadline checks are unchanged.
+
+Pre-review validation: all **26** focused codec/receiver/clock tests passed in **19.521s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff checks
+passed. The admitted full workspace run passed all **10,599** tests (**7 slow**,
+**6 existing skips**) in **608.692s**, including all seven new installed-file
+regressions and the paired-clock restoration canary. No other same-user Nextest
+run was active at launch; one-minute load was **5.49**. Evidence:
+`/tmp/argmin-file-rpc-focused-final.log`,
+`/tmp/argmin-file-rpc-{fmt,clippy,boundaries,workspace}.log`.
+
+Post-review kind-178 validation: the **15** selected receiver/codec/auth tests
+passed in **15.363s**. New complete-frame hashes were then pinned independently;
+the final full suite passed all **10,600** tests (**7 slow**, **6 existing skips**)
+in **607.320s**, including the legacy-epoch collision, exact-cap framing,
+frontend-only role matrix, Progress admission and both old/new frozen composites.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+No other same-user Nextest run was active at launch and one-minute load was below
+10. Logs: `/tmp/argmin-file-kind-focused-v2.log` and
+`/tmp/argmin-file-kind-{fmt,clippy,boundaries,workspace}.log`.
+
+## Candidate Owning Direct PUT Remote File Sender — 2026-11-14
+
+The released-primary `RemoteDirectStagingFileWriter` now sends candidate kind-178
+file requests. It retains the complete terminal/window/history owner and derives
+node, data PG, key and geometry from that owner's captured placement. A supplied
+client is only a handle: it must be the exact remote instance installed for that
+derived participant in the admitted map. Node/epoch equality alone cannot select
+a different endpoint or domain. Ordinary embedded writers cannot call this API.
+
+The writer freezes one absolute transport cutoff at handoff, intersected with
+the captured fence and original confirmation cutoff. Before dispatch it pins the
+logical size and complete-request SHA-256 for the shard index. The attempt borrows
+the writer and is neither independently constructible nor detachable as mutable
+custody. The Unix/TLS client revalidates this borrowed authority before its one
+deadline-bounded request; it exposes no raw production file-send adapter.
+
+Every failed attempt conservatively remains unconfirmed, including an early
+transport rejection. Lost success, malformed authenticated replies and later
+rejections cannot imply absence or reset an earlier attempt. An explicit retry
+must reproduce the exact request, including ciphertext and cutoff; only an exact
+authenticated reply records the file receipt. Confirmed retries send nothing,
+and expiry or an invalid retry cannot erase confirmation. Valid success received
+after the write does not become uncertain merely because the cutoff elapsed on
+the return path. Drop has no cleanup or reservation-release effect. The journal
+stores only a digest and optional receipt per index, not retained shard buffers.
+
+Owner tests use real ciphertext and the actual admitted receiver, including a
+receiver which is also its own witness, under concurrent installed Unix/TLS
+serving. They cover installed/inspected/uncertain introduction history, successful
+readback, no acknowledgement-row SQL, lost and authenticated crossed replies,
+later authenticated rejection without history reset, exact retry,
+equal-CRC ciphertext substitution, same-node foreign client,
+wrong participant/geometry, expired uncertain retry, preserved confirmed state,
+clock-shifted retry and no cleanup on Drop. Compiler probes pin the private
+borrowed attempt, inaccessible journal, no renewed deadline and inability to send
+through an ordinary embedded writer. At this checkpoint the stream remote-effect
+probe still required absence of a stream sender; the next slice below replaces
+that negative with a positive owning-sender probe and corresponding misuse cases.
+
+This is Direct PUT only. Next: apply the same owning-attempt contract to streamed
+PUT and UploadPart, then remote acknowledgement-row persistence and terminal
+handoff. No live publisher activation, schema/encoding change, metadata
+transaction or additional ordinary fsync is introduced.
+
+Validation: the focused handoff/sender/API run passed all **17** tests;
+formatting, strict all-target/all-feature Clippy, the storage boundary checker
+and `git diff --check` passed. The final workspace Nextest run passed
+**10,603 tests**, with **6 skipped**, in **607.678s**.
+
+During fixture development the foreign-client negative constructed its second
+cluster after admitting the original writer. A controlled pause reproduced a
+`Broken pipe` from the original idle pooled connection before the receiver's
+lost-reply hook ran. The fixture now constructs the foreign cluster before
+admission and closes idle request sockets before the receiver-response canary.
+It still requires exactly one receiver call; production transport retries and
+custody semantics were not changed to hide the failure.
+
+## Candidate Owning Stream Remote File Sender — 2026-11-14
+
+`RemoteStreamStagingFileWriter` now sends kind-178 file requests for both streamed
+PUT and UploadPart. Only successful allocation custody can produce it, after
+acknowledged release of the original primary section. It freezes the complete
+stream-file inspection bytes (original allocation request, expected session and
+allocated segment) and one conservative absolute cutoff at handoff. A caller
+supplies only the shard index, bytes and a client handle; placement is derived
+from retained authority and the client must be the exact admitted instance.
+There is no caller-selected segment, session, logical size, endpoint or renewed
+deadline. The ordinary embedded writer cannot send remotely.
+
+Each attempt borrows the owning writer and records its complete-request SHA-256
+before transport. Lost replies, malformed authenticated successes and later
+rejections preserve uncertainty and the original request identity. Explicit exact
+retries reuse the frozen bytes/cutoff; confirmed retries return the recorded file
+receipt without another request. Equal-CRC substitutions are rejected. Expiry
+cannot erase confirmation; a valid success received after a cutoff remains
+evidence. Neither errors nor Drop reallocate, release custody or perform cleanup.
+The journal retains only digests/receipts, not shard buffers. This is file-only
+publication: remote acknowledgement-row persistence and live selection remain
+gated, with no new format, allocation registry, metadata transaction or ordinary
+fsync.
+
+Installed Unix/TLS owner tests use real ciphertext, real allocation and a receiver
+that also performs self-witness confirmation. The success matrix covers both
+stream types, creation/append windows and installed/inspected/uncertain command
+history. Failure cases cover wrong participants, same-node foreign clients,
+invalid geometry, lost and crossed replies, later rejection, equal-CRC changed
+payloads, expiry and clock-shifted exact retry. Readback and unchanged SQL/cursor
+observations pin file-only effects and no cleanup on Drop. Compiler probes cover
+private attempts/inspection/journals, no renewed deadline, and the embedded
+writer's inability to call the remote sender.
+
+Next: remote acknowledgement-row persistence from these recorded file receipts,
+then terminal handoff and frontend integration.
+
+Validation: all **5** focused sender/API tests passed. Formatting, strict
+all-target/all-feature Clippy, storage boundary checks and `git diff --check`
+passed. The full workspace Nextest run passed **10,607 tests**, with **6 skipped**,
+in **614.446s**, including all four new Unix/TLS sender regressions and the
+existing embedded-dispatch and original-primary-session binding matrices.
+
+## Candidate Remote Acknowledgement Transport Contract — 2026-11-14
+
+The next remote-acknowledgement slice establishes framing only, not persistence.
+The legacy acknowledgement RPC carries raw keys and lacks retained-window
+provenance, so it cannot safely substitute for the candidate admission protocol.
+Distinct kind `StagingShardAckRecord` (179) carries `SART`/`SAOK` V1, using the
+same direct-window or exact allocated-stream provenance as the file sender.
+Both live and candidate dispatch return `UnsupportedOperation`; there is no
+production raw-send adapter or owning-writer persistence method yet.
+
+The carrier contains receiver node, **object PG**, epoch, topology, immutable
+absolute cutoff, provenance and an ordered receipt vector. It carries neither
+caller-selected data PG nor shard keys: the future receiver must derive those
+and the acknowledgement primary from the independently confirmed descriptor.
+Count is bounded to 32 before receipt allocation. Indices must be contiguous
+from zero, sizes nonzero/equal and within the existing file framing bound; CRC64
+zero remains valid. These are canonical framing checks, not evidence of the
+retained EC count, codec geometry, actual file success or receipt custody. The
+future owner encoder must source receipts exclusively from its private complete
+set, and the receiver must validate that set against the exact retained window.
+
+Shared provenance encoding preserves the existing file bytes. Stream requests
+cannot cross the allocation's object PG, epoch or topology, or extend its
+absolute cutoff. Replies bind SHA-256 of the entire request, including each
+receipt. Auth class is frontend-only and admission class is Progress; a dedicated
+cap bounds frame admission before decoding. Existing file and legacy-ack
+grammars are not extended through payload-prefix dispatch.
+
+Tests pin new complete request/reply composites alongside unchanged file
+specimens, reject truncation/trailing bytes/unknown tags and versions, crossed
+reply subjects, duplicate/gapped/reordered receipts, malformed nested lengths
+and counts, and excessive allocation cutoffs. Exact-at-cap frame admission and
+maximum-count roundtrip are independent checks. Installed authenticated Unix
+tests require unsupported responses for canonical and malformed requests with
+both selector states, and unchanged PG SQL counters.
+
+Next: receiver-owned primary/witness confirmation before the acknowledgement PG
+lock, exact derived-row validation, and captured-fence checks in the existing
+batch transaction. Then connect the owning writers' receipts and retry history.
+No SQL effect, new fsync, schema change or live activation occurs in this slice.
+
+Validation: all **14** focused framing/authentication/admission tests passed,
+including unchanged file composites and the installed unsupported/non-mutation
+test. Formatting, strict all-target/all-feature Clippy, storage boundary checks
+and `git diff --check` passed. The full workspace Nextest run passed
+**10,613 tests**, with **6 skipped**, in **612.106s**. The expanded test's initial
+compile error (calling `.get()` on an already-raw process-config PG ID) was
+corrected before this validation; no runtime assertion was weakened or retried.
+
+## Candidate Remote Acknowledgement Receiver — 2026-11-14
+
+The receiver gate following the transport-only slice is implemented behind the
+existing test selector; normal kind-179 dispatch remains unsupported. The private
+receiver owns admission, independent metadata-peer confirmation, release and SQL
+effects as one operation. It does not accept a detached confirmation as authority.
+
+Before network IO it checks Active admission/domain, absence of held metadata
+sections, receiver identity/topology, installed placement, complete EC receipt
+count and codec geometry. The retained window derives all keys, the data PG and
+its acknowledgement primary. Stream provenance additionally binds the exact
+allocation/session/segment. Direct PUT uses the existing fixed reservation check.
+Primary/witness confirmation and acknowledged section release finish before the
+acknowledgement PG mutex is acquired. Both network/lock waits and the existing
+transaction retain the original cutoffs; SQL effects use the intersection of the
+client, window and storage node's captured route fence.
+
+The existing exact batch transaction supplies atomic insertion, rollback on a
+later conflicting row, and non-rewriting retries. This adds no transaction,
+schema, fsync, file write, allocation or custody transition to that protocol.
+Row descriptions remain read-only inputs, not transferable effect authority.
+
+Installed Unix/TLS coverage includes Direct PUT, streamed PUT and UploadPart,
+initial/append windows, exact retries, incomplete/size-crossed receipt sets,
+crossed receiver/topology, later-row rollback, and deterministic expiration of
+either the client or server cutoff immediately before SQL insertion. Live
+unsupported/malformed candidate tests remain separate from successful effects.
+The fixture receipts describe real encrypted EC bytes; actual sender receipt
+custody is still the next integration gate, not established by these raw
+test-only transport adapters.
+
+Next: consume the owning writers' private complete receipt sets into an immutable
+remote acknowledgement attempt, retaining uncertainty and exact retry identity;
+then terminal handoff and frontend integration. No live activation in this slice.
+
+Validation: **44** focused acknowledgement tests passed. The receiver snapshots
+explicitly include the physical `shards` rows (metadata checkpoints omit them),
+with a positive insertion canary, so rollback and expiry assertions cannot pass
+while acknowledgement rows remain. Formatting, strict all-target/all-feature
+Clippy, boundary checks and diff checks passed. The final full workspace run
+passed **10,617 tests**, with **6 skipped**, in **620.586s**; all seven slow reports
+completed successfully. Logs: `/tmp/argmin-ack-receiver-focused-final.log` and
+`/tmp/argmin-ack-receiver-workspace-final.log`. An earlier workspace build was
+stopped by this session to strengthen those test snapshots; it was not a failed
+test rerun. Initial fixture failures were corrected by retaining the original
+stream cutoff and establishing valid route/peer admission before deterministic
+SQL-boundary expiry, without relaxing production validation.
+
+## Candidate Owning Remote Acknowledgement Sender — 2026-11-14
+
+Released-primary Direct PUT and streamed PUT/UploadPart writers now expose
+remote acknowledgement persistence from their private, complete successful
+file-receipt journals. A file whose response is uncertain is not counted as a
+receipt, even if the receiver durably wrote it. No caller batch, shard key,
+logical-size override, inspection carrier or new deadline enters this API.
+
+The sender derives the acknowledgement primary from the retained window and
+checks the exact admitted client instance and Active route. The complete encoded
+request is retained before dispatch. All retries use the original file-writer
+cutoff and exact request bytes. Any transport error, crossed success or later
+rejection leaves an uncertain attempt uncertain; authenticated exact success
+advances it to confirmed without transferring or releasing cleanup custody.
+Confirmed retries perform no RPC/SQL, and failed later validation cannot erase
+confirmation. Dropping either uncertain or confirmed writers performs no cleanup.
+The transport entry requires an opaque borrowed attempt, not raw request bytes.
+
+Installed Unix/TLS tests use all-remote participants and real encrypted file
+writes before acknowledgement registration. The success matrix covers all three
+targets, creation/append windows and installed/inspected/uncertain introduction
+history. Additional cases cover lost file replies, incomplete receipt sets,
+wrong-primary and same-node foreign clients, lost/crossed acknowledgement replies,
+later errors, clock-shifted exact retry, expiry and Drop. Compiler probes reject
+forged attempts, receipt injection, deadline replacement and remote persistence
+through an unreleased embedded writer. File readback, exact durable row checks,
+non-rewriting SQL counters and unchanged metadata custody are separate assertions.
+
+Normal dispatch remains unsupported. No format, schema, transaction, fsync or
+cleanup-worker protocol is added. Next: consuming terminal handoff from complete
+file/acknowledgement custody, then frontend integration; this is not activation.
+
+Validation: **54** focused sender/receiver, framing, acknowledgement SQL and API
+tests passed. Formatting, strict all-target/all-feature Clippy, boundary checks
+and diff checks passed. The final full workspace run passed **10,621 tests**,
+with **6 skipped**, in **630.853s**; all seven slow reports completed successfully.
+Logs: `/tmp/argmin-ack-sender-focused-final.log`,
+`/tmp/argmin-ack-sender-clippy-final.log` and
+`/tmp/argmin-ack-sender-workspace.log`. Clippy's test-helper enum-size finding was
+resolved by boxing the fixture variants; no runtime test failure was retried or
+assertion weakened. Final validation also explicitly checks zero acknowledgement
+rows of any status before persistence, separately from exact live-row validation.
+
+## Candidate Acknowledged File Custody Handoff — 2026-11-14
+
+Both embedded and released-primary remote file writers now have a consuming,
+no-effect handoff after complete acknowledgement persistence. Direct PUT yields
+an opaque acknowledged payload holder; streamed PUT and UploadPart yield an
+opaque **single allocated segment** holder. This closes the physical-writing
+phase, not the stream session or upload. In particular, a stream segment still
+needs its append-metadata publication before eventual finalization.
+
+The holders retain the entire original writer: introduction/window context and
+installation history, exact allocation where applicable, original fence/cutoff,
+file attempts and receipt journal, and immutable remote acknowledgement request.
+They expose no write, extraction, reverse-conversion or renewal API. A failed
+handoff retains the identical writer for exact retry, without resetting any
+uncertainty. Missing/partial file receipts, complete files without persisted
+acknowledgements, and lost/crossed acknowledgement responses cannot mint readiness.
+Embedded success is recorded only after the existing batch transaction succeeds;
+no extra transaction or fsync is introduced. Exact file retries preserve receipt
+confirmation, while changed receipts invalidate it.
+
+This is an evidence transfer, not new effect admission: already-confirmed
+evidence can be transferred after cutoff expiry without extending that cutoff.
+Later command construction and installation must enforce their authority and
+retain the same custody. Drop does not delete payloads, release reservations or
+change durable ownership.
+
+The embedded and installed Unix/TLS matrices now exercise failed handoff and
+successful consuming handoff for Direct PUT, streamed PUT and UploadPart. Remote
+coverage includes creation/append windows and installed/inspected/uncertain
+introduction history. Lost/crossed replies retain exact retry bytes through failed
+handoffs; expiry, SQL rollback, physical/acknowledgement readback and unchanged
+durable metadata custody are checked separately. Compiler probes cover all four
+writer forms, rejecting reuse, cloning, writer extraction, post-handoff writes
+and deadline substitution.
+
+Next: bind subsequent Direct PUT terminal and stream append command preparation
+to these acknowledged holders, with consuming submission custody, then frontend
+integration. Candidate dispatch remains test-selected; no live activation,
+format/schema change, cleanup-worker grant or new persistence protocol lands here.
+
+Validation: **11** focused acknowledgement/handoff and API tests passed. The
+subsequently strengthened exact-identity, file-retry, SQL-failure and expiry
+assertions also passed in the final full workspace run: **10,621 tests passed**,
+**6 skipped**, in **634.064s**. All seven slow reports completed successfully.
+Formatting, strict all-target/all-feature Clippy, boundary checks and diff checks
+passed. No runtime failure was retried or assertion weakened. Logs:
+`/tmp/argmin-file-handoff-focused.log`,
+`/tmp/argmin-file-handoff-clippy.log`, and
+`/tmp/argmin-file-handoff-workspace.log`.
+
+## Candidate Embedded Acknowledged Append Preparation — 2026-11-14
+
+The acknowledged streamed PUT/UploadPart segment can now be consumed by an
+embedded append-preparation operation. It accepts only the admitted primary
+section: callers cannot substitute a command, segment, target, receipt set,
+logical size, topology or deadline. The node bridge requires an opaque borrowed
+permit minted inside that consuming operation, and binds the original complete
+command, route, runtime/store and immutable work cutoff.
+
+Under primary serialization and one read-only SQL snapshot, preparation checks
+the retained prefix, exact session/generation/issuer/cursor and current owner.
+It derives the segment integrity witness from the confirmed physical receipts,
+including systematic CRC composition, constructs the append command from the
+retained session and allocation, and captures the next-window descriptor plus
+complete pending inventory. Authority is rechecked after snapshot teardown.
+No pending slot, log position, allocator or owner row is mutated, and no new
+transactional write/fsync or physical effect is introduced.
+
+Success retains the acknowledged physical holder and the complete contextual
+submission together in an opaque prepared holder. Neither can be extracted,
+encoded or reset independently. Failure retains the original acknowledged
+holder for preparation retry, without extending its cutoff or reopening file
+writing. This is still preparation, not acceptance, terminal cleanup permission
+or upload finalization. The next window cannot authorize physical writes until
+its later command/confirmation protocol completes.
+
+Owner tests cover both stream targets and initial/subsequent windows, exact
+command identity and receipt-derived witness, zero SQL changes, local-cursor
+change/rejection/restoration, noncomposing receipt CRCs and expiry. The
+cursor test explicitly validates the unchanged canonical prefix before requiring
+the cursor-specific diagnostic; it does not rely on cache invalidation as the
+negative. Compile-fail probes reject arbitrary inputs, forged permits, reuse,
+cloning, command/context extraction, reverse conversion and deadline replacement.
+
+Next: consuming append submission/installation custody, corresponding remote
+preparation, and Direct PUT terminal preparation before frontend selection.
+Normal dispatch remains gated; no protocol/schema/version change is introduced.
+
+Validation: **11** focused preparation/acknowledgement/API tests and the separate
+node-side API probe passed. Formatting, strict all-target/all-feature Clippy,
+boundary checks and diff checks passed. The full workspace run passed **10,624
+tests**, with **6 skipped**, in **630.310s**; all seven slow reports completed
+successfully. Logs: `/tmp/argmin-append-preparation-focused-verified.log`,
+`/tmp/argmin-append-preparation-node-api.log`,
+`/tmp/argmin-append-preparation-clippy.log`, and
+`/tmp/argmin-append-preparation-workspace.log`.
+
+Initial new-fixture failures were investigated: unfrozen release timestamps
+produced primary/witness disagreement, and direct SQL changes invalidated the
+prefix cache. A canonical `created_at` mutation also correctly failed state-digest
+validation. The final interleaving uses the noncanonical allocation cursor with
+explicit prefix validation, requires its exact rejection diagnostic, restores it,
+and proves retry preserves custody. No production check was weakened and no
+unexplained runtime failure was retried.
+
+## Candidate Embedded Acknowledged Append Installation — 2026-11-14
+
+The prepared streamed PUT/UploadPart append now moves into a consuming installation
+holder. Its private representation retains the complete contextual command and
+all original acknowledged physical custody together; there is no extraction,
+reset, cloning, renewed deadline or caller-selected command input. The only
+production installation entry borrows an opaque attempt from that holder and
+requires the original admitted embedded primary section. A private exact-command
+proof binds the captured complete SHA-256, source identity and retained physical
+authority at the storage boundary.
+
+The node bridge carries the minimum of the immutable writer, section and request
+deadlines into the existing classified pending-slot transaction. That transaction
+derives/validates the complete inventory and rechecks the work deadline and effect
+fence immediately before slot/index insertion. No new ordinary-path transaction,
+fsync, schema or wire version is introduced. Installation does not apply the append
+or authorize the successor window's physical writes.
+
+History is owned throughout the call: definitive rejection restores the previous
+observation; uncertain COMMIT or unwind retains `Unconfirmed`. Exact retry uses
+the same complete command and original cutoff. `Installed` is non-regressing:
+after validating the supplied section/request, a confirmed retry performs no SQL
+and does not repair damaged/replaced evidence. Later publication must independently
+validate the slot. Expired or crossed-authority retries preserve confirmation even
+when they fail. Drop never deletes the original files, acknowledgement rows,
+generation reservation or staging owner.
+
+Owner regressions cover both stream targets, initial/subsequent windows, complete
+slot identity/scope and indexes, unchanged replica prefix, no-effect confirmed
+retry, damaged-index retry, foreign-runtime rejection, deferred-COMMIT failure,
+unwind, uncertainty followed by rejection and exact retry, and both effect-fence
+and monotonic deadline expiry at the SQL pre-effect hook. File bytes, durable
+acknowledgements and the exact owner are checked after custody drops. Compiler
+probes cover consuming submission, forbidden extraction/reset/clone, forged
+installation attempts/proofs, and command/deadline injection.
+
+Next: consuming append publication/fanout custody, corresponding remote
+preparation/installation, and Direct PUT terminal preparation before frontend
+selection. Normal dispatch remains gated.
+
+Validation completed: **9** focused preparation/installation/API tests passed.
+Formatting, strict all-target/all-feature Clippy, boundary checks and diff checks
+passed. The full workspace run passed **10,628 tests**, with **6 skipped**, in
+**632.995s**; all seven slow reports completed successfully. Logs:
+`/tmp/argmin-append-install-focused-corrected.log`,
+`/tmp/argmin-append-install-clippy.log`, and
+`/tmp/argmin-append-install-workspace.log`. The first focused build caught a new
+fixture's `WriteAck.size` typo; it was corrected to `stored_size` before tests
+ran. No runtime failure was retried or assertion weakened.
+
+## Candidate Embedded Acknowledged Append Publication and Fanout — 2026-11-14
+
+Confirmed embedded append installation can now be consumed into a publication
+holder. An unconfirmed or never-attempted installation returns the same submission
+and history. Success retains the actual complete-context sender inside the
+acknowledged segment's original physical custody; there is no caller-selected
+command, new route admission, sender extraction or conversion back to a fresh
+submission. The handoff itself has no SQL, network or cleanup effect.
+
+The sender inherits both the original monotonic cutoff and the absolute portable
+upper bound, shortened by the physical fence. Moving custody does not recalculate
+a remaining-duration wire budget. Embedded publication/apply validates the original
+section and immutable authority before entering the existing complete-command
+operations; their final effect checks retain the same bounded request. The complete
+pending command and indexes are revalidated before publication, not trusted merely
+because the holder previously observed installation.
+
+The holder reuses the existing publication/application journals and embedded
+operations. Witness-before-primary-before-trailing ordering uses the same helper
+as ordinary complete fanout, against the original admitted cohort. An uncertain
+witness reply blocks primary apply until exact retry confirms it. Error or unwind
+after a committed marker/apply preserves uncertainty; expired retries cannot erase
+that uncertainty or earlier confirmation. All-member application records the exact
+staged segment and next-window owner state but does not retire the pending slot,
+release the retained generation/resources, or authorize the next window's writes.
+
+Next: consuming append terminal retirement and successor-window handoff, followed
+by corresponding remote preparation/installation and Direct PUT terminal preparation.
+Live frontend dispatch remains gated. No schema/wire bump, extra transaction or
+fsync is introduced.
+
+Owner tests cover both stream targets and initial/subsequent windows; refusal of
+fresh/uncertain installation, no-effect consuming handoff and retained absolute
+cutoff under a changed wall clock; exact durable segments on every replica;
+witness/primary/trailing ordering and invalid members; lost marker/apply replies
+and unwind after commit; expired retry without history regression; foreign
+sections, crossed slot scope and missing pending indexes; and retained files,
+acknowledgements and resource custody on Drop. Compile-fail probes prevent sender
+or custody extraction, cloning, reverse conversion, reuse, injected commands or
+deadlines, and premature terminal handoff.
+
+Validation: **20** focused append/shared-fanout/API tests passed across the initial
+focused run and the additional rejection matrix. Formatting, strict all-target/
+all-feature Clippy, boundary checks and diff checks passed. The full workspace
+run passed **10,633 tests**, with **6 skipped**, in **639.609s**; all seven slow
+reports completed successfully. No failed test was retried or weakened. Logs:
+`/tmp/argmin-append-publication-focused.log`,
+`/tmp/argmin-append-publication-rejection.log`,
+`/tmp/argmin-append-publication-clippy.log`, and
+`/tmp/argmin-append-publication-workspace.log`.
+
+## Candidate Append Terminal Retirement and Successor Handoff — 2026-11-14
+
+The acknowledged append publication holder now consumes into the existing terminal
+protocol only after the shared exact all-member confirmation check succeeds. All
+fallible checks run before splitting ownership: original route/window validity,
+physical fence, immutable monotonic and absolute portable publication cutoffs,
+publication marker and every admitted member's apply confirmation. Failure returns
+the identical publication owner, physical attempts, journals and cutoffs.
+
+Success moves the same admitted cohort and actual append sender into the canonical
+terminal holder. The prior file attempts and prior window's already-retired command
+bookkeeping can then be discarded: the exact segment and successor owner window
+were installed by all replicas, and the current pending command still owns terminal
+convergence. This is frontend memory retirement, not physical cleanup, generation
+release, reservation release or pending-slot deletion. It avoids retaining a
+recursive chain of old encoded file attempts on long streams. Command-derived
+terminal-work classification and terminal-state initialization are shared with the
+existing owner; no new public constructor or caller-selected completion flag exists.
+
+The existing embedded terminal operation revalidates the exact applied command,
+pending scope and side indexes, retires only that slot, and preserves uncertain
+retirement across COMMIT/reply loss and unwind. Only confirmed retirement permits
+the existing current-primary/witness successor-window confirmation. Interrupted
+retirement also invalidates the existing local prefix-validation cache; a confirmed
+retirement retry does not reseed it. Confirmation continues to fail closed until
+explicit complete-state recovery revalidates the prefix, while the same terminal
+holder retains custody. No cache redesign or automatic revalidation is introduced.
+The window inherits the same cutoff (or a shorter conservative bound) and can enter
+the existing atomic stream allocation and
+file-binding path; it is not permission to renew the upload attempt or release its
+retained resources.
+
+Regressions cover both streamed PUT and UploadPart, initial/subsequent windows,
+partial fanout rejection and unchanged failure custody, two consecutive complete
+append cycles, exact no-effect replay, canonical session/resource preservation,
+retained file/ack bytes, failed or ambiguous retirement blocking the successor,
+lost successful retirement replies and unwind, and expiry without history loss or
+cutoff renewal. API probes pin consuming success/failure transitions and reject
+reuse, raw extraction, reverse conversion and deadline injection.
+
+The initial focused run exposed two fixture assumptions: the two-append traversal
+exhausted its five-second budget through repeated conservative skew deductions,
+and lost-retirement recovery incorrectly assumed exact retry restored prefix
+validation. The multi-round fixture now receives its larger budget up front (never
+on retry); the lost-reply matrix explicitly requires failed confirmation, canonical
+recovery and then successful confirmation. Short-cutoff expiry coverage remains.
+
+Next: corresponding remote append preparation/installation, then Direct PUT
+terminal preparation and the remaining coordinated frontend selection. Normal
+dispatch remains gated. No schema/wire change, extra metadata command, transaction
+or fsync is introduced.
+
+Validation: the 14 focused append-terminal/retirement/API tests passed after the
+fixture corrections above. `cargo fmt --all -- --check`, strict all-target/all-feature
+Clippy, the storage boundary checker and `git diff --check` passed. Full
+`cargo nextest run`: **10,637 passed, 6 skipped** in 640.843 seconds; all seven
+slow-threshold tests completed successfully. No additional Nextest run was active
+and host load was below the admission threshold before the full run started.
+
+## Candidate Remote Append Preparation Framing — 2026-11-15
+
+The next remote integration prerequisite is a bounded, distinct-purpose append
+preparation carrier. `storage_rpc/complete_stream_append_prepare.rs` adds SAPP/SAPR
+V1 payloads without selecting a message kind, changing live dispatch or minting
+an installable command. The request carries the existing stream allocation/file
+inspection and ordered receipts, addressed to the original object-PG primary.
+It rejects Direct PUT provenance, route/topology substitution, cutoff extension,
+changed segment/session fields and incomplete or size-inconsistent receipt sets.
+Receipt CRC64 zero remains valid. The inherited cutoff is an absolute conservative
+wall bound, never a remaining duration.
+
+The reply binds SHA-256 of the entire request plus the primary/PG/epoch and borrows
+bounded complete-context bytes. The codec neither authenticates receipt ownership
+nor decodes a command; even a successful reply remains untrusted framing. In
+particular this is NOT an alternative constructor for `CapturedStreamAppend` or
+a way to detach it from acknowledged physical custody. Prior composite evidence
+is unchanged; new payload specimens are appended in the format ledger.
+
+Next integration must select an unambiguous operation kind (not discriminate a
+legacy body by its leading magic), admit the current primary and retain its exact
+section, intersect the original cutoff with receiver admission, then validate the
+session/window/allocation and capture the append in one snapshot. The consuming
+sender must compare the returned command, witness and successor descriptor to its
+retained request before accepting preparation. Installation must preserve that
+same holder and non-regressing uncertainty, with atomic pre-effect deadline checks.
+Remote preparation/installation and live frontend selection remain gated; this
+slice adds no transaction, fsync or schema change.
+
+Tests cover positive PUT/UploadPart framing, independently crossed request/reply
+subjects, full-request digest binding, wrong-purpose/version/truncation/trailing
+inputs, receipt completeness and geometry, and bounded borrowed response bodies.
+The first focused run rejected the new fixture's incorrect shard size; the fixture
+now pins 4 + 56 + 16 stored bytes over 2 data shards (38 bytes each). Production
+geometry validation was not weakened.
+
+Validation: 12 focused preparation/allocation/acknowledgement codec tests passed;
+the final full run also exercised the added positive zero-CRC canary.
+`cargo fmt --all -- --check`, strict all-target/all-feature Clippy, the storage
+boundary checker and `git diff --check` passed. Full `cargo nextest run`:
+**10,642 passed, 6 skipped**, 639.368 seconds. All seven slow-threshold tests
+completed successfully. No other Nextest run was active and host load was below
+the admission threshold when the full run started.
+
+## Candidate Remote Append Preparation Receiver — 2026-11-15
+
+The codec-only slice above is now followed by a candidate-selector-gated receiver
+on distinct frontend-only RPC kind **180**, `StagingStreamAppendPrepare`. Legacy
+append grammar is not inspected for magic. Frame admission enforces the SAPP cap;
+client scheduling uses progress admission. Live publisher selection is unchanged.
+
+The receiver captures its route fence before admission/decoding and intersects it
+with the immutable request/window cutoff and bounded operation deadline. It
+requires Active admission from its own gate and the held current-primary section.
+Only that owner can mint `RemoteStreamAppendAuthority`, binding the exact store,
+request digest, section and installed placement. One object-PG read snapshot
+checks the settled prefix, full session/generation, original issuer, consumed
+allocation cursor and segment placement. It derives the integrity witness from
+the ordered receipt claims, validates the append, and captures its complete
+successor context and pending inventory. The command index is read, not allocated
+durably. Authority and allocation lifetime are checked again after snapshot
+completion, before the response is exposed.
+
+This is read-only preparation: no slot, log, side-index, session allocator, shard
+file, acknowledgement or generation mutation, and no additional fsync. There is
+no metadata-peer/data-PG IO under the object-PG snapshot. Receipt claims are not a
+substitute for retained physical custody: the next consuming remote sender must
+retain its confirmed acknowledgements and compare the complete command, witness
+and successor descriptor before accepting this response. The receiver returns
+encoded request-bound context, not a detached installable submission.
+
+Unix/TLS coverage exercises PUT and UploadPart, both initial and successor windows,
+and exact repeated read-only captures. Independent crossed prefix/session/
+generation/hash/VID/data-PG inputs fail without effects. Admission coverage rejects
+missing sections, foreign domains and retained-cleanup permits; disabled candidate
+selection rejects the new operation. A deterministic connection-thread test
+expires the request cutoff or server route independently after capture, before
+returning the response, and verifies
+unchanged durable state and closed SQLite read transactions. Framing covers exact
+cap/one-over admission and appends versioned composites without editing the prior
+unframed evidence. Physical file/ack effects are deliberately not claimed by these
+metadata-only receiver fixtures.
+
+The initial expiry test used a wall-only override that also replaced the lease
+clock, then assumed a bounded route in an unbounded fixture. Its corrected setup
+explicitly bounds the server route and advances the two clocks separately; no
+production check or error mapping was relaxed. Eleven focused receiver/codec/auth/
+admission tests passed. `cargo fmt --all -- --check`, strict all-target/all-feature
+Clippy, the storage boundary checker and `git diff --check` passed. Full
+`cargo nextest run`: **10,646 passed, 6 skipped**, 655.458 seconds. All seven
+slow-threshold tests completed successfully. No other Nextest run was active and
+host load was below the admission threshold when the full run started.
+
+Next: consuming remote append sender
+and installation, preserving exact custody, immutable deadlines and monotonic
+uncertainty; Direct PUT terminal preparation and live selection remain gated.
+
+## Candidate Consuming Remote Append Preparation — 2026-11-15
+
+`AcknowledgedStreamStagingSegment` can now open a new primary section after the
+physical phase's acknowledged section release, then consume itself into remote
+preparation. It supplies no caller-selected segment, receipt, context or deadline.
+The request is reconstructed from the retained allocation inspection, confirmed
+file acknowledgements and already-frozen physical cutoff. Transport borrows the
+exact admitted client/session under the original local deadline; it neither
+reconnects nor retries automatically.
+
+A successful authenticated reply is not sufficient. Before constructing a
+prepared holder, the owner checks request SHA-256, primary/PG/epoch, complete
+command decoding, exact next command position, and the full append payload with
+the witness independently reconstructed from its confirmed receipts. It compares
+the successor's complete immutable subject with the retained window, requires
+the adjacent index/VID and geometry, reconstructs participants from its pinned
+placement, and rejects a future-window cutoff beyond the original authority.
+The confirmed-window and physical fences are rechecked after transport. Raw codec
+decoding still does not produce installation authority.
+
+The prepared result retains acknowledged physical custody and the new section's
+process-local identity; neither is extractable. Every preparation failure returns
+the same acknowledged holder, with its prior observations and cutoffs unchanged.
+Read-only preparation can be explicitly attempted again after a lost reply, even
+on a new section, but cannot extend the original deadline or reset physical
+ownership. Success is consuming and cannot be turned back into a fresh builder.
+The embedded installer explicitly rejects remotely prepared inputs; installation
+on the captured remote section is the next slice, not an implicit fallback.
+
+Installed Unix/TLS tests use actual encrypted shards and durable acknowledgement
+rows for PUT and UploadPart, including successor windows. Canonical, correctly
+checksummed malicious replies independently cross payload, parity witness,
+position, cutoff, participant ordering and issuer. Rejection preserves payload,
+acknowledgements, original custody and read-only SQL state. Additional cases cover
+wrong-client rejection before dispatch, successful-reply loss, peer-released
+sections, expiry, explicit retry and Drop. Repeated request correlation pins the
+same request/cutoff. The first malicious-reply fixture accidentally cleared the
+response's connection-reusable flag; the corrected fixture preserves it for
+semantic negatives and tests the released-section case independently. Preparation
+now explicitly rejects a successful response that releases its primary section.
+API-shape probes pin consuming use, private session retention and
+absence of caller-input injection. No schema, format, fsync or live-selection
+change is introduced by this sender slice. Four focused sender/API-shape tests
+passed. Final validation passed: formatting, strict all-target/all-feature Clippy,
+the storage-boundary checker, and the full Nextest suite (10,649 passed, six
+skipped; seven crossed the slow threshold and completed successfully; 644.524s).
+
+Next: remote installation from this prepared holder, retaining its exact section
+identity and monotonic acceptance history, then remote publication/terminal handoff.
+Direct PUT terminal preparation and frontend activation remain gated.
+
+## Candidate Remote Append Installation Receiver — 2026-11-15
+
+The preceding sender slice cannot use the legacy pending-slot RPC, which carries
+only the draft envelope. The next integration step therefore first adds the
+complete-command receiver; connecting the consuming sender is still outstanding.
+Distinct frontend-only kind 181 carries bounded SAPI V1: the original preparation
+claims plus the exact complete command. SAIC V1 confirms the entire request's
+SHA-256. No existing grammar is detected by magic or replaced; this extends the
+uncommitted RPC-v37 transition with append-only framing evidence.
+
+The receiver requires same-domain Active admission, the current primary's held
+section, and a private authority bound to the full installation request and exact
+store. Read-only capture authority cannot install. It validates command position,
+target, full segment/witness correspondence, successor subject/index/VID/geometry,
+canonical placement and nonextended cutoff. Fresh installation revalidates the
+durable session, generation, consumed allocation and settled prefix under the
+same object-PG mutex/primary section before entering the existing complete-slot
+transaction. There is no data-PG network call or physical effect under this lock.
+
+An existing pending slot is not a settled prefix: exact retries use complete
+command/scope/side-index validation rather than rebuild, and damaged indexes fail
+closed without repair. The client cutoff is bound to monotonic time once at
+decode and intersected with the captured storage-node route fence. That same
+fence and the bounded work deadline reach the final pre-INSERT check. Existing
+slot/index atomicity, commit ambiguity and rollback retirement remain unchanged.
+Every wire error is conservative uncertainty, never definitive absence; only an
+exact request-bound success confirms installation. No extra durable write
+transaction or fsync protocol is introduced beyond the existing pending-slot
+insertion; validation uses read snapshots under the held primary section.
+
+Installed Unix/TLS coverage includes PUT/UploadPart, initial/successor windows,
+positive insertion, exact retry, damaged indexes, canonical crossed payload,
+witness, position, cutoff, participant and issuer, plus admission rejection and
+lost-success replay. Expiry is injected immediately before SQL while the other
+deadline remains live. The first expiry fixture used a separately sampled
+wall/monotonic projection and did not reliably cross the actual SQL cutoff;
+the corrected fixture asserts both that its effect hook ran and that the retained
+fence is expired. Receiver fixtures supply ciphertext-shaped receipt claims, not
+proof of physical effects; the preceding owning-sender tests separately exercise
+actual shards/acknowledgements. No frontend selection is activated.
+
+Validation passed: 55 focused tests; formatting; strict all-target/all-feature
+Clippy; the storage-boundary checker; and the full Nextest suite (10,654 passed,
+six skipped, 646.379s; all seven slow-threshold cases completed successfully).
+
+Next: connect the prepared remote holder to this receiver,
+requiring its captured session identity before dispatch and retaining monotonic
+acceptance history through malformed/lost replies, retry, expiry and Drop; then
+remote publication/terminal handoff. Direct PUT terminal preparation remains gated.
+
+## Candidate Owning Remote Append Installation Sender — 2026-11-15
+
+The prepared remote holder now sends SAPI through its captured primary section.
+No independently selected command, receipt manifest, deadline or previous
+acceptance observation enters this API. Client/route identity is checked before
+borrowing the transport with the original deadline; the retained process-local
+section identity is then checked under that mutex. Closing the section and
+reopening one through the same client cannot substitute another section.
+
+Only a private child of the owning complete submission combines its immutable
+context with a mutable installation journal. A proof minted by the physical
+custody owner binds the complete command ID/SHA-256, acknowledged payload,
+original fences and captured session. The exclusive transport attempt contains
+that proof and the journal borrow; no raw send or journal-reset adapter is added.
+Request reconstruction uses the original fixed preparation cutoff and confirmed
+receipts, so retries produce the same request digest.
+
+Before entering transport the observation becomes Unconfirmed, including unwind.
+A definite local NotSent restores the previous state, which may itself already
+be Unconfirmed. Remote errors, bad request-bound confirmations and lost replies
+never establish nonacceptance. A valid exact confirmation records Installed,
+even if the response closes the section: installation is historical evidence,
+not proof the connection remains usable. Already-Installed calls validate their
+supplied authority/session but do not redispatch; later rejection, expiry or
+damaged slot indexes cannot regress that observation. Original source history,
+physical files, acknowledgements and cleanup responsibility remain retained.
+
+Remote publication/terminal handoff is not silently enabled by this connection.
+The consuming publication conversion explicitly returns the entire remote
+submission until that next slice carries its session identity and custody
+forward. Drop has no cleanup effect, whether installation is unattempted,
+uncertain or confirmed. No format, schema, fsync or live-selection change occurs.
+
+Installed Unix/TLS tests use actual encrypted files and durable acknowledgements
+for streamed PUT and UploadPart, including initial and successor windows. They
+cover positive installation, confirmed no-redispatch after index damage, wrong
+client, same-client reconnect, expiry, authenticated malformed/crossed confirmations,
+remote error after commit, exact retry correlation, lost/closed success, Drop,
+and pre-dispatch NotSent/unwind with monotonic history. The first API-shape run
+failed because its standalone session stub omitted the existing require_identity
+method; the corrected stub and all six focused tests pass. API probes reject
+caller-selected deadlines/inputs, detachment, cloning and proof construction.
+
+Validation: all six focused tests; formatting; strict all-target/all-feature
+Clippy; the storage-boundary checker; and the full Nextest suite (10,659 passed,
+six skipped, 655.727s; all seven slow-threshold cases completed successfully).
+
+Next: remote append publication/application and terminal handoff, preserving this
+section identity and custody through every consuming transition. Direct PUT
+terminal preparation and frontend activation remain gated.
+
+## Candidate Owning Remote Append Publication — 2026-11-15
+
+Confirmed installation now consumes into the append publication holder without
+discarding its captured remote section identity. The holder retains the complete
+command sender, original acknowledged file custody, installation observation and
+original local/portable cutoff. Handoff has no metadata effect; the portable
+publication bound is also intersected with the immutable physical/preparation
+bound, not recalculated from a remaining duration.
+
+Remote publication accepts only the original client/session. It acquires that
+session with the original bounded deadline, verifies its retained identity and
+physical authority under the borrow, and keeps the same transport mutex across
+the closed publication attempt. No sender, bytes, resettable observation or new
+deadline escapes. The existing publication protocol and receiver are reused;
+no new format, schema, RPC, transaction or fsync is introduced.
+
+The publication journal is armed before dispatch/unwind. Local NotSent restores
+only its previous observation, including Unconfirmed; authenticated errors,
+malformed confirmations and lost replies cannot establish absence. Exact
+confirmation is historical MarkerConfirmed even if the peer closes afterward;
+later rejection cannot regress it. Installation history remains Installed.
+Publication does not apply the append or retire its source: embedded operations
+explicitly reject remote holders, and remote terminal conversion still returns
+the complete owning publication with an integration-gated error. Drop never
+cleans physical state or releases generation/reservation custody.
+
+Installed Unix/TLS coverage uses actual encrypted files and acknowledgement rows
+for streamed PUT and UploadPart, including initial and successor windows. It
+checks effect-free consuming handoff, exact publication replay, marker-only
+mutation, unchanged replicas and retained payload, wrong client, same-client
+reconnect, original cutoff expiry, crossed/malformed confirmations, remote errors
+after commit, lost replies, closed-success replies, NotSent, unwind and monotonic
+retry history. API probes reject detached section identity, caller-selected
+deadlines/inputs, cloning, extraction and reset paths. Remote application and
+terminal handoff are the next integration slice; Direct PUT terminal preparation
+and live frontend activation remain gated.
+
+The initial focused run exposed two test assertions that incorrectly treated
+SQLite total_changes as committed-state evidence: publication trial apply rolls
+back its changes but still advances that counter. The corrected checks compare
+all durable rows/indexes/prefixes on replay and separately retain exact counter
+checks around Drop. All 30 focused tests, formatting, strict all-target/all-feature
+Clippy and the storage-boundary checker passed. The first full run found that the
+shared transport refactor renamed the existing session-mutex deadline diagnostic;
+the historical bounded-wait regression correctly rejected that change. The
+original diagnostic was restored without changing the regression; all 11 tests
+in the targeted rerun passed. Final validation: formatting, strict
+all-target/all-feature Clippy, storage-boundary checker and full Nextest suite
+(10,664 passed, six skipped, 666.130s; all seven slow-threshold cases completed).
+
+## Candidate Owning Remote Append Application — 2026-11-15
+
+The physical-custody publication holder now applies its retained append across
+an all-remote admitted cohort. Every attempt requires the original primary
+client and preparation section identity, validated under a deadline-bounded
+session borrow. The same borrow survives through each replica RPC and reply;
+primary application dispatches on that held transport, without self-reacquiring
+its mutex or opening another connection. Target clients must belong to the exact
+captured route. A newly constructed client for the same endpoint is not a
+substitute. The immutable publication cutoff and original physical authority are
+revalidated, never replaced by a caller-selected budget.
+
+The existing typed application sender/receiver and exhaustive per-member journal
+are reused. Confirmed publication precedes application; exact witness confirmation
+precedes primary application, and exact primary confirmation precedes remaining
+replicas. An uncertain reply blocks that progression even if the remote apply
+committed. Exact retry on the retained primary section converges without repeating
+durable effects. Ordinary replica RPC reconnection does not replace the primary
+section. A lost primary reply leaves custody retained but cannot authorize a new
+primary section. A valid success that closes the primary transport remains Applied
+historically, while later attempts fail the live-section check.
+
+Installed Unix/TLS tests exercise streamed PUT and UploadPart, including initial
+and successor windows, all five members, staged segment and owner-window/reference
+correspondence, non-mutating exact replay, unchanged unselected peers, retained
+files/acknowledgements, and Drop. The negative matrix covers pre-publication and
+out-of-order attempts, wrong/duplicate clients, original cutoff expiry,
+same-client reopened sessions, SHA-only crossed confirmations, empty replies,
+authenticated errors after commit, lost witness/primary/trailing replies,
+closed-success replies, NotSent and unwind. A paused witness response proves the
+primary-session mutex remains held until confirmation. API probes reject new
+budgets and injected commands while existing opacity probes remain in force.
+
+No format, schema, new RPC or extra transaction/fsync is introduced. All frontend
+selectors remain unchanged. Mixed embedded-replica application and consuming
+remote terminal handoff are next; terminal conversion still returns the entire
+holder, preserving physical custody and every observation. Direct PUT terminal
+preparation remains gated.
+
+Validation: all 13 focused tests passed. Initial test development corrected a
+window-field typo and extended the API fixture's submission-setup rule to include
+application probes; no runtime test failure was suppressed. Final validation:
+formatting, strict all-target/all-feature Clippy, storage-boundary checker and
+full Nextest suite (10,670 passed, six skipped, 676.550s; all seven slow-threshold
+cases completed successfully).
+
+## Candidate Owning Mixed Append Application — 2026-11-15
+
+The acknowledged append publication holder can now apply its retained command
+to an embedded replica under the original remote primary. The route selects the
+embedded runtime from its captured cohort, then borrows the primary session with
+the original cutoff and compares its private identity with the preparation
+identity. That borrow remains inside the embedded application target through
+local PG admission, SQLite commit and confirmation. Reopened same-client sections
+are not interchangeable. Physical authority is rechecked after acquiring the
+session mutex. This adds no caller-selected runtime, command, budget or production
+callback and reuses the existing ordered per-member application journal.
+
+The mixed fixture uses remote primary/witness and physical participants with a
+genuinely embedded trailing metadata replica. Unix/TLS and streamed PUT/UploadPart
+cases cover initial-window application, exact SQL replay, owner window/reference
+correspondence, unselected-peer non-mutation, physical custody and Drop. Negative
+cases cover publication/order gates, crossed clients/members, original expiry and
+same-client reconnect. Before-commit rollback, after-commit error and unwind retain
+Unconfirmed; retry on the original section converges without duplicate effects.
+An after-commit pause proves the original primary mutex remains held until the
+embedded confirmation returns. API probes reject new deadlines and injected
+commands while preserving the existing consuming/opaque holder checks.
+This fixture does not claim embedded-witness or successor-window coverage.
+
+Consuming remote terminal handoff remains the next slice: it must retain the
+original section identity beyond application rather than discard it in the
+generic terminal holder. Until then, terminal conversion returns the complete
+publication holder. Direct PUT terminal preparation and live frontend activation
+remain gated. No schema, format, RPC or extra transaction/fsync is added.
+
+Initial validation caught a route-bridge visibility mismatch for the existing
+identity validator and a fixture assumption that both targets left node 1 outside
+physical placement. The validator is now callable by the bridge without exposing
+identity construction; the mixed fixtures select different trailing members and
+assert exclusion from their actual captured physical participants. Five focused
+tests and the boundary checker passed. The first full run then caught a second
+API fixture that imports the route implementation but lacked its new identity
+type/validator stubs (E0425/E0599); those stubs were updated without weakening any
+probe. That run ended with 8,055 passed, one failed and 2,618 not run. The corrected
+six-test focused run passed. Final validation: formatting, strict
+all-target/all-feature Clippy, storage-boundary checker and full Nextest suite
+(10,674 passed, six skipped, 689.851s; all seven slow-threshold cases completed
+successfully).
+
+## Candidate Session-Bound Remote Append Terminal — 2026-11-15
+
+Remote append publication now has a consuming handoff into a separate opaque
+terminal holder. It requires confirmed application by every original member and
+valid original authority before discarding resolved frontend file-attempt
+bookkeeping. It moves the exact command, route, frozen cutoff and application
+history into terminal custody, together with the preparation-session identity.
+Generic terminal conversion remains unavailable to remote append publication;
+the new wrapper exposes no underlying terminal, reconnect, reverse conversion,
+caller-selected deadline or cleanup API.
+
+The wrapper admits only slot retirement and consuming next-window confirmation.
+It validates the exact original primary client and immutable session identity,
+then invokes the existing bounded, locked operation on that same session
+reference. This identity comparison needs no mutex and cannot race a mutation of
+identity; live/closed state is still checked under the operation's mutex.
+Concurrent closure cannot reconnect or substitute authority. Local and absolute
+portable publication cutoffs are retained and checked without renewal.
+Retirement preserves NotSent/Unconfirmed/Retired history; an ambiguous response
+blocks successor confirmation, and a reconnect cannot retry foreground custody.
+Every failed consuming confirmation returns the same terminal holder. Successful
+capture binds the successor read to the same section for subsequent allocation
+and file binding. No durable session, owner, payload or reservation is deleted by
+handoff or Drop.
+
+The regression matrix covers Unix/TLS, streamed PUT/UploadPart, all-remote initial
+and successor windows, plus a genuinely mixed initial-window cohort. It checks
+effect-free handoff, completion and retirement prerequisites, exact read-only
+retirement retry, successor allocation/file binding, crossed clients, expiry,
+same-client reconnect before/after retirement, and error-after-commit responses
+with reusable or closed transport. Malformed successor-confirmation response,
+same-holder retry and subsequent reconnected allocation rejection pin the lower
+failure path's history/session preservation. API probes pin consuming/opaque shape and
+reject extraction, cloning, reconnect and new deadlines.
+
+No schema, format, new RPC or additional ordinary-path transaction/fsync is added.
+Direct PUT terminal preparation, owner cleanup activation and live frontend
+selection remain separate gates.
+
+Validation: six focused tests, formatting, strict all-target/all-feature Clippy,
+storage-boundary checker and full Nextest suite passed (10,678 passed, six
+skipped, 690.069s; all seven slow-threshold cases completed successfully).
+
+## Candidate Direct PUT Post-Write Snapshot Handoff — 2026-11-15
+
+Acknowledged Direct PUT custody now has a consuming, embedded-primary snapshot
+preparation step. A private borrowed permit selects the original admitted
+runtime/PG/epoch and introduction command; callers cannot inject a subject,
+snapshot, receipt batch, callback or replacement deadline. Under primary
+serialization, the existing bounded PG admission opens a read snapshot and
+revalidates the confirmed prefix, exact retained owner/window/creation resource,
+live allocation issuer and generation reservation. It then loads the current
+object, logical precondition facts and displacement metadata for that exact
+subject in the same snapshot. Original physical/work authority is rechecked
+before returning.
+
+The result keeps the full snapshot and acknowledged physical custody together.
+Only the original introduction ID and logical precondition facts are observable;
+there is no snapshot extraction, reset, terminal command or installable submission.
+Failure returns the original acknowledged holder with unchanged history and
+cutoffs. Neither failure nor Drop deletes files, acknowledgements, reservations
+or staging owners. This adds a read snapshot, not a durable mutation, command-ID
+allocation, format change or ordinary-path fsync.
+
+Tests cover absent/current objects, a distinct same-PG key with a different ETag,
+changed reservation/window state, expiry, and a foreign runtime with matching
+node/PG/epoch followed by successful retry on the original section. They check
+non-mutation and retained physical custody. Existing-object predecessors are
+explicitly metadata-only zero-size fixtures; the newly staged payload uses real
+encrypted files and normal durable acknowledgements. API probes cover consuming
+ownership, private snapshot retention, and rejection of reset, installation and
+caller-injected inputs. During validation the current-object fixture initially
+failed confirmation because the raw fixture writer timestamped each replica
+independently; setup now pins the timestamp, producing identical prefixes.
+
+This is a prerequisite, not completed Direct PUT terminal preparation. Next:
+consume this holder into command construction while atomically revalidating the
+captured facts, bind the terminal command and physical witness to retained
+custody, then integrate owning pending installation/publication. Remote-primary
+preparation and live frontend selection remain gated. No cleanup activation or
+original failure-regression completion is claimed.
+
+Validation: six focused tests, formatting, strict all-target/all-feature Clippy,
+storage-boundary checker and full Nextest suite passed (10,682 passed, six
+skipped, 692.545s; all eight slow-threshold cases completed successfully).
+
+## Candidate Direct PUT Receipt-Bound Manifest — 2026-11-15
+
+Terminal builder inspection identified a missing prerequisite: the snapshot
+holder retained confirmed file acknowledgements but had no custody-bound
+physical manifest. Reusing the existing direct builder's caller-selected
+segment placement and optional witness would not close that boundary. This
+slice adds the consuming manifest handoff before command construction.
+
+The prepared snapshot holder now consumes itself into a witnessed payload.
+The original immutable window supplies bucket/key, generation, segment hash,
+data PG, placement epoch, EC shape and codec; the successful file journal
+supplies logical length and ordered acknowledgements. The only supplied input
+is the segment CRC claim, which must compose from the actual systematic-shard
+receipts with the codec's stored length and canonical EC padding removed. The
+result retains the complete per-shard integrity witness, manifest, original
+snapshot and physical custody together. It cannot be cloned, reset, extracted
+or converted to an installable submission. Original authority is checked before
+and after witness construction. Failure returns the exact prepared holder,
+including its snapshot, deadline and previous observations; Drop does no cleanup.
+
+The tests use real encrypted/EC-encoded files and durable acknowledgements for
+empty, one-byte (padded), and four-byte payloads. They independently compare each
+witness acknowledgement with the actual write result and every manifest field
+with the original window; wrong CRC then correct retry, expiry, non-mutation
+and retained files/acknowledgements/owner are covered. API probes reject reuse,
+cloning, manifest extraction, reset and installation.
+
+No metadata command, SQL mutation, format change, network round trip or fsync is
+added. This is physical evidence, not a new encryption-material or conditional
+authorization. Terminal construction must still consume it, bind logical commit
+and committed-encryption inputs, and atomically revalidate the saved object
+snapshot before installation. Remote-primary snapshot preparation, terminal
+publication and live activation remain gated.
+
+Initial focused validation caught an incorrect test expectation: expiry is
+reported by the captured route fence before the operation-cutoff check. The
+regression now pins `RouteMapExpired` and still requires unchanged custody.
+Seven focused tests, formatting, strict all-target/all-feature Clippy, the
+storage-boundary checker and full Nextest suite passed (10,684 passed, six
+skipped, 687.018s; all eight slow-threshold cases completed successfully).
+
+## Candidate Consuming Direct PUT Terminal Preparation — 2026-11-15
+
+The witnessed payload now consumes itself into a prepared terminal holder under
+the original admitted embedded primary section. Logical commit input reuses
+`StreamPutCommitInput`; callers do not supply segment placement, generation,
+length, acknowledgement witness or reservation proof. Those are derived from the
+retained descriptor and successful physical journal. Version selection must be
+consistent with the supplied versioning state, and encryption must use the
+retained codec and committed object-subject binding.
+
+Under the PG mutex and one read snapshot, preparation revalidates the original
+settled prefix, owner/window, issuer and reservation, reloads and compares the
+complete saved object snapshot, and constructs the terminal envelope at the next
+log position. It reuses the candidate apply component's read-only validation of
+exact selected references, generation high-water fencing and displaced-owner
+transfers. It also validates the complete pending inventory before accepting the
+context. Authority is checked again before returning. Reading the next command
+position and write sequence does not allocate either durably.
+
+Success retains the contextual submission and witnessed physical custody inside
+one opaque, non-Clone holder. Failure returns the exact witnessed holder with its
+original observations and cutoff. Neither result exposes independent command,
+submission or physical-custody extraction. No slot is installed, owner is
+transitioned, resource released or payload deleted, including on Drop. This adds
+no format change, durable mutation, fsync or cross-PG I/O under serialization.
+
+This is actual candidate terminal **preparation**, not terminal publication or
+live frontend activation. Logical policy/conditions remain the frontend
+integration's responsibility. The review correction below closes the missing
+encryption-subject binding rather than deferring that safety check to activation.
+Payload-bearing tests use real DEK rewrapping and decryptability checks, not
+fabricated committed key material. The next handoff must consume the prepared holder into the owning
+installation/publication state machine, preserving exact command identity and
+all uncertain history; it must revalidate at the effect boundary rather than
+treating this saved read snapshot as installation authority. Remote-primary
+preparation and live selection remain gated.
+
+Regressions cover disabled/suspended/enabled version selection, exact derived
+command/proof/witness fields, wrong committed-encryption state, inconsistent
+version input, crossed saved snapshot, changed reservation, expiry and foreign
+runtime sections. Rejected logical inputs and crossed sections can retry using
+the returned original holder. A metadata-only empty predecessor exercises exact
+displacement construction and rejection when its retained owner is missing;
+new replacement payloads use real encrypted shards and acknowledgements.
+SQL change counters, files, acknowledgements and owner checks pin non-mutation.
+API probes reject cloning, reuse, extraction, installation and deadline renewal.
+
+Validation: 21 focused tests, formatting, strict all-target/all-feature Clippy,
+the storage-boundary checker and full Nextest passed: **10,687 passed**, six
+skipped, in **687.742s**. All eight slow-threshold cases completed successfully.
+The overwrite fixture's initial setup errors (an overlength session label and
+an owner assertion outside the required read snapshot) were corrected before
+the clean focused/full runs. Logs are retained at
+`/tmp/argmin-direct-terminal-{tests,fmt,clippy,boundaries,full}.log`.
+
+### Review correction: retain exact encryption-subject provenance
+
+Checking only the codec and committed binding tag was insufficient. Direct file
+binding now takes provisional encryption and mints its subject from the confirmed
+storage descriptor's bucket incarnation, bucket/key and reserved generation.
+The mandatory, private subject is retained by embedded and remote writers and
+every subsequent custody holder before the first physical write. Callers may
+borrow it for cryptography, but cannot replace it after writing.
+
+Terminal preparation requires both `matches_committed_encryption` and an opaque
+process-local `CommittedObjectEncryption` witness from the ciphertext-binding
+transition. That witness retains the exact canonical subject, full provisional
+material binding and resulting committed state. The successor predicate alone
+checks encryption-instance fields; it cannot tell which logical object supplied
+the AEAD context. The additional witness closes same-instance crossed-subject
+rewraps and cannot be recovered by decoding a raw durable encryption state.
+This does not add a durable field or change any format. The crypto owner still
+performs sealing; the storage check preserves its exact input/output provenance,
+not independent cryptographic verification of arbitrary supplied ciphertext.
+
+Independent same-codec regressions cross bucket, key, generation, incarnation,
+encryption instance, original wrapped-key material and the committed-state/witness
+pair. Rejection keeps SQL, files, acknowledgements, deadline and custody unchanged;
+a correct real-DEK rewrap using the retained subject then succeeds. File binding
+and terminal preparation have mandatory typed inputs, with compile-fail probes
+for omission or detaching the retained subject.
+
+Correction validation: 33 focused tests, formatting, strict all-target/all-feature
+Clippy, the storage-boundary checker and full Nextest passed: **10,689 passed**,
+six skipped, in **694.134s**. All eight slow-threshold cases completed
+successfully. Logs are retained at
+`/tmp/argmin-direct-subject-{focused-final,clippy,boundaries,full}.log`.
+
+## Candidate Owning Direct PUT Terminal Installation — 2026-11-15
+
+The reviewed prepared terminal now consumes itself into an owning embedded
+submission. The complete contextual command, witnessed physical payload,
+provisional encryption subject, original introduction history and immutable
+cutoffs stay together. Callers can inspect only command identity and installation
+status; there is no command/custody extraction, clone, reset or caller-selected
+retry deadline. This is still a candidate path, not live publisher selection.
+
+An installation attempt borrows a private proof from that holder. It binds the
+exact terminal ID and complete-command SHA-256 to the original admitted section,
+introduction, topology and payload. Under the existing pending-slot write
+transaction, validation reloads the full object snapshot and exact owner/window,
+issuer and generation reservation, then runs the shared terminal apply preflight.
+The saved snapshot is not installation authority. The original route fence and
+work cutoff are rechecked immediately beside INSERT; slot bytes, scope and both
+side indexes retain the shared atomic installation protocol. No new transaction,
+fsync, format change or network call is introduced.
+
+An uncertain exact retry may already own the pending slot, so installation does
+not demand the preparation-time empty-slot prefix. It instead checks retained
+facts and delegates exact command/scope/index validation to the classified slot
+boundary. Uncertainty is recorded before effects and survives unwind, ambiguous
+commit and subsequent rejection. A definite pre-effect rejection preserves the
+prior observation. Confirmed installation is monotonic: after validating the
+section and captured authority, another call cannot reinstall/repair a slot or
+downgrade that confirmation. Later publication still must validate durable state.
+Drop neither deletes physical payload nor releases generation responsibility.
+
+Regressions cover exact command/scope/index installation with unchanged applied
+prefix, no-write confirmed retries (including damaged indexes), foreign sections,
+preparation-to-install snapshot/reservation changes, pre-INSERT wall/monotonic
+expiry, deferred commit failure and unwind with retained custody and successful
+retry. A lost-confirmation seam runs after the actual commit: exact retry must
+confirm the retained slot, while missing route/staging indexes or missing/crossed
+scope must preserve uncertainty without repair. Compiler probes cover the
+consuming installation handoff and reject reuse, clone, extraction, reset,
+forged installation proof and deadline injection.
+
+Validation: all **16 focused tests**, formatting, strict all-target/all-feature
+Clippy and the storage-boundary checker passed. The full Nextest run passed
+**10,695 tests**, six skipped, in **691.196s**; all eight slow-warning tests
+completed successfully. Initial standalone API probes needed fixture declaration
+updates for the new types; those were corrected before the clean focused/full
+runs. Logs are retained at
+`/tmp/argmin-direct-install-{focused-final,fmt,clippy,boundaries,full}.log`.
+
+The next handoff is owning terminal publication/fanout
+and reference transfer. Remote-primary terminal preparation/installation and
+frontend activation remain gated; this slice does not claim convergence or
+cleanup authority from installation alone.
+
+## Candidate Owning Direct PUT Terminal Publication — 2026-11-15
+
+Confirmed embedded installation now consumes into a private Direct PUT publication
+holder. Unsubmitted or uncertain installation returns the original owning
+submission, preserving exact command and history. Successful handoff retains the
+witnessed payload, original introduction custody and complete publication sender
+together. It preserves the original absolute wall cutoff and intersects the
+monotonic/fence bounds, without recomputing remaining authority, re-admission or
+storage effects. The sender and physical custody cannot be independently extracted,
+cloned or reset; Drop does not delete files or release reservations.
+
+Publication and application reuse the existing admitted complete-command engine.
+The original embedded section is required for every operation. Marker trial apply
+validates the exact pending scope/indexes and ownership transfer, rolls back trial
+effects, then records publication start. Confirmed marker precedes witness apply;
+confirmed witness precedes primary; confirmed primary precedes remaining members.
+Per-member ambiguity survives returned errors, unwind, expiry and retry. Successful
+replica application atomically publishes object/segment metadata and transfers the
+owner's exact references to that object, retaining generation/bucket release
+responsibility. Physical files and acknowledgements remain intact. Repeated exact
+apply performs no additional SQL mutations.
+
+Real encrypted-payload regressions cover all three bucket versioning selections,
+every member of the five-node cohort, exact object/segment/encryption and owner
+records, marker-trial rollback, ordering and nonmember rejection, no-write exact
+replay, foreign sections, damaged scope/indexes, and marker/apply failures before
+commit or after commit (including unwind). Lost witness or primary confirmation
+blocks later members until exact retry. Cutoff and original introduction history
+survive the handoff; failed or dropped holders preserve payload custody. Compiler
+probes accept the owning API and reject reuse, cloning, sender/custody extraction,
+reset, premature terminal extraction and deadline injection.
+
+Validation: all **16 focused tests**, formatting, strict all-target/all-feature
+Clippy and the storage-boundary checker passed. The full Nextest suite passed
+**10,700 tests**, six skipped, in **695.105s**; all eight slow-warning tests
+completed successfully. Logs are retained at
+`/tmp/argmin-direct-publish-{focused-final,fmt,clippy,boundaries,full}.log`.
+
+This adds no transaction, fsync or format change beyond
+the existing marker/apply protocol. It is not slot retirement, reservation release,
+cleanup activation, remote-primary terminal preparation/publication or frontend
+selection. The next handoff must consume confirmed all-member application into
+terminal resource/slot retirement while retaining exact release obligations.
+
+## Candidate Direct PUT Terminal Custody and Proof Release — 2026-11-15
+
+Exact all-member Direct PUT application now consumes into a distinct terminal
+holder. Before splitting ownership, handoff checks the original authority and
+absolute/monotonic cutoff, full cohort confirmation, and command-derived terminal
+work. Any failure returns the original publication with its physical bookkeeping,
+complete command, observations and cutoff intact. In particular, durable apply
+without its reply does not satisfy the completion gate. After confirmation,
+durable object references replace resolved frontend file bookkeeping; the same
+route, complete source, installation/application journals and cutoff move into
+the terminal holder without SQL or network effects.
+
+The narrow holder exposes only observations and exact bucket command-proof release.
+It delegates to the existing closed release authority, recording uncertainty
+before dispatch and preserving it after error or unwind. Successful release is
+monotonic and exact retry performs no further writes. Neither release nor Drop
+deletes files, acknowledgements, object rows, retained staging owners, resource
+obligations or the pending slot. No command, generic terminal, caller deadline,
+successor-window conversion or cleanup operation escapes this holder.
+
+Direct PUT is not append-style quiescent work. Slot retirement deliberately
+remains gated even after bucket release: its transaction still needs exact
+published-owner/reference and release-responsibility validation (including any
+displaced reclaim handoff). This slice does not broaden the generic retirement
+classifier or treat proof release as owner retirement. That transaction check and
+the admitted consuming slot-retirement operation are the next integration slice.
+Remote-primary terminal preparation and live frontend/worker activation remain
+gated. No format change, extra command or new transaction/fsync protocol is added.
+
+Tests cover every incomplete cohort prefix, a committed final replica with a
+lost reply, no-write exact retry and handoff, expired handoff returning original
+history, and real bucket reservation release with an independent canary. Release
+faults and unwind retain uncertainty, expiry does not renew it, confirmed retry
+does not mutate again, and all object replicas/files/acks/owner obligations and
+the pending slot survive release and Drop. API probes reject detached terminal
+access, cloning, reset, reuse, renewal, slot removal and successor allocation.
+
+Validation: **19 focused tests**, formatting, strict all-target/all-feature
+Clippy and the storage-boundary checker passed. The full Nextest run passed
+**10,703 tests**, six skipped, in **692.845s**; all eight slow-warning tests
+completed successfully. Initial new-test failures were diagnosed and corrected:
+the compiler fixture needed the error type declaration, the SQL fault assertion
+must inspect the internal metadata cause rather than the redacted public display,
+and a confirmed-marker retry returns a no-effect historical confirmation whereas
+the terminal handoff itself rejects its expired cutoff. The non-mutation and
+expiry gates remain asserted. Logs are retained at
+`/tmp/argmin-direct-retire-{focused-final,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Direct PUT Slot Retirement Without Displacement — 2026-11-15
+
+The candidate Direct PUT terminal holder now exposes admitted embedded slot
+retirement after confirmed exact bucket-proof release. This narrows the preceding
+slice's blanket slot-retirement gate: only standalone Direct PUT with **no stale
+payload** is admitted. Streamed PUT and overwrites remain gated; an overwrite's
+displaced reclaim handoff needs independent validation, not inference from the
+new object's successful publication.
+
+The existing slot-removal transaction authenticates complete Applied evidence,
+exact pending bytes, scope and side indexes, then validates the original Direct
+PUT owner against the retained command before DELETE or absence confirmation.
+Checks bind target, bucket/key/incarnation, attempt/generation, introduction order,
+configured topology, EC/codec geometry, the complete single selected segment,
+the generation high-water fence and the exact stable bucket-release identity.
+The owner's terminal lifecycle must retain both generation and creation release
+responsibility. A coherent window/reference substitution is rejected against the
+authenticated command, not merely accepted because the two rows agree.
+
+Lost-reply retries may follow later reference transitions. Published Object,
+retiring Object/Reclaim, and completed-reclaim unreferenced owners retain the same
+window and resource custody; the check accepts those legitimate states without
+requiring the original version still be current. It never infers owner retirement
+from missing references. No new command, schema, transaction or fsync is added.
+The original local/portable deadline is checked at the existing pre-DELETE and
+pre-COMMIT effect boundaries. The narrow holder accepts no replacement deadline,
+raw request, detached terminal or next-window conversion.
+
+Tests cover real five-member encrypted Direct PUT publication, exact proof
+release, slot/index removal, and preservation of objects, owners, files and acks.
+Failure/unwind before DELETE, before COMMIT and after COMMIT retain uncertainty;
+absence retry performs no writes, while confirmed retirement never redispatches.
+An independently crossed retained proof rejects removal and absence confirmation
+before the effect hook. Owner-local corruption matrices cover missing owner,
+references/resources/high-water, changed resource states, same-subject proof
+substitution, coherently changed segment hashes, placement and sizes. Reopen,
+later retained-reference transitions, original-command binding, deadline expiry
+beside DELETE/COMMIT and explicit stream/overwrite gating have separate canaries.
+Existing historical embedded/Unix/TLS release tests now exercise the same narrow
+Direct PUT retirement classification. Physical cleanup, owner retirement,
+remote-primary Direct PUT preparation/publication and live activation remain
+separate gates. The next Direct PUT retirement step is the displaced-payload
+handoff, including completion of its reclaim root before an absence retry.
+
+Validation: all **44 focused tests**, formatting, strict all-target/all-feature
+Clippy and the boundary checker passed. The first expanded selection exposed a
+new-test diagnostic assumption: a changed subject-derived hash is rejected by
+structural owner validation before the new command-binding comparison. The
+post-reclaim canary now substitutes a placement epoch, explicitly proves the
+owner remains structurally valid, and requires the command-binding rejection.
+The full workspace Nextest run passed **10,710 tests**, six skipped, in
+**700.518s**. All eight slow-warning tests completed successfully. Logs are at
+`/tmp/argmin-direct-slot-{focused-corrected,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Direct PUT Displaced-Reclaim Retirement — 2026-11-15
+
+Standalone Direct PUT overwrite slot retirement now validates its independent
+displaced-payload handoff in the same removal transaction as the incoming owner.
+This removes the preceding slice's `stale_payload` gate, not the streamed PUT,
+owner-retirement or live-activation gates. No new schema, metadata command,
+transaction or fsync is added.
+
+A present standard/multipart reclaim root must equal the authenticated complete
+command's root, including its full ordered segment/part inventory. Its original
+owners must retain matching windows and exact Reclaim destinations, terminal
+resource responsibilities, bucket incarnation, configured topology and generation
+high-water fences. A live object with the displaced generation, another root
+kind, missing owners, split/missing references or uncovered manifest entries
+rejects retirement before effects. Multipart inspection keeps all attempts in
+scope, including omitted and already-closed attempts; only the selected retained
+owners can cover a present root. All must remain valid for the same upload.
+
+An absent root is not itself success. Only post-reclaim unreferenced owners may
+cover the command's complete displaced manifest, using retained windows rather
+than references that reclaim completion legitimately removed. Unpublished MPU
+attempts cannot substitute for published payload. Historical empty parts contain
+no physical keys; multiple already-completed empty attempts may therefore cover
+the same empty part, but every attempt still retains its separately validated
+obligations. No old resource proof is released or physical cleanup authorized by
+this inspection. Missing old custody still rejects an absent-slot retry.
+
+Metadata-only tests use actual introduction, append, publication, displacement
+and reclaim-completion mutations for Direct PUT, empty/multisegment streamed PUT,
+and empty/multipart manifests. They cover reopen before and after root consumption,
+missing roots/owners/resources/references, crossed incarnation/placement, complete
+manifest substitution after root consumption, and repeated empty-part attempts.
+Installed embedded, Unix and TLS historical matrices exercise all-member apply,
+proof release and overwrite retirement for inspected, installed and uncertain
+origins, while preserving materialized ownership state. Transaction tests remove
+only displaced owners and require rejection before DELETE/absence confirmation.
+A lost retirement reply followed by a logged reclaim-completion command must
+still confirm the original absent slot without further mutation.
+
+Remote-primary Direct PUT terminal preparation/publication, streamed terminal
+integration, frontend activation and autonomous owner cleanup remain separate
+work. The next Direct PUT integration boundary is remote-primary terminal
+preparation/publication with the same retained physical custody and deadline.
+
+Validation: the broad **52-test** focused selection passed, followed by all
+**nine** displaced-retirement cases after adding the logged reclaim/lost-reply
+canary. Formatting, strict all-target/all-feature Clippy, boundary and diff checks
+passed. Full workspace Nextest passed **10,719 tests**, six skipped, in
+**705.503s**; all eight slow-warning tests completed successfully. Logs are at
+`/tmp/argmin-displaced-retirement-{focused-final,final-cases,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Snapshot Framing — 2026-11-15
+
+The next remote-primary boundary starts with read-only post-write snapshot
+framing, not terminal publication. Distinct RPC kind **182** carries DSNP/DSNR
+V1. The request retains the exact Direct PUT descriptor, logical size, complete
+ordered receipt claims and primary route/topology/absolute cutoff. The response
+binds the entire request by SHA-256 and borrows the existing snapshot encoding;
+decoding cannot manufacture a prepared payload, command or installation holder.
+
+This slice only establishes bounded transport and immutable wire evidence.
+Descriptor authority, receipt completeness, the original held session identity,
+durable acknowledgement correspondence and snapshot subjects must still be
+validated by the admitted receiver and consuming sender. The wire codec does not
+claim those checks. The request has frontend-only authorization and Progress
+admission; at this framing checkpoint dispatch unconditionally returned
+UnsupportedOperation, including on candidate-enabled servers. The receiver
+integration below supersedes that test-only gate. No production request selects it, no new transaction
+or fsync is added, and existing protocols/fixtures remain intact.
+
+Tests cover literal composite/reply evidence, request-field substitution,
+cross-purpose/stream rejection, canonical receipts, truncated/trailing framing,
+versions, oversized nested lengths, borrowed replies, transport caps and the
+installed unsupported boundary. Existing snapshot semantics remain owned by
+storage, not by the framing layer. Large-metadata transfer redesign remains the
+separate workstream; this does not impose a smaller displaced-manifest limit.
+
+Next: implement the admitted, same-held-primary receiver and consuming snapshot
+sender. Carry the captured cutoff through deadline rebinding, reject expiry and
+crossed durable facts without effects, and preserve the exact acknowledged owner
+on every error. Then add remote terminal preparation, classified installation,
+publication and retirement; live frontend activation remains gated.
+
+Validation: all **eight** focused codec, admission, authorization and installed
+gate checks passed. The initial new literal had 33 topology-digest bytes rather
+than 32; its exact comparison caught that fixture typo, which was corrected with
+an independently computed request digest before validation. Formatting, strict
+all-target/all-feature Clippy, boundary and diff checks passed. Full workspace
+Nextest passed **10,725 tests**, six skipped, in **704.423s**; all eight
+slow-warning tests completed. Logs:
+`/tmp/argmin-direct-snapshot-{focused-corrected,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Snapshot Receiver — 2026-11-16
+
+The read-only DSNP/DSNR receiver is now selected on candidate-test servers only.
+Live dispatch still returns UnsupportedOperation. Its private authority is minted
+only after validating the exact Active route-admission domain, current node/PG/
+epoch and primary role, and the connection's held current-primary section. The
+authority binds the exact query and PgStore by borrow; surrounding storage code
+cannot substitute independently supplied snapshot subjects or another store.
+
+The absolute conservative wire cutoff is rebound before descriptor decoding and
+intersected with the immutable durable window cutoff. PG mutex admission also
+obeys the server's captured route fence and bounded RPC budget. A single settled
+read snapshot validates the retained active owner/window, generation high-water
+evidence, live allocation issuer and exact fixed-generation reservation, and
+loads the post-write Direct PUT snapshot. Response encoding remains inside that
+snapshot. Successful teardown precedes the final route/work/window deadline and
+allocation-lifetime checks; expiry at that boundary cannot return a prepared
+observation. No durable mutation, new fsync, data-PG access or metadata-peer call
+is introduced. The server's already-held primary section remains held.
+
+Receipt count, order, encoded geometry and configured placement are checked
+against the retained window. They remain *claims*, not evidence of persisted
+data-PG acknowledgements: this receiver deliberately does not read data PGs while
+holding object-PG serialization. The consuming sender still needs to retain its
+confirmed acknowledgement custody, original encryption subject, exact remote
+session identity and immutable deadline. A response alone cannot mint any of
+those, build a terminal command, or authorize installation/publication.
+
+Installed authenticated Unix/TLS coverage includes empty/current-object snapshots,
+a same-PG crossed-key canary, exact retries, foreign/retained admission and missing
+primary-section rejection, crossed route/topology/descriptor and receipt geometry,
+changed durable reservation/window/issuer, and both client and server expiry after
+read-snapshot teardown. Tests compare materialized state, SQL change counts and
+pending shadows; receiver fixtures do not claim physical file/ack effects.
+
+Next: the consuming remote snapshot sender, including reopened-session rejection,
+malformed/lost-response handling and custody-preserving retries. Remote terminal
+preparation, classified installation, publication/retirement and live frontend
+activation remain gated.
+
+Validation: all **ten** focused codec/receiver/gate tests passed. The first
+crossed-route assertions omitted UnknownNode and expected InactivePgRoute instead
+of the PG validator's StaleShardLocation; these test expectations were corrected
+against the existing validator, without changing production error mapping.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+Full workspace Nextest passed **10,729 tests**, six skipped, in **706.312s**;
+all eight slow-warning tests completed. Logs:
+`/tmp/argmin-direct-snapshot-receiver-{final-focused,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Snapshot Sender — 2026-11-16
+
+Acknowledged Direct PUT payload custody now consumes into remote snapshot
+preparation over installed authenticated Unix/TLS. The sender opens one bounded
+post-file primary section: the earlier confirmation/file-binding section was
+deliberately released before physical dispatch. Successful opening captures a
+private session identity in the owning payload. Subsequent preparation must use
+that exact held session and client, not a newly opened connection to the same
+endpoint. Neither opening nor retry accepts a replacement deadline.
+
+Requests derive the exact descriptor, logical size and complete confirmed receipt
+set from retained custody. The original absolute physical cutoff is reused,
+not recalculated from remaining time. Local route/work/window authority is checked
+before dispatch and after decoding. The response must authenticate the entire
+request digest and pass the existing exact-subject/current/displacement validator;
+an active owner cannot accept an already-committed generation or committed-segment
+projection. Only logical authorization facts escape the prepared holder.
+
+Bad replies, transport loss, expiry, foreign clients and reopened sessions return
+the original acknowledged holder with its history, encryption subject, receipt
+journal and cleanup responsibility intact. There is no cleanup on Drop and no
+new transaction, fsync, acknowledgement registration or command allocation. A
+read retry may reuse the still-held section; a lost section cannot be replaced
+inside this holder. The durable owner remains responsible for later recovery.
+
+Runtime canaries write actual fixture ciphertext and persist its acknowledgements
+before preparing snapshots. They cover installed/inspected/uncertain introduction
+origins, Unix/TLS, independently malformed correlation/ETag/object/displacement/
+committed-state replies, exact retry, foreign/reopened/expired sessions, and lost
+or connection-closing replies. Each checks unchanged durable state, retained
+payload files and acknowledgement rows, and preserved custody history. API-shape
+checks compile the consuming path and reject reuse, detached session identity and
+caller-supplied cutoff renewal.
+
+Next: remote terminal preparation with atomic snapshot revalidation, followed by
+classified installation, publication and retirement. Live frontend selection,
+stream terminal integration and autonomous owner cleanup remain gated.
+
+Validation: all **15** focused sender/receiver/codec/admission/API tests passed.
+Strengthening the malformed-response assertions exposed lossy error wrapping in
+the new adapter; it now preserves the typed storage error, and the canary checks
+its existing test-only diagnostic accessor rather than the intentionally redacted
+public display. Formatting, strict all-target/all-feature Clippy, boundary and
+diff checks passed. Full workspace Nextest passed **10,733 tests**, six skipped,
+in **706.051s**; all eight slow-warning tests completed successfully. Logs:
+`/tmp/argmin-direct-snapshot-sender-{focused-final,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Terminal Preparation Framing — 2026-11-16
+
+Remote terminal preparation now has a bounded candidate wire contract, not an
+activated builder. Distinct RPC kind **183** carries DTPQ/DTPR V1 and is
+frontend-only with Progress admission. At the framing checkpoint both ordinary
+and candidate-test dispatch were unsupported; the receiver integration below
+supersedes only that candidate-test gate. Framing adds no command allocation,
+transaction or fsync.
+
+The request retains the exact earlier DSNP descriptor/receipt request and its
+immutable cutoff, a digest of the previously observed snapshot, the segment CRC,
+provisional encryption and logical commit input. The snapshot digest is SHA-256
+of the existing canonical direct-commit snapshot encoding; do not transmit or
+trust an independently supplied second displacement manifest. The admitted
+receiver must rederive those facts under the same held-primary section and one
+read snapshot, compare the digest, derive the physical manifest and command from
+the retained window, then run the existing complete apply preflight before
+returning. Installation must still repeat its own atomic revalidation.
+
+Framing checks only encryption profile roles, version selection, canonical
+receipt/request shape and bounded lengths. It does **not** attest exact encryption
+subject or physical custody. The consuming sender must retain its storage-minted
+provisional subject, require the exact committed-encryption transition, and bind
+the returned command to its logical input and physical manifest before accepting
+it. The receiver independently derives the subject from the durable descriptor
+and supplied provisional material and checks immutable committed-material lineage.
+It cannot authenticate the DEK's AEAD subject without the secret key: exact
+cryptographic rewrap provenance remains the sender's opaque committed-encryption
+evidence, never something the decoded DTO alone establishes. Neither an encoded
+request nor a reply can mint an installation holder by itself.
+
+Replies bind the complete request SHA-256 and primary node/PG/epoch while leaving
+complete-command bytes borrowed and untrusted. Request-only descriptor/provisional
+overhead does not consume the metadata-command payload allowance. Literal
+version-vector fixtures are appended, not regenerated from historical evidence.
+
+Next: admitted remote terminal receiver with atomic snapshot/manifest/encryption
+revalidation, followed by its consuming sender and classified installation,
+publication and retirement. Live frontend selection remains gated.
+
+Validation: all **seven** focused codec/gate/authorization/admission tests passed.
+The initial committed-material negative changed only the metadata-only fixture's
+subject label, which leaves its synthetic ciphertext unchanged; the corrected
+canary substitutes actual serialized wrapped material. Formatting, strict
+all-target/all-feature Clippy, boundary and diff checks passed. Full workspace
+Nextest passed **10,738 tests**, six skipped, in **704.061s**; all eight
+slow-warning tests completed. Logs:
+`/tmp/argmin-direct-prepare-framing-{final-focused,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Terminal Preparation Receiver — 2026-11-16
+
+Candidate-test servers now admit DTPQ through the same private Active-domain,
+current-primary, exact-session/store gate as snapshot inspection. Live dispatch
+still returns UnsupportedOperation. The terminal query immutably owns the exact
+nested snapshot query borrowed by that authority; independent query/store inputs
+cannot substitute for the admitted request. Original wire/window/work deadlines
+and the server route cutoff remain intersected and bounded at PG admission.
+
+The receiver validates receipt completeness, configured placement and combined
+CRC/witness geometry without reading data-PG acknowledgement rows. Under one
+settled read snapshot it validates durable owner/window, fixed reservation and
+allocation issuer, reconstructs the canonical object/displacement snapshot and
+matches its digest, derives encryption-material lineage and the terminal command,
+then runs complete ownership/apply and pending-inventory preflight. Command index
+and write sequence are derived read-only; neither is durably allocated here.
+Context encoding and response binding occur before snapshot teardown, followed
+by final route/work/window and allocation-lifetime checks. No mutation or fsync,
+data-PG access or peer RPC is added; the primary section remains held.
+
+This receiver checks descriptive claims, not frontend physical or cryptographic
+custody. Its reply cannot create a confirmed submission. The consuming sender
+must still bind its original session, confirmed receipts, storage-minted subject,
+opaque committed-encryption proof and exact logical inputs to the returned
+command before installation. In particular material lineage does not prove that
+a ciphertext was actually sealed using a particular object's AEAD context.
+
+Installed authenticated Unix/TLS canaries cover all three versioning modes,
+read-only retries and exact command fields, crossed admission/missing sections,
+snapshot digest/CRC/receipt failures, same-instance encryption-prefix substitution,
+changed durable owner facts and an intervening current-object mutation. Separate
+client-first and server-first expiry cases reject after read-snapshot teardown.
+Tests pin unchanged state/change counts, empty pending shadows and autocommit;
+receiver-only fixtures do not claim real file/ack persistence.
+
+Next: consuming remote terminal sender and exact returned-command validation,
+then classified installation, publication and retirement. Live frontend selection
+and autonomous cleanup remain gated.
+
+Validation: all **17 focused receiver/sender/framing tests passed** in **12.161s**.
+The first focused run exposed a fixture expectation using the template generation
+instead of the generation actually reserved by introduction; expected fields and
+the test encryption subject now come from the durable owner. Strict Clippy also
+identified the oversized terminal-query enum variant, now boxed without changing
+its ownership. Formatting, strict all-target/all-feature Clippy, boundary and diff
+checks passed. Full workspace Nextest passed all **10,742 tests** in **710.264s**
+(eight slow warnings, six existing skips). All warned tests completed successfully.
+Validation logs are `/tmp/argmin-direct-prepare-receiver-{final-focused,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Terminal Preparation Sender — 2026-11-16
+
+The witnessed payload now consumes through remote terminal preparation on its
+original post-file primary section. The holder retains its original provisional
+encryption material alongside the storage-minted subject; opaque committed
+encryption evidence must match that subject and the exact logical input before
+transport. No caller deadline, independent descriptor, receipt set or snapshot
+can mint this request. The wire request is reconstructed from original custody
+and uses the unchanged absolute cutoff; retries cannot reopen the section.
+
+The sender verifies request correlation and complete ordinary context, matching
+PG/epoch and an index after introduction, before comparing the entire terminal
+command with shared pure assembly from its retained manifest, snapshot, input
+and reservation responsibility. The primary remains authoritative for a positive
+write sequence, command index and timestamp; this sender has no independent
+counter snapshot and does not claim to verify those assignments exactly. Reclaim
+timestamp normalization must agree with the returned object timestamp. The shared
+assembler preserves embedded behavior; no new transaction, fsync or format bump
+is introduced. Only a fully checked response produces the existing opaque
+prepared terminal holder, still inseparable from payload custody. Failure returns
+the witnessed holder without releasing or deleting anything.
+
+Real-ciphertext/file/ack Unix/TLS matrices cover installed, inspected and uncertain
+origins; canonical, correctly checksummed crossed replies; exact-request retries;
+crossed cryptographic evidence/client, expiry and same-client reconnect before
+transport; and lost/nonreusable responses. API probes pin consumption, required
+encryption evidence, non-renewable deadlines and private command custody.
+
+Remote terminal installation/publication, live frontend selection and autonomous
+cleanup remain gated. Next is classified remote terminal installation using this
+owning holder, with uncertainty preserved across dispatch and retry.
+
+Validation: all **30 focused terminal/receiver/sender/API-shape tests passed** in
+**39.869s**. The first broader run exposed a new API-probe setup error (E0425:
+`witnessed` was not introduced for the remote probe name); the harness now creates
+the remote witnessed holder before these probes. The preceding seven-test sender
+and embedded-preparation selection passed. Formatting, strict all-target/all-feature
+Clippy, boundary and diff checks passed. Full workspace Nextest passed all
+**10,746 tests** in **717.322s** (eight slow warnings, six existing skips); every
+warned test completed successfully. Logs:
+`/tmp/argmin-direct-terminal-sender-{final-focused,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Terminal Installation Framing — 2026-11-16
+
+Installation needs to carry the exact complete command alongside its original
+preparation, not just a command ID or CRC. `DTIQ`/`DTIC` V1 now reserves distinct
+frontend-only RPC kind **184**, with Progress admission. Both live and candidate
+dispatch remain UnsupportedOperation: this slice adds no installation authority,
+SQL effect, ownership transition or sender method. It extends the existing
+uncommitted RPC **36 → 37** transition without rewriting predecessor evidence.
+
+The request contains a length-delimited unchanged DTPQ V1 preparation and a
+borrowed complete-command carrier. Framing requires the command route to match
+the preparation's primary node/PG/epoch, but does not decode or validate command
+semantics. The 38-byte confirmation carries SHA-256 of the entire request,
+including complete bytes, CRC, preparation snapshot digest, immutable cutoff and
+encryption/logical inputs. Neither an error nor this framing type is absence,
+physical custody, encryption-subject or publication evidence.
+
+The cap is **8,405,753 bytes**: outer framing plus the preparation cap plus the
+full complete-command carrier cap. Request-only fields do not consume the
+supported command budget. Tests preserve a literal 1,015-byte composite and
+38-byte confirmation, independently check route/request substitution, all
+truncations, versions, nested length bounds and cross-protocol rejection, and
+exercise exact-cap/one-over framed admission and maximum-size complete commands.
+The composite's nested preparation is the previously frozen DTPQ specimen; its
+command body is explicitly opaque framing evidence, not a valid terminal command.
+
+Next: admitted receiver plus transaction-bound snapshot/ownership validation,
+then the owning sender's classified dispatch and exact confirmation. Fresh and
+exact-existing installation must revalidate the same custody and all pending
+indexes in the slot transaction, with original client/work/server cutoffs at the
+final effect boundary. A wire error remains uncertain to the sender; only a
+local NotSent outcome may restore previous history. Confirmed Installed history
+must never regress. These receiver/sender obligations are not implemented here.
+
+Validation: all **28 focused framing/authentication/admission/gate tests passed**
+in **0.066s**. An initial compile caught a test using `try_from` rather than the
+wire-kind owner's `from_u16`; corrected before the successful run. Formatting,
+strict all-target/all-feature Clippy, boundary and diff checks passed. Full
+workspace Nextest passed all **10,751 tests** in **713.053s** (eight slow warnings,
+six existing skips); every warned test completed successfully. Logs:
+`/tmp/argmin-direct-install-framing-{focused,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Remote Direct PUT Terminal Installation Receiver — 2026-11-16
+
+The DTIQ/DTIC receiver is now test-selector gated behind authenticated frontend
+admission, an Active permit from this server's admission domain, the current
+primary route, and its held primary section. The private authority binds the
+whole installation request as well as its nested snapshot query and store.
+Live dispatch is still UnsupportedOperation; the consuming installation sender,
+remote publication/terminal handoff and autonomous cleanup remain pending.
+
+The shared pending-slot transaction now accepts a closed embedded/remote Direct
+PUT check. The remote check is minted only by the admitted receiver and borrows
+the original preparation and authority. Within the transaction it reloads the
+exact retained window/issuer/generation reservation, reconstructs the snapshot
+digest and full command from receipt geometry, logical input and encryption
+lineage, and validates the next command index/write sequence and object-owner
+application invariants. The sender still supplies the indispensable opaque
+committed-encryption evidence; a receiver receipt claim is not proof of physical
+durability or cryptographic sealing. No data-PG network reads occur under SQL.
+
+Fresh insertion and exact retry run the same checks. Retry additionally validates
+scope and every pending index without repairing damage. The existing final SQL
+effect check receives the intersection of the original client cutoff and the
+server's route fence, plus the bounded work deadline. No new transaction/fsync
+is added. Lost success leaves the exact complete slot and all custody retained;
+a receiver-only reconnect regression does not authorize owning senders to discard
+their original session/history or reconnect.
+
+Unix/TLS regressions cover positive installation/exact retry, damaged indexes
+and scope, independently crossed command fields, durable owner/counter changes,
+client-first and server-first expiry at the final pre-INSERT hook, and lost
+success followed by exact inspection/retry. The durable-change matrix covers
+current-object replacement and issuer retirement as well as window, reservation
+and sequence changes, both before fresh insertion and on exact retry.
+
+Validation: all **47 focused tests passed** in **33.737s**, including
+embedded terminal and remote preparation/sender regressions. The initial
+five-test run had four passes and one new assertion failure: its reused index
+was correctly rejected by the earlier already-applied log check. The assertion
+now pins that diagnostic, and an independent future-index case exercises the
+new transactional check. Formatting, strict all-target/all-feature Clippy,
+boundary and diff checks passed. Full workspace Nextest passed all **10,756
+tests** in **725.687s** (eight slow warnings, six existing skips); every warned
+test completed successfully. No other same-user Nextest was active at launch
+and load1 was 7.60. Logs:
+`/tmp/argmin-direct-install-receiver-{focused,focused-final,fmt,clippy,boundaries,full}.log`.
+
+Next: consuming remote installation from `DirectTerminalSubmission`, preserving
+Unconfirmed after any attempted dispatch, permitting prior-history restoration
+only for NotSent, and never regressing Installed. Then remote publication and
+the exact all-member terminal custody transfer.
+
+Review correction: assembly using a supplied `last_modified_millis` only proves
+internal consistency, not that the primary selected that timestamp. Terminal
+preparation now retains one fixed-size identity (preparation SHA-256 plus
+complete-command SHA-256) in its held PG section, after successful capture and
+deadline checks. Fresh insertion must match it inside the slot transaction.
+Releasing the section discards it; a later preparation replaces it. A missing or
+different identity permits only exact durable pending bytes as retry-origin
+evidence, with every existing scope/index/ownership check still required. This
+adds neither a wire/schema change nor a durable write or fsync. It does not make
+frontend sessions durable or authorize owning senders to reconnect.
+
+Unix/TLS regressions independently reseal Last-Modified and any displaced reclaim
+timestamp, require rejection without mutation, then install/retry the original
+command. Both empty and displaced-object cases have positive canaries. Closing
+the preparation section blocks fresh installation; a fresh preparation on the
+new section succeeds. Lost-reply retry rejects changed timestamps even without
+the original in-memory identity. All **49 focused tests passed** in **34.394s**;
+formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+Initial validation caught a module-path/test-close compile error, then fixture
+errors (an overlong test session label, missing predecessor high-water fence,
+and missing explicit prefix revalidation before fresh re-preparation following
+rejection). Those fixture setups are corrected without relaxing production
+checks. Full workspace Nextest passed all **10,758 tests** in **721.722s**
+(eight slow warnings, six existing skips); every warned test passed. No other
+same-user Nextest was active at launch and load1 was 7.07. Logs:
+`/tmp/argmin-direct-install-origin-{focused,focused-2,focused-3,focused-final,fmt,clippy,boundaries,full}.log`.
+
+## Candidate Owning Remote Direct PUT Installation Sender — 2026-11-16
+
+`DirectTerminalSubmission::install_remote` now borrows the retained witnessed
+payload and complete command through one classified dispatch. Remote preparation
+retains its exact encoded request alongside the submission, rather than rebuilding
+it from logical inputs or clock state on retry. The private proof binds that
+preparation digest and complete-command digest to the original physical custody
+and held primary-session identity. Embedded-prepared and remotely prepared
+installation paths cannot substitute for one another.
+
+Session acquisition uses the original deadline; neither reconnect nor a new
+deadline is accepted. The holder marks Unconfirmed before dispatch/unwind. Only
+a local NotSent restores the previous observation (including earlier Unconfirmed);
+remote errors, lost replies and invalid confirmations leave Unconfirmed. Exact
+request-bound confirmation records Installed even if the connection is then
+closed. Installed retries still validate supplied authority/session but do not
+redispatch or regress success. A failed attempt or dropped holder never cleans
+physical payload, acknowledgements or reservations. Confirmed custody can be
+consumed into the existing publication holder without a new effect or budget.
+
+Unix/TLS tests use real ciphertext, files and acknowledgement rows. They cover
+all three introduction histories, exact request/cutoff retries after corrupted
+or error responses, lost/nonreusable responses, wrong client/session and expiry,
+NotSent before and after uncertainty, unwind, confirmation non-regression after
+index damage, and retained physical custody on Drop. Compile-time API probes
+pin consuming preparation, private custody, non-cloneability, no history reset,
+and no caller-provided installation deadline. All **six focused sender/API-shape
+tests passed** in **35.482s**. The first build caught a child test module declared
+before the shared macro it uses; moved below that definition. Formatting, strict
+all-target/all-feature Clippy, boundary and diff checks passed. Full workspace
+Nextest validation passed: **10,763 tests in 725.297s**, eight slow tests (all
+completed successfully), six skipped. The full run also passed all five new
+Unix/TLS installation-sender regressions.
+
+Live dispatch remains gated. Next: remote publication with this same owning
+holder/session/deadline, followed by exact all-member terminal handoff and
+reservation/slot retirement. No schema, wire-format or fsync change in this slice.
+
+## Candidate Owning Remote Direct PUT Publication Start — 2026-11-16
+
+`DirectTerminalPublication::publish_remote` now borrows the original primary
+section and invokes the existing classified complete-publication sender without
+exposing it independently of physical custody. Admission requires the exact
+client/session retained through snapshot, terminal preparation and installation,
+plus the original physical/route/work bounds. Neither command nor deadline is
+caller-selectable. The consuming installation-to-publication handoff preserves
+both absolute and monotonic cutoffs and all introduction history.
+
+Publication-start confirms only the durable marker. Its shared trial apply is
+rolled back; it does not commit object references, release reservations, clear
+the pending slot or clean payload. NotSent preserves the prior observation,
+ambiguous replies/unwind retain Unconfirmed, and confirmed publication never
+regresses. Remote-prepared custody cannot invoke embedded publication/application
+or consume into the generic terminal holder that would discard its original
+session identity. The private sender remains inseparable from the payload.
+
+Unix/TLS regressions cover all three introduction histories, exact marker replay
+with unchanged durable object/owner/index state, wrong client, expired original
+cutoff, closed/reopened section, corrupt/empty/wrong-purpose confirmations,
+authenticated error after commit, lost/nonreusable replies, NotSent before and
+after ambiguity, unwind, and no cleanup on Drop. API-shape probes reject caller
+commands and renewed deadlines. All **six focused tests passed in 35.937s**.
+The initial API-probe run exposed missing setup for its new probe-name prefix;
+that fixture setup was corrected before rerunning the complete focused set.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+Full workspace Nextest validation passed: **10,768 tests in 735.931s**, eight
+slow tests (all completed successfully), six skipped. All five new Unix/TLS
+publication-start regressions also passed in that full run.
+
+Next: cohort-ordered remote Direct PUT application, then a session-bound
+all-member terminal handoff and exact reservation/slot retirement. Live dispatch
+remains gated. This slice adds no schema, wire-format or fsync change.
+
+## Candidate Owning Remote Direct PUT Application — 2026-11-16
+
+`DirectTerminalPublication::apply_remote` now uses the retained primary-section
+borrow for primary apply and keeps that borrow live across remote replica RPCs.
+Both publication-start and application share the exact-session admission helper;
+all effects remain bounded by the original authority and immutable cutoff. The
+target must be the exact client in the captured cohort. Marker confirmation is
+required before witness apply, witness confirmation before primary apply, and
+primary confirmation before the remaining members. This is local session
+custody, not a guarantee that the remote primary remains alive.
+
+The complete sender retains per-member uncertainty and confirmations beside the
+witnessed payload. Failed/ambiguous responses cannot authorize later dependent
+roles, reset earlier history, renew authority or clean physical payload. Exact
+apply replay is non-mutating. Successful apply atomically transfers the retained
+window to the command's exact object references/resources. Even after every
+member confirms, the generic terminal handoff rejects remote-prepared custody;
+the session-bound terminal path remains a separate next step.
+
+Unix/TLS tests cover all introduction histories, exact object/owner/reference
+transfer on every original member, marker/witness/primary ordering, exact
+non-mutating replay, duplicate same-endpoint clients, wrong primary, original
+cutoff expiry, reconnect, primary-borrow retention during delayed replica
+confirmation, altered/empty/error responses at all three roles, lost responses,
+nonreusable primary success, NotSent and unwind. Physical bytes and durable
+acknowledgements remain intact through errors and Drop. API probes reject extra
+command/deadline arguments. All **12 focused application/publication/API-shape
+tests passed in 43.638s**. Formatting, strict all-target/all-feature Clippy,
+boundary and diff checks passed. Full workspace Nextest validation passed:
+**10,774 tests in 732.843s**, eight slow tests (all completed successfully),
+six skipped. All six new remote-application regressions also passed in the
+full run.
+
+Next: embedded-replica application in mixed cohorts using the same remote
+primary section, then session-bound all-member handoff and exact reservation/
+slot retirement. Live publisher selection remains gated. No format, schema,
+transaction or fsync is added by this slice.
+
+## Candidate Mixed-Cohort Direct PUT Application — 2026-11-16
+
+`DirectTerminalPublication::apply_embedded_replica` now uses the existing closed
+remote-primary/local-replica bridge. The target is selected only from the
+captured cohort and must actually be embedded, not the remote primary or an
+arbitrary runtime. Its authority retains the exact original primary-session
+borrow through local PG admission, commit and confirmation. Authority is checked
+again after acquiring that borrow; marker/witness/primary ordering and the
+original physical/route/work cutoffs still apply. No independent command,
+deadline, store or production mutation callback can be supplied.
+
+The owning sender records local apply uncertainty before effects. Before-commit
+failure rolls back; after-commit errors or unwind retain Unconfirmed until exact
+retry confirms. AlreadyApplied replay does not repeat durable effects, and a
+later error cannot erase confirmation. Payload, acknowledgement and reservation
+custody remain owned; this does not authorize cleanup or generic terminal handoff.
+
+Unix/TLS-primary regressions use four remote nodes and one genuinely embedded
+remaining metadata replica, asserting that the local member is not a physical
+write/acknowledgement participant. They cover all introduction histories, exact
+object/owner/reference transfer, non-mutating replay, marker/witness/primary
+ordering, retained primary borrow during delayed local confirmation, crossed
+members/primary, expiry/reconnect, before-/after-commit failure, unwind and
+confirmation non-regression. Full-cohort completion still cannot discard the
+original session through the generic terminal API. API probes reject additional
+command and deadline arguments. All **11 focused mixed/remote application and
+API-shape tests passed in 40.317s**. Formatting, strict all-target/all-feature
+Clippy, boundary and diff checks passed. Full workspace Nextest validation
+passed: **10,778 tests in 740.368s**, eight slow tests (all completed
+successfully), six skipped. All four new mixed-cohort application regressions
+also passed in that full run.
+
+Next: session-bound all-member Direct PUT terminal handoff, exact bucket-proof
+release and pending-slot retirement. Live publisher selection remains gated.
+No wire/schema change, transaction or fsync is added by this slice.
+
+## Candidate Remote Direct PUT Terminal Handoff — 2026-11-16
+
+`DirectTerminalPublication::into_remote_terminal` consumes fully confirmed
+publication into an opaque session-bound terminal owner. It verifies the original
+authority/cutoffs and every cohort confirmation before moving custody; failure
+returns the original publication unchanged. The handoff itself performs no
+storage effects. Embedded-only publication retains its existing distinct terminal
+entry, and the remote owner cannot expose a generic terminal or successor window.
+
+Exact bucket-proof release uses the retained bucket-PG route while holding a
+bounded borrow of the original live object-primary session through confirmation.
+The holder accepts neither another client nor a reconnected same-client session.
+Release uncertainty retains the exact obligation and prevents pending-slot
+retirement. A confirmed release permits retirement through that same primary
+session; lost or malformed retirement replies retain Unconfirmed until exact
+absence retry confirms. Neither retry renews authority or regresses confirmed
+history. Payload files, acknowledgements and durable published-owner references
+are preserved, including on Drop.
+
+Unix/TLS tests cover all-remote and mixed cohorts, all introduction histories,
+missing confirmations, original cutoff, crossed/closed/reopened sessions, exact
+proof release alongside an unrelated reservation, release failure and lost reply,
+retirement lost/malformed replies and exact-absence retry. A blocked bucket reply
+proves the primary borrow remains held through release confirmation. API probes
+reject clone, consumed-publication reuse, generic terminal extraction, caller
+deadlines and successor-window conversion.
+
+All **13 focused terminal/API-shape tests passed in 42.590s**. Formatting, strict
+all-target/all-feature Clippy, boundary and diff checks passed. Full workspace
+Nextest passed: **10,784 tests in 746.757s**, eight slow tests (all completed
+successfully), six skipped. All six new terminal regressions passed in that run.
+This slice adds no wire/schema change, transaction or fsync. Next: audit the
+remaining live-publisher integration prerequisites against
+the now-connected candidate Direct PUT path; live publisher selection and the
+durable cleanup worker remain gated.
+
+## Activation Prerequisite Audit — 2026-11-16
+
+This is a source/call-site audit of the current integration tree, not a new
+protocol design or a claim that candidate tests exercise a production S3 request.
+The candidate Direct PUT path is connected from confirmed introduction through
+file and acknowledgement effects, receipt-bound terminal preparation,
+installation, publication, all-member apply, exact proof release and pending-slot
+retirement. Stream PUT and UploadPart have the analogous **append** chain through
+successor-window handoff. Appending a segment is not finalizing either upload.
+
+### Remaining boundaries
+
+Paths in this table are relative to `crates/storage/src/`.
+
+| Boundary | Evidence in the current tree | Remaining integration |
+| --- | --- | --- |
+| Fresh introduction and frontend custody | `pg_store/payload_staging_context_fresh_submission.rs` captures an owning introduction submission, but its only call site is its owner-local test. `node_client/local.rs::build_reserve_put_object_generation_command` still returns `MetadataCommandEnvelope`. `cluster/operation_routes.rs::DirectPutWriteScope` still releases frontend/`GenerationAttempted` proof custody on return or unwind. | Connect admitted primary construction to the owning complete submission and preserve classified acceptance through the frontend handoff. Fresh absence may return frontend custody; accepted or uncertain introduction must not. Do not replace only the builder or only the Drop behavior. |
+| Confirmed Direct PUT success | `pg_store/complete_direct_staging_files/` connects the candidate file/ack, terminal preparation, installation, publication, application and terminal owners for embedded, Unix/TLS and mixed cohorts. | Invoke the chain from the real request workflow, including conditional snapshot reinspection, version/encryption preparation, bounded contender handling and error mapping. Existing candidate tests do not replace this caller migration. |
+| Stream lifecycle and other terminal work | `pg_store/complete_stream_window_allocation/` connects append and successor windows. Owner-aware application in `payload_staging_application.rs` already handles finalization, replacement, completion, abort, deletion and reclaim. However, `payload_staging_terminal_work.rs` permits ordinary slot retirement only for quiescent work, UploadPart creation and **standalone** Direct PUT publication; other non-quiescent work remains `Gated`. | Connect streamed PUT/UploadPart finalization preparation and owning submission; then complete operation-specific terminal release/retirement and durable handoffs for replacement, whole-MPU completion/abort, stream abort and other non-quiescent commands. Application support alone does not satisfy this gate. Do not broaden the retirement classifier without receiver-side custody validation. |
+| Recovery and live command selection | Complete pending, application, reissue, abandonment, historical authorization and startup components exist. `storage_node_server/complete_pending.rs`, `complete_publication.rs` and sibling dispatchers select the complete path only under the owner-test selector. `pg_store/complete_command_recovery.rs` explicitly leaves live startup on the current grammar. Cluster publication/recovery loops still consume the current envelope APIs. | Switch primary builders, pending inspection/installation, fanout, recovery/reissue/abandonment, startup and command-log maintenance together with frontend custody. Preserve complete SHA-256/context and non-regressing uncertainty through every branch; never add v13/v14 fallback or owner-existence dispatch. |
+| Autonomous cleanup and owner retirement | Materialized/pending protection and retained routes are implemented; the candidate physical writers have finite authority and local exclusion. Terminal slot retirement deliberately leaves published owner rows and resource obligations intact. | Implement bounded owner discovery, closure after the immutable horizon, accepted-command convergence, physical file/ack exclusion and exact resource cleanup, followed by confirmed owner retirement. A successful client path or slot removal does not prove crash cleanup. Test unavailable participants without starving other owners/PGs. |
+| Final cleanup-ownership evidence | Six original regressions remain ignored in `cluster/local/tests/{direct_put_cleanup_progress,late_stream_cleanup}.rs`. | Enable the six regressions only after their actual invariants pass. Measure command/transaction/fsync counts and request performance on the integrated paths. General checkpoint limits/memory work belongs to `plans/metadata-checkpoint-transfer-plan.md`, scheduled after this plan is complete; it does not gate activation or completion. |
+
+### Ordered implementation queue
+
+1. **Fresh admitted Direct PUT introduction.** Start with the embedded primary
+   owner: assemble the reservation command and immutable initial descriptor from
+   one serialized authoritative view and return only the owning complete
+   submission. Bind the exact bucket proof, object/incarnation, selected
+   generation, issuer, placement and captured cutoff. No caller-supplied bare
+   envelope, independent descriptor or installable inventory may substitute.
+   Preserve the already-reserved sole physical VID; do not introduce an
+   allocation registry, extra metadata command or ordinary-path durable write.
+   Mirror the owner contract over Unix/TLS before selecting it in a live caller.
+2. **Introduction-to-request custody.** Connect the new builder to classified
+   installation and the existing candidate confirmation/physical chain. Replace
+   the live `GenerationAttempted` release behavior only with this complete
+   handoff: definitive pre-acceptance rejection, exact installation, lost reply,
+   partial fanout, unwind and restart must all retain the correct proof owner.
+   Apply the same contract to PUT/UploadPart session introduction without
+   promising session continuity or bucket-reservation replication.
+3. **Remaining terminal operations.** Finish streamed PUT and UploadPart
+   finalization, part replacement, MPU completion/abort and stream abort,
+   including displaced-reclaim and retained-finalizer custody. Use the existing
+   owner-aware application and shared senders rather than another parallel
+   publication implementation. Add terminal retirement eligibility only when its
+   durable custody check and release responsibility are complete.
+4. **Coordinated live selection.** Migrate all publishers and all current and
+   historical recovery/read/startup paths to the mandatory complete grammar and
+   owning APIs in one coherent activation slice. Inventory the actual branches
+   at that point, update publisher registry/guide and format evidence, and
+   preserve conditional winner reinspection and AWS-visible error semantics.
+   This step is gated by the preceding custody/terminal work, not the separate
+   checkpoint-transfer follow-up. It is not authorization to flip test selectors
+   now. Supporting reviewed code may still be committed beforehand.
+5. **Cleanup completion.** Connect autonomous closure, participant exclusion,
+   retry and owner retirement; demonstrate restart/replacement and all six
+   original regressions, then record overhead and cleanup progress evidence.
+   The physical-write gate remains mandatory even when a client attempt is
+   allowed to fail. Do not infer owner retirement from request failure, an
+   absent session, a released bucket reservation or an empty pending slot.
+
+For the first builder slice, pin a successful no-effect capture; crossed proof,
+subject, generation and placement; occupied/changed prefix; retired issuer; and
+expiry after admission or during capture. Installation interleavings must return
+the original owning submission without resetting history. The following
+frontend slice must additionally prove that uncertain acceptance cannot trigger
+the old release-on-return/Drop path. These are separate reviewable candidate
+steps, not independently selectable live modes.
+
+The audit does not reopen checkpoint paging, cache removal, directory locks,
+session resumption, or bucket-reservation replication. The source/format
+checklist below retains its original baseline as historical evidence; consult
+the format ledger and current constants before the actual switch, rather than
+reusing a past version number or replacing frozen fixtures.
+
+Validation baseline: the preceding terminal slice passed formatting, strict
+all-target/all-feature Clippy, boundary checks and **10,784 full-workspace tests**
+in **746.757s**, with six skips. This audit changes documentation only; it does
+not claim new runtime coverage or close any of the remaining activation gates.
+Audit validation passed formatting, boundary and diff checks plus **16 focused
+fresh-submission, terminal and gated-retirement tests in 21.237s**. The full
+workspace suite was not repeated for this documentation-only update.
+
+## Candidate Admitted Direct PUT Introduction — 2026-11-16
+
+`EmbeddedPublicationSection::prepare_direct_introduction` now constructs fresh
+Direct PUT introduction custody under an admitted current Active-primary
+section. The node owner selects and locks its actual PG; a private constructor
+mints an authority bound to that exact store and section. A same-ID foreign
+store cannot substitute. Historical sections cannot construct fresh authority.
+
+The caller supplies only bucket/key, attempt ID and the bucket proof. The
+builder validates their exact scoped operation/epoch/subject, derives the next
+generation and command position in one settled-prefix read snapshot, and captures
+the original issuer, configured placement/geometry, incarnation and finite window
+cutoff. It validates pending protection inventory in that same snapshot and
+rechecks the original section, effect fence and allocation lifetime after
+snapshot teardown. The section's fixed work deadline intersects the captured
+route fence; an unbounded static route does not create an unbounded window.
+
+The returned `CapturedDirectIntroduction` retains the exact complete submission,
+original fence and a borrow of the original primary section. It is non-Clone,
+initially had no raw command/descriptor extraction or installation/physical-write
+API. The classified installation extension below adds only owning installation
+and scalar history observation. Capture and Drop have no durable effects;
+`NoAcceptanceObserved` is not a global-absence or proof-release certificate.
+Bucket proof existence remains the durable authorization boundary's job; this
+read-only object-PG capture does not manufacture cross-PG authorization.
+
+Owner-local regressions cover exact complete context and no mutation, one
+`BEGIN DEFERRED`/`ROLLBACK`, next generation/index after an applied introduction,
+independent crossed proof fields and PG, existing attempt, pending command,
+retired issuer, same-PG foreign store, and expiry before descriptor capture or
+after snapshot teardown. Normal test compilation pins non-Clone authority and
+custody. All **12 focused introduction/fresh-submission tests passed in 2.439s**.
+Formatting, strict all-target/all-feature Clippy, boundary and diff checks passed.
+Full workspace Nextest passed: **10,791 tests in 742.856s**, eight slow tests
+(all completed successfully), six skipped. All seven new introduction
+regressions passed in that run. Earlier focused failures were fixture setup and
+assertion mistakes (unvalidated seeded prefix, initialization-write baseline and
+an overlong encoded test session ID); those were corrected before final
+validation, not waived or retried unchanged.
+
+The classified installation slice below retains this holder's original
+authority and history on every result. Remaining work is Unix/TLS builder parity and
+the frontend introduction-custody handoff. The live builder and
+`DirectPutWriteScope` remain unchanged until that coherent switch. No schema,
+wire format, durable transaction, command or fsync is added by this candidate
+read-only builder. Remaining activation/worker gates in the audit remain open;
+checkpoint transferability is separate follow-up after this plan completes.
+
+## Candidate Owned Direct PUT Introduction Installation — 2026-11-16
+
+`CapturedDirectIntroduction::install` now borrows its own original admitted
+primary section to select the actual store. A foreign section/store cannot
+substitute even with equal node/PG/epoch. There is no independently installable
+envelope, descriptor or resettable submission export. Repeated calls retain the
+same complete command and acceptance history; the holder remains non-Clone.
+This extends the owning holder rather than adding another wrapper or transaction.
+
+The fixed section work deadline, captured route fence and finite Direct PUT
+staging cutoff all reach the existing pending-slot transaction's final
+pre-INSERT check. The finite cutoff comes from the exact captured descriptor,
+conservatively rebound to the local monotonic clock, and never refreshed by
+installation or retry. Slot and protection sidecars still commit together;
+installation does not apply the owner or mint physical-write authority.
+
+Fresh definitive failure retains `NoAcceptanceObserved`; uncertain commit or
+unwind retains `Unconfirmed`, including after later definitive rejection.
+Confirmed `Installed` is historical success: after validating original authority,
+retries short-circuit without claiming the current slot/indexes remain intact.
+Expiry or crossed authority returns an error without downgrading confirmation.
+Neither errors nor Drop release proof/generation custody or perform cleanup.
+
+Owner-local regressions cover exact sidecar/command identity, no owner apply,
+foreign section rejection, expiry inside the final SQLite effect hook for both
+work and staging bounds, no cutoff renewal, unwind after sidecar writes,
+uncertain COMMIT followed by definitive rejection, non-regressing confirmation
+after index damage/expiry, and no hidden Drop effects. All **24 focused tests
+passed in 5.463s**. Formatting, strict all-target/all-feature Clippy, storage
+boundary and diff checks passed. Full workspace Nextest passed **10,795 tests
+in 741.216s**, eight slow tests (all completed), six skipped. All four new
+installation regressions passed in the full run.
+
+The first focused run caught an extra skew subtraction when reconstructing the
+capture cap, plus a test deadline that expired before its intended effect hook.
+Installation now binds the actual descriptor cutoff rather than reconstructing
+it; the deadline test starts with sufficient authority and proves the hook was
+reached. Both were corrected before final validation.
+
+The publication marker and embedded cohort application are connected by the
+slices below, including mixed remote members. Remaining work is the
+introduction-to-physical custody handoff from this
+same owning holder, with Unix/TLS fresh-builder parity before live
+selection. Frontend `GenerationAttempted` behavior remains unchanged. This
+candidate adds no format/schema, command, transaction or fsync; the activation,
+autonomous cleanup and separate transferability follow-ups remain open.
+
+## Candidate Direct PUT Introduction Publication — 2026-11-16
+
+The admitted introduction holder now consumes confirmed installation into
+`DirectIntroductionPublication`. Fresh or uncertain installation returns an
+owning failure that retains the original section, complete bytes, both cutoff
+forms and cumulative installation history. There is no independent sender,
+envelope extraction or reconstruction of a fresh submission. The handoff itself
+has no storage effect and can preserve already-expired custody.
+
+Construction captures the descriptor's exact absolute cutoff and its conservative
+local `Instant` bound, capped by the original section deadline. Both are moved
+unchanged into the existing publication sender; no clock is sampled to renew
+authority at handoff or retry. Publication uses only the original borrowed
+section and existing primary trial-apply/marker transaction. The source-bound
+deadline reaches the transaction's final pre-COMMIT check. The original route
+fence is also retained and checked before each attempt.
+
+Success confirms publication-start, not durable owner application, replicated
+acceptance, reservation release, pending-slot retirement or physical-write
+authority. Trial owner/reservation mutations are rolled back. Failure before
+commit, lost confirmation after commit and unwind preserve uncertain publication
+history alongside confirmed installation. Later expiry cannot erase either
+history. Neither handoff failures nor either owner's Drop performs cleanup.
+
+Five new regressions cover non-Clone owners, effect-free transfer of each
+installation state, unchanged deadlines across clock adjustment and expiry,
+trial-state rollback, exact marker retries, pre/post-commit errors and unwind,
+retained uncertainty through rejected retries, non-regressing confirmation, and
+expiry at the final commit boundary. All **21 focused introduction/publication
+handoff tests passed in 5.393s**. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**10,800 tests in 741.497s**, eight slow tests (all completed), six skipped.
+All five new regressions passed in that run. The initial build exposed a
+test-only re-export of publication diagnostics; that internal re-export was
+corrected before focused and full validation, without exposing mutation APIs.
+
+The embedded cohort application slice below now connects all-member
+confirmation to this same owning introduction. The terminal/window/physical
+handoff remains open; mixed remote application is connected below. Remote
+fresh-builder parity and the frontend custody switch remain gated. This slice
+adds no format/schema change, extra command, transaction or fsync; production
+publisher selection and the separate transferability work remain unchanged.
+
+## Candidate Direct PUT Introduction Embedded Application — 2026-11-16
+
+Fresh introduction capture now retains its exact current cohort from the
+original admitted primary section. Neither publication nor application takes a
+replacement map, caller-selected acting set or renewed deadline. The same
+non-Clone publication owner drives embedded member application using the shared
+fanout subject, ordering and completion checks: designated lowest-ID nonprimary
+witness, then primary, then every remaining member. Foreign members and attempts
+before the required confirmations fail without mutation.
+
+Exact per-node application history remains alongside confirmed installation and
+publication. An applied-but-unconfirmed witness does not authorize primary
+application until an exact replay confirms it. Lost replies, rollback and unwind
+cannot reset other members' progress. The original cutoff is rechecked at the
+application transaction's final effect/commit boundaries. Borrowed
+`DirectIntroductionCompletion` exists only after every original member is
+confirmed; inspecting it revalidates the owning authority. It is not detached
+terminal, release or physical-write authority, and Drop performs no effects.
+
+Three new regressions cover the unsorted five-member cohort, independent witness/
+primary ordering and foreign-node rejection, exact replicated owner/resource
+equality, incomplete cohorts, lost confirmation and unwind, no-mutation replay,
+expiry beside COMMIT, and borrowed completion expiry. The existing API-shape
+test also pins completion's non-Clone form. All **26 focused introduction and
+embedded-fanout tests passed in 10.497s**. Formatting, strict all-target/all-feature
+Clippy, storage boundary and diff checks passed. Full workspace Nextest passed
+**10,803 tests in 743.160s**, eight slow tests (all completed), six skipped.
+All three new application regressions passed. The first test build corrected
+the assertion's captured-resource type; the first focused run then caught a
+fixture inspection outside its required read transaction (`TransactionRequired`).
+That inspection now uses a snapshot; no test was relaxed or failure waived.
+
+Mixed remote member application is connected by the next slice using the same
+original primary section and retained cohort. Consuming terminal/window/physical handoff remains next.
+Remote fresh-builder parity, frontend custody and live selection remain gated.
+This slice adds no durable format, extra command, transaction or fsync. The
+separate transferability follow-up and autonomous cleanup work remain open.
+
+## Candidate Direct PUT Introduction Mixed Application — 2026-11-16
+
+The introduction publication owner now applies to Unix/TLS members as well as
+embedded members of its captured cohort. It retains the original embedded
+primary section through the closed remote operation and accepts no caller
+deadline, replacement cohort or detached command. Both the general fanout sender
+and this holder use the same remote subject/client/order validation. An exact
+admitted client is required; remote primary application cannot bypass its held
+section. Existing transport and receiver checks carry the original cutoff to
+the application boundary.
+
+Remote witnesses and trailing replicas retain independent application history
+beside confirmed installation/publication. Lost replies and malformed
+authenticated confirmations cannot establish completion or erase uncertainty.
+Exact retries confirm already-applied commands without mutation. Borrowed
+all-member evidence covers the entire original mixed cohort; it still grants
+no release, retirement or physical-write authority.
+
+Two new matrix regressions cover Unix and TLS witnesses, a local witness with
+remote followers, same-node substituted clients before any server starts,
+ordering before dispatch, full replicated owner equality, embedded-shadow
+non-mutation, counted exact retries, expired attempts with zero additional RPCs,
+actual connection loss after remote commit, malformed authenticated replies,
+incomplete four-of-five confirmation, and no effects on Drop. All **27 focused
+introduction/mixed-fanout tests passed in 27.416s**. Formatting, strict
+all-target/all-feature Clippy, storage boundary and diff checks passed. Full
+workspace Nextest passed **10,805 tests in 745.235s**, eight slow tests (all
+completed), six skipped. Both new Unix/TLS matrices passed in the full run.
+
+Next: consuming terminal/window/physical handoff from this same introduction
+owner. Remote fresh-builder parity, frontend custody and live selection remain
+gated; autonomous cleanup and the separate checkpoint-transferability follow-up
+remain open. No new format, command, transaction or fsync is introduced here.
+
+## Candidate Direct PUT Introduction Terminal Custody — 2026-11-16
+
+Confirmed introduction application can now be consumed into a private
+`DirectIntroductionTerminal`. It retains the entire original publication owner:
+the borrowed embedded section, admitted cohort, complete command, installation,
+publication and individual application histories, and both original deadline
+forms. Construction accepts no independent command, section, confirmations or
+deadline. It requires every original member to have confirmed application and
+the captured authority to remain valid. Failure returns the same publication
+owner, including uncertainty; successful handoff has no reverse extraction.
+
+This is an effect-free custody transition, **not slot retirement, a fresh window
+confirmation or physical-write authority**. It deliberately does not convert to
+the generic terminal holder, which does not retain this original embedded
+section. Neither construction nor Drop performs storage work. After expiry the
+holder retains historical application confirmations but cannot validate as live
+authority. Non-Clone assertions pin both the success and failure holders.
+
+The regression matrix exercises unpublished and each incomplete cohort,
+lost-confirmation/unwind histories, exact retry after rejected handoff, expiry
+before and after successful handoff, unchanged deadlines, and no changes to
+replica tables, log positions or SQLite change counts. Pending-slot retention
+is asserted independently. All **23 focused introduction tests passed in
+9.343s**. Formatting, strict all-target/all-feature Clippy, storage boundary and
+diff checks passed. Full workspace Nextest passed **10,807 tests in 743.496s**,
+eight slow tests (all completed), six skipped. The new handoff and non-Clone
+regressions both passed in the full run.
+
+The following slice connects admitted slot retirement. Window confirmation
+through this same owning section remains next, followed by physical-writer binding. Remote fresh-builder
+parity, frontend custody and live selection remain gated. Autonomous cleanup
+remains required; checkpoint transferability is separate follow-up work. This slice
+adds no durable format, transaction, command or fsync.
+
+## Candidate Direct PUT Introduction Slot Retirement — 2026-11-16
+
+The owning introduction terminal now retires its exact pending slot through the
+original embedded primary section. A private, non-Clone borrowed scope connects
+the holder to the existing admitted retirement transaction. No independent
+command, section, deadline or mutable retirement history is accepted at that
+boundary. The same complete sender and cohort still retain all application
+confirmations. Retirement preserves the original monotonic and absolute cutoffs,
+marks attempted work Unconfirmed before entering storage, and confirms Retired
+only after successful completion. Errors and unwinding cannot erase uncertainty;
+confirmed retries perform no storage work and expiry cannot regress Retired.
+
+This removes only the exact primary pending slot and its transactional sidecars.
+It neither releases the generation/bucket proof nor removes the durable staging
+owner, changes replica state, confirms a write window or grants physical writes.
+Drop remains effect-free. The mixed Unix/TLS introduction matrices also exercise
+retirement without additional replica RPCs or mutation of remote/shadow stores.
+
+The first focused run found a real candidate-path gap: Direct PUT introduction
+was classified quiescent, so its retirement skipped durable custody validation.
+The missing-owner regression returned success (24 other tests passed). The
+transaction now validates the command-bound immutable introduction, initial
+window/participants, exact live creation resource and generation high-water
+fence, including an absent-slot retry after lost confirmation. UploadPart keeps
+its distinct release-due creation-resource requirement. No failure was waived.
+
+Tests cover pre-delete/pre-commit failures, lost reply, unwind, exact retries,
+damaged scope/index/owner/incarnation/window/resource/proof/high-water evidence,
+missing owner after an unconfirmed successful delete, and both work-deadline and
+portable-cutoff expiry immediately before deletion. They assert unchanged
+materialized responsibility, log positions and replica state, retained
+uncertainty, no hidden Drop retry, and immutable deadlines.
+
+All **26 focused introduction/creation-retirement tests passed in 13.542s**.
+Formatting, strict all-target/all-feature Clippy, storage boundary and diff
+checks passed. Full workspace Nextest passed **10,809 tests in 748.338s**,
+eight slow tests (all completed), six skipped. Both new retirement matrices and
+the extended Unix/TLS introduction regression passed in that run.
+
+The next slice connects section-bound window confirmation; physical-writer binding remains next. Remote fresh-builder parity,
+live frontend custody and publisher selection remain gated. Autonomous cleanup
+remains required; checkpoint transferability is separate follow-up work. This slice
+reuses existing retirement transactions and adds no format, command or fsync.
+
+## Candidate Direct PUT Introduction Window Confirmation — 2026-11-16
+
+The retired introduction terminal now consumes into `DirectIntroductionWindow`
+through its original held embedded section. A private borrowed scope reaches the
+existing submitted-command window inspection; callers cannot supply another
+section, command, witness or deadline. The entire terminal owner and captured
+read remain together. Successful handoff exposes only scalar observations and
+validity checks, not a detached descriptor, sender, read or physical grant.
+
+Both NoAttemptObserved and Unconfirmed retirement reject before inspection,
+including when an unconfirmed deletion actually removed the slot. After exact
+retirement confirmation, inspection reuses the existing primary snapshot and
+designated-witness prefix comparison. The original owner and resulting read are
+revalidated before returning success. Failure returns the same retired terminal
+with its original histories and cutoffs; retry must perform a fresh inspection.
+Handoff and Drop do not mutate durable responsibility or release anything.
+
+Tests exercise unconfirmed retirement with a lost successful-delete reply,
+exact retirement retry, read-only success, changed primary window and corrupted
+witness prefix evidence, expiry before/during/after inspection, the original
+monotonic work cutoff, no deadline renewal, and validity after handoff. The mixed
+Unix/TLS introduction matrix now reaches this handoff and injects an authenticated
+malformed witness reply: one failed request retains retired custody, an explicit
+retry obtains fresh confirmation, and all durable/embedded-shadow state stays
+unchanged. Non-Clone canaries cover the window, failure owner and private scope.
+
+The initial focused run caught two test assumptions: portable authority expiry
+can report `RouteMapExpired` rather than `OperationDeadlineExceeded`, and an
+injected post-commit storage failure leaves settled-prefix validation cold.
+The regression now asserts those typed expiry outcomes and the explicit
+`ValidationRequired` refusal, preserves retired custody, performs existing
+owner-local recovery, and only then retries window confirmation. Recovery of
+already-settled state is checked for non-mutation. Confirmation must not hide
+recovery or repair evidence, and no cache redesign is part of this slice.
+
+The first full run stopped at the window API-shape test: its independent stub
+environment lacked the new private scope dependency, so even its positive probe
+could not compile (8,127 passed; 2,685 not run). The fixture now models that
+dependency with a private-field, constructor-free stub; the existing positive
+and adversarial probes are unchanged. All 30 focused introduction/API-shape tests
+then passed in 39.550s.
+
+The subsequent full run reached the new monotonic-expiry canary but rejected
+before its intended injection point: the test's four-second deadline included
+fixture setup and preceding publication work (9,054 passed; 1,758 not run).
+The canary now waits at the post-inspection hook for the actual immutable owner
+cutoff captured during introduction, with wall time frozen. It still requires
+that exact hook to be reached and rejects any retry/renewal; no production
+deadline was lengthened and no assertion was waived.
+
+Final validation: all **30 focused introduction/API-shape tests passed in
+39.551s**. Formatting, strict all-target/all-feature Clippy, storage boundary
+and diff checks passed. Full workspace Nextest passed **10,813 tests in
+753.327s**, eight slow tests (all completed), six skipped. The revised
+monotonic-expiry test reached its intended boundary and passed in the full run,
+as did the positive/adversarial API-shape fixture and mixed Unix/TLS matrix.
+
+The following slice connects consuming physical-writer binding, including the required primary-section release before
+remote physical dispatch. Remote fresh-builder parity, frontend custody and live
+publisher selection remain gated. No durable format, command, write transaction
+or fsync is added; autonomous cleanup and checkpoint transferability remain open
+as previously scoped.
+
+## Candidate Direct PUT Introduction File Handoff — 2026-11-16
+
+Confirmed introduction custody now consumes into the existing Direct PUT file
+pipeline. A private consuming scope moves the original sender, all-member
+application history, retired-slot observation, captured read and admitted cohort
+together. Binding inspects the retained window under the original held primary
+section, checks the provisional encryption input, and derives the encryption
+subject and physical fence through the existing file-binding implementation.
+Binding failure retains the complete window and command history; it does not
+release the generation or trigger cleanup on Drop.
+
+`DirectIntroductionFilePreparation` exposes no file effects. Its only forward
+handoff consumes the actual original `EmbeddedPublicationSection`; a private
+process-local identity distinguishes it from a foreign or newly opened section
+even at the same node/PG/epoch. It checks the original bounds, drops the guard
+synchronously, then constructs the existing remote-dispatch writer. Each later
+effect still rechecks expiry. A rejected release retains both the preparation
+and the supplied section, allowing correction of a crossed-section attempt
+without resetting custody. No independently supplied deadline, release claim,
+reconnect or detached sender can mint dispatch authority.
+
+The cohort now borrows the underlying admitted route rather than the shorter
+section borrow. This permits consuming the section after binding while keeping
+route admission pinned. The section identity is only in-memory evidence, not
+a new allocation registry or storage protocol. No directory lock, durable format,
+transaction, fsync or cache change is introduced.
+
+Regressions cover immediate (nonwaiting) lock availability before dispatch-ready
+return; unchanged all-member history and immutable cutoffs; foreign and same-domain
+reopened sections; expiry before binding and before release; invalid committed
+encryption supplied as provisional input; and non-mutating handoff/Drop. The mixed
+Unix/TLS introduction matrix reaches this same binding and synchronous release.
+Positive and compile-fail API probes cover consumption, retry custody, private
+fields, non-Clone, no writes before release, and absence of deadline-renewal APIs.
+
+Validation: all **36 focused tests passed in 44.210s**, including the
+positive/adversarial API fixture and mixed Unix/TLS handoff. Formatting, strict
+all-target/all-feature Clippy, storage-boundary and diff checks passed. Full
+workspace Nextest passed **10,816 tests in 753.883s**, eight slow tests (all
+completed), six skipped. No test failures were waived or retried.
+
+Remote fresh-builder parity and frontend request custody remain the next
+integration gates; live publisher selection remains disabled. Autonomous
+retirement/cleanup remains required, not a claim of this handoff.
+Checkpoint transferability is separate follow-up after this plan completes.
+
+## Candidate Direct PUT Introduction Receiver Capture — 2026-11-16
+
+The first remote fresh-builder slice shares the embedded read-only construction
+algorithm with a storage-server-owned admission boundary. It does **not** add an
+RPC message, enable dispatch, encode a transferable preparation response, or
+claim end-to-end Unix/TLS parity. Those need the same-session owning sender and
+receiver-preparation identity before installation can be connected.
+
+The shared capture routine accepts only the two private authority adapters.
+Callers cannot inject a validation closure, prebuilt command, generation,
+timestamp, placement or descriptor. Both paths select the next generation and
+command index from the settled primary snapshot, validate the exact bucket proof
+and object subject, capture the initial descriptor and pending inventory, then
+recheck authority and allocation lifetime after snapshot teardown. It returns
+the complete owning submission, never separately installable inventory.
+
+The receiver captures its server route fence before store access and requires
+the actual server's Active admission, current Active primary, topology and
+held metadata-command session. Binding scalars alone are insufficient: the
+session's node and lock registry must be the handler's actual domain. The
+receiver intersects the immutable absolute client cutoff with the captured
+server fence and bounds PG acquisition by its local work/route cutoff. A longer
+client cutoff cannot override an earlier server expiry. The prepared result
+retains its original handler, request, session and admission with the owning
+capture; it has no production command/descriptor extraction or installation API.
+
+Receiver-local tests compare the complete captured context with independent
+owner-local expected bytes from the actual remote primary, require no acceptance
+or durable writes, and verify that Drop leaves its session held. The rejection
+matrix covers wrong admission class/domain, missing or foreign serialization,
+crossed node/epoch/topology, non-primary/Peering routes and crossed operation
+proofs. Client-first and server-first expiry are injected before store access,
+inside capture and after snapshot teardown. Actual participant state and
+frontend shadow stores remain unchanged. This is admission/capture coverage,
+not socket evidence; the earlier mixed Unix/TLS tests continue to cover the
+embedded-primary publication/application and file handoff.
+
+Validation: all **35 focused introduction tests passed in 16.762s**. Formatting,
+strict all-target/all-feature Clippy, storage-boundary and diff checks passed.
+Full workspace Nextest passed **10,819 tests in 747.283s**, eight slow tests
+(all completed), six skipped. All three new receiver-capture regressions passed
+in that full run; no test failure was waived or retried.
+
+Next: frame the logical request and authenticated, request-bound preparation
+response, retain same-session preparation identity
+through the owning remote installation handoff, then connect publication and
+frontend custody. No live selection, durable format, write transaction, fsync,
+checkpoint work, cache redesign or directory-lock change is part of this slice.
+
+## Candidate Direct PUT Introduction Framing — 2026-11-17
+
+This prerequisite adds bounded V1 logical request/response payloads and a
+receiver-held preparation identity. It does **not** allocate an outer RPC kind,
+select socket dispatch, install commands, transfer frontend custody or activate
+the live publisher. Receiver-local tests are not Unix/TLS transport evidence.
+
+The request carries the route/topology, immutable absolute cutoff, bucket/key,
+attempt and exact Direct PUT bucket proof. It accepts no generation, timestamp,
+command index, placement or descriptor. Per-field source reservation limits and
+canonical operation/subject checks apply before capture; the aggregate framing
+bound is secondary. The existing admitted capture selects all authoritative
+values from the actual primary's settled view.
+
+Only a private scope borrowing that admitted capture can encode its complete
+submission. Response preparation consumes the receiver's prepared holder;
+there is no general submission encoder or reusable deadline argument. The
+response binds the canonical request SHA-256, complete command SHA-256, route,
+and the captured absolute authority cutoff shortened for inter-host skew.
+The separate receiver I/O/work deadline remains the original local `Instant`
+in its held-session identity: it is not reprojected into a fresh wire duration
+or renewed at installation. In particular the default one-second I/O timeout
+cannot be exported by subtracting the one-second clock-skew budget from its
+remaining duration; that would expire every response. Both bounds must pass
+at the receiver. Decoding returns untrusted borrowed framing,
+not a decoded command or installation authority.
+
+After final authority validation, the actual held PG-session guard records the
+exact request, command and response digests, response cutoff and original local
+deadline. Releasing/reopening the section loses that identity. A resealed changed
+command, altered CRC/cutoff, crossed request or expired response cannot match it.
+Failed response preparation does not replace an earlier receipt. This receipt
+is ephemeral preparation evidence, not durable custody, publication permission,
+or evidence that the bucket reservation has been durably revalidated.
+
+Independent literal V1 request/reply specimens freeze this new grammar without
+rewriting earlier format evidence. Codec tests cover bounded decoding,
+truncation/trailing data, unknown versions, proof constraints, request-field
+binding, route substitution, digest mismatch and cutoff extension. The
+receiver-local regression decodes the logical request, compares the actual
+captured complete command with independent expected bytes, rejects a scope
+borrowed from another capture, and tests resealed substitutions, expiry and
+same-endpoint section reopening. Participant state, SQL change counts and
+frontend shadows must remain unchanged throughout.
+
+Validation: all **40 focused introduction/framing tests passed in 16.382s**.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff checks
+passed. Full workspace Nextest passed **10,824 tests in 756.872s**, eight slow
+tests (all completed), six skipped. The first focused run exposed the erroneous
+projection of the one-second local I/O timeout; that was corrected before these
+runs. The receiver canary now independently expires that original local deadline
+while the exported wall cutoff remains valid. No test failure was waived.
+
+Next: an owning remote sender and classified
+installation consuming this exact same-session preparation, preserving original
+cutoffs and all uncertain acceptance history, then publication and frontend
+custody. No new write transaction, fsync, cache, directory lock or checkpoint
+work is introduced here.
+
+## Candidate Direct PUT Introduction Receiver Installation — 2026-11-17
+
+The receiver-local installation prerequisite now consumes its held-session
+preparation identity into one opaque owning holder. This is not a socket sender
+or dispatcher: no new RPC message kind, live publisher selection, publication
+marker, replicated apply, physical grant or frontend custody transfer is enabled.
+
+The session state is `Vacant`, `Prepared(identity)` or `Claimed(identity)`.
+After exact response validation and Active-primary/domain admission, claiming
+is one-way until the held section ends. Duplicate claims, new captures and
+responses from already-outstanding captures cannot replace `Claimed`. Neither
+construction failure nor holder Drop restores `Prepared`. This prevents creating
+an independent fresh submission after an uncertain attempt. The owning holder
+borrows the actual session, admission, logical request and response, rather than
+retaining only a node/PG/epoch tuple. It has no Clone, reset, context extractor,
+reissue constructor or cleanup Drop.
+
+The private consuming input is the only constructor path. Complete decoding uses
+the actual storage topology, verifies the canonical complete bytes and digest,
+and keeps the resulting submission/history below the owner boundary. Each
+installation obtains the actual PG through the original deadline and checks the
+exact input/command against an opaque admitted authority. It reuses the existing
+complete pending transaction: slot, scope bucket, route dependencies and staging
+protection are derived and validated together. The captured fence and original
+local deadline reach its final pre-effect check; retry cannot renew either.
+
+Definitive rejection restores only the prior observation. Commit uncertainty,
+lost confirmation and unwind retain `Unconfirmed`; exact confirmation records
+`Installed`. An already-confirmed retry validates authority but neither dispatches
+another write nor downgrades history because a slot later changes. This is an
+historical installation observation, not a claim that the slot is still healthy,
+that the command is replicated/applied, or that resource release is authorized.
+
+Receiver-local regressions exercise duplicate claims, stale outstanding captures,
+crossed admission, actual slot/index installation, rollback, commit failure,
+unwind, lost confirmation, damaged exact retries and both original deadline
+bounds expiring immediately before SQLite insertion. Successful installation
+must match independent complete bytes and leave materialized owner state and all
+other participants/frontend shadow stores unchanged. Drop must not mutate state
+or make the consumed preparation available again. These are real receiver/store
+checks, not Unix/TLS exchange evidence; transport outcome classification remains
+an explicit subsequent gate.
+
+Validation: all **48 focused introduction/framing tests passed in 16.476s**.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff checks
+passed. Full workspace Nextest passed **10,832 tests in 751.769s**, eight slow
+tests (all completed), six skipped. All eight new receiver-installation tests
+passed in the full run; no test failure was waived or retried.
+
+Next: the owning socket sender/dispatch connection retaining
+this receiver holder across exchanges, with authenticated exact confirmations and
+lost-response classification. That needs a consuming connection-owned handoff,
+not reconstruction of a fresh submission for each frame. Then connect
+introduction publication and frontend
+request custody. The change reuses the pending transaction and introduces no
+new durability barrier, schema/encoding version, cache, filesystem lock or
+checkpoint-transfer work.
+
+## Candidate Direct PUT Introduction Connection Custody — 2026-11-17
+
+The receiver holder can now consume into its actual held session guard. This
+moves the same complete submission and installation observation; it does not
+encode/decode a new submission or reset history between calls. The original
+request frame, query and Active admission borrow can end while the connection
+retains custody. The guard owns at most one boxed state, original request and
+response identities, and captured absolute/monotonic cutoffs. It does not retain
+a duplicate complete response buffer or add a global registry.
+
+Parking is an inert ownership transfer and remains possible after expiry. A
+failed transfer returns the original holder and observation. Subsequent calls
+require fresh Active admission from the actual handler's domain, exact logical
+request/response identity and the original guard acquisition. A new guard on the
+same connection/node/PG/epoch is not equivalent: the opaque record binds a
+private per-acquisition identity, independently of the scalar preparation claim.
+No later call rebinds the original work deadline or extends the effect fence.
+
+The continuation mutates the stored submission in place. Errors and unwind do
+not temporarily detach it, create a replacement, or erase `Unconfirmed` history.
+Confirmed installation remains historical `Installed`, not evidence of present
+slot health. Neither session release nor Drop performs cleanup, resource release
+or additional database writes. On connection loss, accepted pending custody
+remains durable; uninstalled ownership has acquired no durable effect.
+
+Nine owner-local cases cover fresh and confirmed installation, lost confirmation,
+unwind before parking and during resumed installation, expired parking, original
+work expiry, cutoff expiry at SQLite insertion, and damaged uncertain retries.
+They end the original request/admission scope, exercise mutable session use, then
+resume with fresh admission. Independent complete bytes, indexes, materialized
+state, other participants and frontend shadow stores are checked. Common canaries
+reject crossed admissions, command/response/cutoff/request substitutions, busy
+custody access and an opaque record deliberately moved to a reopened guard.
+Failed parking returns identical custody; final guard release changes no storage.
+
+Validation: all **57 focused introduction/framing tests passed in 18.493s**.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff checks
+passed. Full workspace Nextest passed **10,841 tests in 751.705s**, eight slow
+tests (all completed), six skipped. All nine new continuation tests passed in
+the full run; no test failure was waived or retried.
+
+This is receiver-call evidence, not socket exchange coverage. Next is the
+owning socket sender/dispatch with authenticated exact
+confirmation and lost-response classification, followed by introduction
+publication and frontend request custody. Live publisher selection remains
+gated. There is no new RPC kind, schema/encoding version, transaction, fsync,
+cache, filesystem lock or checkpoint-transfer change.
+
+## Candidate Direct PUT Introduction Preparation Transport — 2026-11-17
+
+The first socket exchange is now connected on distinct RPC kind **185**,
+`StagingDirectIntroductionPrepare`, frontend-only with Progress admission. It
+uses the existing DINQ/DINR V1 framing. Ordinary servers return
+`UnsupportedOperation`; only the existing complete-log test selector admits the
+candidate receiver. No legacy payload discriminator, new durable write or
+publisher activation is introduced.
+
+The admitted sender binds the current route, exact client and held primary
+session before dispatch. It intersects the original work and route deadlines
+once, exports a conservative absolute cutoff, and checks bucket/key placement
+and canonical reservation fields before transport. The server runs the reviewed
+read-only capture, encodes its exact response, claims the preparation, and moves
+that same submission into the session guard **before** returning success. A
+second preparation on that guard is rejected; no later frame resets the retained
+installation observation. Pending-slot installation is not part of preparation.
+
+The client receives an opaque, non-cloneable preparation retaining its complete
+context, original request/reply, admitted route, client and exact session.
+Response decoding validates canonical complete bytes, checksum/digest, topology,
+current command PG/epoch, fresh introduction identity, Direct PUT provenance,
+bucket/key/attempt/incarnation, issuer node, full captured creation proof and
+non-extending cutoff. Only scalar command identity and validity are available
+outside its owner. There is no production context/byte extractor, installation
+method, implicit retry, reconnect or cleanup Drop. Response loss or malformed
+success exports no holder; it does not imply installation uncertainty because
+this operation performs no durable mutation. Later installation must provide
+its own owning NotSent/Unconfirmed/Installed outcome handling.
+
+Post-response validation now owns an armed transport guard: any codec, context,
+request-subject, canonical-byte or final authority rejection invalidates and
+shuts down the original session before returning. Unwind or dropping an
+unaccepted reply does the same. Successful validation alone disarms this guard;
+no fallible construction follows it. This does not claim synchronous peer
+teardown or a release acknowledgement. Ordinary reusable RPC errors, such as
+duplicate preparation, do not revoke an already valid holder.
+
+Installed authenticated Unix and TLS tests cover exact success, duplicate
+preparation, held-session closure/reopen, lost replies, invalid request/digest/
+checksum/cutoff responses, and a canonical resealed complete command with a
+different reservation owner token. That last case passes structural decoding and
+must fail request-subject matching. Preflight rejects invalid proof fields,
+cross-PG subjects and expiry without a preparation RPC. Assertions require no
+slot, owner, log, allocator, participant or frontend-shadow mutation, including
+Drop. Frame admission pins kind 185 and exact/one-over request caps; the role
+matrix and candidate-selector tests cover its authorization/activation gates.
+The malformed-response matrix also checks that retry fails locally with no new
+RPC while the original session value remains alive, then successfully prepares
+on a separately opened section. It covers an expired but otherwise valid reply
+as well as framing/context failures. Separate Unix/TLS canaries cover dropping
+an unvalidated response and unwinding during validation.
+
+Append-only literal request/reply composites pin RPC37/DINQ-DINR1/command14/
+context1/descriptor1 using the previously frozen complete Direct PUT command.
+The old logical opaque-body fixtures remain unchanged. The new frame specimens
+are 353 and 720 bytes respectively; see the format ledger. This extends the
+existing uncommitted RPC 36-to-37 change, not a second format advance.
+
+Validation: the first four-test selection had three passes and one assertion
+failure: the duplicate-preparation canary searched the public
+redacted diagnostic. It now verifies the retained test-only structured detail;
+production error rendering is unchanged. The corrected intermediate selection
+passed all 12 tests. No runtime failure was waived.
+
+Before this review correction, the focused selection passed **66 tests in
+18.301s**. Formatting, strict all-target/all-feature Clippy, storage-boundary
+and diff checks passed. Full
+workspace Nextest passed **10,849 tests in 754.211s**, eight slow tests (all
+completed), six skipped. All eight newly added tests passed in the full run.
+
+After the session-invalidation correction, the focused selection passed **67
+tests in 18.312s**, including the Unix/TLS malformed-response reuse and
+unvalidated-reply drop/unwind canaries. Formatting, strict all-target/all-feature
+Clippy, storage-boundary and diff checks passed. Full workspace Nextest passed
+**10,850 tests in 759.804s**, eight slow tests (all completed), six skipped.
+
+Next at this slice's completion was socket installation using this exact retained
+preparation and server submission; the receiver continuation is recorded below.
+
+### Candidate Direct PUT introduction installation RPC receiver
+
+The distinct frontend-only Progress RPC kind 186 continues the sole submission
+parked by preparation on the original held primary section. The bounded DIIQ1
+request carries the exact preparation request and response, not a freely decoded
+replacement submission. The receiver compares both identities, the complete
+command digest, cutoff and guard acquisition against retained custody before
+reusing the existing installer. It preserves the original clocks and installation
+history through errors; a new frame does not renew authority. A new session,
+including one through the same client, cannot recreate the parked holder.
+
+Successful installation returns DIIC1 plus the whole request's SHA-256. This
+confirms installation only, not replication, materialized ownership, publication
+or physical authority. Confirmation bytes are prepared before effects but sent
+only after success. Lost transport replies keep the exact durable pending slot
+and side indexes. Receiver errors must be treated conservatively by the future
+owning sender; the raw socket driver used in these tests is test-only and grants
+no frontend NotSent/Unconfirmed/Installed classification.
+
+Installed authenticated Unix/TLS tests cover resealed crossed proof, command and
+cutoff responses, exact success/retry without rewriting durable state, release/
+reopen rejection, lost success replies, a lost SQLite commit confirmation followed
+by an exact retry on the same section, and expiry at the final transactional
+pre-effect check. Assertions pin exact pending command bytes and both side indexes,
+non-mutation on rejection, unchanged replicas and frontend shadows. Existing
+owner-local tests retain the deeper admission, damaged-index and unwind matrix.
+Frame tests pin kind 186, exact/one-over admission caps, truncation/trailing/version
+rejection, request-bound confirmation and literal outer/complete composites.
+Ordinary dispatch remains UnsupportedOperation; only candidate-test servers
+select installation. This extends the uncommitted RPC 36-to-37 advance, with no
+new durable schema or command format and no additional ordinary-path transaction.
+
+Validation: initial focused runs exposed two mistakes in the new composite
+evidence (outer-frame offset and comment-bearing hex extraction) and a clock-hook
+setup that expired the request before SQLite. The evidence now uses the correct
+literal lengths/digest, independently checked against hex-only predecessor bytes;
+the paired-clock advance happens inside the final effect hook and its execution
+is asserted. No predecessor fixture was changed and no failure was waived.
+The corrected focused selection passed **74 tests in 18.425s**. Formatting,
+strict all-target/all-feature Clippy, storage-boundary and diff checks passed.
+Full workspace Nextest passed **10,857 tests in 757.020s**, eight slow tests (all
+completed), six skipped. All seven new tests passed in the full run.
+
+Next at receiver completion was the owning installation sender, recorded below.
+
+### Candidate Direct PUT introduction owning installation sender
+
+The admitted remote preparation now consumes into one non-cloneable submission.
+It retains the original complete context, request/response bytes, admitted route,
+actual client and session, private session identity, and absolute/monotonic
+cutoffs. Its `install()` takes no client, session, command or deadline arguments.
+There is no extraction back to preparation or an independent installable context.
+This makes reconnect and retry-deadline replacement unavailable through the API.
+
+Installation validates authority before the bounded transport wait and again
+while holding the exact session. A borrowed attempt carries the same preparation
+and mutable history into the transport owner. Before dispatch the observation
+becomes Unconfirmed. Only transport-proven NotSent restores the previous value;
+all authenticated remote errors, may-have-applied failures, malformed/crossed
+confirmations and unwind leave it Unconfirmed. An exact confirmation records
+Installed. Later calls validate the original authority/session but never send
+again or regress that confirmation, even when the slot's indexes are subsequently
+damaged. A successful confirmation accompanied by connection closure preserves
+Installed without allowing further use of the section. Drop neither retries nor
+cleans resources and conveys no absence evidence.
+
+Unix/TLS tests exercise exact success and no-redispatch after index damage,
+expiry and session reopen before any send, pre-dispatch NotSent from both fresh
+and Unconfirmed states, unwind, lost replies and successful-but-closed replies.
+Authenticated malformed digest, purpose and empty confirmations plus an injected
+post-commit resource error require Unconfirmed; retry of the same holder receives
+the same whole-request-bound confirmation without rewriting SQLite state.
+Assertions preserve the command ID, original cutoffs, replicas and frontend
+shadows, and verify no hidden effects on Drop. An owner-local negative trait check
+pins non-cloneability of both submission and borrowed attempt.
+
+Validation: all six new sender tests passed in **7.041s**; the broader focused
+selection passed **80 tests in 20.200s**. Formatting, strict all-target/all-feature
+Clippy, storage-boundary and diff checks passed. Full workspace Nextest passed
+**10,863 tests in 756.628s**, eight slow tests (all completed), six skipped.
+All six new sender tests passed in the full run; no test failures were waived.
+
+Next at installation-sender completion was the consuming publication-start
+handoff, recorded below.
+No live publisher selection, new format, schema, transaction or physical grant
+is introduced here; autonomous cleanup and production activation remain gated.
+
+### Candidate remote Direct PUT introduction publication-start owner
+
+Confirmed remote installation now consumes into a non-cloneable publication
+owner retaining the original admitted route, client, private session identity,
+complete command and absolute/monotonic deadlines. Fresh or Unconfirmed
+installation cannot make this transition; failure returns the entire original
+submission without resetting its history. The transfer itself is effect-free,
+including after expiry, and cannot renew the captured authority.
+
+Preparation now constructs the shared `ContextualSubmission` exactly once.
+The installation transport borrows its history through a private owner method,
+and publication moves that same value into the existing complete-publication
+sender. This replaces the separate installation enum stored alongside the
+context; no setter or reconstruction from descriptive command bytes can fabricate
+Installed at the handoff. The opaque session/exchange binding remains with the
+specialized owner and is not exported as an independent capability.
+
+Argument-free `publish()` validates that original route/session before and after
+bounded transport acquisition, then uses the existing classified publication
+attempt. NotSent preserves prior history; lost replies, malformed confirmations,
+remote errors and unwind preserve uncertainty. Exact confirmation records
+MarkerConfirmed without resetting Installed, and later failures cannot regress
+the marker. Closing and reopening a section through the same client does not
+permit substitution. Drop performs no cleanup or retry.
+
+Installed authenticated Unix/TLS regressions cover denied fresh/uncertain
+handoffs, expiry during an inert confirmed transfer, backward-clock handoff with
+unchanged cutoffs, primary-marker-only success and exact replay, all replicas
+and frontend shadows unchanged, pre-dispatch NotSent/unwind, malformed
+digest/purpose/empty replies, post-marker resource errors, lost replies,
+successful-but-closed replies, and rejected reconnect. Shared history and all
+cutoffs are asserted independently of the specialized owner's scalar observation.
+Negative trait checks pin non-cloneability of the publication and failure owners.
+
+Validation: the initial new replay test moved only the client clock back by the
+entire one-second authenticated-response skew allowance while performing network
+IO; server clock advancement exceeded that allowance. The corrected canary moves
+the clock only around the inert handoff, asserts unchanged deadlines there, then
+retries using normal clocks. All **143 focused tests passed in 53.174s**.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff checks
+passed. Full workspace Nextest passed **10,869 tests in 759.985s**, eight slow
+tests (all completed), six skipped. All six new tests passed in the full run;
+no failures were waived.
+
+Next at publication-start completion was replica application, recorded below.
+Publication-start alone does not
+apply owner/reservation rows or authorize physical writes. No wire/schema change,
+additional normal-path transaction, live publisher selection, autonomous cleanup
+or production activation is introduced by this slice.
+
+### Candidate remote Direct PUT introduction ordered application
+
+The retained publication owner now applies through its original cohort. The
+shared complete-command checks bind the command subject and exact topology,
+require publication confirmation, and enforce witness → primary → trailing
+replica ordering. Remote targets must be the exact admitted client instances;
+the primary uses the original held session, while embedded replicas are selected
+only through the retained route and its identity-bound target constructor.
+No caller can supply a replacement primary section, deadline or command.
+
+Every attempt keeps the original primary transport borrowed through replica
+commit and classified confirmation, including when the replica is embedded.
+Authority is rechecked after bounded acquisition; embedded apply also checks the
+original cutoff at the transactional effect boundary. The existing per-member
+history distinguishes NoAttemptObserved, Unconfirmed and Applied. NotSent cannot
+erase prior uncertainty, and failed exact retries cannot regress Applied.
+Only an authenticated exact confirmation unlocks dependent members; durable
+apply with a lost reply is not frontend confirmation.
+
+Completion is borrowed from the same owner and requires every original member.
+It revalidates the original session and authority and carries no slot-retirement,
+cleanup or physical-write capability. Dropping either the evidence or its owner
+does not repeat effects or release resources. Existing owner/reservation/window
+apply transactions are reused; this slice adds no wire/schema changes or fsyncs.
+
+The installed Unix/TLS matrix covers embedded and remote witnesses, deliberately
+unsorted acting sets, every member's exact durable owner/resource state, exact
+non-mutating replay, crossed client/member rejection, denied pre-marker and
+out-of-order apply, malformed/digest-crossed confirmations, remote errors after
+commit, lost replies and successful-but-closed primary replies. It distinguishes
+allowed replica reconnect from forbidden primary replacement. Deterministic
+tests pause remote/embedded confirmation to prove the primary borrow remains
+held, exercise pre-dispatch NotSent/unwind and pre/post-commit embedded failures,
+and expire authority inside the embedded transaction before its first effect.
+All tests retain original bounds/history and check untouched peers and frontend
+shadows; completion is rejected after expiry or primary closure.
+
+Validation: a new fixture initially failed compilation because its test body
+referenced a macro-private directory binding; that was corrected. The initial
+transaction-expiry canary advanced only wall time, which correctly did not
+expire the embedded admission's already-bound `std::time::Instant`. It now
+asserts entry before that captured deadline, waits at the pre-effect hook until
+the deadline passes, and verifies rejection with no SQL effects. No production
+deadline behavior was changed to satisfy the test. All **136 focused tests
+passed in 91.327s**, including all seven new tests. Formatting, strict
+all-target/all-feature Clippy, storage-boundary and diff checks passed.
+After waiting for the host load gate, full workspace Nextest passed **10,876
+tests in 783.848s**, eight slow tests (all completed), six skipped. All seven new
+tests passed in the full run; no failures were waived.
+
+Next at ordered-application completion was the consuming terminal handoff,
+recorded below. The current owner
+does not export a detached generic sender or authorize physical writes.
+Live publisher selection, autonomous cleanup and production activation remain
+gated.
+
+### Candidate remote Direct PUT introduction consuming terminal handoff
+
+The confirmed publication owner now consumes into a non-cloneable terminal
+owner. Handoff requires the original private session identity, still-valid
+captured authority, publication confirmation and exact application confirmation
+from every original cohort member. It does not infer frontend confirmation from
+durable replica state: a lost final-member reply remains Unconfirmed even when
+all five stores have applied. Failure returns the SAME publication holder,
+including each member's history, installation history and original deadlines.
+
+Successful handoff moves that holder without reconstructing a sender, encoding
+commands, accessing storage, dispatching an RPC, sampling replacement deadlines
+or releasing resources. There is no successful reverse conversion or detached
+generic sender. The original client/session/cohort remain inseparable. Terminal
+validity checks use that same original authority, while scalar confirmation
+observations remain historical facts after expiry or session closure. Drop is
+effect-free. No terminal mutation, physical-write capability, wire/schema change
+or additional normal-path transaction is introduced in this slice.
+
+Installed Unix/TLS tests exercise both embedded and remote witnesses, rejection
+before publication and after every partial-confirmation prefix, uncertain remote
+witness/primary/trailing replies, and an applied-but-unconfirmed final embedded
+member. Exact retries confirm without repeating SQL effects before handoff.
+Success under a backward wall-clock adjustment retains both captured cutoffs;
+expired and closed/reopened original sessions reject handoff without losing
+custody. A successful terminal holder also rejects later expiry or primary
+replacement while preserving all historical confirmations. Every transfer and
+Drop checks unchanged durable state, pending slot, resources and frontend
+shadows. Negative trait checks pin both terminal/failure owners as non-Clone.
+
+Validation: all five new tests passed in **9.144s**; the complete focused
+introduction selection passed **89 tests in 30.903s**. Formatting, strict
+all-target/all-feature Clippy, storage-boundary and diff checks passed.
+After waiting for the host load gate, full workspace Nextest passed **10,881
+tests in 772.345s**, eight slow tests (all completed), six skipped. All five new
+tests passed in the full run; no failures were waived.
+
+Next at terminal-handoff completion was exact remote introduction slot retirement,
+recorded below, then window confirmation and frontend request custody.
+Slot removal is not physical-write authorization or cleanup success.
+Live publisher selection, autonomous cleanup and production activation remain
+gated.
+
+### Candidate remote Direct PUT introduction exact slot retirement
+
+The terminal owner now offers argument-free retirement through its original
+held primary session. Only that owner can mint the private borrowed retirement
+scope; no independent command, sender history, replacement session or later
+deadline can be supplied. The shared retirement protocol validates the exact
+cohort's application confirmations and quiescent terminal work, then retains the
+original transport borrow through response classification. The receiver validates
+exact applied evidence and durable owner/resource custody in the same transaction
+that removes the pending slot and side indexes. It does not remove owner/windows,
+generation or bucket-proof responsibilities, or command-log evidence.
+
+NotSent restores only the previous observation. Lost/malformed/error replies and
+unwind retain Unconfirmed; exact absence retries must still validate durable
+custody. Retired never regresses or redispatches, including after later expiry
+or closure rejects further use. A reopened connection cannot substitute for the
+original session. Drop does not retry, release resources or delete payload.
+No durable/wire format changed and live receiver/publisher selection stays gated.
+
+Installed Unix/TLS tests cover exact retirement,
+custody-preserving absence retries, damaged resources, malformed confirmation
+identity/purpose, error/lost/closed replies, NotSent/unwind, immutable cutoffs and
+expiry immediately before transactional deletion. A response barrier also proves
+the original primary transport borrow remains held until confirmation.
+All **141 focused tests passed in 75.510s**, including the six new tests. One
+existing corruption-matrix test completed at 62.147s after the slow threshold.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff
+checks passed. After waiting for the host-load admission gate, full workspace
+Nextest passed **10,887 tests in 781.364s**, eight slow tests (all completed),
+six skipped. All six new tests passed in the full run; no failures were waived.
+
+Next at slot-retirement completion was original-session window confirmation,
+recorded below, then physical-writer handoff and frontend request custody.
+Slot retirement alone is neither physical-write
+authorization nor cleanup success. Autonomous cleanup and production activation
+remain gated.
+
+### Candidate remote Direct PUT introduction window confirmation
+
+The terminal owner now consumes confirmed slot retirement into an opaque remote
+window holder. The operation accepts no new session, client, cohort or deadline:
+its private borrowed scope selects the original complete submission and admitted
+primary binding. It reuses the shared read-only primary/witness confirmation
+protocol, which retains the primary transport borrow across both inspections.
+The final handoff rechecks the original session and captured bounds as well as
+the returned window observation. A positive read cannot renew expired authority
+or survive primary-session closure.
+
+Any failed inspection returns the SAME terminal holder, preserving installation,
+publication, all-member application and retirement history. Unconfirmed retirement
+cannot be promoted by inspecting an absent slot. Success retains the read and
+entire terminal custody together; there is no raw descriptor/sender export,
+reverse conversion, physical-write authority or effect on Drop. The next consuming
+physical handoff must still bind that private window to its original session.
+
+Owner-local Unix/TLS regressions cover embedded/remote witnesses, exact successful
+prefix and no storage changes, missing/uncertain retirement, malformed descriptor/
+witness/purpose responses, error replies and exact retries, corrupt primary or
+witness state, original-session closure both during and after a positive reply,
+expiry at each inspection stage, and primary-borrow exclusion throughout witness
+and primary inspection. The owner/failure/scope types are non-Clone.
+The first expiry canary advanced only the client wall clock and hit
+authenticated RPC replay freshness rejection instead of the intended boundary;
+it now waits for the originally captured monotonic deadline at the selected
+stage, with no simulated peer clock skew or production behavior change. The
+initial three-second setup budget was also too short for conservative inter-host
+skew deductions; the fixture now admits with eight seconds and proves each hook
+is reached before expiry. The isolated ten-interleaving expiry matrix passed in
+60.264s, including its deliberate waits.
+
+The broader run also exposed a reply/disconnect race in the preceding retirement
+expiry fixture: its server attempted to send the deadline rejection after the
+client timed out, producing `Broken pipe` in the strict listener harness. The
+test-only expiry schedule now asserts that the pre-delete hook was reached and
+that the actual response is the expected retirement `TransportTimeout`, then
+closes without sending that intentionally late rejection. It does not suppress
+other server failures or change production transport behavior. The non-mutation
+and retained-uncertainty assertions remain; the corrected isolated regression
+passed in 20.230s. The failed run was not counted as validation success.
+
+Final focused validation passed **117 tests in 83.745s**, including all eight new
+tests. The API-shape test completed at 72.755s and the deliberately waiting expiry
+matrix at 66.241s. Formatting, strict all-target/all-feature Clippy, storage-boundary
+and diff checks passed. After waiting for the host-load gate, full workspace
+Nextest passed **10,895 tests in 787.280s**, nine slow tests (all completed),
+six skipped. All eight new tests and the corrected retirement expiry fixture
+passed in the full run. No failures were waived.
+
+The consuming remote physical-writer handoff is covered by the following slice;
+real frontend custody remains next.
+Live selection and autonomous cleanup remain gated. Checkpoint scalability remains
+separate work scheduled after this plan completes, not an activation prerequisite.
+
+### Candidate remote Direct PUT introduction file handoff
+
+The confirmed remote introduction window now consumes into the existing remote
+Direct PUT physical writer. No client, session, route, command or deadline is
+supplied at this boundary. A private consuming scope transfers the original
+submission, publication/application history and captured window. The owned route
+projection copies the exact current admission, cohort, fence and cutoff; it does
+not reload the runtime map or mint a fresh deadline. Provisional encryption is
+validated before any primary release.
+
+The shared file binding revalidates the retained session identity under the
+transport borrow and inspects the exact durable owner/window. Its explicit,
+deadline-bounded release RPC must acknowledge removal of the original primary
+guard before a physical writer is returned. It rechecks original authority after
+release. Failure retains opaque custody, including uncertainty after a failed
+release; there is no reset, alternate-session binding or cleanup on Drop. This
+reuses the sole reserved Direct PUT VID and adds no allocation registry,
+transaction, fsync or wire-format change.
+
+Unix/TLS regressions pause server teardown and prove binding cannot return while
+the original guard remains held, then assert immediate release without a waiting
+reacquisition. They also cover malformed/error release acknowledgements,
+same-client reconnection, expired authority and committed-encryption rejection
+before release. Success preserves installed and all-member-applied history and
+does not extend either cutoff. Binding and failure/Drop leave durable owner,
+reservation and file state unchanged. Non-Clone canaries cover the scope, failure
+holder and resulting writer. Shared file/release tests continue to cover physical
+effects and release-time expiry; this slice does not activate live publishers.
+
+The first focused run exposed a new assertion inspecting the sanitized RPC error
+Display rather than its stored diagnostic. The assertion now checks the exact
+stored release rejection/payload-decode detail; no production behavior changed.
+All five new tests passed in 9.503s. Broader validation passed **116 tests in
+83.435s**, including shared physical-write/release-expiry and API-shape coverage.
+The API-shape test (70.639s) and deliberate expiry matrix (65.408s) both completed.
+Formatting, strict all-target/all-feature Clippy, storage-boundary and diff checks
+passed. After waiting for the host-load admission gate, full workspace Nextest
+passed **10,900 tests in 787.889s**, nine slow tests (all completed), six skipped.
+All five new tests passed in that run; no failures were waived.
+
+The embedded request-custody binding follows below. Remote request custody and
+the complete request workflow remain ahead of live selection and autonomous
+cleanup in the ordered activation queue.
+Checkpoint scalability remains separate work after this plan, not a prerequisite.
+
+### Candidate embedded Direct PUT request custody
+
+`EmbeddedPublicationSection::prepare_request_direct_introduction` derives the
+bucket, key and exact bucket proof from a real `DirectPutWriteScope`. It requires
+that scope's exact admission, object PG, epoch and primary before read-only
+capture. Successful preparation consumes the scope's single introduction claim;
+neither a second introduction nor the legacy generation/payload/commit entry may
+run through that scope afterward. Failed preparation leaves frontend ownership.
+
+The returned non-Clone holder borrows the request custody and owns the complete
+captured introduction. Neither a raw prepared command nor an independently
+installable capture can escape it. Its private concrete owner arms uncertainty
+before entering installation. A definitive first-attempt pre-acceptance rejection
+restores release eligibility; interrupted/uncertain acceptance remains retained
+across later rejection, and confirmed installation cannot regress. Claiming and
+updating this state are private to the introduction-owner module, not callable
+through a request-side boolean or supplied classification.
+
+Normal snapshot-scope return and unwind now consult that candidate custody.
+Accepted or uncertain introduction suppresses frontend bucket-proof release.
+Only positively confirmed installation can consume into the existing publication
+owner; rejected handoff returns the same request-bound holder. Subsequent partial
+fanout or frontend unwinding therefore leaves the exact proof with command
+recovery. Drop never clears a slot, removes an owner or frees a generation.
+The ordinary live `GenerationAttempted` path is unchanged until coordinated
+selection; adding the candidate binding alone is not production activation.
+
+Owner-local tests use the production bucket-snapshot scope and real durable
+reservations, preserving independent proof canaries. They cover no-attempt and
+transactionally rejected return, duplicate preparation and legacy-entry rejection,
+wrong admission and PG, confirmed retry expiry, partial witness fanout followed
+by return/unwind, interrupted installation with later rejection or exact retry,
+and unwinding both before and during installation. Private-state and non-Clone
+canaries pin sticky uncertainty and the non-detachable ownership shape.
+The first focused execution had one fixture error (a noncanonical session ID),
+corrected to the standard validated test identifier before further validation.
+
+All **14 focused request/legacy-scope tests passed in 2.603s**. Broader validation
+passed **123 introduction/scope/API-shape tests in 82.909s**, including seven new
+tests. The API-shape matrix and deliberate expiry matrix both completed after
+crossing the slow threshold. Formatting, strict all-target/all-feature Clippy,
+storage-boundary and diff checks passed. After the host-load admission gate
+cleared, full workspace Nextest passed **10,907 tests in 792.016s**, nine slow
+tests (all completed), six skipped. All seven new tests passed in the full run;
+no failures were waived.
+
+The held Unix/TLS binding follows below. Next, connect the actual encrypted
+request workflow through the existing physical/terminal chain. Remaining
+stream terminal, recovery/live selection and autonomous-cleanup gates stay open.
+Checkpoint transfer remains independent follow-up after this plan completes.
+
+### Candidate remote Direct PUT request custody
+
+`CompleteFanoutRoute::prepare_request_direct_introduction_remote` derives its
+bucket, key and exact proof from the real `DirectPutWriteScope`. Admission identity,
+current route class, PG, epoch and primary must match before any preparation RPC.
+The existing authenticated preparation validates its response and retains the
+original session and immutable bounds; malformed success closes that session.
+Only a successful descriptive capture claims the request's single introduction.
+
+The non-Clone request holder owns the existing remote submission and borrows the
+scope's private custody state. It arms uncertainty before installation, preserves
+that history on unwind, and consults the classified sender on ordinary return.
+Frontend release remains permitted before any installation attempt and after a
+definitive first-attempt rejection. Lost/crossed replies
+and interrupted attempts cannot be downgraded by subsequent rejection; confirmed
+installation remains confirmed. The holder permits no raw submission extraction,
+replacement session or refreshed deadline. A rejected publication handoff returns
+the same request-bound holder; confirmed installation transfers to the existing
+publication/application/terminal chain without changing its captured bounds.
+
+Installed Unix/TLS regressions use the real bucket-snapshot scope and durable
+reservation allocator, with independent reservation canaries. They cover capture
+without installation, pre-dispatch rejection, expiry, malformed preparation and
+session invalidation, duplicate/legacy entry rejection, crossed admission before
+transport, lost/crossed installation replies, exact retry, refusal to reconnect,
+installation unwind, and partial witness application followed by request return
+or unwind. Request return checks the real reservation rows rather than inferring
+release from sender status. The mixed-endpoint fixture routes bucket snapshot/reservation operations
+to the same actual remote nodes as its candidate command endpoint.
+
+The first focused run exposed a test-server scheduling error: serial `accept_one`
+allowed an idle pooled TLS connection to block the best-effort unwind release,
+which returned `store_rpc_transport_failure` and left its reservation. The fixture
+now uses the production-style concurrent handler for pooled bucket RPCs alongside
+the held primary session. The unchanged release assertion passes for both Unix
+and TLS. Temporary release diagnostics were removed. All **five focused tests
+passed in 9.573s**. The broader introduction/fanout run passed **169 tests in
+132.648s**, three slow (all completed), with formatting, strict all-target/all-feature
+Clippy, boundary and diff checks passing. After the host-load gate cleared, full
+workspace Nextest passed **10,912 tests in 804.029s**, nine slow (all completed),
+six skipped. All five new tests passed in that run; no failures were waived.
+
+No wire/schema format, transaction, fsync or live selector is added. Next: connect
+the encrypted request workflow to this
+candidate custody chain, then finish stream terminal/recovery integration and
+autonomous cleanup. Checkpoint transferability is not a prerequisite.
+
+### Candidate Direct PUT request encryption handoff
+
+The released-primary file owner now consumes into a size-bound standard-object
+segment preparation. Its object identity is derived from the retained confirmed
+window and provisional encryption; callers provide neither a generation nor a
+replacement subject. Logical length must fit the captured window, and prior
+file/acknowledgement attempts prevent re-entering encryption. The preparation
+exposes only borrowed object/segment subjects for the crypto owner and an opaque
+introduction identity. Failed binding returns the same owning preparation.
+
+The crypto boundary now returns opaque, non-Clone `CommittedObjectEncryption`
+evidence from the actual SSE-C/SSE-S3 DEK/checksum sealing operation. The durable
+state can be borrowed or consumed for existing callers; decoding that state
+cannot recover the original subject evidence. Storage still does not know the
+crypto keys: this is exact subject/provenance binding, not an independent
+authentication of the supplied payload bytes. Existing live callers consume the
+evidence into the same durable state and retain their existing wire behavior.
+
+Ciphertext acceptance requires the exact committed evidence, exact codec-derived
+stored length, and the original still-valid window/fence. It moves the caller's
+owned buffer without copying, computes its stored CRC64 once, and retains bytes,
+evidence, size-bound subject and original file custody in one non-Clone holder.
+No production accessor can extract the raw writer or detach installable evidence.
+Acceptance, rejection and Drop perform no storage IO or reservation release.
+
+Owner tests start with real bucket reservations and the request-bound embedded
+or Unix/TLS introduction, apply every member, retire the introduction slot and
+release the original primary section before encrypting. They exercise empty,
+4 KiB, cross-record and 8 MiB payloads with real Cobblestone encryption and
+decryptable committed DEKs; independent bucket/key/incarnation/generation,
+length and expiry negatives preserve owner state and the request proof. The
+existing SSE-C and managed-encryption terminal canaries use the actual evidence
+producer and continue to verify payload and checksum decryption after rewrap.
+Compiler probes additionally reject cloning either encryption owner, reusing the
+consumed writer/preparation, and extracting the private writer or ciphertext;
+positive binding and same-owner retry probes must compile.
+
+All **18 focused request-custody/encryption tests passed in 10.291s**. Formatting,
+strict all-target/all-feature Clippy, boundary and diff checks passed. The first
+full run exposed missing encryption-interface stubs in the existing isolated API
+compilation fixture (8,130 passed, one failed, 2,785 not run). The fixture was
+updated, not bypassed; its expanded compiler-probe test passed in 38.451s.
+After the fixture correction, formatting, strict all-target/all-feature Clippy,
+boundary and diff checks passed again; full workspace Nextest passed **10,916
+tests, six skipped, in 792.121s**. This is a candidate encryption handoff, not a
+live PUT selector or complete request driver. Next: consume the encrypted holder through
+the existing placed file/acknowledgement pipeline and carry its CRC/encryption
+evidence into conditional snapshot reinspection and terminal publication. Do not
+add a parallel EC/physical-write implementation or reopen checkpoint transfer.
+
+### Candidate encrypted Direct PUT file and acknowledgement dispatch
+
+The encrypted holder now derives its segment hash, reserved VID and EC shape
+from the retained window. It uses the same scratch-backed EC encoder as existing
+placement writes, without introducing a second encoding implementation or an
+owned copy of every shard. The encoding adapter exposes computation only, not
+the underlying map/runtime or any physical-write grant. The complete transport
+list is checked against captured placement before the first effect. Each actual
+file/acknowledgement effect still rechecks its existing immutable authority.
+
+Dispatch borrows the owning holder: callers cannot replace ciphertext, logical
+size, generation, encryption evidence, CRC or deadline. Errors and unwind keep
+the original holder; remote attempts retain their exact request digest and
+uncertainty. Confirmed remote retries send no additional file request. Partial
+dispatch never triggers frontend rollback or generation/reservation release.
+Acknowledgement persistence uses the existing captured data-PG primary and its
+complete receipt validation; it cannot succeed with an incomplete file set.
+Drop remains non-mutating. No new format, fsync, metadata command or live selector
+is introduced by this adapter.
+
+Coverage uses real request-bound introductions and actual encrypted payloads:
+empty, small and cross-record embedded payloads; exact systematic bytes/padding
+and independently encoded parity; durable acknowledgement rows only on their
+captured primary; unwind after file publication and retry; expiry with unchanged
+metadata; and Unix/TLS lost-file replies, confirmed retry suppression and crossed
+later participants rejected before any RPC. Compiler probes reject substituted
+bytes or a new deadline. All **seven focused tests passed in 40.856s**, including
+the compiler probes. Formatting, strict all-target/all-feature Clippy, boundary
+and diff checks passed. Full workspace Nextest passed **10,918 tests, six
+skipped, in 805.729s**. The focused fixture corrections preserved the actual
+placement and transaction contracts; no failing assertion was waived.
+
+Next: consume this whole holder into the existing conditional snapshot and
+terminal-preparation chain, carrying its original committed encryption evidence
+and stored CRC. Do not expose an independently usable acknowledged payload or
+discard uncertain history to make that connection. Production selection and
+autonomous cleanup remain gated; checkpoint transfer stays a separate workstream.
+
+### Candidate encrypted Direct PUT terminal preparation
+
+The encrypted payload now consumes into an acknowledged owner only after its
+existing receipt journal confirms persistence. Until then, failure returns the
+same encrypted payload and its file-attempt history. The successful transition
+retains complete introduction/window/receipt custody, committed encryption
+evidence and the stored CRC; the now-redundant ciphertext buffer can be dropped.
+
+Snapshot inspection invokes the existing embedded or Unix/TLS preparation and
+integrity builders using that retained CRC, not a new caller checksum. Only
+logical authorization/conditional facts are borrowed out. Inspection failures
+return the same acknowledged owner, including any bound remote session identity.
+The inspected owner can discard its old metadata snapshot and reinspect through
+the same admitted section/session, without discarding payload custody, evidence
+or extending deadlines. This is a mechanism for the eventual request conditional
+loop, not an implementation of that loop or its AWS winner/loser mapping.
+
+Terminal preparation uses the internally retained committed evidence. The
+existing logical commit DTO is still accepted, but crossed encryption is
+rejected against that evidence; no API accepts replacement evidence or a CRC.
+Failure returns the same inspected owner. Success hands off only the existing
+opaque, fully bound terminal preparation, containing both authenticated command
+and physical custody, to the established installation/publication chain. The
+wrapper lives inside that owner's private subtree; no raw custody constructor
+or field is made more visible to connect the steps.
+
+Embedded and Unix/TLS regressions start with real request reservations, actual
+encrypted file writes and acknowledgement persistence. They reject provisional
+encryption substitution, deliberately crossed captured snapshots, and expired
+embedded inspection; reinspection then prepares the exact command without SQL
+mutation. Command assertions pin payload generation, logical size, committed
+encryption, stored CRC and integrity-witness presence. Compiler probes require the
+consuming paths to compile and reject cloning, reuse, raw custody/evidence
+extraction and caller checksum injection. All **seven focused tests passed in
+42.316s**. Formatting, strict all-target/all-feature Clippy, boundary and diff
+checks passed. Full workspace Nextest passed **10,920 tests, six skipped, in
+791.592s**.
+
+Next: connect the request-owned conditional evaluation/retry loop to these
+borrowed snapshot facts and consume successful preparation through classified
+installation/publication/terminal retirement. Production selection and autonomous
+cleanup remain gated. Checkpoint transfer is not a prerequisite.
+
+### Candidate encrypted Direct PUT request decision
+
+The inspected encrypted owner now has embedded and Unix/TLS single-attempt
+decision entries using the ordinary Direct PUT callback contract: inspect the
+borrowed current ETag and either accept or return the caller's exact request
+error. The actual S3 conditional evaluator remains in server-core; this bridge
+does not duplicate it or map storage contention to a conditional status.
+
+The original section/route deadline and, for remote work, the exact retained
+primary session are validated before invoking request logic. Accepted decisions
+then enter the existing terminal builder, which revalidates authority and the
+exact captured snapshot before producing a command. Request rejection and
+storage failure are separate typed outcomes; both retain the same inspected
+owner and encryption evidence. No failure can independently expose physical
+custody or renew a deadline. Reinspection through the prior consuming API loses
+old snapshot facts, and a subsequent decision attempt invokes the callback again.
+
+This helper performs exactly one decision/preparation attempt and never drains
+contenders or retries internally. The live owner loop must still enforce its
+shared work budget, converge/reinspect winners, and preserve AWS conditional
+precedence. It is not yet wired into the live S3 request selector. The existing
+lower terminal builders remain trusted owner machinery, not a claim that this
+optional candidate wrapper alone enforces all request policies.
+
+Regressions cover embedded and Unix/TLS request rejection without mutation,
+expired authority without callback invocation, expiry during evaluation rejected
+before preparation, accepted decisions rejected by crossed snapshot validation,
+and fresh callback invocation after reinspection. Compiler probes pin consuming
+use and retained failure custody. After aligning the compiler fixture's error
+stub with the production `Debug` implementation, all **seven focused tests
+passed in 44.116s**. Formatting, strict Clippy, boundary and diff checks passed.
+Full workspace Nextest passed: **10,920 tests in 793.853s**, with six skipped.
+Next: connect the bounded owner-loop decision outcomes to the existing
+classified installation/publication/retirement chain; do not introduce an
+all-command drain or broaden conditional error mapping.
+
+### Candidate encrypted request terminal chain
+
+The real request-scope/encryption fixtures now join the existing terminal handles
+instead of stopping after command preparation. This is integration evidence, not
+a new wrapper or live selector: the production budgeted owner loop is still
+unconnected. No new command, fsync, deadline, or retry policy is introduced.
+
+Embedded coverage includes empty, 4 KiB and multi-record payloads. Unix and TLS
+coverage uses a remote primary/witness with embedded remaining replicas. After
+the sole terminal slot is committed, an injected authenticated error leaves the
+sender Unconfirmed; publication is refused until the same owner and held session
+confirm an exact retry without changing durable state. A witness-only partial
+apply cannot transfer to terminal custody. All-member application then permits
+exact reservation release and pending-slot retirement, followed by successful
+return through the original request scope. The earlier interrupted/preparation-
+only variants continue to require retention of the request reservation.
+
+The tests reread systematic shard files after terminal effects, compare their
+exact ciphertext, and unwrap/decrypt it using every replica's persisted object
+encryption. They also compare the complete owner/reference state against the
+published object, require primary slot absence, preserve pre-existing bucket
+reservations, and reject implicit Drop cleanup. This pins crypto readability and
+cleanup custody in the same request chain, rather than relying on independent
+terminal fixtures with synthetic preparation.
+
+Validation: both focused chain tests passed; formatting, strict Clippy, boundary
+and diff checks passed. Full workspace Nextest passed **10,922 tests in
+798.020s**, with six skipped. Next: production owner-loop integration with the shared
+request budget, one-contender progress and exact winner reinspection; preserve
+the distinct request/storage errors and retained unresolved holders. Live
+activation, stream/UploadPart integration and autonomous owner retirement remain
+gated. Checkpoint transferability remains the independent follow-up plan.
+
+### Candidate encrypted Direct PUT terminal-work bound
+
+The encrypted handoff now captures the time component of the existing Direct
+PUT metadata work budget (10 seconds) exactly once, after file acknowledgement
+persistence and before terminal snapshot inspection. It intersects that deadline
+with the original writer/admission bounds, never lengthening them. The absolute
+portable cutoff is captured with the established conservative clock-skew
+allowance; no remaining-duration deadline is transported or regenerated during
+reinspection. This is not a new budget policy or a live selector change.
+
+The consuming handoff retains the narrowed monotonic deadline, portable cutoff,
+and intersected effect fence inside the existing custody holder. Inspection,
+request decisions, preparation, installation and publication reuse those bounds;
+terminal transfer preserves them for reservation release and slot retirement.
+Failed inspection, rejected decisions, stale-snapshot reinspection and uncertain
+installation cannot return to ciphertext ownership to start a fresh budget.
+The intersected fence reaches the final SQLite pre-effect check, not just the
+frontend preflight. Earlier preparation/physical writes retain their existing
+admission/window authority; the terminal budget does not retroactively renew it.
+
+Tests pin budget expiry while the original window is still live, retained exact
+bounds through reinspection/preparation, and expiry immediately before pending
+slot insertion with no slot/sidecar/state mutation. The real encrypted embedded
+and Unix/TLS terminal chains remain the success canaries. Eight focused tests
+passed after aligning the API fixture's `StoreError` stub with production's
+`Debug` implementation. Formatting, strict Clippy, boundary and diff checks
+passed. Full workspace Nextest passed **10,922 tests in 800.504s**, six skipped,
+including the final deadline-propagation assertions and conservative fence
+export adjustment.
+
+Review correction: the SQL-boundary expiry canary now advances paired clocks to
+just beyond the terminal cutoff, rather than using `u64::MAX`. It captures the
+original physical effect fence before terminal handoff and asserts that fence
+is still valid inside the pre-effect hook; the original section also remains
+valid after rejection. A mutation probe omitting only the terminal-fence
+intersection made installation succeed and failed the regression at its expected
+rejection assertion. The production intersection was restored. The full-suite
+result above precedes this test-only correction. With production code restored,
+all **eight focused tests passed in 44.688s**; formatting, strict Clippy and diff
+checks passed. The full suite was not repeated for this test-only correction.
+
+This connects the immutable time bound, **not the complete retry controller**.
+The production owner loop still needs explicit one-contender progress, shared
+attempt accounting/backoff and exact winner reinspection, without broad error
+remapping or abandoning uncertain custody. Autonomous cleanup, stream/UploadPart
+wiring and live activation remain gated; checkpoint transfer remains separate.
+
+### Candidate encrypted terminal installation reinspection
+
+Prepared encrypted terminal commands now retain their committed-encryption
+evidence through owning installation. The previous encrypted preparation wrapper
+discarded that evidence on success, leaving no safe way for a definitive
+installation rejection to return to request snapshot inspection.
+
+The new consuming `into_reinspection` transition accepts only
+`NoAcceptanceObserved`. It discards the unaccepted command and captured metadata
+snapshot, then returns the same acknowledged encrypted owner: exact physical
+custody, CRC, committed encryption, original session and narrowed deadlines.
+Another preparation must load fresh facts and run its request decision again.
+This does not allocate another generation or reopen the file-writing stage.
+
+Unconfirmed and Installed histories reject that transition and return the exact
+submission owner unchanged. A rejected publication handoff also retains the
+encryption evidence. Only confirmed installation permits the existing owning
+publication transition, at which point its exact installed command carries the
+committed encryption metadata. There is no raw-command/physical-owner extraction
+or externally callable unaccepted-payload projection; the lower consuming
+projection is private to the terminal owner subtree.
+
+The embedded regression forces a definitive rejection at the final SQL fence,
+asserts that the invalidated prefix fails reinspection without losing custody,
+performs existing explicit owner-local recovery validation in the fixture,
+reinspects under the unchanged budget, reevaluates conditions, and publishes a
+decryptable object. Unix/TLS coverage performs definitive preflight rejection
+and same-session reinspection, then checks that uncertain and confirmed
+installation cannot discard the command. Existing exact retry, all-member
+application, resource release and retirement checks remain. Compiler probes
+cover consuming use and inaccessible raw preparation/submission/custody fields;
+the new holders are non-Clone. All **ten focused tests passed in 45.886s** after
+correcting fixture setup and explicitly accounting for prefix invalidation.
+Formatting, strict Clippy, boundary and diff checks passed. Full workspace
+Nextest passed **10,923 tests in 792.752s**, with six skipped.
+
+At this slice's boundary, admitted prefix validation after rollback was still
+open; the following slice supplies that read-only integration. Next: wire typed
+contention/reinspection outcomes and one-observed-contender progress into the
+production budgeted owner loop. The deferred cache redesign stays out of scope.
+This transition does not select
+retryable errors, authorize reconnect, drain commands, remap conditional errors,
+or enable live publication. Stream/UploadPart and autonomous cleanup remain
+required; checkpoint transfer remains an independent follow-up.
+
+### Candidate read-only prefix validation for Direct reinspection
+
+Admitted embedded and held-session Unix/TLS Direct PUT snapshot inspection now
+explicitly revalidates a cold prefix before capturing fresh request facts. This
+closes the definitive-installation-rollback gap above without invoking startup
+recovery from a request or preserving an invalidated cache entry.
+
+The read-only validator shares startup's exact log/receipt/checkpoint bounds,
+foreign-PG rejection, complete log grammar, materialized-state digest and pending
+context/index checks. It owns a `query_only` SQLite snapshot and never links a
+tombstone tail, repairs digest tables, removes pending custody, advances a log
+index or commits a write. Digest-cache drift fails closed instead of being
+repaired here. Successful teardown and an unchanged allocation/database stamp
+are required before retaining validation. Failed rollback retires the connection.
+A valid warm entry avoids full history/materialized-state rescans.
+
+Review correction: cold foreground validation is bounded independently of
+checkpoint cadence. One pass allows at most **4,096 suffix entries, 100,000
+scanned rows, and 16 MiB of cumulative input bytes**. The row/byte allowance is
+shared across retained-evidence keys, checkpoint candidates, suffix commands,
+materialized-state hashing and the pending carrier; it is not reset per phase.
+Checkpoint and command BLOB lengths are charged before loading/decoding them.
+The scalar foreign-PG scan is also charged rather than hidden inside an
+unbounded `WHERE pg_id <> ...` query. Materialized values are charged before
+hashing. Exhaustion reports validation-budget contention and leaves the cache
+cold and custody unchanged; it does not checkpoint, compact or silently invoke
+startup recovery. A separate maintenance/recovery owner must establish usable
+validation evidence when the foreground allowance is insufficient.
+
+Embedded and remote inspection pass the intersection of the existing work and
+route bounds into validation. Checks occur between suffix entries, during row
+scans/hashing, around checkpoint validation, and before retaining the cache.
+Work expiry is independently tested while route authority remains valid. These
+are cooperative checks between bounded work units, not cancellation of a kernel
+I/O call already in flight. No new timeout is minted on reinspection. Startup
+recovery retains its existing non-foreground validation path.
+
+Both callers validate their existing admission, exact held section/session and
+immutable deadline before validation and again before capturing/exposing the
+new snapshot. Validation does not renew authority, authorize any physical effect,
+or bypass a pending contender: the ordinary settled-prefix pending barrier still
+applies after validation. An incomplete tail needs the existing recovery owner;
+this is not a general request recovery loop. There is no wire/schema change,
+new durable transaction/fsync, directory lock, or cache redesign.
+
+The encrypted embedded chain now retries its actual SQL-fence rejection without
+test-only startup recovery and proves no SQL mutation during reinspection.
+Unix and TLS exercise receiver rollback invalidation on the same held session,
+then continue through exact installation, fanout and decryptable publication.
+Owner-local tests cover warm reuse, all context families, corrupted history,
+foreign/future log evidence, materialized-state and digest-cache damage, damaged
+pending indexes, the retained pending barrier and failed snapshot teardown.
+
+The initial focused run exposed an observation-baseline error in the new remote
+test: SQLite counts a rolled-back update in `total_changes`. The assertion now
+captures that counter after the deliberate rollback and independently checks
+unchanged durable state; all 17 focused tests passed in 6.208s. The first full
+run then passed 8,133 tests and failed the standalone window API compiler fixture
+because its dependency declarations lacked the new prefix-validation method.
+The fixture now declares that method; the real helper takes typed `NodeId`,
+consistent with its calling routes. No ownership/privacy assertion was removed.
+Final validation: **18 focused tests passed in 46.099s**, including the complete
+window API probe; formatting, strict workspace Clippy, boundary and diff checks
+passed. Full workspace Nextest passed **10,927 tests in 794.215s**, with six
+skipped. No failing test was waived or retried without diagnosing its cause.
+
+The budget review adds cumulative entry/byte exhaustion after a validated
+prefix, independent work/route expiry between entries, shared materialized-row
+limits, oversized-checkpoint admission and inclusive production-limit canaries.
+The old all-context fixture includes synthetic histories beyond 4,096 entries:
+it now requires non-mutating rejection at exactly that limit, then explicitly
+records a fixture-maintenance checkpoint before checking success and warm reuse.
+All **24 focused tests passed in 46.461s**. The first full run passed 8,059 tests
+before the embedded publication API fixture failed because its dependency
+declarations lacked the effect-fence type and section projection newly used by
+the real bridge. Adding those fixture declarations preserved all privacy and
+callback-escape assertions; that probe then passed independently. Formatting,
+strict workspace Clippy, boundary and diff checks passed. The final full
+workspace run passed **10,933 tests in 791.804s**, with six skipped.
+Live selection, the bounded contender/request loop, stream/UploadPart integration
+and autonomous cleanup remain open. Checkpoint transfer remains separate.
+
+### Candidate encrypted terminal attempt accounting
+
+The acknowledged encrypted Direct PUT owner now retains the actual
+`RequestWorkBudget`, rather than retaining only its cutoff. An opaque, non-Clone
+accounting token is created at that sole consuming handoff and stays attached to
+the payload through inspection, request decisions, preparation and installation.
+There is no public extraction or replacement of the budget. Its original
+monotonic and portable cutoffs continue to restrict the existing effect fence.
+
+Each fresh inspection and each installation attempt charges one work unit.
+Request decision and preparation recheck time without charging a second unit
+within that inspection. Failed preparation, definitive installation rejection,
+reinspection, uncertain replies and rejected terminal handoffs retain the same
+counter and deadline. Expired preflight cannot start another attempt; exhaustion
+does not release reservations, delete payload or downgrade installation history.
+The production budget still uses the existing time limit with no fixed attempt
+maximum; finite attempt limits are test-only canaries for retained accounting.
+
+Embedded coverage uses an exhausted two-unit budget after a rejected request
+decision and reinspection, then requires rejection before SQLite installation
+and on further inspection, unchanged durable state and no hidden Drop cleanup.
+Unix/TLS coverage requires rejection before installation transport, and counts
+the actual inspection, lost-reply installation and exact-confirmation retry
+without resetting on error. Compiler probes reject budget extraction from both
+acknowledged payload and installation owners, and a trait assertion pins the
+accounting token's non-Clone shape.
+
+This first slice added **preparation/installation accounting**, not the completed
+request owner loop. Initially confirmed installation ended the attempt counter;
+the following publication/terminal slice removes that discontinuity. Recovery,
+one-contender convergence, backoff and exact-winner reinspection remain integration
+work. No contender is
+drained or sleep introduced by these helpers. Live selection, streams,
+UploadPart and autonomous cleanup remain gated. No format, transaction/fsync,
+checkpoint-transfer or deferred cache-design change is included.
+
+Validation: **seven focused tests passed in 48.617s**, including the compiler
+privacy probes. Formatting, strict workspace Clippy, boundary and diff checks
+passed. Full workspace Nextest passed **10,934 tests in 797.263s**, with six
+skipped, including the Unix/TLS exhaustion-before-transport canary. No failure
+was waived or retried. Changes remain part of the uncommitted integration slice.
+
+### Candidate encrypted publication and terminal accounting
+
+Confirmed encrypted Direct PUT installation now consumes the same work budget
+into an opaque publication owner. It exposes only closed effect methods and
+scalar observations: no `Deref`, unbudgeted-owner extraction, fresh-budget
+constructor or separately callable sender escapes to surrounding request code.
+Both embedded and Unix/TLS paths charge that retained budget before publication,
+each replica-application attempt, reservation release and pending-slot retirement.
+These are effect-attempt units, not a new fixed limit on outer-loop iterations;
+the existing production time limit and no-fixed-attempt-maximum policy remain.
+
+Pure consuming handoffs do not charge an effect attempt. An incomplete apply or
+wrong terminal handoff returns the same publication holder and counter; successful
+all-member handoff carries the counter into the embedded or session-bound remote
+terminal owner. Deadline/attempt rejection occurs before delegating the effect
+and cannot erase marker, application, reservation or retirement observations.
+Unconfirmed replies retain exact custody for a later same-owner attempt. Successful
+retirement completes accounting without adding cleanup-on-Drop behavior.
+
+The embedded exhaustion matrix covers publication, partial fanout, proof release
+and slot retirement, requiring unchanged durable state, retained observations
+and no hidden cleanup. Existing readable-payload chains now pin cumulative
+counts across every handoff. Unix/TLS additionally injects an uncertain marker
+reply after an uncertain installation, rejects expired retry before transport,
+then confirms that same marker and completes mixed-cohort apply and retirement
+without resetting the counter. Compiler probes reject extraction of the raw
+publication/terminal/failure holder or budget; owner-local assertions pin the
+non-Clone shapes.
+
+This connects accounting through the candidate publication chain, **not live
+request selection or autonomous recovery**. One-contender convergence, backoff,
+exact-winner reinspection and recovery orchestration remain next integration
+work. Streams, UploadPart and the cleanup worker remain gated. There is no schema,
+wire, transaction/fsync, checkpoint-transfer or deferred cache-design change.
+
+The first focused run passed 12 tests and failed the new exhaustion matrix's
+diagnostic assertion: `BucketSnapshotLoadError` deliberately renders a generic
+message rather than the nested contention context. The test now matches the
+exact `Store(MetadataCommandContention)` variant and budget context, and similarly
+requires retirement's `NotSent` classification. No production error mapping or
+cleanup assertion was weakened. Strict Clippy additionally required boxing the
+owning handoff failure/budget pair; formatting, strict workspace Clippy, boundary
+and diff checks then passed.
+
+The initial full validation **failed**: the workspace run stopped after 7,181 passes
+on `control_plane::tests::rpc::unix_control_plane_client_stops_heartbeat_retry_before_lease_window_expires`.
+Its fake server failed `read_control_plane_unix_request(...).unwrap()` at
+`control_plane/tests/rpc.rs:8268` with redacted `RpcProtocol`, followed by the
+server-thread join panic at line 8302. The run finished in 256.518s with one
+failure, six skipped and 3,754 tests not run. The test's one-millisecond initial
+request window can expire after connection but before frame write; a truncated
+prefix is consistent with the reported protocol error, but its exact cause is
+not exposed by this log. This slice does not change that control-plane path.
+The test was left unchanged and neither it nor the full suite was blindly rerun.
+Log: `/tmp/argmin-publication-accounting-full.log`. Focused validation of the
+corrected accounting slice then passed **all 13 tests in 49.570s**, including
+the exact-error exhaustion matrix, Unix/TLS uncertain-marker chain and compiler
+privacy probes (`/tmp/argmin-publication-accounting-focused-final.log`). This
+focused success does not supersede the failed full-suite result. Changes remain
+uncommitted and live activation remains gated.
+
+After the user handed the heartbeat failure to a separate investigation and
+explicitly requested a rerun, formatting and strict workspace Clippy passed,
+followed by **10,936 tests passed in 831.699s**, zero failures and six skipped.
+The heartbeat test passed unchanged. Log:
+`/tmp/argmin-publication-accounting-full-rerun.log`. This successful full rerun
+completes validation of the slice; it does not diagnose or resolve the earlier
+heartbeat failure. Its evidence remains above for the independent investigation.
+
+### Candidate encrypted Direct PUT publication step
+
+The budgeted encrypted publication holder now has embedded and Unix/TLS
+single-step operations. Each call performs at most one publication marker or
+replica apply; it never loops, sleeps, drains another command, releases a proof
+or retires a slot. The original budget and deadline are checked on every call.
+After all confirmations, a read-only `ReadyForTerminal` observation lets the
+caller choose the existing consuming terminal handoff; it is not a capability
+and does not bypass that handoff's admission or completion checks.
+
+Selection comes from the captured cohort and retained confirmation journal:
+confirm the publication marker, then the lowest-ID non-primary witness, then
+the primary, then remaining members in NodeId order. An Unconfirmed marker or
+replica stays selected until the exact operation is confirmed. The remote caller
+supplies only the connection for the required peer (or selects embedded transport
+with no connection), not the next node or a replacement cohort. A crossed node
+is rejected before charging/dispatch, and existing transport admission additionally
+requires the exact captured client and original primary session. Ready responses
+also validate section/session and immutable deadline without charging an effect.
+
+The real encrypted embedded and mixed Unix/TLS chains exercise one effect per
+step, witness-before-primary ordering, exact cumulative budget counts, partial
+handoff rejection and repeated non-mutating readiness. Remote regressions retain
+uncertain marker and witness replies, reject skipping that witness, and retry
+the exact witness without replay mutation before continuing. Exhaustion tests
+use the new step at both marker and partial-fanout boundaries. Compiler probes
+reject caller node selection on embedded advancement or a new remote deadline.
+
+This is bounded progress for the **already installed current command**, not
+one-contender recovery or the complete request retry loop. Request selection,
+contender convergence/backoff, exact-winner reinspection, autonomous recovery,
+streams, UploadPart and cleanup remain gated. No persistence/format/fsync change,
+checkpoint-transfer dependency or cache redesign is introduced.
+
+The initial focused run passed eight runtime/ownership tests and failed the
+standalone API compiler fixture because its stub `StoreError` lacked the
+`RouteCapabilitySubjectMismatch` variant used by crossed-target validation.
+The fixture now declares that variant; no positive or negative API assertion
+was removed. All **nine focused tests passed in 52.036s**, including the final
+uncertain-witness schedule and compiler probes. Formatting, strict workspace
+Clippy, boundary and diff checks passed. Full workspace Nextest passed
+**10,936 tests in 794.606s**, with zero failures and six skipped. Logs:
+`/tmp/argmin-publication-progress-focused-final.log` and
+`/tmp/argmin-publication-progress-full.log`. Changes remain uncommitted.
+
+### Candidate encrypted Direct PUT contender capture
+
+The acknowledged encrypted owner can now inspect one complete pending slot
+under its original admitted embedded primary section. This consumes one attempt
+from the existing terminal-work budget and retains the exact complete context
+and publication-start observation alongside the encrypted payload and work
+state. Only scalar contender identity/start diagnostics leave the production
+holder. A clear observation can return the original payload for normal snapshot
+inspection and request evaluation; it is not authority to install without
+revalidation. A present contender cannot take that transition or detach its
+command, payload or budget. Failed capture returns the original payload with
+its accounting intact; Drop performs no cleanup.
+
+This whole-slot inspection differs deliberately from an epoch-scoped pending
+query: it rejects a slot belonging to another epoch instead of reporting absence.
+The existing complete-context/index/scope validation runs inside a read snapshot,
+with admitted section, original request, deadline and live allocation lifetime
+checks around capture. It performs no SQL writes or new durable commands.
+
+Real encrypted payload tests cover clear, unstarted, publication-started,
+damaged scope, expired and exhausted observations, exact retained bytes,
+unchanged replica state and no hidden Drop effects. Compiler probes prevent
+detaching either owner, cloning the holder or supplying a replacement deadline.
+The existing installed pending-query matrix additionally checks that strict
+inspection rejects historical slots while epoch-scoped query semantics remain
+unchanged.
+
+This slice established **embedded capture only**. The next slice below adds
+bounded draining for quiescent contenders, not arbitrary command convergence.
+Remote capture, contention/backoff, exact-winner reinspection and
+live caller selection remain gated. Checkpoint transfer, cache redesign and
+directory locking are not dependencies.
+
+The initial type check found two integration mistakes (a typed NodeId passed to
+a raw-ID reader and a nonexistent test-config topology field). Both were corrected
+before runtime validation. The focused capture/pending/compiler run passed
+**three tests in 53.471s**; the broader pending-custody/encrypted-publication and
+embedded-authority run passed **17 tests in 5.146s**. Formatting, strict workspace
+Clippy, boundary and diff checks passed. Full workspace Nextest passed
+**10,937 tests in 795.097s**, with zero failures and six skipped. Logs:
+`/tmp/argmin-contender-focused.log`, `/tmp/argmin-contender-focused-broad.log`
+and `/tmp/argmin-contender-full.log`. Changes remain uncommitted.
+
+### Candidate encrypted Direct PUT quiescent contender drain
+
+The captured contender can now consume into an embedded draining owner only
+when its retained complete context derives quiescent terminal work. A clear slot
+or a contender with a reservation-release, physical-cleanup, displaced-payload
+or retained-finalizer obligation is rejected before publication; the failure
+retains the original capture. This deliberately does not classify an unsupported
+terminal family as an empty cleanup operation.
+
+The draining owner retains the request's acknowledged encrypted payload, exact
+contender, original admitted cohort, both immutable deadline representations and
+the same work budget. Each advancement confirms only the publication marker or
+one replica: lowest-ID non-primary witness, primary, then trailing members in
+NodeId order. An unconfirmed effect remains selected. Every call rechecks the
+original section, payload authority and deadline; each effect charges the
+existing attempt budget. No loop, sleep, caller-selected replica, replacement
+deadline or detachable sender is exposed.
+
+Only all-member confirmation permits the consuming terminal handoff. Exact-slot
+retirement is a separate budgeted operation using the existing admitted receiver
+and transactional custody checks. Failure retains the terminal owner and its
+uncertainty. Only confirmed retirement returns the original PUT payload for
+request reinspection; it cannot scan or drain a second contender. Repeated
+confirmed retirement performs no new effect, even if a successor now occupies
+the slot. Returning the payload does not refresh its budget or authorize stale
+snapshot publication.
+
+Draining advances the settled prefix beyond the original physical-window
+observation. The returned PUT therefore carries a private requirement to
+reinspect that same window on its next embedded snapshot attempt. The existing
+primary/witness inspection revalidates the exact durable descriptor and replaces
+only the observed prefix; it preserves the original issuer, deadlines, effect
+fence and descriptor. If an ambiguous effect left either embedded member's
+prefix validation cold, it uses the existing bounded, read-only prefix validator
+before inspection; it neither repairs nor replays durable state. This step is
+charged within that snapshot attempt and adds no fsync or work to the
+no-contender path. Failed reinspection retains custody and the requirement;
+another contender can instead be captured
+without pretending the slot is clear.
+
+The real encrypted-payload regressions cover deterministic witness-first
+ordering, one effect per call, partial-handoff rejection, lost marker/apply/
+retirement confirmation and apply unwind, exact non-mutating retries, exhaustion
+before marker, witness and retirement, successor-slot preservation, retained
+physical bytes, and unchanged original deadline/accounting after return. Compiler probes reject
+detaching either payload or sender, cloning/reusing the owner, choosing a target,
+renewing the deadline, or recovering the payload before the terminal handoff.
+
+This is the first contender execution family, not the completed request loop.
+Non-quiescent contender obligations, remote parity, recovery/reissue/abandonment,
+backoff and live selection remain to be integrated. No format change, new
+ordinary-path fsync, checkpoint-transfer dependency, cache redesign or directory
+lock is introduced. Validation results follow below.
+
+The first focused run passed three tests and failed the new successful-drain
+regression at post-drain snapshot inspection: `staging window primary and
+designated witness prefixes differ`. The contender had correctly advanced the
+prefix, but the payload still held the old observation. This was an integration
+defect, not a test to relax or blindly rerun. The reinspection handoff above
+addresses it; the same exact-success assertion remains. Log:
+`/tmp/argmin-contender-drain-focused.log`.
+
+The next run reached post-ambiguity reinspection and exposed
+`complete settled prefix requires explicit local validation`. Reconfirmation
+now invokes the existing bounded validator on the selected embedded primary and
+witness before inspecting their prefixes. The three runtime regressions then
+passed unchanged, including the success path after each lost reply and unwind;
+the API-shape test also passed. The corrected focused run passed **four tests in
+58.141s**, followed by **40 surrounding confirmation, publication and bounded
+prefix-validation tests in 29.708s**. Logs:
+`/tmp/argmin-contender-drain-focused-validated.log` and
+`/tmp/argmin-contender-drain-broad.log`. Formatting, strict workspace Clippy,
+storage boundary and diff checks passed. Full workspace Nextest passed
+**10,940 tests in 799.561s**, with zero failures and six skipped. Full-suite log:
+`/tmp/argmin-contender-drain-full.log`. Changes remain uncommitted.
 
 ## Coordinated Integration Checklist — 2026-11-03
 
@@ -230,8 +11361,10 @@ All source paths below are under `crates/storage/src/`.
 | SQL/canonical/checkpoint state | `pg_store/schema.rs`, `pg_store/command_log.rs`, owner-local semantic validation and fixtures |
 | Historical routes/references | Both summary and exact-reference queries in `pg_store.rs`, pending-command references, and affected scavenger/backfill reference enumeration |
 
-- [ ] At implementation start verify parent evidence for the **current** vector:
-  PG schema 10, command 13, canonical state 9, checkpoint 7, storage RPC 34.
+- [ ] At activation verify parent evidence against the actual current vector.
+  The **historical implementation-start baseline** was PG schema 10, command 13,
+  canonical state 9, checkpoint 7, storage RPC 34; it is no longer the current
+  tree's format vector.
   Earlier plan snapshots naming schema 9/command 12/RPC 30 are historical, not
   the next bump's baseline. Do not preassign the next numbers. The
   [consolidated predecessor audit](#consolidated-predecessor-evidence-audit--2026-11-04)
@@ -283,8 +11416,11 @@ that any unchecked integration requirement has been satisfied.
 2. **Scoped settled-prefix confirmation and physical admission:** confirm exact
    materialized windows through the current authoritative object-PG primary with
    matching witness-prefix or certified transfer evidence. Follow the selected
-   [confirmation rule](#settled-prefix-confirmation-decision--2026-10-30),
-   not introducing-envelope retention or an extra confirmation journal. Bind
+   [confirmation rule](#settled-prefix-confirmation-decision--2026-10-30), using
+   the existing fail-closed cache and its retired-allocation correction under
+   the 2026-11-13 scope limit above. Cache replacement and the wider mutation/opening
+   redesign are not prerequisites here. Do not require introducing-envelope
+   retention or an extra confirmation journal. Bind
    portable absolute cutoffs to receiver-local monotonic deadlines; never renew
    an old window through route renewal. Both file and ack owners recheck under
    their existing local exclusion; no data-PG/file lock spans a network call.
@@ -2240,7 +13376,7 @@ frontend accepted/uncertain custody still need coordinated activation. The
 milestone remains uncommitted and incomplete; no physical-cleanup acceptance
 claim is made.
 
-### External dependency: bounded metadata checkpoint transfer — 2026-11-06
+### Separate follow-up: bounded metadata checkpoint transfer — 2026-11-06
 
 Checkpoint sizing and transfer are a **separate workstream**, tracked in
 [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md). They are
@@ -2267,10 +13403,11 @@ the owner graph correctly; they do not prove that arbitrarily large valid PGs
 can be recovered or transferred.
 
 Do not reject or discard an already authenticated abandoned proof at retention
-time to fit a transport limit. Cleanup ownership integration may continue, but
-**production activation remains gated on resolving this external transferability
-dependency**. The separate workstream must demonstrate recovery of valid
-accumulated obligations without silently dropping evidence. No per-owner quota,
+time to fit a transport limit. Cleanup ownership integration, production
+activation and completion do not depend on resolving this pre-existing issue.
+The separate workstream is scheduled after this plan is complete and must
+demonstrate recovery of valid accumulated obligations without silently dropping
+evidence. No per-owner quota,
 replicated capacity-reservation protocol, or promise of session continuity is
 introduced as a substitute.
 
@@ -2431,7 +13568,7 @@ The coordinated activation must therefore include all of the following:
   accepted/uncertain frontend custody and terminal transfers together. Freezing
   this evidence does not independently make that integration safe or complete.
 
-Checkpoint scalability remains a separate activation dependency. This step
+Checkpoint scalability remains separate follow-up work after cleanup ownership is complete. This step
 does not reintroduce export sessions, spool files or checkpoint paging. The six
 original acceptance skips remain open.
 
@@ -2477,7 +13614,7 @@ and producers remain unchanged and carry only ordinary reservation dependencies.
 Window descriptors, pending physical-reference paging, frontend custody and
 terminal dispatch remain to be connected together. No owner table is populated
 by this step, no new physical authority is granted, and the six original skips
-and separate checkpoint-transferability dependency remain open.
+and separate checkpoint-transferability follow-up remain open.
 
 The sidecar uses the existing pending-slot transactions and cascade lifetime.
 Owner-local tests pin literal V2 bytes/checksums at zero/one/two/maximum counts,
@@ -2551,7 +13688,7 @@ dispatch, accepted/uncertain frontend custody and terminal transfers still must
 be connected before activation. In particular this private index reader is not
 yet called by physical auditing; no unused window gains effective protection
 merely from landing this component. Six original acceptance skips and the
-external checkpoint-transferability dependency remain open.
+external checkpoint-transferability follow-up remain open.
 
 Final validation: formatting, strict all-target/all-feature Clippy, the storage
 boundary checker, all **35 storage doctests**, and diff checks passed. Full
@@ -2628,7 +13765,7 @@ audit includes RPC authentication as well as RPC codecs and format/version tests
 **Still open:** production commands initialize empty indexes. Mandatory command
 descriptors, authoritative capture, builder/apply dispatch, accepted/uncertain
 frontend custody and terminal transfers must land together before activation.
-The six original acceptance skips and external checkpoint-transferability gate
+The six original acceptance skips and external checkpoint-transferability follow-up
 remain unresolved. This component makes pending protection discoverable; it does
 not grant physical-write or deletion authority or complete the cleanup protocol.
 
@@ -2728,7 +13865,7 @@ the immutable cutoff), so they cannot authenticate or replace mandatory bytes
 in the future checksummed command carrier. Fresh builders, decoded apply/replay,
 reissue/recovery, mandatory projection dispatch and frontend custody/terminal
 transfers remain coordinated work. The six original acceptance skips and external
-checkpoint-transferability dependency remain open. This slice adds no format
+checkpoint-transferability follow-up remain open. This slice adds no format
 change, new publisher, ordinary-path transaction or physical authority.
 
 Validation completed. `cargo check -p storage` passed. The first focused build
@@ -2798,7 +13935,7 @@ cleanup/recovery dispatch must still activate together. This component preserves
 the existing same-epoch slot-replacement rule; it does not establish cross-epoch
 recovery authorization or replace the separate historical-source follow-up
 protocol. It adds no format, command, physical authority or owner-based deletion.
-All six original acceptance skips and the external checkpoint-transfer gate
+All six original acceptance skips and the external checkpoint-transfer follow-up
 remain unresolved.
 
 Validation completed. `cargo check -p storage` passed. The initial focused run
@@ -2849,7 +13986,7 @@ yet. Fresh append capture, mandatory command carriers, builder snapshot wiring,
 pending dispatch, frontend accepted/uncertain custody and terminal transfers
 remain part of the coordinated switch. No format changes or owner-based
 deletion are included here; the six original acceptance skips and external
-checkpoint-transferability gate remain unresolved.
+checkpoint-transferability follow-up remain unresolved.
 
 Six owner-local test matrices cover read-only capture and bound application for
 all three targets; independently occupied attempts; stale generation and command
@@ -2912,7 +14049,7 @@ capture components. Mandatory checksummed carriers, production builder snapshot
 wiring, descriptor-aware dispatch, accepted/uncertain frontend custody and
 terminal transfers must still be connected together. No new physical authority,
 owner-based deletion or format changes are activated by this component. The six
-original acceptance skips and external checkpoint-transferability gate remain
+original acceptance skips and external checkpoint-transferability follow-up remain
 unresolved.
 
 The first focused run passed six tests and rejected
@@ -2949,7 +14086,7 @@ envelopes without staging descriptors. Applying descriptor effects alongside
 those envelopes would leave the descriptor unauthenticated by the applied log,
 so mandatory carriers, descriptor-aware dispatch, accepted/uncertain frontend
 custody and terminal transfers still need the coordinated switch. The six
-acceptance skips and external checkpoint-transferability gate remain open.
+acceptance skips and external checkpoint-transferability follow-up remain open.
 
 Owner-local canaries cover coherent reads across a separate WAL writer,
 read-only enforcement, early error/unwind cleanup, preservation of preexisting
@@ -3009,7 +14146,7 @@ or wire format, write transaction/fsync or production custody change. Command-v1
 bytes alone still do not authenticate the bundled descriptor. The mandatory
 checksummed carrier, installed dispatch, terminal transfers and frontend
 accepted/uncertain ownership must switch together; the six acceptance skips and
-external checkpoint-transferability gate remain unresolved. Component tests
+external checkpoint-transferability follow-up remain unresolved. Component tests
 explicitly do not record the separate descriptor as authenticated applied-log
 evidence.
 
@@ -3073,8 +14210,8 @@ closed context, not infer it from owner existence or supply an optional-source
 fallback. Command acceptance/already-applied handling, authenticated log
 recording, pending dispatch and frontend custody remain part of the coordinated
 activation. No format changes, physical authority or acceptance skips are added
-or removed by this component. Checkpoint transferability remains an external
-activation dependency.
+or removed by this component. Checkpoint transferability is separate follow-up
+after this plan completes, not an activation dependency.
 
 The first focused build caught two fixture-only `E0277` errors from using
 `.into()` for validated bucket/key types; those now use their checked constructors
@@ -3227,7 +14364,7 @@ rollback tests now use the same source-bound application path. Raw pair setup is
 test-only. These remain metadata-only component tests; no installed-RPC or
 production-custody activation is claimed. Source V1 and applied-command V13
 evidence is unchanged. Mandatory authenticated command fields and the external
-checkpoint-transferability gate remain open.
+checkpoint-transferability follow-up remain open.
 
 Validation: all **26** focused abandonment/application tests passed, including
 the four new candidate matrices and the preserved V1/V13 source specimen.
@@ -3269,7 +14406,7 @@ observation does not prove that the slot is still present, the owner was applied
 or replicas accepted it. Current v13 bytes still do not authenticate the descriptor.
 The mandatory carrier, installed node/client paths and frontend custody switch
 remain a coordinated activation requirement; the current `DirectPutWriteScope`
-behavior is unchanged. Checkpoint transferability remains an external gate.
+behavior is unchanged. Checkpoint transferability remains separate follow-up work.
 
 Six owner-local matrices exercise all three introductions and both append targets:
 committed insertion/exact retry/reopen, failure at either sidecar insertion with
@@ -3350,7 +14487,7 @@ reissue requires the enclosing recovery authorization/serialization boundary;
 historical/new-epoch recovery is not enabled by this holder. Current v13 command
 bytes still do not authenticate the descriptor. The mandatory carrier, installed
 node/client flow, frontend custody switch and terminal handoffs remain coordinated
-activation work, with checkpoint transferability still an external gate.
+activation work; checkpoint transferability is separate follow-up work.
 
 Six metadata-only owner-local matrices cover all three introduction targets and
 both append targets: repeated reissue/reopen with the original descriptor/cutoff,
@@ -3435,7 +14572,7 @@ nonempty route evidence does not authorize application before a real source
 tombstone exists, followed by successful application with that authentication.
 No schema, encoding, RPC, transaction/fsync, production custody or physical
 cleanup behavior changes. The six original skips and external checkpoint-
-transferability gate remain open.
+transferability follow-up remain open.
 
 Validation: all **eight** focused abandonment candidate/route tests passed,
 including the four new tests. Formatting, strict all-target/all-feature Clippy,
@@ -3487,7 +14624,7 @@ the applied-command checksum/hash, preserve predecessor evidence, advance that
 grammar, account for combined command/RPC limits, and connect builders, pending
 projection, owned submissions and terminal dispatch together. This step adds no
 SQL, RPC, transaction or fsync. The six original skips and external checkpoint-
-transferability gate remain open.
+transferability follow-up remain open.
 
 Validation: all **16** focused context/receiver/abandonment-candidate tests passed,
 including the **seven** new tests. Formatting, strict all-target/all-feature
@@ -3562,7 +14699,7 @@ remain separate and do not lend the owning context or reset their observations.
 No live dispatcher/carrier is switched, no v13 envelope is treated as
 authentication of a separate field, and no format, RPC, transaction/fsync or
 physical-cleanup behavior changes. The coordinated authenticated carrier/custody
-switch, six original skips and external checkpoint-transferability gate remain
+switch, six original skips and external checkpoint-transferability follow-up remain
 open.
 
 Validation: all **23** focused context/reissue/abandonment tests passed,
@@ -3624,7 +14761,7 @@ patched with unauthenticated context, and the new view cannot install itself.
 The mandatory authenticated carrier, exact context-aware retry/replacement and
 accepted/uncertain frontend custody must still switch together. No schema,
 format, RPC, transaction/fsync, physical authority or skip changes are made;
-the six original regressions and external checkpoint-transferability dependency
+the six original regressions and external checkpoint-transferability follow-up
 remain open.
 
 The first focused build caught a test-only `E0432`: the fixture imported
@@ -3677,7 +14814,7 @@ transaction must consume it during the coordinated authenticated-carrier switch;
 current v13 commands still cannot authenticate a separately supplied context.
 No schema, format, RPC, transaction/fsync, physical authority or skip changes
 are made. The six original regressions and external checkpoint-transferability
-dependency remain open.
+follow-up remain open.
 
 All **31** focused context/pending-reissue tests passed, including the **six**
 new regressions and their independent same-context/changed-payload negatives.
@@ -3754,7 +14891,7 @@ listing passed in **118.644s**, and the GET ACL authorization matrix in
 
 No schema, format, RPC, ordinary-path transaction/fsync or physical authority
 changes are introduced. The six original skipped regressions, coordinated
-activation and external checkpoint-transferability gate remain open.
+activation and external checkpoint-transferability follow-up remain open.
 
 #### Review correction: exact abort segment subjects
 
@@ -3815,7 +14952,7 @@ transaction after the mandatory authenticated carrier is connected. Existing
 unresolved submission holders do not expose a context to this constructor.
 No production caller is switched, and no new ordinary-path transaction, fsync,
 schema, format or RPC is introduced. The coordinated carrier/custody activation,
-six original acceptance skips and external checkpoint-transferability gate remain
+six original acceptance skips and external checkpoint-transferability follow-up remain
 open.
 
 Five metadata-only matrices cover all five introduction/append cases, ordinary
@@ -3962,7 +15099,7 @@ seconds** and passed in **113.867s**; oversized version listing passed in
 **64.912s**. Logs are at
 `/tmp/argmin-pending-payload-transaction-{focused,expanded,doc,fmt,clippy,boundaries,gate,workspace}.log`.
 The six original acceptance skips and external checkpoint-transferability
-dependency remain open.
+follow-up remain open.
 
 ### Exact pending payload-page validation — 2026-11-07
 
@@ -4020,7 +15157,7 @@ test was inspected while slow (actively accumulating CPU time) and passed in
 **109.199s**; oversized version listing passed in **62.441s**. Logs are at
 `/tmp/argmin-pending-payload-validation-{expanded-final,boundaries,doc,fmt,clippy,gate,workspace}.log`.
 The six original acceptance skips, complete-context activation and external
-checkpoint-transferability dependency remain open.
+checkpoint-transferability follow-up remain open.
 
 ### Complete fresh pending-payload protection — 2026-11-07
 
@@ -4052,7 +15189,7 @@ part of focused validation.
 
 This is pending-protection hardening, not authenticated-context or frontend
 custody activation. The six original acceptance skips and external checkpoint-
-transferability gate remain open.
+transferability follow-up remain open.
 
 The initial focused build caught a fixture-only `E0277` (`SessionId` requires its
 validated constructor). The next run exposed two new fixture setup errors:
@@ -4098,7 +15235,7 @@ Fresh installation still requires exact geometry and cannot downgrade to
 identity-only pages. Discovery remains inside its existing read-only snapshot;
 no new durable format, write transaction, fsync, index repair, frontend custody
 or descriptor activation is introduced. The six acceptance skips and external
-checkpoint-transferability dependency remain open.
+checkpoint-transferability follow-up remain open.
 
 Owner-local metadata tests isolate the pending command from live segment rows
 and prospective staging owners. PUT/UploadPart append/abort matrices cover
@@ -4153,7 +15290,7 @@ complete-context boundary, not leave two production submission paths. In
 particular its old bare-envelope inspection cannot become an escape for the
 future context-bearing bytes of an unresolved command.
 No production caller switches and no schema, format, RPC or durability barrier
-changes. The six acceptance skips and checkpoint-transferability dependency
+changes. The six acceptance skips and checkpoint-transferability follow-up
 remain open.
 
 Metadata-only canaries cover all five introduction/append cases with fresh,
@@ -4214,7 +15351,7 @@ This remains a process-local integration component. It does not add a v13
 send/install API, connect production custody, establish durable acceptance or
 change schema/format/RPC/fsync behavior. The next authenticated-carrier switch
 must consolidate the described-only adapter and preserve these owning transitions;
-the six original skips and separate checkpoint-transferability dependency remain
+the six original skips and separate checkpoint-transferability follow-up remain
 open.
 
 Validation: all **12** focused context submission/reissue tests passed, including
@@ -4270,7 +15407,7 @@ scalar-only inventory access and non-Clone scopes/errors.
 This is still preparatory integration, not the authenticated carrier or a live
 custody switch. It adds no schema/format/RPC change, production transaction/fsync
 or physical authority. The coordinated carrier/installation/frontend transition,
-six original skipped regressions and external checkpoint-transferability gate
+six original skipped regressions and external checkpoint-transferability follow-up
 remain open.
 
 The first focused build stopped before test execution with three test-only
@@ -4329,8 +15466,8 @@ pins consuming scope/error recovery, scalar-only inspection and non-Clone types.
 
 No production caller or wire/durable format is switched, and no new ordinary-path
 transaction/fsync or physical authority is introduced. Authenticated carrier,
-context-aware installation/frontend custody, the six original skips and external
-checkpoint-transferability remain gated.
+context-aware installation/frontend custody and the six original skips remain
+gated. Checkpoint transferability is separate follow-up after this plan completes.
 
 Validation: seven focused tests passed (the six new tests plus the API-shape
 canary), followed by 734 expanded staging/pending/snapshot tests and all 35 storage
@@ -4381,7 +15518,7 @@ Nextest compilation pins consuming command inputs and the owning return types.
 No production writer/reader or physical authority is activated; no format,
 schema, RPC, ordinary-path transaction or fsync changes. The mandatory
 authenticated carrier, installation/frontend custody, six original skipped
-regressions and separate checkpoint-transferability gate remain open.
+regressions and separate checkpoint-transferability follow-up remain open.
 
 Validation: all six focused tests passed (five new regressions and the API-shape
 canary). After self-review added the pre-SQL deadline check and removed the
@@ -4439,7 +15576,7 @@ The source check is a refactor of the existing apply contract, not a new durable
 format or production activation. No schema/RPC/ordinary-path fsync changes, no
 new physical authority and no optional-owner fallback. The authenticated carrier,
 installation/frontend transition, six original skips and separate checkpoint-
-transferability gate remain open.
+transferability follow-up remain open.
 
 Validation: all six focused tests, 744 expanded storage tests and 35 storage
 doctests passed. Formatting, strict all-target/all-feature Clippy, the storage
@@ -4486,7 +15623,7 @@ inspection cannot select the unsent successor or authorize source retirement.
 This is still read-only preparation, not the authenticated carrier/custody
 switch. No format/schema/RPC or ordinary-path fsync changes, new physical
 authority or acceptance-skip removal. Carrier integration, frontend custody,
-terminal activation and the separate checkpoint-transferability gate remain
+terminal activation and the separate checkpoint-transferability follow-up remain
 open.
 
 Validation: all six focused checks, 749 expanded storage tests and 35 storage
@@ -4532,7 +15669,7 @@ ordinary Nextest API-shape canary pins consuming construction, scalar observatio
 and non-Clone behavior for the new holder.
 
 No production carrier/custody activation, schema/RPC/fsync change or new physical
-authority. The six original skips and separate checkpoint-transferability gate
+authority. The six original skips and separate checkpoint-transferability follow-up
 remain open.
 
 The first focused build used an incorrect new fixture: the rejection matrix
@@ -4591,7 +15728,7 @@ explicitly injected external faults.
 
 No production carrier/custody activation, format/schema/RPC change, extra
 ordinary-path fsync or new physical authority. The six original skipped
-acceptance regressions and separate checkpoint-transferability gate remain
+acceptance regressions and separate checkpoint-transferability follow-up remain
 open. The next integration must still connect mandatory authenticated contexts
 to installation/recovery and frontend custody together.
 
@@ -4645,7 +15782,7 @@ observations; their complete authenticated installation carrier is not active.
 No production carrier/custody activation, format/schema/RPC changes, new physical
 authority or ordinary-path fsync. Mandatory carrier integration and the six
 original acceptance regressions remain open, as does the separate checkpoint
-transferability dependency.
+transferability follow-up.
 
 The first focused build rejected references to private
 helpers in a sibling test module; the new tests now use their own position and
@@ -4701,7 +15838,7 @@ they do not claim transport-loss or accepted-replacement coverage.
 
 No format/schema/RPC/fsync or production custody/physical-authority changes.
 Mandatory carrier integration, the six original skipped acceptance regressions
-and the separate checkpoint-transferability dependency remain open.
+and the separate checkpoint-transferability follow-up remain open.
 
 All twelve initial focused checks, 773 expanded storage tests and 35 storage
 doctests passed. The first strict Clippy pass rejected three `clone_on_copy`
@@ -4748,7 +15885,7 @@ non-Clone behavior.
 
 No format/schema/RPC/fsync changes or production activation. The complete-context
 carrier/custody integration, six original acceptance regressions and separate
-checkpoint-transferability gate remain open. These triple holders still have
+checkpoint-transferability follow-up remain open. These triple holders still have
 fresh local submission observations; accepted/ambiguous triple installation is
 not claimed before that carrier is connected.
 
@@ -4906,7 +16043,10 @@ successfully released proof; later retirement remains separately gated.
    windows and the captured next cutoff, without allocating another interval.
 5. Direct PUT uses its already reserved payload generation as its single physical
    VID, not the stream allocator origin. Its owner/window and encrypted payload
-   binding must agree before staging. Reject arithmetic overflow at construction,
+   binding must agree before staging. Duplicate holders reuse that fixed VID;
+   the physical gate rejects mismatched bytes rather than adding another local
+   allocation registry or transaction (decision confirmed 2026-11-13).
+   Reject arithmetic overflow at construction,
    decoding, apply and checkpoint validation rather than saturating a horizon or
    wrapping an interval.
 
@@ -7568,9 +18708,12 @@ question. It does not implement the confirmation RPC or a new route capability.
    the admitted acting set. Identical owner/window rows at different prefixes do
    not suffice. Do not release primary serialization between selecting the prefix,
    checking settlement and capturing the descriptor. The bounded metadata-witness
-   inspection runs while primary serialization remains held, following the existing
-   held-primary inspection order; no data-PG/physical lock is held across that
-   network call. Replica apply of future owner/window commands
+   inspection runs while primary serialization remains held. The embedded path
+   can retain its primary snapshot through the witness call; the remote-primary
+   path instead reads the witness first and then the primary snapshot on the
+   same continuously held section. Compare both exact prefixes before confirming;
+   no snapshot registry or release/reacquisition gap is permitted. No
+   data-PG/physical lock is held across that network call. Replica apply of future owner/window commands
    and checkpoint semantic validation must enforce the immutable relationships.
 4. Return an opaque confirmed physical scope bounded by the descriptor's original
    cutoff and the request/receiving-route fences. The later file/ack owner still
@@ -7579,8 +18722,13 @@ question. It does not implement the confirmation RPC or a new route capability.
 
 Use the existing settled-prefix invariants, not full checkpoint generation or a
 complete table scan on every confirmation. The implementation must demonstrate a
-bounded lookup using owner-local validated/cached prefix state, plus a no-write
-canary. Holding metadata serialization for the lookup adds contention, not a new
+bounded lookup using owner-local validated PG state, plus a no-write canary.
+The [2026-11-12 simplification](#settled-prefix-validation-simplification--2026-11-12)
+selects lifecycle validation preserved by closed transactions rather than an
+independently maintained answer cache. The
+[mutation-path audit](#validated-pg-mutation-path-audit--2026-11-12) is complete;
+its transaction and connection-ownership changes remain implementation work.
+Holding metadata serialization for the lookup adds contention, not a new
 commit. The metadata-witness inspection is the permitted network call under
 primary serialization and must respect the captured deadline and work budget.
 Release primary serialization after capturing the confirmed descriptor, before

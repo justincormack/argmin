@@ -177,7 +177,7 @@ fn abandoned(
     source: &MetadataCommandEnvelope,
     cleanup: &MetadataCommandEnvelope,
 ) -> ContextualCommand {
-    let candidate = PartFinalizationSource::capture(source)
+    let candidate = PartFinalizationSource::capture_for_test(source)
         .unwrap()
         .bind_cleanup(cleanup.clone(), &topology())
         .unwrap();

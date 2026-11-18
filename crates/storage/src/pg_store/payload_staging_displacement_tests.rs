@@ -13,7 +13,7 @@ use crate::pg_store::PgStore;
 use crate::types::MultipartReclaimRecord;
 use crate::{StoredObject, VersionId};
 
-fn source(pg: &PgStore, count: usize) -> Vec<StagingOwnerRecord> {
+pub(super) fn source(pg: &PgStore, count: usize) -> Vec<StagingOwnerRecord> {
     let owners = completion::setup(pg, count);
     completion::apply(pg, &completion::command(pg, &owners[0], VersionId::Null)).unwrap();
     owners.iter().map(|owner| append::load(pg, owner)).collect()
@@ -52,7 +52,7 @@ fn reclaim(pg: &PgStore, owner: &StagingOwnerRecord) -> ObjectPayloadReclaimComm
     ))
 }
 
-fn incoming(
+pub(super) fn incoming(
     pg: &PgStore,
     old: &[StagingOwnerRecord],
     kind: u8,
@@ -406,7 +406,7 @@ fn staging_multipart_displacement_requires_the_complete_unique_owner_set() {
                     };
                     generation.reservation_id = extra.subject.id.attempt.clone();
                     sql::insert(
-                        &pg.conn,
+                        &pg,
                         PgId::new(pg.pg_id),
                         &topology(),
                         &extra.validate(&topology()).unwrap(),

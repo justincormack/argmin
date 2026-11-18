@@ -242,6 +242,15 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardWrite | StorageRpcMessageKind::ShardRepairWrite => {
             STORAGE_RPC_MAX_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::StagingShardWrite => complete_staging_file::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingShardAckRecord => complete_staging_ack::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingStreamAppendPrepare => complete_stream_append_prepare::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingStreamAppendInstall => complete_stream_append_install::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingDirectSnapshot => complete_direct_snapshot::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingDirectPrepare => complete_direct_prepare::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingDirectInstall => complete_direct_install::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingDirectIntroductionPrepare => complete_direct_introduction::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::StagingDirectIntroductionInstall => complete_direct_introduction_install::MAX_REQUEST_BYTES,
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
         }
@@ -342,29 +351,29 @@ fn message_kind_request_max_payload_len(
                 + STORAGE_RPC_MAX_OPERATION_DEADLINE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandReplicaState => {
-            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+            complete_stream_file_primary::MAX_REQUEST_BYTES
         }
-        StorageRpcMessageKind::MetadataCommandAcceptance
-        | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
-        | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
-        | StorageRpcMessageKind::MetadataCommandPublicationStart
-        | StorageRpcMessageKind::MetadataCommandAbandoned
-        | StorageRpcMessageKind::MetadataCommandRecordAbandoned
-        | StorageRpcMessageKind::MetadataCommandApplyAndRecord
-        | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
+        StorageRpcMessageKind::MetadataCommandPublicationStart => complete_publication::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::MetadataCommandApplyAndRecord => complete_application::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::MetadataCommandRecordAbandoned => complete_replica_abandonment::MAX_REQUEST_BYTES,
+        StorageRpcMessageKind::MetadataCommandRetainedAbortApply
         | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataCommandAppliedLogHashes
+        | StorageRpcMessageKind::MetadataCommandAcceptance
+        | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
+        | StorageRpcMessageKind::MetadataCommandAbandoned => complete_applied::MAX_REQUEST_BYTES,
         StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned => {
             STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotInsert
-        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
-        | StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
+        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataCommandPendingSlotRemove => complete_retirement::MAX_REQUEST_BYTES,
         StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
         }
@@ -495,7 +504,7 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare => {
-            STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN
+            complete_stream_file_primary::MAX_REQUEST_BYTES
         }
         StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad => {
             STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN

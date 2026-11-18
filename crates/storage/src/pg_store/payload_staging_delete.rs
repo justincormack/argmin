@@ -112,11 +112,13 @@ pub(in super::super) fn apply_in_open_transaction(
             Ok((before.validate(topology)?, after.validate(topology)?))
         })
         .collect::<Result<Vec<_>, DeleteError>>()?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    pg.apply_delete_object_version_command(command)?;
-    for (before, after) in &checked {
-        sql::retain_object_reclaim(&pg.conn, PgId::new(pg.pg_id), topology, before, after)?;
-    }
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        pg.apply_delete_object_version_command(command)?;
+        for (before, after) in &checked {
+            sql::retain_object_reclaim(pg, PgId::new(pg.pg_id), topology, before, after)?;
+        }
+        Ok(())
+    })();
+    savepoint.finish(result)
 }

@@ -1,6 +1,19 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+pub(in crate::node_runtime) use command_log::{
+    DirectIntroductionFilePreparation, DirectStagingFileFailure,
+};
+pub(in crate::node_runtime) use command_log::{
+    DirectStagingPreparation, DirectStagingSnapshot, DirectTerminalInstallation,
+    DirectTerminalInstallationObservation, DirectTerminalInstallationProof,
+    DirectTerminalPreparation, StreamAppendInstallation, StreamAppendInstallationObservation,
+    StreamAppendInstallationProof, StreamAppendPreparation,
+};
+pub(in crate::node_runtime) use command_log::{
+    RemoteStagingAcknowledgementAttempt, StagingAcknowledgementBatch,
+};
+pub(in crate::node_runtime) use payload_staging::CapturedStreamAppend;
 /// PgStore — per-PG shard I/O and object metadata, backed by filesystem + SQLite.
 ///
 /// Owns a single `rusqlite::Connection` to the per-PG `metadata.db` and manages
@@ -147,10 +160,45 @@ mod command_build_snapshot;
 pub(in crate::node_runtime) mod command_build_snapshot_tests;
 #[path = "pg_store/command_log.rs"]
 mod command_log;
+pub(in crate::node_runtime) use command_log::RemoteDirectStagingFileWriter;
+#[cfg(test)]
+pub(in crate::node_runtime) use command_log::RemoteStreamStagingFileWriter;
+pub(in crate::node_runtime) use command_log::{
+    DirectStagingFileWriter, RemoteDirectFileAttempt, RemoteStreamFileAttempt,
+    StreamStagingFileWriter,
+};
+#[path = "pg_store/metadata_transaction.rs"]
+mod metadata_transaction;
+pub(in crate::node_runtime) use command_log::{
+    CompleteRetirementQuery, CompleteRetirementRequest, CompleteSettledPrefixError,
+};
 #[path = "pg_store/metadata.rs"]
 mod metadata;
 #[path = "pg_store/payload_staging.rs"]
 mod payload_staging;
+pub(in crate::node_runtime) use payload_staging::CapturedDirectIntroduction;
+pub(in crate::node_runtime) use payload_staging::CapturedDirectTerminal;
+pub(crate) use payload_staging::CommandContextCodecAuthority;
+#[cfg(test)]
+pub(in crate::node_runtime) use payload_staging::DirectIntroductionInstallation;
+pub(crate) use payload_staging::DirectPutRequestCustody;
+pub(in crate::node_runtime) use payload_staging::RemoteDirectPreparationQuery;
+pub(in crate::node_runtime) use payload_staging::RemoteDirectSnapshotQuery;
+pub(in crate::node_runtime) use payload_staging::RemoteStreamAllocationQuery;
+pub(in crate::node_runtime) use payload_staging::RemoteStreamAppendQuery;
+
+pub(in crate::node_runtime) use payload_staging::CapturedDirectIntroductionCore;
+pub(in crate::node_runtime) use payload_staging::RemoteDirectInstallationAttempt;
+pub(in crate::node_runtime) use payload_staging::RemoteDirectIntroductionAttempt;
+pub(in crate::node_runtime) use payload_staging::RemoteStreamAppendInstallationAttempt;
+pub(in crate::node_runtime) use payload_staging::{
+    AbandonedPartCustodyError, AbandonedPartCustodyObservation, StagingWindowConfirmationError,
+    StagingWindowConfirmationObservation, StagingWindowConfirmationRequest,
+    StagingWindowInspectionDescription,
+};
+pub(in crate::node_runtime) use payload_staging::{
+    RemoteIntroductionInstallation, RemoteIntroductionInstallationState,
+};
 #[path = "pg_store/pending_staging_index.rs"]
 mod pending_staging_index;
 #[path = "pg_store/rows.rs"]
@@ -166,7 +214,7 @@ mod shards;
 #[path = "pg_store/sql_types.rs"]
 mod sql_types;
 
-use schema::{init_pg_schema, require_current_pg_schema};
+use schema::require_current_pg_schema;
 
 pub(in crate::node_runtime) use allocation_lifetime::ReplacementLifetime as PgAllocationReplacement;
 #[cfg(test)]
@@ -175,18 +223,61 @@ pub(in crate::node_runtime) use shard_file_mutations::ShardFileMutations;
 
 #[cfg(test)]
 pub(crate) use crate::control_plane::METADATA_CANONICAL_STATE_ENCODING_VERSION;
+pub(in crate::node_runtime) use command_log::ApplicationObservation;
+#[cfg(test)]
+pub(super) use command_log::CompleteAcceptanceDisposition;
+pub(super) use command_log::CompletePublicationError;
+pub(super) use command_log::CompletePublicationQuery;
+pub(super) use command_log::CompleteReplicaAbandonmentAttempt;
+pub(in crate::node_runtime) use command_log::PublicationObservation;
 pub(crate) use command_log::{
     decode_metadata_command_checkpoint_candidate_rows, EpochMismatchedPendingMetadataCommand,
     MetadataCommandCheckpointCandidateRow, MetadataCommandStartupDisposition,
 };
 #[cfg(test)]
 use command_log::{digest_len_prefixed_bytes, MetadataDigestFilter, METADATA_DIGEST_TABLES};
+#[allow(unused_imports)] // Candidate owning preparation; live selection remains gated.
+pub(in crate::node_runtime) use command_log::{
+    AbandonedPartInstallation, AbandonedPartInstallationObservation, AbandonedPartPreparation,
+    AbandonedPartPreparationError, AbandonedPartPreparationFailure, AbandonedPartPublication,
+    AbandonedPartTerminalFailure, AbandonedPartTerminalHandoff, PreparedAbandonedPart,
+    PreparedAbandonedPartBorrow,
+};
+#[allow(unused_imports)]
+// Candidate cohort types; only owner tests select them until activation.
+pub(super) use command_log::{
+    AbandonmentHandoffError, AbandonmentHandoffFailure, AllocatedStreamWindow,
+    CompleteAbandonmentHandoff, CompleteApplicationAttempt, CompleteApplicationSendError,
+    CompleteFanoutCompletion, CompleteFanoutSender, CompletePublicationAttempt,
+    CompletePublicationSendError, CompletePublicationSender, CompleteRetirementAttempt,
+    CompleteRetirementSendError, CompleteTerminalHandoff, CompleteUnstartedAbandonment,
+    ConfirmedStagingWindow, RemoteStreamAllocationAttempt, ReplicaAbandonmentObservation,
+    ReplicaAbandonmentPermit, StagingWindowHandoffFailure, StreamWindowAllocationFailure,
+    StreamWindowAllocationPermit, TerminalHandoffFailure, TerminalReservationAuthority,
+    TerminalReservationObservation, TerminalSlotRetirementAuthority,
+    TerminalSlotRetirementObservation, UnstartedAbandonmentAuthority,
+    UnstartedAbandonmentObservation,
+};
+pub(in crate::node_runtime) use command_log::{
+    CompleteAbandonedEvidence, CompleteAbandonedQuery, CompleteAcceptanceEvidence,
+    CompleteAcceptanceKind, CompleteAcceptanceQuery, CompleteApplicationError,
+    CompleteApplicationQuery, CompleteApplicationRequest, CompleteAppliedEvidence,
+    CompleteAppliedQuery, CompleteLogHashPage, CompleteLogHashRangeRequest,
+    CompleteLogMaintenanceRequest, CompleteLogPage, CompleteLogRangeRequest, CompleteLogReadError,
+    CompleteMaintenanceError, CompletePendingEvidence, CompletePendingInspectionError,
+    CompletePendingRequest, CompletePublicationRequest,
+};
+#[allow(unused_imports)]
+pub(super) use command_log::{CompleteAbandonmentAttempt, CompleteAbandonmentSendError};
+pub(super) use command_log::{CompleteAbandonmentQuery, CompleteAbandonmentRequest};
+pub(super) use command_log::{CompleteReplicaAbandonmentQuery, CompleteReplicaAbandonmentRequest};
 pub use command_log::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
     MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
 };
 use command_log::{ObjectGenerationReservationConstraint, ObjectGenerationReservationIdentity};
+pub(crate) use payload_staging::CompleteTerminalReservationRelease;
 pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow};
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
@@ -745,16 +836,20 @@ pub struct PgStore {
     // A failed transaction recovery must never be reused through node access.
     // Only reopening the store (with normal startup recovery) clears retirement.
     connection_retired: std::cell::Cell<bool>,
+    metadata_transaction_scopes: metadata_transaction::Scopes,
     allocation_lifetime: allocation_lifetime::PgAllocationLifetime,
     shard_file_mutations: std::sync::Arc<ShardFileMutations>,
     clean_metadata_digest_revision: AtomicU64,
+    complete_prefix_validation: command_log::CompletePrefixValidationCache,
     // Discovery hint only; never part of durable state or cleanup authority.
     // Access is serialized by the owning PG lock, like the SQLite connection.
     payload_reclaim_scan_cursor: std::cell::RefCell<Option<PayloadReclaimRoot>>,
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    fail_pending_slot_rollbacks: std::cell::Cell<u8>,
+    fail_metadata_command_rollbacks: std::cell::Cell<u8>,
+    #[cfg(test)]
+    fail_next_snapshot_rollback: std::cell::Cell<bool>,
     #[cfg(test)]
     fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -981,14 +1076,18 @@ pub(crate) fn inspect_pg_shard_inventory(
         tmp_dir: pg_dir.join("tmp"),
         conn,
         connection_retired: std::cell::Cell::new(false),
+        metadata_transaction_scopes: Default::default(),
         allocation_lifetime: allocation_lifetime::PgAllocationLifetime::retired(),
         shard_file_mutations: Default::default(),
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+        complete_prefix_validation: Default::default(),
         payload_reclaim_scan_cursor: Default::default(),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
-        fail_pending_slot_rollbacks: std::cell::Cell::new(0),
+        fail_metadata_command_rollbacks: std::cell::Cell::new(0),
+        #[cfg(test)]
+        fail_next_snapshot_rollback: std::cell::Cell::new(false),
         #[cfg(test)]
         fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
@@ -1206,7 +1305,7 @@ impl PgStore {
             return Err(StoreError::Db {
                 context: "access retired PG metadata connection",
                 source: crate::error::DatabaseError::new(format!(
-                    "PG {} requires reopen and recovery after failed pending-slot rollback",
+                    "PG {} requires reopen and recovery after an unconfirmed metadata transaction",
                     self.pg_id
                 )),
             });
@@ -1215,6 +1314,7 @@ impl PgStore {
     }
 
     fn retire_connection(&self) {
+        self.complete_prefix_validation.invalidate();
         self.connection_retired.set(true);
         self.allocation_lifetime.retire();
         self.conn.flush_prepared_statement_cache();
@@ -1302,34 +1402,56 @@ impl PgStore {
             context: "register metadata digest SQL functions",
             source: e.into(),
         })?;
-        init_pg_schema(&conn)?;
-        conn.busy_timeout(std::time::Duration::from_millis(0))
+        let store = Self::uninitialized(pg_id, shards_dir, tmp_dir, conn)?;
+        let store = schema::initialize(store)?;
+        store
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(0))
             .map_err(|e| StoreError::Db {
                 context: "configure pg database busy timeout",
                 source: e.into(),
             })?;
 
-        // Clean up any orphaned temp files from previous crashes.
-        if let Ok(entries) = fs::read_dir(&tmp_dir) {
+        store.ensure_metadata_digest_bootstrap()?;
+        store.ensure_metadata_command_replica_state(initial_cluster_epoch)?;
+
+        // Only clean crash residue after initialization succeeded. No partially
+        // initialized store escapes on an error or unwind.
+        if let Ok(entries) = fs::read_dir(&store.tmp_dir) {
             for entry in entries.flatten() {
                 let _ = fs::remove_file(entry.path());
             }
         }
 
+        Ok(store)
+    }
+
+    // Private, unvalidated construction for opening. This does not establish
+    // complete-prefix eligibility or publish the store through a node.
+    fn uninitialized(
+        pg_id: u32,
+        shards_dir: PathBuf,
+        tmp_dir: PathBuf,
+        conn: Connection,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
             pg_id,
             shards_dir,
             tmp_dir,
             conn,
             connection_retired: std::cell::Cell::new(false),
+            metadata_transaction_scopes: Default::default(),
             allocation_lifetime: allocation_lifetime::PgAllocationLifetime::new()?,
             shard_file_mutations: Default::default(),
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+            complete_prefix_validation: Default::default(),
             payload_reclaim_scan_cursor: Default::default(),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            fail_pending_slot_rollbacks: std::cell::Cell::new(0),
+            fail_metadata_command_rollbacks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fail_next_snapshot_rollback: std::cell::Cell::new(false),
             #[cfg(test)]
             fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1362,11 +1484,6 @@ impl PgStore {
             metadata_command_log_replay_validation_entries: AtomicU64::new(0),
             #[cfg(test)]
             shard_scavenger_reference_match_calls: AtomicU64::new(0),
-        })
-        .and_then(|store| {
-            store.ensure_metadata_digest_bootstrap()?;
-            store.ensure_metadata_command_replica_state(initial_cluster_epoch)?;
-            Ok(store)
         })
     }
 

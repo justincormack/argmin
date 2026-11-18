@@ -1,0 +1,14 @@
+argmin-storage-node-runtime-config-v5
+node_id 7
+cluster_epoch 9
+route_map_validity until 12345
+ec_shape 4 2
+socket_path 2f72756e2f6172676d696e2f73746f726167652d372e736f636b
+pg_ids 1
+0
+pg_routes 1
+0 9 2 7 - - - - - - - 2 7 8
+historical_pg_routes 1
+0 3 1 7 - - - - - - - 2 7 8
+pending_metadata_command_recoveries 1
+0 7 3 11 123

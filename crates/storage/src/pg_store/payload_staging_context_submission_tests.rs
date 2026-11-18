@@ -73,6 +73,7 @@ fn reject(submission: &mut StagingSubmission, pg: &PgStore) {
 }
 
 fn interrupt(submission: &mut StagingSubmission, pg: &PgStore) {
+    let before = (pending_install::observe(pg), introduction::state(pg));
     let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         PgStore::test_with_before_pending_slot_effect_hook(
             |in_transaction| {
@@ -84,8 +85,12 @@ fn interrupt(submission: &mut StagingSubmission, pg: &PgStore) {
     }));
     assert!(interrupted.is_err());
     assert_eq!(submission.observation(), Observed::Unconfirmed);
-    assert!(!pg.conn.is_autocommit());
-    pg.conn.execute_batch("ROLLBACK").unwrap();
+    assert!(pg.conn.is_autocommit());
+    pg.require_usable_connection().unwrap();
+    assert_eq!(
+        (pending_install::observe(pg), introduction::state(pg)),
+        before
+    );
 }
 
 #[test]
@@ -317,7 +322,7 @@ fn staging_context_submission_fresh_inputs_retain_all_context_kinds() {
         let source = part::command(&pg, &owner);
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
         let context = ContextualCommand::abandoned_part(
-            PartFinalizationSource::capture(&source)
+            PartFinalizationSource::capture_for_test(&source)
                 .unwrap()
                 .bind_cleanup(cleanup.clone(), &topology())
                 .unwrap(),

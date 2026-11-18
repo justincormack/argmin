@@ -20,6 +20,10 @@ use crate::{
 };
 use rusqlite::OptionalExtension;
 
+#[path = "payload_staging_object_retirement.rs"]
+mod retirement;
+pub(super) use retirement::require_direct_retirement;
+
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum ObjectError {
     #[error("staging object publication requires the enclosing command transaction")]
@@ -370,11 +374,27 @@ pub(super) fn retained_for_reclaim(
     Ok(vec![(old, retired)])
 }
 
-pub(in super::super) fn apply_in_open_transaction(
+struct PublicationPlan {
+    owner: StagingOwnerRecord,
+    after: StagingOwnerRecord,
+    displaced: Vec<(StagingOwnerRecord, StagingOwnerRecord)>,
+}
+
+/// Shared read-only validation for primary preparation and deterministic apply.
+/// The resulting plan never escapes this module as cached mutation authority.
+pub(super) fn validate_in_open_transaction(
+    pg: &PgStore,
+    topology: &PgTopology,
+    envelope: &MetadataCommandEnvelope,
+) -> Result<(), ObjectError> {
+    prepare_in_open_transaction(pg, topology, envelope).map(|_| ())
+}
+
+fn prepare_in_open_transaction(
     pg: &PgStore,
     configured_topology: &PgTopology,
     envelope: &MetadataCommandEnvelope,
-) -> Result<(), ObjectError> {
+) -> Result<PublicationPlan, ObjectError> {
     if pg.conn.is_autocommit() {
         return Err(ObjectError::TransactionRequired);
     }
@@ -387,7 +407,7 @@ pub(in super::super) fn apply_in_open_transaction(
         &command.generation_reservation_id,
     )?
     .ok_or(ObjectError::LiveResponsibility)?;
-    let checked = owner.validate(configured_topology)?;
+    owner.validate(configured_topology)?;
     if !envelope.verify_checksum()
         || envelope.id().pg_id() != owner.subject.object_pg
         || !command_follows(owner.subject.id.introduction, envelope.id())
@@ -424,6 +444,40 @@ pub(in super::super) fn apply_in_open_transaction(
         Ok(_) => return Err(ObjectError::DisplacedPayload),
         Err(error) => return Err(error.into()),
     };
+    for (old, retired) in &displaced {
+        old.validate(configured_topology)?;
+        retired.validate(configured_topology)?;
+    }
+    let references = command
+        .segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| owner.selected_object_reference(command, index, segment))
+        .collect::<Result<Vec<_>, _>>()?;
+    let after = owner.published_standard(&references)?;
+    after.validate(configured_topology)?;
+    Ok(PublicationPlan {
+        owner,
+        after,
+        displaced,
+    })
+}
+
+pub(in super::super) fn apply_in_open_transaction(
+    pg: &PgStore,
+    configured_topology: &PgTopology,
+    envelope: &MetadataCommandEnvelope,
+) -> Result<(), ObjectError> {
+    let PublicationPlan {
+        owner,
+        after,
+        displaced,
+    } = prepare_in_open_transaction(pg, configured_topology, envelope)?;
+    let MetadataCommandPayload::CommitDirectPutObject(command) = envelope.payload() else {
+        return Err(ObjectError::CommandBinding);
+    };
+    let checked = owner.validate(configured_topology)?;
+    let checked_after = after.validate(configured_topology)?;
     let checked_displaced = displaced
         .iter()
         .map(|(old, retired)| -> Result<_, StagingInvariant> {
@@ -433,32 +487,26 @@ pub(in super::super) fn apply_in_open_transaction(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let references = command
-        .segments
-        .iter()
-        .enumerate()
-        .map(|(index, segment)| owner.selected_object_reference(command, index, segment))
-        .collect::<Result<Vec<_>, _>>()?;
-    let after = owner.published_standard(&references)?;
-    let checked_after = after.validate(configured_topology)?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    pg.apply_commit_direct_put_object_command(command)?;
-    sql::publish_standard(
-        &pg.conn,
-        owner.subject.object_pg,
-        configured_topology,
-        &checked,
-        &checked_after,
-    )?;
-    for (old, retired) in &checked_displaced {
-        sql::retain_object_reclaim(
-            &pg.conn,
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        pg.apply_commit_direct_put_object_command(command)?;
+        sql::publish_standard(
+            pg,
             owner.subject.object_pg,
             configured_topology,
-            old,
-            retired,
+            &checked,
+            &checked_after,
         )?;
-    }
-    savepoint.commit()?;
-    Ok(())
+        for (old, retired) in &checked_displaced {
+            sql::retain_object_reclaim(
+                pg,
+                owner.subject.object_pg,
+                configured_topology,
+                old,
+                retired,
+            )?;
+        }
+        Ok(())
+    })();
+    savepoint.finish(result)
 }

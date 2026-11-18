@@ -258,7 +258,7 @@ fn abandoned_context(
     cleanup: &MetadataCommandEnvelope,
 ) -> ContextualCommand {
     ContextualCommand::abandoned_part(
-        PartFinalizationSource::capture(finalizer)
+        PartFinalizationSource::capture_for_test(finalizer)
             .unwrap()
             .bind_cleanup(cleanup.clone(), &topology())
             .unwrap(),

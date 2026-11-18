@@ -3171,6 +3171,7 @@ fn storage_cluster_runtime_map_workers_resample_time_for_each_operation() {
                                     ClusterEpoch::INITIAL,
                                     NonZeroU64::MIN,
                                     u64::from(pg_id),
+                                    [0xA5; 32],
                                 ),
                             ),
                         )

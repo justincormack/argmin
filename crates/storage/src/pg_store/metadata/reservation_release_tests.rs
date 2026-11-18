@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 type RecordMutation = (&'static str, fn(&mut BucketWriteReservationRecord));
 
@@ -196,4 +201,218 @@ fn bucket_reservation_record_release_preserves_renewal_while_proof_release_owns_
         .durable_bucket_write_reservation(&original.bucket, &original.reservation_id)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn embedded_proof_release_expires_after_sqlite_inspection_without_mutation() {
+    use crate::node_client::RetainedBucketWriteReservationNodeClient;
+    use crate::node_runtime::client_facade::LocalStorageNodeClient;
+    use crate::BucketSnapshotLoadError;
+
+    for already_absent in [false, true] {
+        let dir = test_util::tempdir();
+        let node = Arc::new(crate::node::SharedStorageNode::open(dir.path(), &[0]).unwrap());
+        let client = LocalStorageNodeClient::new(NodeId::new(0), Arc::clone(&node));
+        let record = seed(&node.get_pg(0).unwrap(), Some("key"));
+        let proof = BucketWriteReservationProof::from(&record);
+        if already_absent {
+            node.get_pg(0)
+                .unwrap()
+                .release_metadata_command_bucket_write_reservation(&proof)
+                .unwrap();
+        }
+        let observe = || {
+            let pg = node.get_pg(0).unwrap();
+            assert!(pg.conn.is_autocommit());
+            (
+                pg.conn.total_changes(),
+                pg.metadata_checkpoint_table_blocks().unwrap(),
+                pg.metadata_command_replica_state().unwrap(),
+            )
+        };
+        let before = observe();
+        let reached = Arc::new(AtomicBool::new(false));
+        let hook_reached = Arc::clone(&reached);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let route = client
+            .open_retained_bucket_write_reservation_route(
+                node.bucket_metadata_pg_for(&proof.bucket),
+                &proof.bucket,
+            )
+            .unwrap();
+        let error = PgStore::test_with_before_proof_release_effect_hook(
+            move |in_transaction, captured| {
+                assert!(in_transaction, "must hold SQLite writer serialization");
+                assert_eq!(
+                    captured,
+                    Some(deadline),
+                    "do not rebase the caller's cutoff"
+                );
+                hook_reached.store(true, Ordering::SeqCst);
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(remaining);
+                }
+            },
+            || route.release_metadata_command_bucket_write_reservation_until(&proof, deadline),
+        )
+        .unwrap_err();
+        assert!(reached.load(Ordering::SeqCst));
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Store(StoreError::OperationDeadlineExceeded {
+                    context: "release metadata command bucket write reservation"
+                })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            observe(),
+            before,
+            "no DELETE, not merely a rolled-back deletion"
+        );
+
+        let retry_deadline = Instant::now() + Duration::from_secs(30);
+        route
+            .release_metadata_command_bucket_write_reservation_until(&proof, retry_deadline)
+            .unwrap();
+        let after = observe();
+        assert_eq!(after.0, before.0 + u64::from(!already_absent));
+        route
+            .release_metadata_command_bucket_write_reservation_until(&proof, retry_deadline)
+            .unwrap();
+        assert_eq!(
+            observe(),
+            after,
+            "exact absence confirmation must not mutate"
+        );
+        let remaining = node
+            .get_pg(0)
+            .unwrap()
+            .durable_bucket_write_reservations(&record.bucket)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].reservation_id, "canary");
+    }
+}
+
+#[test]
+fn bucket_reservation_proof_release_unwind_and_commit_failure_keep_retryable_state() {
+    let dir = test_util::tempdir();
+    let store = PgStore::open(dir.path(), 0).unwrap();
+    let record = seed(&store, Some("key"));
+    let proof = BucketWriteReservationProof::from(&record);
+    let before = store.metadata_checkpoint_table_blocks().unwrap();
+    let reached = Arc::new(AtomicBool::new(false));
+    let hook_reached = Arc::clone(&reached);
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PgStore::test_with_before_proof_release_effect_hook(
+            move |in_transaction, _| {
+                assert!(in_transaction);
+                hook_reached.store(true, Ordering::SeqCst);
+                panic!("interrupt proof release before DELETE");
+            },
+            || store.release_metadata_command_bucket_write_reservation(&proof),
+        )
+    }));
+    assert!(interrupted.is_err());
+    assert!(reached.load(Ordering::SeqCst));
+    assert!(store.conn.is_autocommit());
+    assert_eq!(store.metadata_checkpoint_table_blocks().unwrap(), before);
+    store
+        .fail_next_metadata_txn_commit
+        .store(true, Ordering::Relaxed);
+    assert!(store
+        .release_metadata_command_bucket_write_reservation(&proof)
+        .is_err());
+    assert!(store.conn.is_autocommit());
+    assert_eq!(store.metadata_checkpoint_table_blocks().unwrap(), before);
+    store.require_usable_connection().unwrap();
+    drop(store);
+    let reopened = PgStore::open(dir.path(), 0).unwrap();
+    assert_eq!(reopened.metadata_checkpoint_table_blocks().unwrap(), before);
+    reopened
+        .release_metadata_command_bucket_write_reservation(&proof)
+        .unwrap();
+    reopened
+        .release_metadata_command_bucket_write_reservation(&proof)
+        .unwrap();
+    let remaining = reopened
+        .durable_bucket_write_reservations(&record.bucket)
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].reservation_id, "canary");
+}
+
+#[test]
+fn bucket_reservation_proof_release_retires_connection_on_unconfirmed_rollback() {
+    for unwind in [false, true] {
+        let dir = test_util::tempdir();
+        let store = PgStore::open(dir.path(), 0).unwrap();
+        let record = seed(&store, Some("key"));
+        let proof = BucketWriteReservationProof::from(&record);
+        let before = store.metadata_checkpoint_table_blocks().unwrap();
+        let writes = store.conn.total_changes();
+        store.test_fail_metadata_command_rollbacks(1);
+        if unwind {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                PgStore::test_with_before_proof_release_effect_hook(
+                    |in_transaction, _| {
+                        assert!(in_transaction);
+                        panic!("interrupt release with unconfirmed rollback");
+                    },
+                    || store.release_metadata_command_bucket_write_reservation(&proof),
+                )
+            }));
+            assert!(result.is_err());
+        } else {
+            let mut crossed = proof.clone();
+            crossed.owner_token = "not-the-owner".into();
+            let error = store
+                .release_metadata_command_bucket_write_reservation(&crossed)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    MetadataError::Db {
+                        context: "metadata operation and rollback failed",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert!(error
+                .to_string()
+                .contains("injected metadata-command rollback failure"));
+        }
+        assert!(
+            !store.conn.is_autocommit(),
+            "the failed rollback is not silently retried"
+        );
+        assert_eq!(store.conn.total_changes(), writes);
+        assert!(store.require_usable_connection().is_err());
+        assert!(matches!(
+            store.release_metadata_command_bucket_write_reservation(&proof),
+            Err(MetadataError::RouteEffectRejected {
+                source: StoreError::Db {
+                    context: "access retired PG metadata connection",
+                    ..
+                }
+            })
+        ));
+        drop(store);
+        let reopened = PgStore::open(dir.path(), 0).unwrap();
+        reopened.require_usable_connection().unwrap();
+        assert_eq!(reopened.metadata_checkpoint_table_blocks().unwrap(), before);
+        reopened
+            .release_metadata_command_bucket_write_reservation(&proof)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .durable_bucket_write_reservations(&record.bucket)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }

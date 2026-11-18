@@ -355,97 +355,7 @@ impl PgMetadataStore for PgStore {
         &self,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), MetadataError> {
-        let name = &proof.bucket;
-        let reservation_id = proof.reservation_id.as_str();
-
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| MetadataError::Db {
-                context: "begin release metadata command bucket write reservation",
-                source: source.into(),
-            })?;
-
-        let result =
-            (|| {
-                let existing = self.durable_bucket_write_reservation(name, reservation_id)?;
-                match existing {
-                    Some(record) if proof.matches_record(&record) => {
-                        let generation = i64::try_from(record.bucket_execution_generation)
-                            .map_err(|source| MetadataError::Db {
-                                context:
-                                    "release metadata command bucket write reservation generation",
-                                source: crate::error::DatabaseError::to_sql_conversion_failure(
-                                    Box::new(source),
-                                ),
-                            })?;
-                        let incarnation = i64::try_from(record.bucket_incarnation_generation)
-                            .map_err(|source| MetadataError::Db {
-                                context:
-                                    "release metadata command bucket write reservation incarnation",
-                                source: crate::error::DatabaseError::to_sql_conversion_failure(
-                                    Box::new(source),
-                                ),
-                            })?;
-                        let lease_deadline =
-                            i64::try_from(record.lease_deadline).map_err(|source| {
-                                MetadataError::Db {
-                            context:
-                                "release metadata command bucket write reservation lease deadline",
-                            source: crate::error::DatabaseError::to_sql_conversion_failure(
-                                Box::new(source),
-                            ),
-                        }
-                            })?;
-                        let deleted = self
-                            .conn
-                            .execute(
-                                "DELETE FROM bucket_write_reservations \
-                             WHERE bucket_name = ?1 AND reservation_id = ?2 \
-                               AND owner_token = ?3 AND cluster_epoch = ?4 \
-                               AND bucket_execution_generation = ?5 \
-                               AND bucket_incarnation_generation = ?6 \
-                               AND lease_deadline = ?7",
-                                params![
-                                    name.as_str(),
-                                    reservation_id,
-                                    record.owner_token,
-                                    record.cluster_epoch.get(),
-                                    generation,
-                                    incarnation,
-                                    lease_deadline,
-                                ],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context:
-                                    "release metadata command durable bucket write reservation",
-                                source: source.into(),
-                            })?;
-                        if deleted != 1 {
-                            return Err(MetadataError::BucketWriteReservationConflict {
-                                reservation_id: reservation_id.to_string(),
-                            });
-                        }
-                    }
-                    Some(_) => {
-                        return Err(MetadataError::BucketWriteReservationConflict {
-                            reservation_id: reservation_id.to_string(),
-                        });
-                    }
-                    None => {
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            })();
-
-        match result {
-            Ok(()) => self
-                .commit_immediate_txn("commit release metadata command bucket write reservation"),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        self.release_metadata_command_bucket_write_reservation_with_deadline(proof, None)
     }
 
     fn begin_durable_bucket_write_drain(
@@ -507,12 +417,8 @@ impl PgMetadataStore for PgStore {
             context: "clear durable bucket write drain lease deadline",
             source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| MetadataError::Db {
-                context: "clear durable bucket write drain (begin txn)",
-                source: source.into(),
-            })?;
+        let transaction =
+            self.begin_immediate_txn("clear durable bucket write drain (begin txn)")?;
         let result = (|| {
             let deleted = self
                 .conn
@@ -571,13 +477,11 @@ impl PgMetadataStore for PgStore {
                 drain_id: drain_id.to_string(),
             })
         })();
-        match result {
-            Ok(()) => self.commit_immediate_txn("clear durable bucket write drain (commit txn)"),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result,
+            "clear durable bucket write drain (commit txn)",
+        )
     }
 
     fn clear_expired_durable_bucket_write_drain(
@@ -589,12 +493,8 @@ impl PgMetadataStore for PgStore {
             context: "clear expired durable bucket write drain now",
             source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| MetadataError::Db {
-                context: "clear expired durable bucket write drain (begin txn)",
-                source: source.into(),
-            })?;
+        let transaction =
+            self.begin_immediate_txn("clear expired durable bucket write drain (begin txn)")?;
         let result = (|| {
             let Some(record) = (match self.conn.query_row(
                 "SELECT bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
@@ -680,15 +580,11 @@ impl PgMetadataStore for PgStore {
             }
             Ok(Some(record))
         })();
-        match result {
-            Ok(record) => self
-                .commit_immediate_txn("clear expired durable bucket write drain (commit txn)")
-                .map(|()| record),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result,
+            "clear expired durable bucket write drain (commit txn)",
+        )
     }
 
     fn heartbeat_durable_bucket_write_drain(
@@ -714,12 +610,8 @@ impl PgMetadataStore for PgStore {
             context: "heartbeat durable bucket write drain now",
             source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| MetadataError::Db {
-                context: "heartbeat durable bucket write drain (begin txn)",
-                source: source.into(),
-            })?;
+        let transaction =
+            self.begin_immediate_txn("heartbeat durable bucket write drain (begin txn)")?;
         let result = (|| {
             let Some(record) = (match self.conn.query_row(
                 "SELECT bucket_name, drain_id, owner_token, cluster_epoch, bucket_execution_generation, \
@@ -801,15 +693,11 @@ impl PgMetadataStore for PgStore {
                 }
             })
         })();
-        match result {
-            Ok(record) => self
-                .commit_immediate_txn("heartbeat durable bucket write drain (commit txn)")
-                .map(|()| record),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result,
+            "heartbeat durable bucket write drain (commit txn)",
+        )
     }
 
     fn record_bucket_delete_attempt_outcome(
@@ -1258,12 +1146,7 @@ impl PgMetadataStore for PgStore {
             self.pg_id
         );
         let now = PgStore::now_millis();
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "put object meta (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("put object meta (begin txn)")?;
 
         let result: Result<(), MetadataError> = (|| match req {
             PutObjectReq::Live(req) => {
@@ -1379,16 +1262,7 @@ impl PgMetadataStore for PgStore {
             }
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("put object meta (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "put object meta (commit txn)")
     }
 
     fn get_object_meta(
@@ -1611,26 +1485,12 @@ impl PgMetadataStore for PgStore {
             key,
             version_id
         );
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "delete object version (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("delete object version (begin txn)")?;
 
         let result: Result<(), MetadataError> =
             self.delete_object_version_in_open_txn(bucket, key, version_id);
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("delete object version (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "delete object version (commit txn)")
     }
 
     fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
@@ -2044,12 +1904,7 @@ impl PgMetadataStore for PgStore {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "reserve object generation (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("reserve object generation (begin txn)")?;
 
         let result: Result<GenerationId, MetadataError> = (|| {
             let generation_id = self.next_generation_id(bucket, key)?;
@@ -2070,16 +1925,11 @@ impl PgMetadataStore for PgStore {
             Ok(generation_id)
         })();
 
-        match result {
-            Ok(generation_id) => {
-                self.commit_immediate_txn("reserve object generation (commit txn)")?;
-                Ok(generation_id)
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result,
+            "reserve object generation (commit txn)",
+        )
     }
 
     fn get_object_generation_reservation(
@@ -2120,12 +1970,7 @@ impl PgMetadataStore for PgStore {
         &self,
         reclaim: &ObjectSegmentsReclaimRecord,
     ) -> Result<(), MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "put object segments reclaim (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("put object segments reclaim (begin txn)")?;
 
         let result: Result<(), MetadataError> = (|| {
             self.conn
@@ -2171,16 +2016,11 @@ impl PgMetadataStore for PgStore {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("put object segments reclaim (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result,
+            "put object segments reclaim (commit txn)",
+        )
     }
 
     fn get_object_segments_reclaim(
@@ -2282,12 +2122,7 @@ impl PgMetadataStore for PgStore {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn put_multipart_reclaim(&self, reclaim: &MultipartReclaimRecord) -> Result<(), MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "put multipart reclaim (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("put multipart reclaim (begin txn)")?;
 
         let result: Result<(), MetadataError> = (|| {
             self.conn
@@ -2353,16 +2188,7 @@ impl PgMetadataStore for PgStore {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("put multipart reclaim (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "put multipart reclaim (commit txn)")
     }
 
     fn get_multipart_reclaim(
@@ -3971,23 +3797,23 @@ impl PgMetadataStore for PgStore {
         let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
         let command =
             CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
-            req.clone(),
-            object_generation_id,
-            None,
-            PgStore::now_millis(),
-            BucketWriteReservationProof {
-                bucket: req.bucket.clone(),
-                reservation_id: "test-create-mpu-reservation".to_string(),
-                owner_token: "test-owner-token".to_string(),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                bucket_execution_generation: 1,
-                bucket_incarnation_generation: 1,
-                operation_kind: "create-multipart-upload".to_string(),
-                created_at: PgStore::now_millis(),
-                lease_deadline: PgStore::now_millis().saturating_add(1_000),
-                target_context: Some(req.key.as_str().to_string()),
-            },
-        );
+                req.clone(),
+                object_generation_id,
+                None,
+                PgStore::now_millis(),
+                BucketWriteReservationProof {
+                    bucket: req.bucket.clone(),
+                    reservation_id: "test-create-mpu-reservation".to_string(),
+                    owner_token: "test-owner-token".to_string(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
+                    operation_kind: "create-multipart-upload".to_string(),
+                    created_at: PgStore::now_millis(),
+                    lease_deadline: PgStore::now_millis().saturating_add(1_000),
+                    target_context: Some(req.key.as_str().to_string()),
+                },
+            );
         self.create_multipart_upload_explicit(command.upload())
     }
 
@@ -4179,12 +4005,7 @@ impl PgMetadataStore for PgStore {
 
     #[cfg(test)]
     fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "delete multipart upload (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("delete multipart upload (begin txn)")?;
 
         let result = (|| -> Result<(), MetadataError> {
             self.conn
@@ -4215,16 +4036,7 @@ impl PgMetadataStore for PgStore {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("delete multipart upload (commit txn)")?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "delete multipart upload (commit txn)")
     }
 
     fn list_multipart_uploads(
@@ -4461,12 +4273,7 @@ impl PgMetadataStore for PgStore {
         &self,
         part: &MultipartPartRecord,
     ) -> Result<Option<u32>, MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "upsert part (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("upsert part (begin txn)")?;
 
         let result = (|| -> Result<Option<u32>, rusqlite::Error> {
             // Read previous generation before overwrite.
@@ -4505,27 +4312,24 @@ impl PgMetadataStore for PgStore {
             Ok(prev_gen)
         })();
 
-        match result {
-            Ok(prev_gen) => {
-                self.commit_immediate_txn("upsert part (commit txn)")?;
-                Ok(prev_gen)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+        self.finish_immediate_txn(
+            transaction,
+            result.map_err(|e| {
                 // FK violation means the upload_id doesn't exist.
                 if let rusqlite::Error::SqliteFailure(ref err, _) = e {
                     if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
-                        return Err(MetadataError::NoSuchUpload {
+                        return MetadataError::NoSuchUpload {
                             upload_id: part.upload_id.to_string(),
-                        });
+                        };
                     }
                 }
-                Err(MetadataError::Db {
+                MetadataError::Db {
                     context: "upsert multipart part",
                     source: e.into(),
-                })
-            }
-        }
+                }
+            }),
+            "upsert part (commit txn)",
+        )
     }
 
     #[cfg(test)]
@@ -4534,12 +4338,7 @@ impl PgMetadataStore for PgStore {
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "upsert multipart part segments (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("upsert multipart part segments (begin txn)")?;
 
         let result =
             (|| -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), rusqlite::Error> {
@@ -4665,33 +4464,33 @@ impl PgMetadataStore for PgStore {
                         segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
-                        segment.shard_integrity.as_ref().map(|witness| witness.encode()),
+                        segment
+                            .shard_integrity
+                            .as_ref()
+                            .map(|witness| witness.encode()),
                     ])?;
                 }
 
                 Ok((prev_gen, prev_segments))
             })();
 
-        match result {
-            Ok(prev_state) => {
-                self.commit_immediate_txn("upsert multipart part segments (commit txn)")?;
-                Ok(prev_state)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+        self.finish_immediate_txn(
+            transaction,
+            result.map_err(|e| {
                 if let rusqlite::Error::SqliteFailure(ref err, _) = e {
                     if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
-                        return Err(MetadataError::NoSuchUpload {
+                        return MetadataError::NoSuchUpload {
                             upload_id: part.upload_id.to_string(),
-                        });
+                        };
                     }
                 }
-                Err(MetadataError::Db {
+                MetadataError::Db {
                     context: "upsert multipart part segments",
                     source: e.into(),
-                })
-            }
-        }
+                }
+            }),
+            "upsert multipart part segments (commit txn)",
+        )
     }
 
     fn get_multipart_part(
@@ -4812,12 +4611,7 @@ impl PgMetadataStore for PgStore {
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn commit_object_parts(&self, parts: &[ObjectPartRecord]) -> Result<(), MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "commit object parts (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("commit object parts (begin txn)")?;
 
         let result: Result<(), rusqlite::Error> = (|| {
             let mut stmt = self.conn.prepare_cached(
@@ -4853,19 +4647,14 @@ impl PgMetadataStore for PgStore {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("commit object parts (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(MetadataError::Db {
-                    context: "commit object parts",
-                    source: e.into(),
-                })
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result.map_err(|e| MetadataError::Db {
+                context: "commit object parts",
+                source: e.into(),
+            }),
+            "commit object parts (commit txn)",
+        )
     }
 
     fn get_object_parts(
@@ -5044,12 +4833,7 @@ impl PgMetadataStore for PgStore {
         let encryption_type = obj.encryption.encryption_type() as u8;
         let encryption_state = obj.encryption.encode_state();
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "complete multipart commit (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("complete multipart commit (begin txn)")?;
 
         let result = (|| -> Result<CompleteMultipartCommitCleanup, rusqlite::Error> {
             // Validate part identity matches object.
@@ -5376,19 +5160,14 @@ impl PgMetadataStore for PgStore {
             })
         })();
 
-        match result {
-            Ok(cleanup) => {
-                self.commit_immediate_txn("complete multipart commit (commit txn)")?;
-                Ok(cleanup)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(MetadataError::Db {
-                    context: "complete multipart commit",
-                    source: e.into(),
-                })
-            }
-        }
+        self.finish_immediate_txn(
+            transaction,
+            result.map_err(|e| MetadataError::Db {
+                context: "complete multipart commit",
+                source: e.into(),
+            }),
+            "complete multipart commit (commit txn)",
+        )
     }
     // ── Streaming upload session methods ──────────────────────────────
 
@@ -5691,12 +5470,7 @@ impl PgMetadataStore for PgStore {
             });
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "put segment object (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("put segment object (begin txn)")?;
 
         let result: Result<(), MetadataError> = (|| {
             let now = PgStore::now_millis();
@@ -5832,7 +5606,10 @@ impl PgMetadataStore for PgStore {
                     segment.placement_cluster_epoch.get() as i64,
                     segment.ec_k,
                     segment.ec_m,
-                    segment.shard_integrity.as_ref().map(|witness| witness.encode()),
+                    segment
+                        .shard_integrity
+                        .as_ref()
+                        .map(|witness| witness.encode()),
                 ])
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (insert segment)",
@@ -5843,16 +5620,7 @@ impl PgMetadataStore for PgStore {
             Ok(())
         })();
 
-        match result {
-            Ok(()) => {
-                self.commit_immediate_txn("put segment object (commit txn)")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "put segment object (commit txn)")
     }
 
     #[cfg(test)]
@@ -5862,12 +5630,7 @@ impl PgMetadataStore for PgStore {
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "commit stream part (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = self.begin_immediate_txn("commit stream part (begin txn)")?;
 
         let result: Result<Vec<MultipartPartSegmentRecord>, MetadataError> = (|| {
             // 1. Verify session exists, is InProgress, is UploadPart kind, and matches
@@ -6069,7 +5832,10 @@ impl PgMetadataStore for PgStore {
                         segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
-                        segment.shard_integrity.as_ref().map(|witness| witness.encode()),
+                        segment
+                            .shard_integrity
+                            .as_ref()
+                            .map(|witness| witness.encode()),
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (insert segment)",
@@ -6092,16 +5858,7 @@ impl PgMetadataStore for PgStore {
             Ok(displaced_segments)
         })();
 
-        match result {
-            Ok(displaced_segments) => {
-                self.commit_immediate_txn("commit stream part (commit txn)")?;
-                Ok(displaced_segments)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.finish_immediate_txn(transaction, result, "commit stream part (commit txn)")
     }
 
     fn get_object_segments(

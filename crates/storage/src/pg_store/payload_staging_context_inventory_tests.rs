@@ -175,7 +175,7 @@ fn staging_context_inventory_abandonment_rejects_crossed_segments_at_binding_and
     let source = part::command(&pg, &owner);
     let command = abandonment::cleanup(&pg, &owner, &source);
     let context = ContextualCommand::abandoned_part(
-        PartFinalizationSource::capture(&source)
+        PartFinalizationSource::capture_for_test(&source)
             .unwrap()
             .bind_cleanup(command.clone(), &topology())
             .unwrap(),
@@ -201,7 +201,7 @@ fn staging_context_inventory_abandonment_rejects_crossed_segments_at_binding_and
         for session_only in [true, false] {
             let crossed = crossed_abort_segment(&command, index, &foreign[index], session_only);
             assert!(matches!(
-                PartFinalizationSource::capture(&source)
+                PartFinalizationSource::capture_for_test(&source)
                     .unwrap()
                     .bind_cleanup(crossed.clone(), &topology()),
                 Err(AbandonmentError::Subject)
@@ -334,7 +334,7 @@ fn staging_context_inventory_abandonment_survives_compaction_reopen_then_session
         let owner = part::initialize(&pg, count);
         let source = part::command(&pg, &owner);
         let command = abandonment::cleanup(&pg, &owner, &source);
-        let candidate = PartFinalizationSource::capture(&source)
+        let candidate = PartFinalizationSource::capture_for_test(&source)
             .unwrap()
             .bind_cleanup(command.clone(), &topology())
             .unwrap();

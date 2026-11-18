@@ -16,6 +16,11 @@ use crate::node_runtime::pg_store::PgStore;
 
 #[path = "payload_staging_descriptor_binding.rs"]
 mod binding;
+pub(in crate::node_runtime::pg_store) use binding::DirectStagingManifest;
+pub(in crate::node_runtime) use binding::{
+    StagingWindowConfirmationError, StagingWindowConfirmationObservation,
+    StagingWindowConfirmationRequest, StagingWindowInspectionDescription,
+};
 
 pub(in super::super) use binding::PendingStagingProtection;
 #[cfg(test)]
@@ -53,6 +58,30 @@ pub(in super::super) struct AppendDescriptor {
 }
 
 impl IntroductionDescriptor {
+    pub(super) fn matches_remote_direct_request(
+        &self,
+        request: &crate::storage_rpc::complete_direct_introduction::Request,
+        id: MetadataCommandId,
+        cutoff: u64,
+    ) -> bool {
+        let subject = &self.0.subject;
+        subject.target == StagingTarget::DirectPut
+            && subject.id.introduction == id
+            && subject.id.attempt == request.attempt
+            && subject.bucket == request.bucket
+            && subject.key == request.key
+            && subject.bucket_incarnation == request.proof.bucket_incarnation_generation
+            && subject.object_pg == request.route.pg
+            && subject.originating_epoch == request.route.epoch
+            && subject.issuer.node_id == request.route.node
+            && cutoff <= self.cutoff_ms()
+            && matches!(&self.0.resources.creation, ResourceResponsibility::Live(resource)
+                if *resource == StagingBucketResource::capture(&request.proof, resource.release_pg))
+    }
+    pub(super) fn cutoff_ms(&self) -> u64 {
+        self.0.windows[0].cutoff_ms
+    }
+
     pub(super) fn capture(owner: &CheckedStagingOwner<'_>) -> Result<Self, DescriptorError> {
         let owner = owner.record;
         if owner.lifecycle != StagingLifecycle::Active
@@ -115,6 +144,22 @@ impl IntroductionDescriptor {
 }
 
 impl AppendDescriptor {
+    #[cfg(test)]
+    pub(in super::super) fn test_cross_remote_reply(&mut self, field: &str) {
+        match field {
+            "cutoff" => {
+                self.window.issued_at_ms += 1_000_000;
+                self.window.cutoff_ms += 1_000_000;
+            }
+            "participants" => self.window.participants.files.swap(0, 1),
+            "issuer" => {
+                self.subject.issuer.lifetime[0] ^= 1;
+                self.window.issuer.lifetime[0] ^= 1;
+            }
+            _ => panic!("unknown descriptor fault"),
+        }
+    }
+
     pub(super) fn capture(
         owner: &CheckedStagingOwner<'_>,
         window: StagingWindow,

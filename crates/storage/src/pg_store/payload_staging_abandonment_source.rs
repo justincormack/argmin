@@ -7,21 +7,32 @@
 //! application validates the durable terminal chain in the caller's transaction.
 //! Tombstone V2 persists SHA-256 of the original command bytes. The CRC in this
 //! carrier is only an integrity check; it cannot establish source identity.
-//! No current command/RPC embeds this carrier yet.
+//! Source V2 embeds the complete V14 finalizer with mandatory ordinary context
+//! V1. No current production command/RPC embeds this candidate carrier yet.
 
-use super::{AbandonmentError, AbandonmentOutcome};
+use super::super::abandonment::{self, AbandonmentError, AbandonmentOutcome};
+use super::{CarrierError, ContextualCommand, Input};
 use crate::metadata_command::{
-    decode_metadata_command_envelope, MetadataCommandEnvelope, MetadataCommandFormatError,
-    MetadataCommandId, MetadataCommandPayload, MAX_METADATA_COMMAND_BYTES,
+    MetadataCommandEnvelope, MetadataCommandFormatError, MetadataCommandId, MetadataCommandPayload,
+    MAX_METADATA_COMMAND_BYTES,
 };
-use crate::node_runtime::{pg_store::PgStore, MetadataCommandDecodeAuthority};
+use crate::node_runtime::pg_store::{MetadataCommandStartupDisposition, PgStore};
 use crate::pg_topology::PgTopology;
 use std::sync::Arc;
 
+// The release implementation can inspect the immutable source here without
+// exporting a raw source/proof accessor to the surrounding store or caller.
+#[path = "payload_staging_terminal_release.rs"]
+mod terminal_release;
+pub(crate) use terminal_release::CompleteTerminalReservationRelease;
+
 const MAGIC: &[u8; 8] = b"stg-abnd";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 8 + 4;
-pub(in super::super) const MAX_SOURCE_BYTES: usize = HEADER_BYTES + MAX_METADATA_COMMAND_BYTES;
+// A finalizer always carries exactly the three-byte ordinary context. Its
+// payload keeps the supported 2 MiB limit; source framing is additional.
+const MAX_FINALIZER_BYTES: usize = MAX_METADATA_COMMAND_BYTES + 3;
+pub(in super::super) const MAX_SOURCE_BYTES: usize = HEADER_BYTES + MAX_FINALIZER_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super::super) enum SourceError {
@@ -35,8 +46,27 @@ pub(in super::super::super) enum SourceError {
 /// independently at the apply boundary, and has no caller-visible raw envelope.
 /// A source may outlive its log entry, but only authenticated durable terminal
 /// evidence (including compacted receipts) permits the custody transition.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in super::super::super) struct PartFinalizationSource(MetadataCommandEnvelope);
+#[derive(Clone)]
+pub(in super::super::super) struct PartFinalizationSource(Arc<ContextualCommand>);
+
+impl std::fmt::Debug for PartFinalizationSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartFinalizationSource")
+            .field("id", &self.0.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PartFinalizationSource {
+    fn eq(&self, other: &Self) -> bool {
+        // Both inputs are necessarily ordinary finalizers in the same exact
+        // grammar. Comparing their immutable input binds every encoded field.
+        self.0.topology == other.0.topology && self.draft() == other.draft()
+    }
+}
+
+impl Eq for PartFinalizationSource {}
 
 /// Owned description of one cleanup and its indispensable original source.
 /// Private fields prevent independently replacing/dropping source context at
@@ -44,7 +74,7 @@ pub(in super::super::super) struct PartFinalizationSource(MetadataCommandEnvelop
 /// durable source authentication remains inside the application transaction.
 pub(in super::super::super) struct AbandonedPartCleanupCommand {
     command: MetadataCommandEnvelope,
-    source: Arc<PartFinalizationSource>,
+    source: PartFinalizationSource,
     topology: PgTopology,
 }
 
@@ -52,45 +82,83 @@ pub(in super::super::super) struct BoundPartCleanup<'a>(&'a AbandonedPartCleanup
 
 impl PartFinalizationSource {
     pub(in super::super::super) fn capture(
-        source: &MetadataCommandEnvelope,
+        source: &ContextualCommand,
     ) -> Result<Self, SourceError> {
-        Self::require_kind(source)?;
-        let bytes = source.command_bytes();
-        if bytes.len() > MAX_METADATA_COMMAND_BYTES {
-            return Err(SourceError::Encoding("source command exceeds bound"));
-        }
-        if checksum::crc64::checksum(&bytes) != source.checksum_crc64() {
-            return Err(SourceError::Encoding("source checksum"));
-        }
-        Ok(Self(source.clone()))
-    }
-
-    fn require_kind(source: &MetadataCommandEnvelope) -> Result<(), SourceError> {
+        let Input::Ordinary(command) = &source.input else {
+            return Err(SourceError::Encoding(
+                "source is not an ordinary CommitStreamPart",
+            ));
+        };
         if !matches!(
-            source.payload(),
+            command.payload(),
             MetadataCommandPayload::CommitStreamPart(_)
         ) {
             return Err(SourceError::Encoding("source is not CommitStreamPart"));
         }
-        Ok(())
+        let encoded = source.encode_command().map_err(Self::carrier_error)?;
+        if encoded.bytes().len() > MAX_FINALIZER_BYTES {
+            return Err(SourceError::Encoding("source command exceeds bound"));
+        }
+        // Copy descriptive evidence only. No submission holder lends its
+        // ContextualCommand; its installation history remains in that holder.
+        Ok(Self(Arc::new(ContextualCommand {
+            input: Input::Ordinary(command.clone()),
+            topology: source.topology.clone(),
+        })))
+    }
+
+    fn carrier_error(error: CarrierError) -> SourceError {
+        match error {
+            CarrierError::Format(error) => SourceError::Command(error),
+            CarrierError::Context(_) => SourceError::Encoding("invalid source context"),
+        }
+    }
+
+    // Semantic input for the private abandonment component. Never offered as
+    // a pre-submission context or as the original command's durable identity.
+    pub(in super::super) fn draft(&self) -> &MetadataCommandEnvelope {
+        let Input::Ordinary(command) = &self.0.input else {
+            unreachable!("source captures only an ordinary finalizer");
+        };
+        command
+    }
+
+    #[cfg(test)]
+    pub(in super::super::super) fn capture_for_test(
+        draft: &MetadataCommandEnvelope,
+    ) -> Result<Self, SourceError> {
+        let input = ContextualCommand {
+            input: Input::Ordinary(draft.clone()),
+            topology: super::super::tests::topology(),
+        };
+        Self::capture(&input)
+    }
+
+    #[cfg(test)]
+    pub(in super::super::super) fn decode_for_test(bytes: &[u8]) -> Result<Self, SourceError> {
+        Self::decode(bytes, &super::super::tests::topology())
     }
 
     pub(in super::super::super) fn encode(&self) -> Vec<u8> {
-        let bytes = self.0.command_bytes();
+        let encoded = self.0.encode_command().expect("captured bounded finalizer");
+        let bytes = encoded.bytes();
         let mut output = Vec::with_capacity(HEADER_BYTES + bytes.len());
         output.extend_from_slice(MAGIC);
         output.extend_from_slice(&VERSION.to_le_bytes());
-        output.extend_from_slice(&self.0.checksum_crc64().to_le_bytes());
+        output.extend_from_slice(&encoded.checksum_crc64().to_le_bytes());
         output.extend_from_slice(
             &u32::try_from(bytes.len())
                 .expect("bounded source")
                 .to_le_bytes(),
         );
-        output.extend_from_slice(&bytes);
+        output.extend_from_slice(bytes);
         output
     }
 
-    pub(in super::super::super) fn decode(bytes: &[u8]) -> Result<Self, SourceError> {
+    pub(in super::super::super) fn decode(
+        bytes: &[u8],
+        topology: &PgTopology,
+    ) -> Result<Self, SourceError> {
         // Bound the complete carrier and its nested allocation BEFORE decoding
         // any command vectors. No duration, clock or route is interpreted here.
         if bytes.len() > MAX_SOURCE_BYTES {
@@ -106,7 +174,7 @@ impl PartFinalizationSource {
         }
         let checksum = u64::from_le_bytes(header[10..18].try_into().expect("fixed header"));
         let len = u32::from_le_bytes(header[18..22].try_into().expect("fixed header")) as usize;
-        if len > MAX_METADATA_COMMAND_BYTES {
+        if len > MAX_FINALIZER_BYTES {
             return Err(SourceError::Encoding("source command exceeds bound"));
         }
         if len != command.len() {
@@ -115,10 +183,9 @@ impl PartFinalizationSource {
         if checksum::crc64::checksum(command) != checksum {
             return Err(SourceError::Encoding("source checksum"));
         }
-        let source =
-            decode_metadata_command_envelope(command, &MetadataCommandDecodeAuthority::new())?;
-        Self::require_kind(&source)?;
-        Ok(Self(source))
+        let source = ContextualCommand::decode_finalizer_source(command, checksum, topology)
+            .map_err(Self::carrier_error)?;
+        Self::capture(&source)
     }
 
     pub(in super::super::super) fn bind_cleanup(
@@ -126,10 +193,13 @@ impl PartFinalizationSource {
         command: MetadataCommandEnvelope,
         topology: &PgTopology,
     ) -> Result<AbandonedPartCleanupCommand, AbandonmentError> {
-        super::validate_part_closure_subject(topology, &self.0, &command)?;
+        if topology != &self.0.topology {
+            return Err(AbandonmentError::Topology);
+        }
+        abandonment::validate_part_closure_subject(topology, self.draft(), &command)?;
         Ok(AbandonedPartCleanupCommand {
             command,
-            source: Arc::new(self),
+            source: self,
             topology: topology.clone(),
         })
     }
@@ -144,7 +214,7 @@ impl AbandonedPartCleanupCommand {
         bytes: &[u8],
         topology: &PgTopology,
     ) -> Result<Self, AbandonmentError> {
-        PartFinalizationSource::decode(bytes)?.bind_cleanup(command, topology)
+        PartFinalizationSource::decode(bytes, topology)?.bind_cleanup(command, topology)
     }
 
     pub(in super::super::super) fn command(&self) -> &MetadataCommandEnvelope {
@@ -177,10 +247,10 @@ impl AbandonedPartCleanupCommand {
             return Err(AbandonmentError::ReissuePosition);
         }
         let command = MetadataCommandEnvelope::new(id, self.command.payload().clone());
-        super::validate_part_closure_subject(&self.topology, &self.source.0, &command)?;
+        abandonment::validate_part_closure_subject(&self.topology, self.source.draft(), &command)?;
         Ok(Self {
             command,
-            source: Arc::clone(&self.source),
+            source: self.source.clone(),
             topology: self.topology.clone(),
         })
     }
@@ -196,6 +266,33 @@ impl AbandonedPartCleanupCommand {
 }
 
 impl BoundPartCleanup<'_> {
+    pub(in super::super) fn source_has_started_publication(
+        &self,
+        pg: &PgStore,
+    ) -> Result<bool, AbandonmentError> {
+        let encoded = self
+            .0
+            .source
+            .0
+            .encode_command()
+            .map_err(PartFinalizationSource::carrier_error)?;
+        Ok(pg.complete_source_has_started_publication(&encoded)?)
+    }
+
+    pub(in super::super) fn inspect_source_terminal(
+        &self,
+        pg: &PgStore,
+        node_id: u32,
+    ) -> Result<MetadataCommandStartupDisposition, AbandonmentError> {
+        let encoded = self
+            .0
+            .source
+            .0
+            .encode_command()
+            .map_err(PartFinalizationSource::carrier_error)?;
+        Ok(encoded.inspect_terminal_in_open_transaction(pg, node_id)?)
+    }
+
     /// Read-only inspection in the caller's PG snapshot. Replica application
     /// must re-run this validation in its mutation transaction; this returns no
     /// certificate, raw source or permission to release/delete anything.
@@ -204,7 +301,7 @@ impl BoundPartCleanup<'_> {
         pg: &PgStore,
         node_id: u32,
     ) -> Result<(), AbandonmentError> {
-        super::require_abandoned_source_in_open_transaction(pg, node_id, self)
+        abandonment::require_abandoned_source_in_open_transaction(pg, node_id, self)
     }
 
     /// Project cleanup payload using the immutable original source, not a live
@@ -213,7 +310,8 @@ impl BoundPartCleanup<'_> {
     pub(in super::super::super) fn pending_payload_references(
         &self,
     ) -> Result<Vec<crate::types::ShardScavengerPayloadReference>, crate::StoreError> {
-        let MetadataCommandPayload::CommitStreamPart(source) = self.0.source.0.payload() else {
+        let MetadataCommandPayload::CommitStreamPart(source) = self.0.source.draft().payload()
+        else {
             unreachable!("private source carrier requires CommitStreamPart");
         };
         let mut references = Vec::new();
@@ -247,7 +345,7 @@ impl BoundPartCleanup<'_> {
             PendingMetadataCommandRouteDependency, PendingRouteTarget,
         };
 
-        let source = &self.0.source.0;
+        let source = self.0.source.draft();
         let MetadataCommandPayload::CommitStreamPart(part) = source.payload() else {
             unreachable!("private source carrier requires CommitStreamPart");
         };
@@ -272,14 +370,14 @@ impl BoundPartCleanup<'_> {
         routes
     }
 
-    pub(super) fn inputs(
+    pub(in super::super) fn inputs(
         &self,
     ) -> (
         &PgTopology,
         &MetadataCommandEnvelope,
         &MetadataCommandEnvelope,
     ) {
-        (&self.0.topology, &self.0.source.0, &self.0.command)
+        (&self.0.topology, self.0.source.draft(), &self.0.command)
     }
 
     pub(in super::super::super) fn apply_in_open_transaction(
@@ -292,6 +390,6 @@ impl BoundPartCleanup<'_> {
         // the original command's SHA-256, not just its CRC64. Do not cache the
         // disposition: validate the exact source and
         // follow-up under the same transaction that transfers custody.
-        super::apply_part_closure_in_open_transaction(pg, node_id, self)
+        abandonment::apply_part_closure_in_open_transaction(pg, node_id, self)
     }
 }

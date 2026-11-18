@@ -573,6 +573,15 @@ pub(crate) fn storage_rpc_admission_class(
         }
 
         StorageRpcMessageKind::ShardWrite
+        | StorageRpcMessageKind::StagingShardWrite
+        | StorageRpcMessageKind::StagingShardAckRecord
+        | StorageRpcMessageKind::StagingStreamAppendPrepare
+        | StorageRpcMessageKind::StagingStreamAppendInstall
+        | StorageRpcMessageKind::StagingDirectSnapshot
+        | StorageRpcMessageKind::StagingDirectPrepare
+        | StorageRpcMessageKind::StagingDirectInstall
+        | StorageRpcMessageKind::StagingDirectIntroductionPrepare
+        | StorageRpcMessageKind::StagingDirectIntroductionInstall
         | StorageRpcMessageKind::ShardRepairWrite
         | StorageRpcMessageKind::ShardAckRecord
         | StorageRpcMessageKind::ShardAckValidate
@@ -1255,7 +1264,43 @@ mod tests {
     #[test]
     fn shard_write_uses_progress_admission_class() {
         assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingDirectInstall),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingDirectIntroductionPrepare),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingDirectIntroductionInstall),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingDirectPrepare),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingDirectSnapshot),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
             storage_rpc_admission_class(StorageRpcMessageKind::ShardWrite),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingShardWrite),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingShardAckRecord),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingStreamAppendPrepare),
+            UnixStorageNodeRpcAdmissionClass::Progress
+        );
+        assert_eq!(
+            storage_rpc_admission_class(StorageRpcMessageKind::StagingStreamAppendInstall),
             UnixStorageNodeRpcAdmissionClass::Progress
         );
     }

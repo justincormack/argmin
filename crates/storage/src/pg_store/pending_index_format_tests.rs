@@ -86,12 +86,14 @@ fn pending_index_route_v1_frozen_checksum_and_retired_schema_rejection() {
         ).unwrap();
         drop(conn);
         let conn = Connection::open(&path).unwrap();
+        let pg = PgStore::uninitialized(0, Default::default(), Default::default(), conn).unwrap();
+        let conn = &pg.conn;
         let before = conn.total_changes();
-        let error = super::super::schema::init_pg_schema(&conn).unwrap_err();
+        let error = super::super::schema::test_initialize(&pg).unwrap_err();
         assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
         assert!(error
             .to_string()
-            .contains("unsupported version 11; expected 12"));
+            .contains("unsupported version 11; expected 13"));
         assert_eq!(conn.total_changes(), before);
         let persisted: i64 = conn.query_row(
             "SELECT dependency_checksum FROM metadata_command_pending_route_dependencies WHERE singleton = 0",

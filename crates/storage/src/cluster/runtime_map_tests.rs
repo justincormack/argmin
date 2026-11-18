@@ -25,6 +25,7 @@ mod runtime_map_refresh_invalidation_tests {
                         ClusterEpoch::INITIAL,
                         NonZeroU64::new(1).unwrap(),
                         checksum,
+                        [0xA5; 32],
                     ),
                 ),
             )
@@ -76,6 +77,7 @@ mod runtime_map_refresh_invalidation_tests {
                         ClusterEpoch::INITIAL,
                         NonZeroU64::new(1).unwrap(),
                         pg_id as u64 + 1,
+                        [0xA5; 32],
                     ),
                 ),
             )
@@ -179,6 +181,7 @@ mod runtime_map_refresh_invalidation_tests {
                                     ClusterEpoch::INITIAL,
                                     NonZeroU64::new(1).unwrap(),
                                     pg_id as u64 + 1,
+                                    [0xA5; 32],
                                 ),
                             ),
                         )
@@ -226,6 +229,7 @@ mod runtime_map_refresh_invalidation_tests {
                                     ClusterEpoch::INITIAL,
                                     NonZeroU64::new(1).unwrap(),
                                     pg_id as u64 + 1,
+                                    [0xA5; 32],
                                 ),
                             ),
                         )
@@ -1865,6 +1869,7 @@ mod runtime_map_refresh_invalidation_tests {
                         ClusterEpoch::INITIAL,
                         std::num::NonZeroU64::MIN,
                         0,
+                        [0xA5; 32],
                     ),
                 },
             ),

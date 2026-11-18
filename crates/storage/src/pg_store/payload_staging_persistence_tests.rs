@@ -31,7 +31,7 @@ fn seed(store: &PgStore, owner: &StagingOwnerRecord) {
             owner.subject.payload_generation,
         )
         .unwrap();
-    insert(&store.conn, owner);
+    insert(store, owner);
     assert_eq!(
         store.cached_metadata_state_digest().unwrap(),
         store.metadata_state_digest().unwrap()

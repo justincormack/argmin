@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::metadata_transaction::{with_rollback_error, MetadataTransaction};
 use super::*;
 
 #[cfg(test)]
@@ -10,6 +11,10 @@ mod deadline_tests;
 #[cfg(test)]
 #[path = "shard_ack_deadline_tests.rs"]
 mod ack_deadline_tests;
+
+#[cfg(test)]
+#[path = "shard_transaction_tests.rs"]
+mod transaction_tests;
 
 #[cfg(test)]
 #[path = "shard_deletion_tests.rs"]
@@ -529,6 +534,11 @@ impl PgStore {
                             if actual.stored_size == expected.stored_size
                                 && actual.crc64 == expected.crc64
                             {
+                                if existing != data {
+                                    return Err(StoreError::PayloadShardSetMismatch {
+                                        reason: "existing shard bytes differ from exact publication retry".into(),
+                                    });
+                                }
                                 if let Some(parent) = shard_path.parent() {
                                     sync_prefix_dir(parent).map_err(|e| StoreError::Io {
                                         context: "fsync shard parent dir",
@@ -665,71 +675,6 @@ impl PgStore {
         Ok(())
     }
 
-    pub fn register_written_shards_batch(
-        &self,
-        shards: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), StoreError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "PgStore::register_written_shards_batch",
-            "pg_id={} shards={}",
-            self.pg_id,
-            shards.len()
-        );
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "register written shards batch (begin txn)",
-                source: e.into(),
-            })?;
-
-        let now = Self::now_secs() as i64;
-        let result: Result<(), StoreError> = (|| {
-            let mut stmt = self
-                .conn
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO shards (shard_key, data_size, crc64_nvme, created_at, status) \
-                     VALUES (?1, ?2, ?3, ?4, 0)",
-                )
-                .map_err(|e| StoreError::Db {
-                    context: "register written shards batch (prepare)",
-                    source: e.into(),
-                })?;
-
-            for (key, ack) in shards {
-                stmt.execute(params![
-                    key.as_bytes().as_slice(),
-                    ack.stored_size as i64,
-                    ack.crc64 as i64,
-                    now,
-                ])
-                .map_err(|e| StoreError::Db {
-                    context: "register written shards batch (insert shard record)",
-                    source: e.into(),
-                })?;
-            }
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(StoreError::Db {
-                        context: "register written shards batch (commit txn)",
-                        source: e.into(),
-                    });
-                }
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-
     pub fn register_written_shards_batch_exact(
         &self,
         shards: &[(&ShardKey, WriteAck)],
@@ -784,12 +729,10 @@ impl PgStore {
             self.pg_id,
             shards.len()
         );
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "register written shards batch exact (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = MetadataTransaction::begin_outer(
+            self,
+            "register written shards batch exact (begin txn)",
+        )?;
 
         let now = Self::now_secs() as i64;
         let result: Result<(), StoreError> = (|| {
@@ -869,24 +812,16 @@ impl PgStore {
             Ok(())
         })();
 
+        #[cfg(test)]
+        let result = result.and_then(|()| transaction_tests::before_finish(self));
         match result {
-            Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(StoreError::Db {
-                        context: "register written shards batch exact (commit txn)",
-                        source: e.into(),
-                    });
-                }
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
+            Ok(()) => transaction.commit("register written shards batch exact (commit txn)"),
+            Err(error) => Err(with_rollback_error(error, transaction.rollback())),
         }
     }
 
+    // Atomicity fixture only. Production appends use the admitted command path.
+    #[cfg(test)]
     pub fn register_written_shards_and_append_stream_segment(
         &self,
         shards: &[(&ShardKey, WriteAck)],
@@ -901,12 +836,14 @@ impl PgStore {
             segment.segment_index,
             shards.len()
         );
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "append stream segment with shard publish (begin txn)",
-                source: e.into(),
-            })?;
+        let transaction = MetadataTransaction::begin_outer(
+            self,
+            "append stream segment with shard publish (begin txn)",
+        )
+        .map_err(|error| MetadataError::Db {
+            context: "append stream segment with shard publish (begin txn)",
+            source: crate::error::DatabaseError::new(error.to_string()),
+        })?;
 
         let now = Self::now_secs() as i64;
         let result: Result<(), MetadataError> = (|| {
@@ -963,21 +900,26 @@ impl PgStore {
             Ok(())
         })();
 
+        let result = result.and_then(|()| {
+            transaction_tests::before_finish(self)
+                .map_err(|source| MetadataError::RouteEffectRejected { source })
+        });
         match result {
-            Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "append stream segment with shard publish (commit txn)",
-                        source: e.into(),
-                    });
-                }
-                Ok(())
-            }
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
+            Ok(()) => transaction
+                .commit("append stream segment with shard publish (commit txn)")
+                .map_err(|error| MetadataError::Db {
+                    context: "append stream segment with shard publish (commit txn)",
+                    source: crate::error::DatabaseError::new(error.to_string()),
+                }),
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(MetadataError::Db {
+                    context: "append stream segment with shard publish rollback failed",
+                    source: crate::error::DatabaseError::new(format!(
+                        "operation: {error}; rollback: {rollback}"
+                    )),
+                }),
+            },
         }
     }
 }

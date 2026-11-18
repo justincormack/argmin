@@ -137,6 +137,7 @@ fn authorized_recovery_rejects_malformed_encryption_profile_before_effects() {
         fixture.active_epoch,
         NonZeroU64::new(command.id().log_index().get()).unwrap(),
         checksum::crc64::checksum(&malformed_bytes),
+        checksum::sha256::digest(&malformed_bytes),
     );
     fixture
         .authority
@@ -417,6 +418,7 @@ fn incomplete_fallback_scan_retries_skipped_pg_after_target_releases_claim() {
                         first_command.id().cluster_epoch(),
                         NonZeroU64::new(first_command.id().log_index().get()).unwrap(),
                         first_command.checksum_crc64(),
+                        first_command.command_sha256(),
                     ),
                 ),
             )],
@@ -570,6 +572,7 @@ fn route_independent_listing_recovers_later_real_authority_task_after_earlier_fa
         active_epoch,
         std::num::NonZeroU64::MIN,
         command.checksum_crc64(),
+        command.command_sha256(),
     );
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
     authority.set_pg_state(pg_id, PgState::Peering).unwrap();
@@ -800,6 +803,7 @@ fn scoped_local_pending_recovery_ignores_unrelated_retired_route_actor() {
         pending_epoch,
         std::num::NonZeroU64::MIN,
         command.checksum_crc64(),
+        command.command_sha256(),
     );
     insert_pending_metadata_command_for_test(&local_map, pg_id, &bucket, &command);
 
@@ -1004,6 +1008,7 @@ fn refresh_recovery_applies_direct_put_from_historical_active_route() {
         active_epoch,
         std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
         command.checksum_crc64(),
+        command.command_sha256(),
     );
     authority.set_pg_state(pg_id, PgState::Peering).unwrap();
     for node_id in node_ids {
@@ -1159,6 +1164,7 @@ impl HistoricalRouteRecoveryFixture {
             self.active_epoch,
             std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
             command.checksum_crc64(),
+            command.command_sha256(),
         );
         self.authority
             .set_pg_state(self.pg_id, PgState::Peering)
@@ -1185,6 +1191,7 @@ impl HistoricalRouteRecoveryFixture {
             self.active_epoch,
             std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
             command.checksum_crc64(),
+            command.command_sha256(),
         );
         for node_id in self.node_ids {
             self.now_ms += 1;
@@ -1289,6 +1296,109 @@ impl HistoricalRouteRecoveryFixture {
         assert_eq!(outcome, PendingMetadataCommandOutcome::Applied);
         1
     }
+}
+
+#[test]
+fn refresh_recovery_sha_only_identity_change_reports_both_digests_without_mutation() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-sha-only-mismatch");
+    let bucket = BucketName::new("historical-sha-only-mismatch").unwrap();
+    let command = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        fixture
+            .active_map
+            .test_next_metadata_command_log_index(fixture.pg_id)
+            .get(),
+        bucket.clone(),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &fixture.active_map,
+        NodeId::new(0),
+        fixture.pg_id,
+        &bucket,
+        &command,
+    );
+    let actual_digest = command.command_sha256();
+    let mut reported_digest = actual_digest;
+    reported_digest[0] ^= 1;
+    let pending = PendingMetadataCommandObservation::new(
+        fixture.active_epoch,
+        std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+        command.checksum_crc64(),
+        reported_digest,
+    );
+    fixture
+        .authority
+        .set_pg_state(fixture.pg_id, PgState::Peering)
+        .unwrap();
+    for node_id in fixture.node_ids {
+        fixture.now_ms += 1;
+        heartbeat_authority_with_pending(
+            &mut fixture.authority,
+            &fixture.active_map,
+            node_id,
+            fixture.pg_id,
+            (node_id == NodeId::new(0)).then_some(pending),
+            fixture.now_ms,
+        );
+    }
+    let states = || {
+        fixture.node_ids.map(|node_id| {
+            let pg = fixture
+                .active_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(fixture.pg_id.get())
+                .unwrap();
+            pg.metadata_command_replica_state().unwrap()
+        })
+    };
+    let before = states();
+    let error = fixture
+        .handle
+        .recover_reported_pending_metadata_command(
+            &fixture.authority,
+            fixture.now_ms + 1,
+            None,
+            fixture.pg_id,
+            NodeId::new(0),
+            pending,
+        )
+        .unwrap_err();
+    let PendingMetadataCommandRefreshRecoveryError::IdentityChanged {
+        expected_epoch,
+        expected_index,
+        expected_checksum,
+        expected_sha256,
+        actual_epoch,
+        actual_index,
+        actual_checksum,
+        actual_sha256,
+        ..
+    } = &error
+    else {
+        panic!("expected the exact-command identity diagnostic: {error}");
+    };
+    assert_eq!(expected_epoch, actual_epoch);
+    assert_eq!(expected_index, actual_index);
+    assert_eq!(expected_checksum, actual_checksum);
+    assert_eq!(**expected_sha256, reported_digest);
+    assert_eq!(**actual_sha256, actual_digest);
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("SHA-256 {reported_digest:02x?}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("SHA-256 {actual_digest:02x?}")),
+        "{message}"
+    );
+    assert_eq!(error.diagnostic_kind(), "pending_recovery_identity_changed");
+    assert_eq!(states(), before);
+    assert_fixture_pending_command(&fixture, Some(&command));
 }
 
 #[test]

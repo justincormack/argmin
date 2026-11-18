@@ -93,6 +93,57 @@ fn command_build_snapshot_restores_connection_on_error_and_unwind() {
 }
 
 #[test]
+fn command_build_snapshot_failed_rollback_retires_store_on_finish_error_and_unwind() {
+    for exit in ["finish", "error", "unwind"] {
+        let (dir, pg) = fixture();
+        let writes = pg.conn.total_changes();
+        pg.fail_next_snapshot_rollback.set(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let snapshot = pg.command_build_snapshot().unwrap();
+            assert_eq!(canary(&pg), 1);
+            match exit {
+                "finish" => snapshot.finish(),
+                "error" => Err(MetadataError::InvariantViolation {
+                    context: "snapshot teardown regression",
+                    reason: "injected builder failure".into(),
+                }),
+                "unwind" => panic!("snapshot teardown unwind regression"),
+                _ => unreachable!(),
+            }
+        }));
+        if exit == "unwind" {
+            assert!(result.is_err());
+        } else {
+            let error = result.unwrap().unwrap_err();
+            assert!(error.to_string().contains(if exit == "finish" {
+                "injected read-snapshot rollback failure"
+            } else {
+                "injected builder failure"
+            }));
+        }
+        assert!(
+            !pg.conn.is_autocommit(),
+            "failed rollback was hidden by a retry"
+        );
+        assert!(!read_only(&pg));
+        assert_eq!(pg.conn.total_changes(), writes);
+        assert!(pg.require_usable_connection().is_err());
+        assert!(pg.stream_allocation_issuer(crate::NodeId::new(0)).is_err());
+        assert!(pg.command_build_snapshot().is_err());
+        // Ending the stale transaction is not permission to reuse the store.
+        pg.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(pg.conn.is_autocommit());
+        assert!(pg.require_usable_connection().is_err());
+        assert!(pg.command_build_snapshot().is_err());
+        drop(pg);
+        let pg = PgStore::open(dir.path(), 0).unwrap();
+        pg.require_usable_connection().unwrap();
+        pg.command_build_snapshot().unwrap().finish().unwrap();
+        assert_restored(&pg);
+    }
+}
+
+#[test]
 fn command_build_snapshot_rejects_nesting_without_touching_caller_transaction() {
     let (_dir, pg) = fixture();
     pg.conn

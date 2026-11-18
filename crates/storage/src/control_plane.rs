@@ -60,7 +60,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 18;
+const CONTROL_PLANE_RPC_VERSION: u16 = 19;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -72,7 +72,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 32;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 33;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -91,7 +91,7 @@ const CONTROL_PLANE_RPC_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 1 + 8 + 4;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
-const CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN: usize = 4 + 4 + 8 + 8 + 8;
+const CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN: usize = 4 + 4 + 8 + 8 + 8 + 32;
 const CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN: usize = 4 + 1 + 4;
 const CONTROL_PLANE_RPC_NODE_LEASE_DIAGNOSTIC_MIN_LEN: usize = 4 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
@@ -1883,9 +1883,9 @@ impl ClusterControlSnapshot {
                         pg_id: record.pg_id.get(),
                         cluster_epoch: self.cluster_epoch,
                         first_node_id: existing.reporting_node_id.as_u32(),
-                        first: existing.pending,
+                        first: Box::new(existing.pending),
                         second_node_id: node_id.as_u32(),
-                        second: pending,
+                        second: Box::new(pending),
                     });
                 }
             } else {
@@ -6742,8 +6742,8 @@ pub struct ClusterRuntimeMapSnapshot {
 }
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
-const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v3";
-const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v3";
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v4";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -7221,6 +7221,7 @@ pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSna
                 digest_u64(hasher, pending.cluster_epoch().get());
                 digest_u64(hasher, pending.log_index());
                 digest_u64(hasher, pending.command_checksum());
+                hasher.update(&pending.command_sha256());
             }
             None => digest_u8(hasher, 0),
         }
@@ -8165,6 +8166,7 @@ pub struct PendingMetadataCommandObservation {
     cluster_epoch: ClusterEpoch,
     log_index: NonZeroU64,
     command_checksum: u64,
+    command_sha256: [u8; 32],
 }
 
 impl PendingMetadataCommandObservation {
@@ -8173,11 +8175,13 @@ impl PendingMetadataCommandObservation {
         cluster_epoch: ClusterEpoch,
         log_index: NonZeroU64,
         command_checksum: u64,
+        command_sha256: [u8; 32],
     ) -> Self {
         Self {
             cluster_epoch,
             log_index,
             command_checksum,
+            command_sha256,
         }
     }
 
@@ -8194,6 +8198,13 @@ impl PendingMetadataCommandObservation {
     #[must_use]
     pub const fn command_checksum(self) -> u64 {
         self.command_checksum
+    }
+
+    /// Cryptographic identity of the exact encoded command, including its
+    /// mandatory context when present. CRC64 alone cannot authorize recovery.
+    #[must_use]
+    pub const fn command_sha256(self) -> [u8; 32] {
+        self.command_sha256
     }
 }
 
@@ -10192,7 +10203,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
@@ -10219,7 +10230,11 @@ fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> S
                 .pending_metadata_command
                 .map(PendingMetadataCommandObservation::command_checksum)
         ),
-        record.metadata_log_epoch.get()
+        record.metadata_log_epoch.get(),
+        record.pending_metadata_command.map_or_else(
+            || "-".to_owned(),
+            |pending| hex_encode(&pending.command_sha256())
+        )
     )
 }
 
@@ -11280,10 +11295,10 @@ fn parse_node_pg_record(
     value: &str,
 ) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 14 {
+    if fields.len() != 15 {
         return Err(parse_error(
             line,
-            "node PG observation record must have fourteen fields",
+            "node PG observation record must have fifteen fields",
         ));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
@@ -11311,19 +11326,30 @@ fn parse_node_pg_record(
     let pending_command_checksum = parse_option_u64(line, fields[12], "pending command checksum")?;
     let metadata_log_epoch = ClusterEpoch::new(parse_u64(line, fields[13], "metadata log epoch")?)
         .ok_or_else(|| parse_error(line, "metadata log epoch must be nonzero"))?;
+    let pending_command_sha256 = if fields[14] == "-" {
+        None
+    } else {
+        Some(
+            hex_decode(line, fields[14])?
+                .try_into()
+                .map_err(|_| parse_error(line, "pending command SHA-256 must contain 32 bytes"))?,
+        )
+    };
     let pending_metadata_command = match (
         pending_cluster_epoch,
         pending_log_index,
         pending_command_checksum,
+        pending_command_sha256,
     ) {
-        (None, None, None) => None,
-        (Some(cluster_epoch), Some(log_index), Some(command_checksum)) => {
+        (None, None, None, None) => None,
+        (Some(cluster_epoch), Some(log_index), Some(command_checksum), Some(command_sha256)) => {
             let log_index = NonZeroU64::new(log_index)
                 .ok_or_else(|| parse_error(line, "pending command log index must be nonzero"))?;
             Some(PendingMetadataCommandObservation::new(
                 cluster_epoch,
                 log_index,
                 command_checksum,
+                command_sha256,
             ))
         }
         _ => {

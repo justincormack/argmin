@@ -415,7 +415,7 @@ fn staging_close_cannot_demote_published_ownership_or_run_without_transaction() 
             )
             .unwrap();
         sql::insert(
-            &pg.conn,
+            &pg,
             owner.subject.object_pg,
             &topology(),
             &owner.validate(&topology()).unwrap(),

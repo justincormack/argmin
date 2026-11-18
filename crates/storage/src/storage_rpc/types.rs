@@ -180,6 +180,15 @@ pub(crate) enum StorageRpcMessageKind {
     ShardHistoricalReadRange = 175,
     ObjectGenerationReserveCommandBuild = 176,
     ObjectStreamAppendCommandBuild = 177,
+    StagingShardWrite = 178,
+    StagingShardAckRecord = 179,
+    StagingStreamAppendPrepare = 180,
+    StagingStreamAppendInstall = 181,
+    StagingDirectSnapshot = 182,
+    StagingDirectPrepare = 183,
+    StagingDirectInstall = 184,
+    StagingDirectIntroductionPrepare = 185,
+    StagingDirectIntroductionInstall = 186,
 }
 
 /// Opaque diagnostic identifying a failure reported by a storage node.
@@ -220,6 +229,9 @@ pub(crate) enum StorageRpcWireErrorCode {
     MultipartConditionalRequestConflict = 25,
     MetadataCommandIntegrity = 26,
     MetadataCommandMutationUncertain = 27,
+    /// The requested retained-log interval exceeds its cumulative validation
+    /// byte budget. Only this error permits retrying a smaller interval.
+    RetainedLogValidationBudgetExceeded = 28,
 }
 
 pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
@@ -266,6 +278,8 @@ impl StorageNodeFailure {
         Self(StorageRpcWireErrorCode::MetadataCommandIntegrity);
     pub(crate) const MetadataCommandMutationUncertain: Self =
         Self(StorageRpcWireErrorCode::MetadataCommandMutationUncertain);
+    pub(crate) const RetainedLogValidationBudgetExceeded: Self =
+        Self(StorageRpcWireErrorCode::RetainedLogValidationBudgetExceeded);
 
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
@@ -296,6 +310,7 @@ impl StorageNodeFailure {
             25 => Ok(Self::MultipartConditionalRequestConflict),
             26 => Ok(Self::MetadataCommandIntegrity),
             27 => Ok(Self::MetadataCommandMutationUncertain),
+            28 => Ok(Self::RetainedLogValidationBudgetExceeded),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -329,6 +344,15 @@ impl StorageRpcMessageKind {
             Self::Health => "health",
             Self::MetadataCommand => "metadata command",
             Self::ShardWrite => "shard write",
+            Self::StagingShardWrite => "staging shard write",
+            Self::StagingShardAckRecord => "staging shard acknowledgement record",
+            Self::StagingStreamAppendPrepare => "staging stream append preparation",
+            Self::StagingStreamAppendInstall => "staging stream append installation",
+            Self::StagingDirectSnapshot => "staging direct payload snapshot",
+            Self::StagingDirectPrepare => "staging direct terminal preparation",
+            Self::StagingDirectInstall => "staging direct terminal installation",
+            Self::StagingDirectIntroductionPrepare => "staging direct introduction preparation",
+            Self::StagingDirectIntroductionInstall => "staging direct introduction installation",
             Self::ShardRepairWrite => "shard repair write",
             Self::ShardRead => "shard read",
             Self::ShardHistoricalRead => "shard historical read",
@@ -739,6 +763,15 @@ impl StorageRpcMessageKind {
             175 => Ok(Self::ShardHistoricalReadRange),
             176 => Ok(Self::ObjectGenerationReserveCommandBuild),
             177 => Ok(Self::ObjectStreamAppendCommandBuild),
+            178 => Ok(Self::StagingShardWrite),
+            179 => Ok(Self::StagingShardAckRecord),
+            180 => Ok(Self::StagingStreamAppendPrepare),
+            181 => Ok(Self::StagingStreamAppendInstall),
+            182 => Ok(Self::StagingDirectSnapshot),
+            183 => Ok(Self::StagingDirectPrepare),
+            184 => Ok(Self::StagingDirectInstall),
+            185 => Ok(Self::StagingDirectIntroductionPrepare),
+            186 => Ok(Self::StagingDirectIntroductionInstall),
             _ => Err(StorageRpcFrameError::UnknownMessageKind(value)),
         }
     }

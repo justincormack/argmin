@@ -788,6 +788,7 @@ metadata_proof_carrier_leaks=$(
             crates/storage/src \
             -g '*.rs' \
             -g '!crates/storage/src/pg_store/command_log.rs' \
+            -g '!crates/storage/src/pg_store/complete_command_log_range.rs' \
             || true
         rg -n --color=never \
             '\b(MetadataCommandLogHash|CanonicalStateDigest)::from_encoded_parts\b' \

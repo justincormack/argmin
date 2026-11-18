@@ -559,10 +559,12 @@ fn control_plane_raft_durable_restart_artifact_v6_aggregate_is_exact_and_complet
         let decoded = ControlPlaneRaftRestartArtifact::decode_durable_artifact(bytes).unwrap();
         assert_eq!(decoded.encode_durable_artifact().unwrap(), *bytes);
     }
+    let frozen = raft_test_decode_hex(include_str!("restart_v6_command_v20_state_v32.hex"));
+    assert_eq!(aggregate, crate::tests::frozen_hex_fixture(include_str!("restart_v6_command_v21_state_v33.hex")));
     assert_eq!(
         (
-            aggregate.len(),
-            raft_test_hex(&checksum::sha256::digest(&aggregate))
+            frozen.len(),
+            raft_test_hex(&checksum::sha256::digest(&frozen))
         ),
         (
             2200,

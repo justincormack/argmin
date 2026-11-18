@@ -15,6 +15,25 @@
 
 use std::collections::BTreeSet;
 
+/// Validated row descriptions, not mutation authority. Only the owning file
+/// holder or independently admitted receiver can bind these to an effect fence.
+pub(in crate::node_runtime) struct StagingAcknowledgementRecords {
+    pub(super) pg: PgId,
+    pub(super) primary: NodeId,
+    pub(super) epoch: ClusterEpoch,
+    pub(super) rows: Vec<(crate::ShardKey, crate::WriteAck)>,
+}
+
+impl StagingAcknowledgementRecords {
+    pub(in crate::node_runtime) fn destination(&self) -> (PgId, NodeId, ClusterEpoch) {
+        (self.pg, self.primary, self.epoch)
+    }
+
+    pub(in crate::node_runtime) fn rows(&self) -> &[(crate::ShardKey, crate::WriteAck)] {
+        &self.rows
+    }
+}
+
 use crate::metadata_command::{
     BucketWriteReservationProof, MetadataCommandId, StreamAllocationIssuer,
     PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
@@ -35,17 +54,68 @@ mod sql;
 #[path = "payload_staging_capture.rs"]
 mod capture;
 
+#[path = "payload_staging_direct_introduction.rs"]
+mod direct_introduction;
+pub(in crate::node_runtime) use direct_introduction::CapturedDirectIntroduction;
+pub(in crate::node_runtime) use direct_introduction::CapturedDirectIntroductionCore;
+pub(in crate::node_runtime::pg_store) use direct_introduction::DirectIntroductionFileScope;
+#[cfg(test)]
+pub(in crate::node_runtime) use direct_introduction::DirectIntroductionInstallation;
+pub(in crate::node_runtime::pg_store) use direct_introduction::DirectIntroductionRetirementScope;
+pub(in crate::node_runtime::pg_store) use direct_introduction::DirectIntroductionWindowScope;
+pub(crate) use direct_introduction::DirectPutRequestCustody;
+pub(in crate::node_runtime::pg_store) use direct_introduction::RemoteIntroductionRetirementScope;
+pub(in crate::node_runtime::pg_store) use direct_introduction::{
+    RemoteIntroductionFileScope, RemoteIntroductionWindowScope,
+};
+pub(in crate::node_runtime) use direct_introduction::{
+    RemoteIntroductionInstallation, RemoteIntroductionInstallationState,
+};
+
+#[path = "payload_staging_acknowledged_append.rs"]
+mod acknowledged_append;
+pub(super) use acknowledged_append::capture_acknowledged_append;
+pub(in crate::node_runtime) use acknowledged_append::CapturedStreamAppend;
+
 #[path = "payload_staging_candidate.rs"]
 mod candidate;
 
 #[path = "payload_staging_submission.rs"]
 mod submission;
+pub(super) use submission::{CompletePendingReplacement, SubmissionError};
+
+pub(in crate::node_runtime) use submission::RemoteDirectInstallationAttempt;
+pub(in crate::node_runtime) use submission::RemoteDirectIntroductionAttempt;
+pub(in crate::node_runtime) use submission::RemoteStreamAppendInstallationAttempt;
 
 #[path = "payload_staging_command_context.rs"]
 mod command_context;
+pub(super) use command_context::ApplicationError;
+pub(in crate::node_runtime) use command_context::CapturedDirectTerminal;
+pub(super) use command_context::CapturedWindowRead;
+pub(crate) use command_context::CommandContextCodecAuthority;
+pub(crate) use command_context::CompleteTerminalReservationRelease;
+pub(super) use command_context::ContextError;
+pub(super) use command_context::ContextualCommand;
+pub(in crate::node_runtime::pg_store) use command_context::DirectInstallationCheck;
+pub(super) use command_context::EncodedContextualCommand;
+pub(in crate::node_runtime) use command_context::RemoteDirectPreparationQuery;
+pub(in crate::node_runtime) use command_context::{
+    AbandonedPartCustodyError, AbandonedPartCustodyObservation,
+};
+pub(super) use command_context::{CompletePendingIndexes, CompletePendingProjection};
+#[allow(unused_imports)] // Candidate terminal diagnostics; execution remains gated.
+pub(super) use command_context::{
+    TerminalPayloadWork, TerminalReservationWork, TerminalSlotWork, TerminalWorkObservation,
+};
 
 #[path = "payload_staging_descriptor.rs"]
 mod descriptor;
+pub(super) use descriptor::DirectStagingManifest;
+pub(in crate::node_runtime) use descriptor::{
+    StagingWindowConfirmationError, StagingWindowConfirmationObservation,
+    StagingWindowConfirmationRequest, StagingWindowInspectionDescription,
+};
 
 #[path = "payload_staging_introduction.rs"]
 mod introduction;
@@ -55,6 +125,15 @@ mod append;
 
 #[path = "payload_staging_preparation.rs"]
 mod preparation;
+pub(super) use preparation::prepare_confirmed_stream_window;
+#[path = "payload_staging_remote_direct_snapshot.rs"]
+mod remote_direct_snapshot;
+#[path = "payload_staging_remote_preparation.rs"]
+mod remote_preparation;
+pub(in crate::node_runtime) use remote_direct_snapshot::RemoteDirectSnapshotQuery;
+pub(in crate::node_runtime) use remote_preparation::{
+    RemoteStreamAllocationQuery, RemoteStreamAppendQuery,
+};
 
 #[path = "payload_staging_close.rs"]
 mod close;
@@ -88,6 +167,7 @@ mod inventory;
 
 pub(super) use descriptor::PendingStagingProtection;
 pub(super) use sql::{ROUTE_REFERENCES, SCHEMA, TABLES};
+pub(super) use submission::{ContextSubmissionObservation, SubmittedPublicationEvidence};
 
 pub(super) fn extend_scavenger_protection_page(
     conn: &rusqlite::Connection,

@@ -282,9 +282,11 @@ pub(super) fn apply_in_open_transaction(
     // No commit/fsync: this nests inside the command's existing transaction.
     // Roll back the generation high-water, reservation and session too if any
     // owner child fails; callers cannot accidentally commit a partial apply.
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    bound.apply_live(pg)?;
-    sql::insert(&pg.conn, PgId::new(pg.pg_id), configured_topology, &checked)?;
-    savepoint.commit()?;
-    Ok(IntroductionApplied::Created)
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        bound.apply_live(pg)?;
+        sql::insert(pg, PgId::new(pg.pg_id), configured_topology, &checked)?;
+        Ok(IntroductionApplied::Created)
+    })();
+    savepoint.finish(result)
 }

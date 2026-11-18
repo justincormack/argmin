@@ -589,6 +589,88 @@ include!("storage_node_server/admission.rs");
 
 include!("storage_node_server/routes.rs");
 
+// Compiled before activation; only installed unit tests select this grammar.
+#[allow(dead_code)] // Candidate current-replica admission, not live RPC selection.
+#[path = "storage_node_server/complete_application.rs"]
+mod complete_application;
+#[allow(dead_code)] // Owner tests alone select installed complete application.
+#[path = "storage_node_server/complete_application_rpc.rs"]
+mod complete_application_rpc;
+#[path = "storage_node_server/complete_direct_file_receiver.rs"]
+#[allow(dead_code)] // Candidate file receiver; live RPC selection remains gated.
+mod complete_direct_file_receiver;
+#[allow(dead_code)]
+#[path = "storage_node_server/complete_log.rs"]
+mod complete_log;
+#[allow(dead_code)]
+#[path = "storage_node_server/complete_maintenance.rs"]
+mod complete_maintenance;
+#[allow(dead_code)]
+#[path = "storage_node_server/complete_pending.rs"]
+mod complete_pending;
+#[allow(dead_code)]
+#[path = "storage_node_server/complete_publication.rs"]
+mod complete_publication;
+#[allow(dead_code)] // Owner tests select candidate retirement until live activation.
+#[path = "storage_node_server/complete_retirement.rs"]
+mod complete_retirement;
+#[allow(dead_code)] // Candidate witness protocol, not selected by live dispatch.
+#[path = "storage_node_server/complete_settled_prefix.rs"]
+mod complete_settled_prefix;
+#[path = "storage_node_server/complete_staging_ack_receiver.rs"]
+mod complete_staging_ack_receiver;
+#[allow(dead_code)] // Candidate allocation; live selection remains gated.
+#[path = "storage_node_server/complete_stream_allocation.rs"]
+mod complete_stream_allocation;
+#[path = "storage_node_server/complete_stream_append_prepare.rs"]
+mod complete_stream_append_prepare;
+pub(in crate::node_runtime) use complete_stream_append_prepare::RemoteStreamAppendAuthority;
+#[allow(dead_code)] // Candidate receiver only; live frontend selection is gated.
+#[path = "storage_node_server/complete_direct_snapshot.rs"]
+mod complete_direct_snapshot;
+pub(in crate::node_runtime) use complete_direct_snapshot::RemoteDirectSnapshotAuthority;
+#[allow(dead_code)] // Read-only receiver prerequisite; transport and live selection remain gated.
+#[path = "storage_node_server/complete_direct_introduction.rs"]
+mod complete_direct_introduction;
+pub(in crate::node_runtime) use complete_direct_introduction::DirectIntroductionResponseScope;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_direct_introduction::ParkedIntroductionTest;
+pub(in crate::node_runtime) use complete_direct_introduction::RemoteDirectIntroductionAuthority;
+pub(in crate::node_runtime) use complete_direct_introduction::{
+    RemoteIntroductionInstallationAuthority, RemoteIntroductionInstallationInput,
+};
+#[allow(dead_code)] // Receiver lookup prerequisite; physical dispatch remains gated.
+#[path = "storage_node_server/complete_window_peers.rs"]
+mod complete_window_peers;
+#[allow(dead_code)] // Candidate primary inspection; live selection remains gated.
+#[path = "storage_node_server/complete_window_primary.rs"]
+mod complete_window_primary;
+#[allow(dead_code)] // Independent receiver observation; physical dispatch remains gated.
+#[path = "storage_node_server/complete_window_receiver.rs"]
+mod complete_window_receiver;
+pub(in crate::node_runtime) use complete_application::CompleteApplicationAuthority;
+pub(in crate::node_runtime) use complete_maintenance::{
+    CompleteLogMutationAuthority, Mutation as CompleteLogMutation,
+};
+pub(in crate::node_runtime) use complete_publication::CompletePublicationAuthority;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_retirement::test_retirement_before_delete;
+pub(in crate::node_runtime) use complete_retirement::CompleteRetirementAuthority;
+pub(in crate::node_runtime) use complete_stream_allocation::RemoteStreamAllocationAuthority;
+
+#[path = "storage_node_server/complete_abandonment.rs"]
+#[allow(dead_code)] // Candidate receiver remains owner-test-selected.
+mod complete_abandonment;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_abandonment::test_abandonment_before_insert;
+pub(in crate::node_runtime) use complete_abandonment::CompleteAbandonmentAuthority;
+#[path = "storage_node_server/complete_replica_abandonment.rs"]
+#[allow(dead_code)] // Candidate receiver; live selection and owning remote sender remain gated.
+mod complete_replica_abandonment;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_replica_abandonment::test_replica_abandonment_stage;
+pub(in crate::node_runtime) use complete_replica_abandonment::RemoteReplicaAbandonmentAuthority;
+
 impl StorageNodeConnectionHandler {
     fn read_request_frame(
         &self,
@@ -638,6 +720,25 @@ impl StorageNodeConnectionHandler {
         }
         #[cfg(test)]
         let response = &response;
+        #[cfg(test)]
+        if complete_publication::test_lose_committed_reply(response)
+            || complete_application_rpc::test_lose_committed_reply(response)
+            || complete_retirement::test_lose_committed_reply(response)
+            || complete_retirement::test_drop_expired_reply(response)
+            || complete_abandonment::test_lose_committed_reply(response)
+            || complete_settled_prefix::test_lose_reply(response)
+            || complete_stream_allocation::test_lose_reply(response)
+            || complete_direct_file_receiver::test_lose_reply(response)
+            || complete_staging_ack_receiver::test_lose_reply(response)
+            || complete_stream_append_prepare::test_lose_reply(response)
+            || complete_direct_snapshot::test_lose_reply(response)
+            || complete_direct_introduction::test_lose_reply(response)
+        {
+            stream
+                .shutdown(std::net::Shutdown::Both)
+                .map_err(StorageRpcStreamError::Io)?;
+            return Ok(());
+        }
         let Some(auth) = self.rpc_auth.as_deref() else {
             return write_storage_rpc_frame_to(stream, response);
         };
@@ -695,6 +796,7 @@ impl StorageNodeConnectionHandler {
         }
         self.config = Arc::clone(&runtime_route.config);
         self.route_map_lease = runtime_route.route_map_lease;
+        self.window_confirmation_peers = runtime_route.window_confirmation_peers.clone();
     }
 
     fn metadata_command_pg_guard(
@@ -1637,15 +1739,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare => {
-                match decode_stream_segment_append_prepare_request(&frame.payload) {
-                    Ok(request) => {
-                        self.stream_segment_append_prepare_response(route_permit, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.stream_allocation_dispatch(session, route_permit, &frame.payload)
             }
             StorageRpcMessageKind::ObjectMultipartUploadMatch => {
                 match decode_multipart_upload_match_request(
@@ -1867,6 +1961,36 @@ impl StorageNodeConnectionHandler {
                     message: error.to_string(),
                 }),
             },
+            StorageRpcMessageKind::StagingShardWrite => {
+                self.staging_shard_write_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingShardAckRecord => {
+                self.staging_ack_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingStreamAppendPrepare => {
+                self.staging_stream_append_prepare_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingStreamAppendInstall => {
+                self.staging_stream_append_install_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingDirectSnapshot => {
+                self.staging_direct_snapshot_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingDirectPrepare => {
+                self.staging_direct_prepare_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingDirectInstall => {
+                self.staging_direct_install_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingDirectIntroductionPrepare => {
+                self.staging_direct_introduction_dispatch(session, route_permit, &frame.payload)
+            }
+            StorageRpcMessageKind::StagingDirectIntroductionInstall => self
+                .staging_direct_introduction_install_dispatch(
+                    session,
+                    route_permit,
+                    &frame.payload,
+                ),
             StorageRpcMessageKind::ShardRepairWrite => {
                 match decode_shard_write_request(&frame.payload) {
                     Ok(request) => self.shard_repair_write_response(route_permit, request),
@@ -2186,44 +2310,22 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandReplicaState => {
-                match decode_metadata_command_state_request(&frame.payload) {
-                    Ok(request) => self.metadata_command_replica_state_response(session, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_state_dispatch(session, route_permit, &frame.payload)
             }
-            StorageRpcMessageKind::MetadataCommandAcceptance => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => self.metadata_command_acceptance_response(session, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
-            StorageRpcMessageKind::MetadataCommandAbandonAcceptance => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => {
-                        self.metadata_command_abandon_acceptance_response(session, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
+            StorageRpcMessageKind::MetadataCommandAcceptance => self
+                .metadata_command_acceptance_dispatch(
+                    session,
+                    &frame.payload,
+                    crate::node_runtime::pg_store::CompleteAcceptanceKind::Apply,
+                ),
+            StorageRpcMessageKind::MetadataCommandAbandonAcceptance => self
+                .metadata_command_acceptance_dispatch(
+                    session,
+                    &frame.payload,
+                    crate::node_runtime::pg_store::CompleteAcceptanceKind::Abandon,
+                ),
             StorageRpcMessageKind::MetadataCommandPublicationStart => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => {
-                        self.metadata_command_publication_start_response(session, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_publication_dispatch(session, route_permit, &frame.payload)
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert => {
                 match decode_metadata_command_pending_slot_request(
@@ -2255,18 +2357,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
-                match decode_metadata_command_pending_slot_request(
-                    &frame.payload,
-                    &command_decode_authority,
-                ) {
-                    Ok(request) => {
-                        self.metadata_command_pending_slot_remove_response(session, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_retirement_dispatch(session, route_permit, &frame.payload)
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
                 match decode_metadata_command_pending_slot_replace_request(
@@ -2462,13 +2553,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => self.metadata_command_applied_hashes_response(session, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_applied_hashes_dispatch(session, &frame.payload)
             }
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
                 match decode_metadata_command_matching_applied_request(
@@ -2485,35 +2570,16 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAbandoned => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => self.metadata_command_abandoned_response(session, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_abandoned_dispatch(session, &frame.payload)
             }
-            StorageRpcMessageKind::MetadataCommandRecordAbandoned => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => {
-                        self.metadata_command_record_abandoned_response(session, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned => self
+                .metadata_command_record_abandonment_dispatch(
+                    session,
+                    route_permit,
+                    &frame.payload,
+                ),
             StorageRpcMessageKind::MetadataCommandApplyAndRecord => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
-                    Ok(request) => {
-                        self.metadata_command_apply_and_record_response(session, request)
-                    }
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
+                self.metadata_command_application_dispatch(session, route_permit, &frame.payload)
             }
             StorageRpcMessageKind::MetadataCommandRetainedAbortApply => {
                 match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
@@ -7783,6 +7849,10 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_log_hash_range_response(session, request);
+        }
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
@@ -7837,6 +7907,10 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_log_entry_range_response(session, request);
+        }
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
@@ -7988,6 +8062,10 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_pending_response(session, request);
+        }
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
@@ -8098,6 +8176,14 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_maintenance_response(
+                session,
+                request,
+                complete_maintenance::Operation::Export,
+            );
+        }
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
@@ -8129,6 +8215,14 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_maintenance_response(
+                session,
+                request,
+                complete_maintenance::Operation::Record,
+            );
+        }
         if let Err(error) =
             self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
         {
@@ -8170,6 +8264,14 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        #[cfg(test)]
+        if self.complete_log_operations {
+            return self.complete_metadata_command_maintenance_response(
+                session,
+                request,
+                complete_maintenance::Operation::Compact,
+            );
+        }
         if let Err(error) =
             self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
         {

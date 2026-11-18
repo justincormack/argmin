@@ -96,7 +96,6 @@ use crate::storage_rpc::{
     decode_shard_ack_item_response, decode_shard_read_range_response,
     decode_shard_scavenger_reference_match_response,
     decode_shard_scavenger_reference_page_response, decode_shard_write_ack,
-    decode_storage_rpc_response_payload,
     decode_storage_rpc_response_payload_with_connection_disposition,
     decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
     decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
@@ -378,6 +377,9 @@ fn validate_placed_segment_shard_backfill_claim_epoch(
     Ok(())
 }
 
+#[allow(dead_code)] // Candidate interface; production switches with complete custody.
+#[path = "node_client/complete_pending.rs"]
+mod complete_pending;
 #[path = "node_client/interface.rs"]
 mod interface;
 #[path = "node_client/local.rs"]
@@ -392,6 +394,10 @@ mod unix_object_rpc;
 mod unix_rpc;
 #[path = "node_client/unix_sessions.rs"]
 mod unix_sessions;
+pub(crate) use unix_sessions::{
+    CompletePrimarySessionBorrow, MetadataCommandSessionIdentity,
+    UnixStorageNodeMetadataCommandSession,
+};
 
 use super::payload_placement::PayloadPlacementInput;
 pub(crate) use interface::*;
@@ -798,7 +804,7 @@ fn load_stream_part_finalize_snapshot_from_pg(
     })
 }
 
-fn load_direct_put_commit_snapshot_from_pg(
+pub(in crate::node_runtime) fn load_direct_put_commit_snapshot_from_pg(
     pg: &PgStore,
     node_id: NodeId,
     bucket: &BucketName,
@@ -1487,6 +1493,7 @@ impl MetadataReadAuthorization {
 
 #[allow(dead_code)]
 pub(crate) struct UnixStorageNodeClient {
+    instance: Arc<UnixStorageNodeClientInstance>,
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
     endpoint: StorageRpcClientEndpoint,
@@ -1495,6 +1502,10 @@ pub(crate) struct UnixStorageNodeClient {
     rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
 }
+
+// Not endpoint/admission identity: separate clients may share both. Sessions
+// retain this exact process-local instance for admitted fanout provenance.
+struct UnixStorageNodeClientInstance;
 
 #[derive(Debug)]
 enum StorageRpcRequestDispatchFailure {

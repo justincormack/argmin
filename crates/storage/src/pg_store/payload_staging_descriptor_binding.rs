@@ -20,6 +20,14 @@ use crate::types::{
 };
 use crate::StreamUploadTarget;
 
+#[path = "payload_staging_window_confirmation.rs"]
+mod confirmation;
+pub(in crate::node_runtime::pg_store) use confirmation::DirectStagingManifest;
+pub(in crate::node_runtime) use confirmation::{
+    StagingWindowConfirmationError, StagingWindowConfirmationObservation,
+    StagingWindowConfirmationRequest, StagingWindowInspectionDescription,
+};
+
 pub(in super::super::super) struct BoundIntroductionDescriptor<'a> {
     descriptor: &'a IntroductionDescriptor,
     command: &'a MetadataCommandEnvelope,
@@ -63,6 +71,23 @@ impl IntroductionDescriptor {
 }
 
 impl BoundIntroductionDescriptor<'_> {
+    pub(in super::super::super) fn require_creation_retirement(
+        &self,
+        pg: &PgStore,
+    ) -> Result<(), introduction::IntroductionError> {
+        let expected = &self.descriptor.0;
+        if pg.pg_id != expected.subject.object_pg.get()
+            || !matches!(
+                expected.subject.target,
+                StagingTarget::DirectPut | StagingTarget::UploadPart { .. }
+            )
+        {
+            return Err(introduction::IntroductionError::CommandBinding);
+        }
+        sql::require_creation_retirement(&pg.conn, expected, self.topology)?;
+        Ok(())
+    }
+
     pub(in super::super) fn inputs(
         &self,
     ) -> (&PgTopology, &MetadataCommandEnvelope, &StagingOwnerRecord) {

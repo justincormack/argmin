@@ -219,15 +219,17 @@ pub(in super::super) fn apply_in_open_transaction(
     let (bound, owner, closed) = prepare_in_open_transaction(pg, configured_topology, envelope)?;
     let checked = owner.validate(configured_topology)?;
     let checked_closed = closed.validate(configured_topology)?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    bound.apply_live(pg)?;
-    sql::close_unpublished(
-        &pg.conn,
-        owner.subject.object_pg,
-        configured_topology,
-        &checked,
-        &checked_closed,
-    )?;
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        bound.apply_live(pg)?;
+        sql::close_unpublished(
+            pg,
+            owner.subject.object_pg,
+            configured_topology,
+            &checked,
+            &checked_closed,
+        )?;
+        Ok(())
+    })();
+    savepoint.finish(result)
 }

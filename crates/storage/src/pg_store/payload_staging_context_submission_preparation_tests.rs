@@ -405,7 +405,7 @@ fn staging_context_submission_preparation_keeps_ordinary_and_abandonment_context
             let command = abandonment::cleanup(&pg, &owner, &source);
             let context = if source_bound {
                 ContextualCommand::abandoned_part(
-                    PartFinalizationSource::capture(&source)
+                    PartFinalizationSource::capture_for_test(&source)
                         .unwrap()
                         .bind_cleanup(command.clone(), &topology())
                         .unwrap(),

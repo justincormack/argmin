@@ -2066,6 +2066,7 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
         active_epoch,
         NonZeroU64::MIN,
         pending_command.checksum_crc64(),
+        pending_command.command_sha256(),
     );
     let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     pending_heartbeat.requested_lease_duration_ms = 1_000;
@@ -2611,8 +2612,12 @@ fn stale_historical_primary_heartbeat_reports_pending_after_acting_set_change() 
         PgState::Active,
         "the replacement route must be serving before historical evidence arrives"
     );
-    let pending =
-        PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0xfeed_cafe);
+    let pending = PendingMetadataCommandObservation::new(
+        historical_epoch,
+        NonZeroU64::MIN,
+        0xfeed_cafe,
+        [0xA5; 32],
+    );
     let mut stale = heartbeat_from_record(&authority, 1, historical_epoch, 3_108);
     stale.node_incarnation += 1;
     stale.pg_observations = vec![NodePgHeartbeatObservation {

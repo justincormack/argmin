@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::super::metadata_transaction::MetadataTransaction;
 use super::*;
 
 fn command(store: &PgStore, bucket_control: bool, index: u64) -> MetadataCommandEnvelope {
@@ -473,7 +474,7 @@ fn pending_slot_effect_fence_preserves_failure_classification_and_rollback() {
 }
 
 #[test]
-fn pending_slot_failed_savepoint_rollback_recovers_entire_connection_as_uncertain() {
+fn pending_slot_failed_savepoint_rollback_retires_without_ending_parent_transaction() {
     let dir = test_util::tempdir();
     let store = PgStore::open(dir.path(), 0).unwrap();
     seed(&store);
@@ -481,7 +482,7 @@ fn pending_slot_failed_savepoint_rollback_recovers_entire_connection_as_uncertai
     store.conn.execute_batch("CREATE TEMP TABLE caller_work (value INTEGER);
         CREATE TEMP TRIGGER fail_pending BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'nested sidecar failure'); END;
         BEGIN IMMEDIATE; INSERT INTO caller_work VALUES (17);").unwrap();
-    store.test_fail_pending_slot_rollbacks(1);
+    store.test_fail_metadata_command_rollbacks(1);
     let result = store.try_insert_pending_metadata_command_slot_classified(
         0,
         &target,
@@ -495,22 +496,250 @@ fn pending_slot_failed_savepoint_rollback_recovers_entire_connection_as_uncertai
         "{result:?}"
     );
     assert!(
-        store.conn.is_autocommit(),
-        "failed savepoint rollback left enclosing transaction usable"
+        !store.conn.is_autocommit(),
+        "failed savepoint rollback secretly retried the enclosing transaction"
     );
-    store.require_usable_connection().unwrap();
+    assert!(store.require_usable_connection().is_err());
+    assert!(store
+        .commit_unmanaged_test_transaction("must not commit parent")
+        .is_err());
     let count: u32 = store
         .conn
         .query_row("SELECT count(*) FROM caller_work", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        count, 0,
-        "recovery must roll back the caller transaction too"
+        count, 1,
+        "failed child must not secretly roll back caller work"
     );
+    store.conn.execute_batch("ROLLBACK").unwrap();
+    assert!(store.require_usable_connection().is_err());
+    drop(store);
+    let store = PgStore::open(dir.path(), 0).unwrap();
     assert!(store
         .pending_metadata_command_slot_any_epoch(0)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn pending_slot_classified_owned_scopes_keep_one_outer_commit() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::{Arc, Mutex};
+
+    for nested in [false, true] {
+        let dir = test_util::tempdir();
+        let mut pg = PgStore::open(dir.path(), 0).unwrap();
+        seed(&pg);
+        let first = command(&pg, false, 1);
+        let second = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                first.id().cluster_epoch(),
+                first.id().pg_id(),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            first.payload().clone(),
+        );
+        let statements = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&statements);
+        pg.conn
+            .trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(move |event: TraceEvent<'_>| {
+                    if let TraceEvent::Stmt(_, sql) = event {
+                        if ["BEGIN", "SAVEPOINT", "RELEASE", "COMMIT", "ROLLBACK"]
+                            .iter()
+                            .any(|p| sql.starts_with(p))
+                        {
+                            recorded.lock().unwrap().push(sql.to_owned());
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        let outer = nested.then(|| MetadataTransaction::begin(&pg, "outer").unwrap());
+        let observer = rusqlite::Connection::open(pg.conn.path().unwrap()).unwrap();
+        pg.try_insert_pending_metadata_command_slot_classified(
+            0,
+            &first,
+            Some(first.bucket_name()),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(pg
+                .replace_pending_metadata_command_slot_for_reissue(
+                    0,
+                    &first,
+                    &second,
+                    Some(second.bucket_name())
+                )
+                .unwrap());
+        }
+        if let Some(outer) = outer {
+            let count: u32 = observer
+                .query_row(
+                    "SELECT count(*) FROM metadata_command_pending_slot",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "child release committed installation");
+            outer.commit("outer commit").unwrap();
+        }
+        let index: u64 = observer
+            .query_row(
+                "SELECT log_index FROM metadata_command_pending_slot",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 2);
+        let sql = statements.lock().unwrap();
+        assert_eq!(
+            sql.iter().filter(|s| s.starts_with("BEGIN")).count(),
+            if nested { 1 } else { 3 }
+        );
+        assert_eq!(
+            sql.iter().filter(|s| s.as_str() == "COMMIT").count(),
+            if nested { 1 } else { 3 }
+        );
+        let savepoints: Vec<_> = sql
+            .iter()
+            .filter_map(|s| s.strip_prefix("SAVEPOINT "))
+            .collect();
+        assert_eq!(savepoints.len(), if nested { 3 } else { 0 });
+        assert_eq!(
+            savepoints
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            savepoints.len()
+        );
+        for name in savepoints {
+            assert!(sql.contains(&format!("RELEASE {name}")));
+        }
+        assert!(!sql.iter().any(|s| s.starts_with("ROLLBACK")));
+    }
+}
+
+#[test]
+fn pending_slot_classified_managed_child_failure_cannot_commit_partial_indexes() {
+    for failed_rollback in [false, true] {
+        let dir = test_util::tempdir();
+        let pg = PgStore::open(dir.path(), 0).unwrap();
+        seed(&pg);
+        let target = command(&pg, false, 1);
+        pg.conn.execute_batch("CREATE TEMP TABLE parent_work (value INTEGER); CREATE TEMP TRIGGER fail_index BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'classified child sidecar failure'); END").unwrap();
+        let outer = MetadataTransaction::begin(&pg, "outer").unwrap();
+        pg.conn
+            .execute("INSERT INTO parent_work VALUES (17)", [])
+            .unwrap();
+        if failed_rollback {
+            pg.test_fail_metadata_command_rollbacks(1);
+        }
+        let error = pg
+            .try_insert_pending_metadata_command_slot_classified(
+                0,
+                &target,
+                Some(target.bucket_name()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            matches!(
+                error,
+                PendingMetadataCommandSlotInsertError::MayHaveApplied(_)
+            ),
+            failed_rollback
+        );
+        assert!(error
+            .into_source()
+            .to_string()
+            .contains("classified child sidecar failure"));
+        assert!(!pg.conn.is_autocommit());
+        let value: u32 = pg
+            .conn
+            .query_row("SELECT value FROM parent_work", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, 17);
+        if failed_rollback {
+            assert!(pg.require_usable_connection().is_err());
+            let count: u32 = pg
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM metadata_command_pending_slot",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "must retain the unrolled-back partial write");
+            assert!(outer.commit("must not commit").is_err());
+            assert!(pg
+                .commit_unmanaged_test_transaction("legacy must not commit")
+                .is_err());
+            assert!(!pg.conn.is_autocommit(), "hidden parent rollback");
+        } else {
+            assert!(pg
+                .pending_metadata_command_slot_any_epoch(0)
+                .unwrap()
+                .is_none());
+            outer.commit("parent only").unwrap();
+            assert_eq!(
+                pg.conn
+                    .query_row("SELECT value FROM parent_work", [], |r| r.get::<_, u32>(0))
+                    .unwrap(),
+                17
+            );
+        }
+        drop(pg);
+        let pg = PgStore::open(dir.path(), 0).unwrap();
+        assert!(pg
+            .pending_metadata_command_slot_any_epoch(0)
+            .unwrap()
+            .is_none());
+        pg.try_insert_pending_metadata_command_slot_classified(
+            0,
+            &target,
+            Some(target.bucket_name()),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn pending_slot_classified_begin_rejection_differs_from_lost_scope_ownership() {
+    for lost_scope in [false, true] {
+        let dir = test_util::tempdir();
+        let pg = PgStore::open(dir.path(), 0).unwrap();
+        let other = rusqlite::Connection::open(pg.conn.path().unwrap()).unwrap();
+        pg.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let outer = if lost_scope {
+            let outer = MetadataTransaction::begin(&pg, "outer").unwrap();
+            pg.conn.execute_batch("ROLLBACK").unwrap(); // model an escaped SQL owner
+            Some(outer)
+        } else {
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            None
+        };
+        let error = pg
+            .with_pending_slot_insert_transaction(|| -> Result<(), StoreError> {
+                panic!("failed transaction entry reached mutation body")
+            })
+            .unwrap_err();
+        if lost_scope {
+            assert!(matches!(
+                error,
+                PendingMetadataCommandSlotInsertError::MayHaveApplied(_)
+            ));
+            assert!(pg.require_usable_connection().is_err());
+        } else {
+            assert!(matches!(
+                error,
+                PendingMetadataCommandSlotInsertError::Definitive(_)
+            ));
+            pg.require_usable_connection().unwrap();
+            other.execute_batch("ROLLBACK").unwrap();
+        }
+        drop(outer);
+    }
 }
 
 #[test]
@@ -525,7 +754,7 @@ fn pending_slot_failed_rollback_retires_node_access_until_reopen() {
         seed(&store);
         let target = command(&store, false, 1);
         store.conn.execute_batch("CREATE TEMP TRIGGER fail_pending BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'retired sidecar failure'); END;").unwrap();
-        store.test_fail_pending_slot_rollbacks(2);
+        store.test_fail_metadata_command_rollbacks(2);
         let result = store.try_insert_pending_metadata_command_slot_classified(
             0,
             &target,

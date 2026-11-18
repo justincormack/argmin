@@ -616,14 +616,25 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         commit_guard: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| {
-                BucketSnapshotLoadError::Metadata(MetadataError::Db {
-                    context: "apply metadata command and record (begin txn)",
-                    source: source.into(),
-                })
-            })?;
+        self.require_usable_connection()?;
+        // This entry owns the durable outcome, not a savepoint in a caller's
+        // transaction. Preserve the old BEGIN rejection without adopting it.
+        if !self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "apply current metadata command inside caller transaction",
+            }
+            .into());
+        }
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "apply metadata command and record (begin txn)",
+        )
+        .map_err(|error| {
+            Self::store_error_as_metadata_db(
+                "apply metadata command and record (begin txn)",
+                error,
+            )
+        })?;
 
         let result = (|| match self
             .metadata_command_acceptance(node_id, command)
@@ -654,25 +665,46 @@ impl PgStore {
                     Ok(record)
                 }
             }
-        })();
+        })()
+        .and_then(|record| {
+            // This is the live server's final captured-route fence, including
+            // AlreadyApplied replay cleanup. Keep it inside the owned scope.
+            commit_guard().map_err(BucketSnapshotLoadError::Store)?;
+            Ok(record)
+        });
 
         match result {
             Ok(record) => {
-                if let Err(error) = commit_guard() {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(BucketSnapshotLoadError::Store(error));
-                }
-                self.commit_immediate_txn("apply metadata command and record (commit txn)")
-                    .map_err(BucketSnapshotLoadError::Metadata)?;
+                transaction
+                    .commit("apply metadata command and record (commit txn)")
+                    .map_err(|error| {
+                        Self::store_error_as_metadata_db(
+                            "apply metadata command and record (commit txn)",
+                            error,
+                        )
+                    })?;
                 self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
                 Ok(record.state)
             }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                self.invalidate_clean_metadata_digest_revision();
-                Err(error)
-            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => {
+                    // The outer error deliberately has a redacted Display.
+                    // Preserve the owner-internal causes, but do not return the
+                    // original semantic rejection after unconfirmed teardown.
+                    let cause = match error {
+                        BucketSnapshotLoadError::Store(error) => error.to_string(),
+                        BucketSnapshotLoadError::Metadata(error) => error.to_string(),
+                    };
+                    Err(StoreError::Db {
+                        context: "apply metadata command and record (rollback txn)",
+                        source: crate::error::DatabaseError::new(format!(
+                            "operation: {cause}; rollback failed: {rollback}"
+                        )),
+                    }
+                    .into())
+                }
+            },
         }
     }
 

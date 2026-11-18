@@ -48,6 +48,11 @@ pub(crate) const MAX_METADATA_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 2;
 
+// Private integration codec. The live command writer/reader remain v13 until
+// builders, pending installation, recovery, apply and custody switch together.
+#[path = "metadata_command/context_carrier.rs"]
+pub(crate) mod context_carrier;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MetadataCommandRecordFormat {
     Applied,
@@ -2275,6 +2280,96 @@ pub(crate) struct MetadataCommandEnvelope {
 }
 
 impl MetadataCommandEnvelope {
+    /// Shared command/proof subject check for fanout and exact terminal release.
+    pub(crate) fn bucket_write_reservation_subject_matches(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> bool {
+        match self.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => [
+                PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            ]
+            .into_iter()
+            .any(|operation_kind| {
+                proof.matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &commit.object.bucket,
+                    operation_kind,
+                    Some(commit.object.key.as_str()),
+                )
+            }),
+            MetadataCommandPayload::PutObjectMetadata(update) => proof
+                .matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &update.object.bucket,
+                    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+                    Some(update.object.key.as_str()),
+                ),
+            MetadataCommandPayload::DeleteObjectVersion(delete) => proof
+                .matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &delete.bucket,
+                    match delete.mode {
+                        DeleteObjectVersionMode::Current => {
+                            DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND
+                        }
+                        DeleteObjectVersionMode::Specific => {
+                            DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND
+                        }
+                    },
+                    Some(delete.key.as_str()),
+                ),
+            MetadataCommandPayload::InsertDeleteMarker(marker) => proof
+                .matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &marker.bucket,
+                    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+                    Some(marker.key.as_str()),
+                ),
+            MetadataCommandPayload::CreateMultipartUpload(create) => proof
+                .matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &create.upload().bucket,
+                    crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(create.upload().key.as_str()),
+                ),
+            MetadataCommandPayload::CreateStreamUpload(create) => proof
+                .matches_exact_mutation_subject(
+                    self.id().cluster_epoch(),
+                    &create.session.bucket,
+                    match create.session.target {
+                        StreamUploadTarget::PutObject => {
+                            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        }
+                        StreamUploadTarget::UploadPart { .. } => {
+                            UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        }
+                    },
+                    Some(create.session.key.as_str()),
+                ),
+            MetadataCommandPayload::CommitStreamPart(commit) => {
+                commit.has_consistent_subject()
+                    && proof.matches_exact_mutation_subject(
+                        self.id().cluster_epoch(),
+                        &commit.bucket,
+                        UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+                        Some(commit.key.as_str()),
+                    )
+            }
+            MetadataCommandPayload::AbortMultipartUpload(abort) => {
+                abort.has_consistent_subject()
+                    && proof.matches_exact_mutation_subject(
+                        self.id().cluster_epoch(),
+                        &abort.bucket,
+                        ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                        Some(abort.key.as_str()),
+                    )
+            }
+            _ => true,
+        }
+    }
+
     pub(crate) fn new(id: MetadataCommandId, payload: MetadataCommandPayload) -> Self {
         let checksum_crc64 = checksum::crc64::checksum(&canonical_command_bytes(id, &payload));
         Self {
@@ -2329,10 +2424,12 @@ impl MetadataCommandEnvelope {
         bytes
     }
 
+    #[cfg(test)]
     pub(crate) fn abandoned_log_bytes(&self) -> Vec<u8> {
         abandoned_command_log_bytes(self.id, self.checksum_crc64, self.command_sha256())
     }
 
+    #[cfg(test)]
     pub(crate) fn abandoned_log_checksum_crc64(&self) -> u64 {
         checksum::crc64::checksum(&self.abandoned_log_bytes())
     }

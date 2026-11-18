@@ -67,7 +67,7 @@ impl StorageNodeProcessConfig {
     const CONTROL_PLANE_RUNTIME_CONFIG_FILE: &'static str = "control-plane-runtime-config-v1";
     const CONTROL_PLANE_RUNTIME_CONFIG_MAGIC_PREFIX: &'static str =
         "argmin-storage-node-runtime-config-v";
-    const CONTROL_PLANE_RUNTIME_CONFIG_VERSION: u16 = 5;
+    const CONTROL_PLANE_RUNTIME_CONFIG_VERSION: u16 = 6;
 
     pub fn new(parts: StorageNodeProcessConfigParts) -> Result<Self, StorageNodeServerError> {
         let config = Self {
@@ -857,12 +857,13 @@ fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> Str
     ));
     for (pg_id, recovery) in &config.pending_metadata_command_recoveries {
         out.push_str(&format!(
-            "{} {} {} {} {}\n",
+            "{} {} {} {} {} {}\n",
             pg_id.get(),
             recovery.reporting_node_id().as_u32(),
             recovery.pending().cluster_epoch().get(),
             recovery.pending().log_index(),
-            recovery.pending().command_checksum()
+            recovery.pending().command_checksum(),
+            hex_encode(&recovery.pending().command_sha256())
         ));
     }
     out
@@ -970,6 +971,10 @@ fn decode_control_plane_runtime_config(
         let cluster_epoch = next_runtime_config_field(path, &mut fields, invalid)?;
         let log_index = next_runtime_config_field(path, &mut fields, invalid)?;
         let command_checksum = next_runtime_config_field(path, &mut fields, invalid)?;
+        let command_sha256 = next_runtime_config_field(path, &mut fields, invalid)?;
+        let command_sha256 = hex_decode(path, command_sha256)?
+            .try_into()
+            .map_err(|_| runtime_config_invalid(path, "recovery command SHA-256 must contain 32 bytes"))?;
         if fields.next().is_some() {
             return Err(runtime_config_invalid(
                 path,
@@ -995,6 +1000,7 @@ fn decode_control_plane_runtime_config(
                         runtime_config_invalid(path, "recovery command log index must be nonzero")
                     })?,
                     parse_u64_field(path, command_checksum, "recovery command checksum")?,
+                    command_sha256,
                 ),
             ),
         ));

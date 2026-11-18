@@ -176,6 +176,55 @@ pub(super) struct SseS3SegmentTestFixture {
 }
 
 impl SseS3SegmentTestFixture {
+    /// Open bytes read back from durable shards using the committed row's DEK.
+    /// The wrap context is captured before consuming the storage-minted subject.
+    pub(super) fn open_committed_payload(
+        &self,
+        encryption: &ObjectEncryption,
+        wrap_context: &[u8],
+        ciphertext: &[u8],
+    ) -> Vec<u8> {
+        let ObjectEncryption::SseS3(state) = encryption else {
+            panic!("expected committed SSE-S3 fixture");
+        };
+        let mut wrapped = state.wrapped_dek().to_vec();
+        let dek = Aes256GcmKey::new(&self.wrapping_key)
+            .unwrap()
+            .open_in_place(*state.wrap_nonce(), wrap_context, &mut wrapped)
+            .expect("durable committed encryption must unwrap");
+        cobblestone::open(
+            Cobblestone256Key::new(dek).unwrap(),
+            &self.payload_aead_context,
+            ciphertext,
+        )
+        .expect("durable payload must authenticate after terminal publication")
+    }
+
+    /// Encrypt actual bytes against a storage-minted sole-segment subject.
+    /// Used by candidate request integration, not metadata-only fixtures.
+    pub(super) fn encrypt_for_subject(
+        &mut self,
+        subject: &crate::SegmentEncryptionSubject,
+        plaintext: &[u8],
+    ) {
+        assert!(subject.matches_standard_object_segment(
+            &self.encryption,
+            0,
+            plaintext.len() as u64
+        ));
+        self.payload_aead_context = subject.payload_aead_context().to_vec();
+        self.storage_bytes = cobblestone::seal(
+            &Cobblestone256Key::new(&self.dek).unwrap(),
+            [0x56; COBBLESTONE_SALT_LEN],
+            &self.payload_aead_context,
+            plaintext,
+        )
+        .unwrap();
+        self.logical_size = plaintext.len() as u64;
+        self.storage_crc64 = checksum::crc64::checksum(&self.storage_bytes);
+        self.payload_crc64 = checksum::crc64::checksum(plaintext);
+    }
+
     /// Rewraps this fixture's actual DEK under an exact committed-object subject.
     ///
     /// Payload-bearing fixtures must use this transition instead of fabricating wrapped bytes:
@@ -184,6 +233,15 @@ impl SseS3SegmentTestFixture {
         &self,
         subject: &ObjectEncryptionSubject,
     ) -> ObjectEncryption {
+        self.committed_encryption_evidence(subject)
+            .encryption()
+            .clone()
+    }
+
+    pub(super) fn committed_encryption_evidence(
+        &self,
+        subject: &ObjectEncryptionSubject,
+    ) -> crate::types::CommittedObjectEncryption {
         let wrap_nonce = [0x55; SSE_S3_WRAP_NONCE_LEN];
         let mut wrapped_dek = self.dek.to_vec();
         Aes256GcmKey::new(&self.wrapping_key)
@@ -199,7 +257,7 @@ impl SseS3SegmentTestFixture {
             .expect("AES-GCM wrapped DEK must have the durable length");
         let committed = self
             .encryption
-            .bind_committed_object_ciphertexts(
+            .bind_committed_object_ciphertexts_with_evidence(
                 subject,
                 wrap_nonce,
                 wrapped_dek,
@@ -208,7 +266,7 @@ impl SseS3SegmentTestFixture {
             )
             .expect("payload fixture must admit its exact committed subject");
 
-        let ObjectEncryption::SseS3(state) = &committed else {
+        let ObjectEncryption::SseS3(state) = committed.encryption() else {
             unreachable!("SSE-S3 fixture must remain SSE-S3");
         };
         let mut unwrapped = state.wrapped_dek().to_vec();

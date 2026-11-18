@@ -401,6 +401,10 @@ struct StorageNodeMetadataCommandLockBinding {
 struct StorageNodeSessionMetadataCommandGuard {
     binding: StorageNodeMetadataCommandLockBinding,
     _guard: StorageNodeMetadataCommandGuard,
+    direct_preparation: std::cell::Cell<Option<complete_direct_snapshot::DirectPreparationIdentity>>,
+    introduction_preparation: std::cell::Cell<complete_direct_introduction::IntroductionPreparationState>,
+    introduction_section_identity: Arc<()>,
+    introduction_installation: std::cell::RefCell<Option<Box<complete_direct_introduction::ParkedIntroductionInstallation>>>,
 }
 
 struct ValidatedReadHandleAcquireRequest {
@@ -491,6 +495,10 @@ impl StorageNodeSession {
             StorageNodeSessionMetadataCommandGuard {
                 binding,
                 _guard: guard,
+                direct_preparation: std::cell::Cell::new(None),
+                introduction_preparation: std::cell::Cell::new(complete_direct_introduction::IntroductionPreparationState::Vacant),
+                introduction_section_identity: Arc::new(()),
+                introduction_installation: std::cell::RefCell::new(None),
             },
         );
         Ok(())

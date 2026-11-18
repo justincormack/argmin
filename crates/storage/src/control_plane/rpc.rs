@@ -7519,6 +7519,7 @@ fn encode_control_plane_rpc_response(
             write_u64(&mut payload, pending.cluster_epoch().get());
             write_u64(&mut payload, pending.log_index());
             write_u64(&mut payload, pending.command_checksum());
+            payload.extend_from_slice(&pending.command_sha256());
         }
         Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
             pg_id,
@@ -7761,6 +7762,7 @@ fn decode_control_plane_rpc_response_frame(
                 )
             })?;
             let pending_command_checksum = reader.read_u64()?;
+            let pending_command_sha256 = reader.read_exact(32)?.try_into().expect("fixed SHA-256");
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::PgPeeringPendingMetadataCommand {
@@ -7771,6 +7773,7 @@ fn decode_control_plane_rpc_response_frame(
                         pending_cluster_epoch,
                         pending_log_index,
                         pending_command_checksum,
+                        pending_command_sha256,
                     ),
                 },
             ))
@@ -8886,6 +8889,7 @@ fn write_pending_metadata_command_recovery_listing(
         write_u64(out, task.recovery().pending().cluster_epoch().get());
         write_u64(out, task.recovery().pending().log_index());
         write_u64(out, task.recovery().pending().command_checksum());
+        out.extend_from_slice(&task.recovery().pending().command_sha256());
     }
     write_u32(
         out,
@@ -8928,6 +8932,7 @@ fn read_pending_metadata_command_recovery_listing(
                 )
             })?,
             reader.read_u64()?,
+            reader.read_exact(32)?.try_into().expect("fixed SHA-256"),
         );
         tasks.push(PendingMetadataCommandRecoveryTask::new(
             pg_id,
@@ -9197,6 +9202,7 @@ fn write_pg_route_snapshots(
                 write_u64(out, recovery.pending().cluster_epoch().get());
                 write_u64(out, recovery.pending().log_index());
                 write_u64(out, recovery.pending().command_checksum());
+                out.extend_from_slice(&recovery.pending().command_sha256());
             }
             None => write_u8(out, 0),
         }
@@ -9749,6 +9755,7 @@ fn read_pg_route_snapshots(
                         )
                     })?,
                     reader.read_u64()?,
+                    reader.read_exact(32)?.try_into().expect("fixed SHA-256"),
                 ),
             }),
             tag => {
@@ -9831,6 +9838,7 @@ fn write_pending_metadata_command_observation(
             write_u64(out, pending.cluster_epoch().get());
             write_u64(out, pending.log_index());
             write_u64(out, pending.command_checksum());
+            out.extend_from_slice(&pending.command_sha256());
         }
         None => write_u8(out, 0),
     }
@@ -9850,10 +9858,12 @@ fn read_pending_metadata_command_observation(
                 )
             })?;
             let command_checksum = reader.read_u64()?;
+            let command_sha256 = reader.read_exact(32)?.try_into().expect("fixed SHA-256");
             Ok(Some(PendingMetadataCommandObservation::new(
                 cluster_epoch,
                 log_index,
                 command_checksum,
+                command_sha256,
             )))
         }
         present => Err(ControlPlaneError::rpc_protocol(format!(

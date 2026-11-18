@@ -4,7 +4,41 @@
 //! Independently authenticated finalization obligations on one closed attempt.
 //! Metadata-only component schedules, not physical-release receipts.
 
+use super::super::super::command_context::ContextualCommand;
 use super::*;
+
+fn complete_cleanup(
+    source: &MetadataCommandEnvelope,
+    cleanup: &MetadataCommandEnvelope,
+) -> ContextualCommand {
+    ContextualCommand::abandoned_part(
+        PartFinalizationSource::capture_for_test(source)
+            .unwrap()
+            .bind_cleanup(cleanup.clone(), &topology())
+            .unwrap(),
+        &topology(),
+    )
+    .unwrap()
+}
+
+fn commit_cleanup(
+    pg: &PgStore,
+    source: &MetadataCommandEnvelope,
+    cleanup: &MetadataCommandEnvelope,
+) {
+    // The component call above previews its exact outcome in this transaction.
+    // Roll that preview back, then run the inseparable apply/record boundary.
+    // Recording a v13 draft here would lose the cleanup's retained source.
+    pg.conn.execute_batch("ROLLBACK").unwrap();
+    let context = complete_cleanup(source, cleanup);
+    pg.apply_complete_metadata_command_and_record(
+        0,
+        &context.encode_command().unwrap(),
+        &topology(),
+    )
+    .unwrap();
+    pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+}
 
 fn next_source(
     pg: &PgStore,
@@ -65,8 +99,7 @@ fn staging_obligations_distinct_sources_survive_compaction_restart_and_renewed_r
             apply(&pg, &source, &cleanup).unwrap(),
             AbandonmentOutcome::ClosedAndRetained
         );
-        pg.record_metadata_command_applied_inner(0, &cleanup)
-            .unwrap();
+        commit_cleanup(&pg, &source, &cleanup);
         let primary = append::load(&pg, &owner);
         let mut retained = primary.clone();
         for (suffix, renewal) in [("-z", 0), ("-a", 0), ("-z", 1_000)] {
@@ -83,7 +116,7 @@ fn staging_obligations_distinct_sources_survive_compaction_restart_and_renewed_r
             assert_eq!(pg.conn.total_changes(), changes);
             assert_eq!(introduction::state(&pg), before);
             pg.conn.execute_batch("COMMIT").unwrap();
-            pg.record_metadata_command_abandoned(0, &source).unwrap();
+            record_source_abandoned(&pg, &source);
             pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             let outcome = apply(&pg, &source, &follow_up).unwrap();
             if renewal == 0 {
@@ -108,15 +141,18 @@ fn staging_obligations_distinct_sources_survive_compaction_restart_and_renewed_r
                 retained.resources.finalization,
                 primary.resources.finalization
             );
-            pg.record_metadata_command_applied_inner(0, &follow_up)
-                .unwrap();
+            commit_cleanup(&pg, &source, &follow_up);
             pg.conn.execute_batch("COMMIT").unwrap();
             let checkpoint = pg
-                .record_current_metadata_command_checkpoint(0, source.id().cluster_epoch())
+                .test_checkpoint_and_compact_complete_command(
+                    0,
+                    &complete_cleanup(&source, &follow_up)
+                        .encode_command()
+                        .unwrap(),
+                    2,
+                )
                 .unwrap();
             checkpoint.verify().unwrap();
-            pg.compact_metadata_command_log_with_receipt_retention(source.id().cluster_epoch(), 2)
-                .unwrap();
             drop(pg);
             pg = PgStore::open(dir.path(), pg_id).unwrap();
             pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -160,12 +196,11 @@ fn staging_obligations_failed_insert_preserves_earlier_proofs_and_outer_transact
         let cleanup = cleanup(&pg, &owner, &first);
         terminal(&pg, &first, true);
         apply(&pg, &first, &cleanup).unwrap();
-        pg.record_metadata_command_applied_inner(0, &cleanup)
-            .unwrap();
+        commit_cleanup(&pg, &first, &cleanup);
         let second = next_source(&pg, &first, "-second", 0);
         let follow_up = follow_up(&second, &cleanup);
         pg.conn.execute_batch("COMMIT").unwrap();
-        pg.record_metadata_command_abandoned(0, &second).unwrap();
+        record_source_abandoned(&pg, &second);
         pg.conn.execute_batch(&format!("BEGIN IMMEDIATE;
             CREATE TEMP TABLE outer_work(value INTEGER); INSERT INTO outer_work VALUES (42);
             CREATE TEMP TRIGGER fail_extra {trigger_time} INSERT ON payload_staging_resources WHEN NEW.role = 2

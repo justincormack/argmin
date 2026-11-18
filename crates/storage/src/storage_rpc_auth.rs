@@ -159,6 +159,20 @@ struct StorageRpcClientSigner {
     transport_limits: StorageRpcTransportLimits,
 }
 
+impl StorageNodeStorageRpcClientCapability {
+    /// Outbound receiver lookups must belong to the serving node and the same
+    /// authentication domain, not merely possess some storage-node credential.
+    pub(crate) fn matches_server(&self, node: NodeId, server: &StorageRpcServerAuthConfig) -> bool {
+        matches!(self.0.credential.principal(),
+            ControlPlaneAuthPrincipal::StorageNode { node_id, .. }
+            | ControlPlaneAuthPrincipal::StorageNodeProcess { node_id } if *node_id == node)
+            && self.0.credential.cluster_id() == server.cluster_id
+            && self.0.topology_generation == server.topology_generation
+            && self.0.topology_digest == server.topology_digest
+            && server.credentials.accepts_credential(&self.0.credential)
+    }
+}
+
 impl fmt::Debug for StorageRpcClientSigner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StorageRpcClientSigner")
@@ -1548,6 +1562,15 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         StorageRpcMessageKind::MetadataCommand
         | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
         | StorageRpcMessageKind::ShardWrite
+        | StorageRpcMessageKind::StagingShardWrite
+        | StorageRpcMessageKind::StagingShardAckRecord
+        | StorageRpcMessageKind::StagingStreamAppendPrepare
+        | StorageRpcMessageKind::StagingStreamAppendInstall
+        | StorageRpcMessageKind::StagingDirectSnapshot
+        | StorageRpcMessageKind::StagingDirectPrepare
+        | StorageRpcMessageKind::StagingDirectInstall
+        | StorageRpcMessageKind::StagingDirectIntroductionPrepare
+        | StorageRpcMessageKind::StagingDirectIntroductionInstall
         | StorageRpcMessageKind::ShardRead
         | StorageRpcMessageKind::ShardReadRange
         | StorageRpcMessageKind::ReadHandlesAcquire
@@ -2301,7 +2324,12 @@ mod tests {
             decode_binding(&historical_v35),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        assert_eq!(hex_bytes(&request), "4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d6524000807060504030201030003000000d57c6801f8e8aee6616263");
+        let historical_v36 = crate::tests::frozen_hex_fixture("4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d6524000807060504030201030003000000d57c6801f8e8aee6616263");
+        assert_eq!(
+            decode_binding(&historical_v36),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        assert_eq!(hex_bytes(&request), "4152475352504342000201020304050607080000004030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566112233440000000037180000006172676d696e2d73746f726167652d7270632d6672616d6525000807060504030201030003000000c48f5795c358d711616263");
 
         let transcript = storage_rpc_request_transcript(b"fixed authenticated request envelope");
         assert_eq!(
@@ -2396,7 +2424,12 @@ mod tests {
             decode_binding(&historical_v35),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        assert_eq!(hex_bytes(&response), "41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d6524000807060504030201030003000000d57c6801f8e8aee6616263");
+        let historical_v36 = crate::tests::frozen_hex_fixture("41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d6524000807060504030201030003000000d57c6801f8e8aee6616263");
+        assert_eq!(
+            decode_binding(&historical_v36),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        assert_eq!(hex_bytes(&response), "41524753525043420002010203040506070800000040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465661122334401673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037180000006172676d696e2d73746f726167652d7270632d6672616d6525000807060504030201030003000000c48f5795c358d711616263");
 
         let decoded_request = decode_binding(&request).unwrap();
         assert!(decoded_request.request_transcript.is_none());
@@ -2809,7 +2842,23 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 174, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 183, "every wire kind must be classified");
+        for kind in [
+            StorageRpcMessageKind::StagingShardWrite,
+            StorageRpcMessageKind::StagingShardAckRecord,
+            StorageRpcMessageKind::StagingStreamAppendPrepare,
+            StorageRpcMessageKind::StagingStreamAppendInstall,
+            StorageRpcMessageKind::StagingDirectSnapshot,
+            StorageRpcMessageKind::StagingDirectPrepare,
+            StorageRpcMessageKind::StagingDirectInstall,
+            StorageRpcMessageKind::StagingDirectIntroductionPrepare,
+            StorageRpcMessageKind::StagingDirectIntroductionInstall,
+        ] {
+            assert!(principal_allows_operation(&frontend, kind));
+            for principal in [&storage, &admin, &maintenance, &raft, &service] {
+                assert!(!principal_allows_operation(principal, kind));
+            }
+        }
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

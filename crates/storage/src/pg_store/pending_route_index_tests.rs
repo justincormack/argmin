@@ -40,10 +40,12 @@ fn install(store: &PgStore, dependencies: Vec<PendingMetadataCommandRouteDepende
         .replace_pending_metadata_command_route_dependency_sidecar(
             &PendingMetadataCommandRouteDependencySidecar {
                 command_checksum: checksum,
+                command_sha256: checksum::sha256::digest(b"opaque envelope"),
                 checksum: PgStore::pending_metadata_command_route_dependency_checksum(
                     id,
                     checksum,
                     &dependencies,
+                    &checksum::sha256::digest(b"opaque envelope"),
                 ),
                 dependencies,
             },
@@ -59,15 +61,15 @@ fn encoded(store: &PgStore) -> (Vec<u8>, i64) {
 }
 
 #[test]
-fn pending_route_index_v2_frozen_bytes_checksums_reopen_and_exact_routes() {
-    // Literal V2 records and checksums, independently checked with bitwise
+fn pending_route_index_v3_frozen_bytes_checksums_reopen_and_exact_routes() {
+    // Literal V2 and V3 checksums, independently checked with bitwise
     // CRC-64/NVME. Do not regenerate these when changing the next writer.
     let specimens = [
-        (0, "", 0x3cad_c84c_f5ad_f472_u64),
+        (0, "", (0x3cad_c84c_f5ad_f472_u64, 0x7f2b0471b4c25795_u64)),
         (
             1,
             "0000000000000001009192939495969798",
-            0x5e5d_0ae6_504b_20df,
+            (0x5e5d_0ae6_504b_20df_u64, 0x9f4bc7119be6ed24_u64),
         ),
         (
             2,
@@ -75,7 +77,7 @@ fn pending_route_index_v2_frozen_bytes_checksums_reopen_and_exact_routes() {
                 "0000000000000001009192939495969798",
                 "0000000000000002010000000000000007"
             ),
-            0x0e3d_87b0_c93c_a8e3,
+            (0x0e3d_87b0_c93c_a8e3_u64, 0x144ee564efb848b2_u64),
         ),
         (
             5,
@@ -86,11 +88,15 @@ fn pending_route_index_v2_frozen_bytes_checksums_reopen_and_exact_routes() {
                 "000000000000000401000000000000000d",
                 "0000000000000005010000000000000011",
             ),
-            0x5ffa_7860_1569_518e,
+            (0x5ffa_7860_1569_518e_u64, 0x5c360089831d90da_u64),
         ),
     ];
     let (id, checksum) = identity();
-    for (count, bytes, expected_checksum) in specimens {
+    for (count, bytes, (old_checksum, expected_checksum)) in specimens {
+        assert_eq!(
+            reseal_v2(count as u8, &crate::tests::frozen_hex_fixture(bytes)),
+            old_checksum
+        );
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), id.pg_id().get()).unwrap();
         let dependencies = dependencies()[..count].to_vec();
@@ -109,6 +115,7 @@ fn pending_route_index_v2_frozen_bytes_checksums_reopen_and_exact_routes() {
             Some(PendingMetadataCommandRouteReferences {
                 id,
                 command_checksum: checksum,
+                command_sha256: checksum::sha256::digest(b"opaque envelope"),
                 dependencies: dependencies.clone(),
             })
         );
@@ -159,7 +166,7 @@ fn pending_route_index_v2_frozen_bytes_checksums_reopen_and_exact_routes() {
     }
 }
 
-fn reseal(count: u8, bytes: &[u8]) -> u64 {
+fn reseal_v2(count: u8, bytes: &[u8]) -> u64 {
     let mut preimage = b"argmin.metadata.pending-route-dependencies.v2".to_vec();
     preimage.extend(crate::tests::frozen_hex_fixture(concat!(
         "0102030405060708",
@@ -167,6 +174,20 @@ fn reseal(count: u8, bytes: &[u8]) -> u64 {
         "2122232425262728",
         "8182838485868788",
     )));
+    preimage.push(count);
+    preimage.extend_from_slice(bytes);
+    checksum::crc64::checksum(&preimage)
+}
+
+fn reseal(count: u8, bytes: &[u8]) -> u64 {
+    let mut preimage = b"argmin.metadata.pending-route-dependencies.v3".to_vec();
+    preimage.extend(crate::tests::frozen_hex_fixture(concat!(
+        "0102030405060708",
+        "0000000011223344",
+        "2122232425262728",
+        "8182838485868788",
+    )));
+    preimage.extend_from_slice(&checksum::sha256::digest(b"opaque envelope"));
     preimage.push(count);
     preimage.extend_from_slice(bytes);
     checksum::crc64::checksum(&preimage)
@@ -190,6 +211,7 @@ fn pending_route_index_v2_orders_target_tags_and_values_within_one_epoch() {
         Some(PendingMetadataCommandRouteReferences {
             id,
             command_checksum,
+            command_sha256: checksum::sha256::digest(b"opaque envelope"),
             dependencies,
         })
     );
@@ -334,6 +356,7 @@ fn pending_route_index_v2_writer_rejects_invalid_sets_before_sql() {
             .replace_pending_metadata_command_route_dependency_sidecar(
                 &PendingMetadataCommandRouteDependencySidecar {
                     command_checksum: identity().1,
+                    command_sha256: checksum::sha256::digest(b"opaque envelope"),
                     dependencies: bad,
                     checksum: 0,
                 }
@@ -366,10 +389,12 @@ fn pending_route_index_v2_replacement_rolls_back_and_removal_cascades() {
         .replace_pending_metadata_command_route_dependency_sidecar(
             &PendingMetadataCommandRouteDependencySidecar {
                 command_checksum: command.checksum_crc64(),
+                command_sha256: command.command_sha256(),
                 checksum: PgStore::pending_metadata_command_route_dependency_checksum(
                     command.id(),
                     command.checksum_crc64(),
                     &dependencies,
+                    &command.command_sha256(),
                 ),
                 dependencies,
             },

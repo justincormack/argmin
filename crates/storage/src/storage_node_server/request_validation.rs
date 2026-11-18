@@ -164,6 +164,7 @@ impl StorageNodeConnectionHandler {
                             )
                             .expect("typed metadata command log index must be nonzero"),
                             request.authorized_source.checksum_crc64(),
+                            request.authorized_source.command_sha256(),
                         )
             },
         );
@@ -359,6 +360,10 @@ impl StorageNodeConnectionHandler {
             request.pg_id,
         ) {
             return encode_storage_rpc_error_response(&error);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.metadata_command_before_release_test_hook.lock().unwrap().clone() {
+            hook();
         }
         session.release_metadata_command_pg_lock(request.pg_id);
         Ok(encode_storage_rpc_success_response(&[]))
@@ -579,6 +584,7 @@ impl StorageNodeConnectionHandler {
             std::num::NonZeroU64::new(authorized_source.id().log_index().get())
                 .expect("typed metadata command log index must be nonzero"),
             authorized_source.checksum_crc64(),
+            authorized_source.command_sha256(),
         );
         let authorized = self.config.pending_metadata_command_recoveries.iter().any(
             |(authorized_pg_id, recovery)| {

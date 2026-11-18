@@ -477,7 +477,7 @@ fn staging_fresh_append_capture_rejects_closed_owner_despite_prepared_live_sessi
         let closed = owner.closed_unpublished().unwrap();
         let topology = topology();
         sql::close_unpublished(
-            &pg.conn,
+            &pg,
             owner.subject.object_pg,
             &topology,
             &owner.validate(&topology).unwrap(),

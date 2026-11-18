@@ -629,9 +629,9 @@ pub enum ControlPlaneError {
         pg_id: u32,
         cluster_epoch: ClusterEpoch,
         first_node_id: u32,
-        first: PendingMetadataCommandObservation,
+        first: Box<PendingMetadataCommandObservation>,
         second_node_id: u32,
-        second: PendingMetadataCommandObservation,
+        second: Box<PendingMetadataCommandObservation>,
     },
 
     #[error(

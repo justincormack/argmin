@@ -2734,9 +2734,9 @@ enum PendingMetadataCommandRefreshRecoveryError {
     )]
     AuthorizationChanged {
         pg_id: u32,
-        expected: crate::control_plane::PendingMetadataCommandRecovery,
+        expected: Box<crate::control_plane::PendingMetadataCommandRecovery>,
         actual_state: PgState,
-        actual: Option<crate::control_plane::PendingMetadataCommandRecovery>,
+        actual: Option<Box<crate::control_plane::PendingMetadataCommandRecovery>>,
     },
     #[error(
         "reported pending metadata command PG {pg_id} epoch {pending_epoch} route primary is node {actual_primary}, not reporting node {reporting_node}"
@@ -2756,16 +2756,18 @@ enum PendingMetadataCommandRefreshRecoveryError {
         state: PgState,
     },
     #[error(
-        "reported pending metadata command identity changed for PG {pg_id}: expected epoch {expected_epoch} index {expected_index} checksum {expected_checksum}, got epoch {actual_epoch} index {actual_index} checksum {actual_checksum}"
+        "reported pending metadata command identity changed for PG {pg_id}: expected epoch {expected_epoch} index {expected_index} checksum {expected_checksum} SHA-256 {expected_sha256:02x?}, got epoch {actual_epoch} index {actual_index} checksum {actual_checksum} SHA-256 {actual_sha256:02x?}"
     )]
     IdentityChanged {
         pg_id: u32,
         expected_epoch: ClusterEpoch,
         expected_index: u64,
         expected_checksum: u64,
+        expected_sha256: Box<[u8; 32]>,
         actual_epoch: ClusterEpoch,
         actual_index: u64,
         actual_checksum: u64,
+        actual_sha256: Box<[u8; 32]>,
     },
 }
 

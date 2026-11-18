@@ -634,12 +634,11 @@ impl SseCustomerWriteContext {
 
     /// Performs the one-way terminal transition from provisional SSE-C state
     /// to DEK and checksum ciphertext bound to the committed object subject.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn seal_committed_object_encryption(
+    pub(crate) fn seal_committed_object_encryption_with_evidence(
         &self,
         subject: &ObjectEncryptionSubject,
         checksum: Option<&ObjectChecksumMetadata>,
-    ) -> Result<ObjectEncryption, ServerError> {
+    ) -> Result<storage::CommittedObjectEncryption, ServerError> {
         let ObjectEncryption::SseCustomer(state) = &self.encryption else {
             return Err(ServerError::InternalError {
                 reason: "SSE-C write context missing encryption state".to_string(),
@@ -667,7 +666,7 @@ impl SseCustomerWriteContext {
             "SSE-C",
         )?;
         self.encryption
-            .bind_committed_object_ciphertexts(
+            .bind_committed_object_ciphertexts_with_evidence(
                 subject,
                 wrap_nonce,
                 wrapped_dek,
@@ -759,12 +758,11 @@ impl ManagedEncryptionWriteContext {
     /// Performs the one-way terminal transition from provisional managed
     /// state to DEK and checksum ciphertext bound to the committed object
     /// subject.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn seal_committed_object_encryption(
+    pub(crate) fn seal_committed_object_encryption_with_evidence(
         &self,
         subject: &ObjectEncryptionSubject,
         checksum: Option<&ObjectChecksumMetadata>,
-    ) -> Result<ObjectEncryption, ServerError> {
+    ) -> Result<storage::CommittedObjectEncryption, ServerError> {
         let wrap_subject = subject.dek_wrap_subject();
         let checksum_subject = subject.checksum_subject();
         require_terminal_subjects(
@@ -791,7 +789,7 @@ impl ManagedEncryptionWriteContext {
             MANAGED_ENCRYPTION_LABEL,
         )?;
         self.encryption
-            .bind_committed_object_ciphertexts(
+            .bind_committed_object_ciphertexts_with_evidence(
                 subject,
                 wrap_nonce,
                 wrapped_dek,
@@ -2159,9 +2157,12 @@ mod tests {
             .encrypt_authorized_segment(&provisional_segment_subject, 0, plaintext)
             .unwrap();
         let checksum = terminal_checksum();
-        let committed = write
-            .seal_committed_object_encryption(&provisional_subject, Some(&checksum))
+        let evidence = write
+            .seal_committed_object_encryption_with_evidence(&provisional_subject, Some(&checksum))
             .unwrap();
+        let expected = evidence.encryption().clone();
+        let committed = evidence.into_encryption();
+        assert_eq!(committed, expected);
         assert_eq!(
             committed.key_binding(),
             ObjectEncryptionKeyBinding::ObjectSubjectV2
@@ -2225,9 +2226,12 @@ mod tests {
             .encrypt_authorized_segment(&provisional_segment_subject, 0, plaintext)
             .unwrap();
         let checksum = terminal_checksum();
-        let committed = write
-            .seal_committed_object_encryption(&provisional_subject, Some(&checksum))
+        let evidence = write
+            .seal_committed_object_encryption_with_evidence(&provisional_subject, Some(&checksum))
             .unwrap();
+        let expected = evidence.encryption().clone();
+        let committed = evidence.into_encryption();
+        assert_eq!(committed, expected);
         assert_eq!(
             committed.key_binding(),
             ObjectEncryptionKeyBinding::ObjectSubjectV2

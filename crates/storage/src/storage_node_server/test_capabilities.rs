@@ -3761,6 +3761,111 @@
     }
 
     #[test]
+    fn storage_node_server_direct_snapshot_requires_candidate_selector() {
+        for candidate in [false, true] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+            if candidate {
+                server.select_complete_log_operations_for_test();
+            }
+            let join = thread::spawn(move || server.accept_one().unwrap());
+            let mut client = UnixStream::connect(&config.socket_path).unwrap();
+            let frame = encode_storage_rpc_frame(
+                17,
+                StorageRpcMessageKind::StagingDirectSnapshot,
+                b"",
+            ).unwrap();
+            client.write_all(&frame).unwrap();
+            let response = read_storage_rpc_frame_from(&mut client).unwrap();
+            drop(client);
+            join.join().unwrap();
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap().unwrap_err();
+            assert_eq!(error.code, if candidate {
+                StorageRpcErrorCode::PayloadDecode
+            } else {
+                StorageRpcErrorCode::UnsupportedOperation
+            });
+            if !candidate {
+                assert_eq!(error.message, "staging direct payload snapshot is not activated");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_node_server_direct_prepare_requires_candidate_selector() {
+        for candidate in [false, true] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+            if candidate { server.select_complete_log_operations_for_test(); }
+            let join = thread::spawn(move || server.accept_one().unwrap());
+            let mut client = UnixStream::connect(&config.socket_path).unwrap();
+            let frame = encode_storage_rpc_frame(17, StorageRpcMessageKind::StagingDirectPrepare, b"").unwrap();
+            client.write_all(&frame).unwrap();
+            let response = read_storage_rpc_frame_from(&mut client).unwrap();
+            drop(client);
+            join.join().unwrap();
+            let error = decode_storage_rpc_response_payload(&response.payload).unwrap().unwrap_err();
+            assert_eq!(error.code, if candidate { StorageRpcErrorCode::PayloadDecode } else { StorageRpcErrorCode::UnsupportedOperation });
+            if !candidate {
+                assert_eq!(error.message, "staging direct terminal preparation is not activated");
+            }
+        }
+    }
+
+    #[test]
+    fn storage_node_server_direct_install_remains_gated() {
+        {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let server = StorageNodeServer::bind(config.clone()).unwrap();
+            let join = thread::spawn(move || server.accept_one().unwrap());
+            let mut client = UnixStream::connect(&config.socket_path).unwrap();
+            let frame = encode_storage_rpc_frame(17, StorageRpcMessageKind::StagingDirectInstall, b"").unwrap();
+            client.write_all(&frame).unwrap();
+            let response = read_storage_rpc_frame_from(&mut client).unwrap();
+            drop(client);
+            join.join().unwrap();
+            let error = decode_storage_rpc_response_payload(&response.payload).unwrap().unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::UnsupportedOperation);
+            assert_eq!(error.message, "staging direct terminal installation is not activated");
+        }
+    }
+
+    #[test]
+    fn storage_node_server_direct_introduction_prepare_requires_candidate_selector() {
+        for kind in [StorageRpcMessageKind::StagingDirectIntroductionPrepare, StorageRpcMessageKind::StagingDirectIntroductionInstall] {
+        for candidate in [false, true] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let mut server = StorageNodeServer::bind(config.clone()).unwrap();
+            if candidate { server.select_complete_log_operations_for_test(); }
+            let join = thread::spawn(move || server.accept_one().unwrap());
+            let mut client = UnixStream::connect(&config.socket_path).unwrap();
+            let frame = encode_storage_rpc_frame(17, kind, b"").unwrap();
+            client.write_all(&frame).unwrap();
+            let response = read_storage_rpc_frame_from(&mut client).unwrap();
+            drop(client);
+            join.join().unwrap();
+            let error = decode_storage_rpc_response_payload(&response.payload).unwrap().unwrap_err();
+            assert_eq!(error.code, if candidate { StorageRpcErrorCode::PayloadDecode } else { StorageRpcErrorCode::UnsupportedOperation });
+            if !candidate {
+                assert_eq!(error.message, match kind {
+                    StorageRpcMessageKind::StagingDirectIntroductionPrepare => "staging direct introduction preparation is not activated",
+                    _ => "staging direct introduction installation is not activated",
+                });
+            }
+        }
+        }
+    }
+
+    #[test]
     fn storage_node_server_returns_unsupported_operation_error() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);

@@ -26,6 +26,9 @@ pub(in super::super::super::super) struct ContextPendingRetention {
 }
 
 impl ContextPendingRetention {
+    pub(in super::super) fn installation_routes(&self) -> &[PendingMetadataCommandRouteDependency] {
+        &self.routes
+    }
     pub(super) fn route_dependency_count(&self) -> usize {
         self.routes.len()
     }
@@ -37,14 +40,13 @@ impl ContextPendingRetention {
 
 #[cfg(test)]
 impl ContextPendingRetention {
-    pub(in super::super::super::super) fn command_id(&self) -> MetadataCommandId {
-        self.command_id
-    }
-
     pub(in super::super::super::super) fn routes(
         &self,
     ) -> &[PendingMetadataCommandRouteDependency] {
-        &self.routes
+        self.installation_routes()
+    }
+    pub(in super::super::super::super) fn command_id(&self) -> MetadataCommandId {
+        self.command_id
     }
 
     pub(in super::super::super::super) fn future_window(

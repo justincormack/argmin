@@ -83,6 +83,7 @@ fn historical_bucket_delete_replica_head(
                     authorized_epoch,
                     std::num::NonZeroU64::MIN,
                     0x1234,
+                    [0xA5; 32],
                 ),
             ),
         ));

@@ -515,7 +515,7 @@ fn staging_context_reissue_preparation_preserves_ordinary_and_abandonment_pairs(
         let source = part::command(&pg, &owner);
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
         let abandoned = ContextualCommand::abandoned_part(
-            PartFinalizationSource::capture(&source)
+            PartFinalizationSource::capture_for_test(&source)
                 .unwrap()
                 .bind_cleanup(cleanup.clone(), &topology())
                 .unwrap(),

@@ -129,6 +129,33 @@ pub(crate) struct TestTimeOverrideGuard {
     not_send_or_sync: PhantomData<Rc<()>>,
 }
 
+/// An owner-local paired clock override for an interleaving that ends in a
+/// later hook. The wall guard also makes this guard thread-bound and !Send.
+#[cfg(test)]
+pub(crate) struct TestTimeAndMonotonicOverrideGuard {
+    _wall: TestTimeOverrideGuard,
+    previous_monotonic: Option<u64>,
+}
+
+#[cfg(test)]
+impl Drop for TestTimeAndMonotonicOverrideGuard {
+    fn drop(&mut self) {
+        MONOTONIC_TIME_OVERRIDE_MILLIS.with(|slot| slot.set(self.previous_monotonic));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_time_and_monotonic_override_guard(
+    wall: u64,
+    monotonic: u64,
+) -> TestTimeAndMonotonicOverrideGuard {
+    TestTimeAndMonotonicOverrideGuard {
+        _wall: test_time_override_guard(wall),
+        previous_monotonic: MONOTONIC_TIME_OVERRIDE_MILLIS
+            .with(|slot| slot.replace(Some(monotonic))),
+    }
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 impl TestTimeOverrideGuard {
     pub(crate) fn set(&self, now_millis: u64) {
@@ -364,6 +391,18 @@ mod tests {
         clock_health_time_millis_inner, lease_time_millis, wall_clock_health_sample_with,
         CLOCK_HEALTH_SAMPLE_ATTEMPTS,
     };
+
+    #[test]
+    fn paired_clock_guard_restores_both_independent_clocks() {
+        super::with_time_and_monotonic_override(1_000, 100, || {
+            let guard = super::test_time_and_monotonic_override_guard(3_500, 2_600);
+            assert_eq!(super::current_time_millis(), 3_500);
+            assert_eq!(super::monotonic_time_millis(), 2_600);
+            drop(guard);
+            assert_eq!(super::current_time_millis(), 1_000);
+            assert_eq!(super::monotonic_time_millis(), 100);
+        });
+    }
 
     #[test]
     fn wall_clock_health_sample_retries_scheduler_delay() {

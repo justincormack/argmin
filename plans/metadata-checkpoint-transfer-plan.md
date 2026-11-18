@@ -3,7 +3,8 @@
 
 # Bounded Metadata Checkpoint Transfer
 
-Status: **Next — separate workstream, implementation not started.** Recorded
+Status: **After durable cleanup ownership completes — separate workstream,
+implementation not started; not an activation or completion dependency.** Recorded
 2026-11-06 after withdrawing the uncommitted paging experiment from
 [durable cleanup ownership](durable-generation-cleanup-ownership.md).
 See the [roadmap](README.md). This document records the problem, constraints and
@@ -25,10 +26,12 @@ inside the already complex cleanup protocol was the wrong workstream boundary.
 
 Keep cleanup-specific records, semantic validation, canonical/checkpoint version
 advances, immutable format evidence and custody integration in the cleanup plan.
-Move **all checkpoint-size, streaming and aggregate-memory fixes here**. Owner
-integration may proceed independently, but its production activation must not
-claim transferability until this dependency is resolved. Do not discard an
-accepted obligation to satisfy a transport limit.
+Move **all checkpoint-size, streaming and aggregate-memory fixes here**. Cleanup
+ownership integration, production activation and completion proceed independently
+of these pre-existing limitations. This work is scheduled after the cleanup plan
+is complete, not as its prerequisite. Cleanup completion must not be described as
+fixing general checkpoint scalability. Do not discard an accepted obligation to
+satisfy a transport limit.
 
 ## Problem inventory
 
@@ -231,7 +234,7 @@ from staged rows rather than concatenate them into another full allocation.
    semantics; optimize framing only if useful.
 4. **Failure/resource evidence and measurements.** Complete the matrix below,
    record throughput, peak memory, lock/transaction duration and WAL growth,
-   and then close the external cleanup activation dependency. Receive staging
+   and then close this separate checkpoint-scalability workstream. Receive staging
    or compression needs separate measured justification afterward.
 
 Required regressions:

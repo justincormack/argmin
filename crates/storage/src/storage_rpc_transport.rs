@@ -413,6 +413,27 @@ impl StorageRpcClientEndpoint {
     }
 
     #[cfg(test)]
+    pub(crate) fn close_idle_requests_for_test(&self) {
+        let pool = match &self.inner {
+            StorageRpcClientEndpointInner::Unix { request_pool, .. }
+            | StorageRpcClientEndpointInner::Tcp { request_pool, .. } => request_pool,
+            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => return,
+        };
+        let idle = {
+            let mut state = pool.state.lock().unwrap();
+            assert_eq!(
+                state.open,
+                state.idle.len(),
+                "fixture still has active requests"
+            );
+            state.open = 0;
+            std::mem::take(&mut state.idle)
+        };
+        drop(idle);
+        pool.available.notify_all();
+    }
+
+    #[cfg(test)]
     pub(crate) fn idle_session_connection_count_for_test(&self) -> usize {
         match &self.inner {
             StorageRpcClientEndpointInner::Unix { session_pool, .. }

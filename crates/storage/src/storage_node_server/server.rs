@@ -5,6 +5,7 @@
 struct StorageNodeRuntimeRouteState {
     config: Arc<StorageNodeProcessConfig>,
     route_map_lease: Option<BoundRouteMapLease>,
+    window_confirmation_peers: Option<Arc<complete_window_peers::WindowPeers>>,
 }
 #[derive(Clone)]
 pub struct StorageNodeRpcListenerConfig {
@@ -140,6 +141,7 @@ impl StorageNodeRpcListener {
 
 pub struct StorageNodeServer {
     runtime_route_state: Arc<RwLock<StorageNodeRuntimeRouteState>>,
+    window_confirmation_transport: Option<Arc<complete_window_peers::PeerTransport>>,
     runtime_config_install_lock: Mutex<()>,
     // A failed publication may have retired some local issuers. Even a later
     // same-route/validity-only install must drain and establish fresh identities
@@ -154,6 +156,9 @@ pub struct StorageNodeServer {
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
+    // Explicit test selection until coordinated complete-command activation.
+    #[cfg(test)]
+    complete_log_operations: bool,
     #[cfg(test)]
     runtime_config_stage_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
     #[cfg(test)]
@@ -166,6 +171,8 @@ pub struct StorageNodeServer {
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
     #[cfg(test)]
     response_frame_test_hook: Arc<Mutex<Option<StorageRpcResponseFrameTestHook>>>,
+    #[cfg(test)]
+    metadata_command_before_release_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
     #[cfg(test)]
     metadata_command_before_commit_test_hook:
         Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
@@ -198,13 +205,60 @@ impl StorageNodeDataDirGuard {
         self,
         config_data_dir: &Path,
     ) -> Result<StorageNodeDataDirLock, StorageNodeServerError> {
+        self.require_path(config_data_dir)?;
+        Ok(self.lock)
+    }
+
+    fn require_path(&self, config_data_dir: &Path) -> Result<(), StorageNodeServerError> {
         if self.data_dir != config_data_dir {
             return Err(StorageNodeServerError::DataDirLockPathMismatch {
-                locked_path: self.data_dir,
+                locked_path: self.data_dir.clone(),
                 config_path: config_data_dir.to_path_buf(),
             });
         }
-        Ok(self.lock)
+        Ok(())
+    }
+
+    pub(in crate::node_runtime) fn locked_data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+}
+
+// No configuration/wire selector and no decoder fallback. The complete branch
+// is selected only by owner-local tests until coordinated protocol activation.
+#[derive(Clone, Copy)]
+enum StorageNodeStartupGrammar {
+    Current,
+    #[cfg(test)]
+    Complete,
+}
+
+impl StorageNodeStartupGrammar {
+    fn open_node(
+        self,
+        guard: &StorageNodeDataDirGuard,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        node_id: NodeId,
+    ) -> Result<SharedStorageNode, StoreError> {
+        match self {
+            Self::Current => {
+                let node = SharedStorageNode::open_with_default_ec_shape(
+                    guard.locked_data_dir(),
+                    pg_ids,
+                    default_ec_shape,
+                )?;
+                node.recover_pg_metadata_command_state(node_id)?;
+                Ok(node)
+            }
+            #[cfg(test)]
+            Self::Complete => SharedStorageNode::open_complete_for_startup(
+                guard,
+                pg_ids,
+                default_ec_shape,
+                node_id,
+            ),
+        }
     }
 }
 
@@ -223,6 +277,7 @@ pub struct StorageNodeBootstrap {
     configured_socket_path: PathBuf,
     startup_runtime_config: Option<StorageNodeProcessConfig>,
     data_dir_guard: StorageNodeDataDirGuard,
+    startup_grammar: StorageNodeStartupGrammar,
 }
 
 /// Exclusive production storage-node ownership retained during initialization.
@@ -379,8 +434,42 @@ impl StorageNodeBootstrap {
         default_ec_shape: EcShape,
         configured_socket_path: impl Into<PathBuf>,
     ) -> Result<Self, StorageNodeServerError> {
-        let data_dir = data_dir.into();
-        let configured_socket_path = configured_socket_path.into();
+        Self::open_with_startup_grammar(
+            node_id,
+            data_dir.into(),
+            pg_ids,
+            default_ec_shape,
+            configured_socket_path.into(),
+            StorageNodeStartupGrammar::Current,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn open_complete_for_test(
+        node_id: NodeId,
+        data_dir: impl Into<PathBuf>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        configured_socket_path: impl Into<PathBuf>,
+    ) -> Result<Self, StorageNodeServerError> {
+        Self::open_with_startup_grammar(
+            node_id,
+            data_dir.into(),
+            pg_ids,
+            default_ec_shape,
+            configured_socket_path.into(),
+            StorageNodeStartupGrammar::Complete,
+        )
+    }
+
+    fn open_with_startup_grammar(
+        node_id: NodeId,
+        data_dir: PathBuf,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        configured_socket_path: PathBuf,
+        startup_grammar: StorageNodeStartupGrammar,
+    ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&data_dir)?;
         let startup_runtime_config = StorageNodeProcessConfig::load_control_plane_runtime_config(
             &data_dir,
@@ -389,9 +478,7 @@ impl StorageNodeBootstrap {
             &configured_socket_path,
         )?;
         let node_incarnation = advance_storage_node_incarnation(&data_dir)?;
-        let node =
-            SharedStorageNode::open_with_default_ec_shape(&data_dir, pg_ids, default_ec_shape)?;
-        node.recover_pg_metadata_command_state(node_id)?;
+        let node = startup_grammar.open_node(&data_dir_guard, pg_ids, default_ec_shape, node_id)?;
         Ok(Self {
             node,
             node_id,
@@ -401,6 +488,7 @@ impl StorageNodeBootstrap {
             configured_socket_path,
             startup_runtime_config,
             data_dir_guard,
+            startup_grammar,
         })
     }
 
@@ -471,6 +559,7 @@ impl StorageNodeBootstrap {
         Ok(PreparedStorageNodeServer::with_data_dir_guard(
             config,
             self.data_dir_guard,
+            self.startup_grammar,
         ))
     }
 }
@@ -486,6 +575,11 @@ pub struct PreparedStorageNodeServer {
     data_dir_guard: Option<StorageNodeDataDirGuard>,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+    startup_grammar: StorageNodeStartupGrammar,
+    window_confirmation: Option<(
+        Arc<complete_window_peers::PeerTransport>,
+        Arc<complete_window_peers::WindowPeers>,
+    )>,
 }
 
 impl PreparedStorageNodeServer {
@@ -496,18 +590,23 @@ impl PreparedStorageNodeServer {
             data_dir_guard: None,
             rpc_auth: None,
             rpc_listeners: None,
+            startup_grammar: StorageNodeStartupGrammar::Current,
+            window_confirmation: None,
         }
     }
 
     fn with_data_dir_guard(
         config: StorageNodeProcessConfig,
         data_dir_guard: StorageNodeDataDirGuard,
+        startup_grammar: StorageNodeStartupGrammar,
     ) -> Self {
         Self {
             config,
             data_dir_guard: Some(data_dir_guard),
             rpc_auth: None,
             rpc_listeners: None,
+            startup_grammar,
+            window_confirmation: None,
         }
     }
 
@@ -529,19 +628,47 @@ impl PreparedStorageNodeServer {
     }
 
     pub fn bind(self) -> Result<StorageNodeServer, StorageNodeServerError> {
-        match self.data_dir_guard {
+        let grammar = self.startup_grammar;
+        self.bind_with_startup_grammar(grammar)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn bind_complete_for_test(
+        self,
+    ) -> Result<StorageNodeServer, StorageNodeServerError> {
+        self.bind_with_startup_grammar(StorageNodeStartupGrammar::Complete)
+    }
+
+    fn bind_with_startup_grammar(
+        self,
+        grammar: StorageNodeStartupGrammar,
+    ) -> Result<StorageNodeServer, StorageNodeServerError> {
+        // Later builder options may replace auth. Reject before opening stores.
+        if let Some((transport, _)) = &self.window_confirmation {
+            transport.require_auth(&self.config, self.rpc_auth.as_deref())?;
+        }
+        let mut server = match self.data_dir_guard {
             Some(data_dir_guard) => StorageNodeServer::bind_with_data_dir_guard(
                 self.config,
                 data_dir_guard,
                 self.rpc_auth,
                 self.rpc_listeners,
+                grammar,
             ),
             None => StorageNodeServer::bind_with_rpc_auth(
                 self.config,
                 self.rpc_auth,
                 self.rpc_listeners,
+                grammar,
             ),
+        }?;
+        if let Some((transport, peers)) = self.window_confirmation {
+            server.window_confirmation_transport = Some(transport);
+            server.runtime_route_state.write()
+                .unwrap_or_else(|e| e.into_inner())
+                .window_confirmation_peers = Some(peers);
         }
+        Ok(server)
     }
 }
 
@@ -834,7 +961,7 @@ fn bind_storage_node_rpc_listeners(
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
-        Self::bind_with_rpc_auth(config, None, None)
+        Self::bind_with_rpc_auth(config, None, None, StorageNodeStartupGrammar::Current)
     }
 
     #[cfg(test)]
@@ -846,9 +973,10 @@ impl StorageNodeServer {
         config: StorageNodeProcessConfig,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+        grammar: StorageNodeStartupGrammar,
     ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
-        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth, rpc_listeners)
+        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth, rpc_listeners, grammar)
     }
 
     fn bind_with_data_dir_guard(
@@ -856,16 +984,18 @@ impl StorageNodeServer {
         data_dir_guard: StorageNodeDataDirGuard,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+        grammar: StorageNodeStartupGrammar,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
-        let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
+        data_dir_guard.require_path(&config.data_dir)?;
         validate_process_config_matches_persisted_runtime_config(&config)?;
-        let node = SharedStorageNode::open_with_default_ec_shape(
-            &config.data_dir,
+        let node = grammar.open_node(
+            &data_dir_guard,
             &config.pg_ids,
             config.default_ec_shape,
+            config.node_id,
         )?;
-        node.recover_pg_metadata_command_state(config.node_id)?;
+        let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
         let rpc_listeners = rpc_listeners
             .unwrap_or_else(|| vec![StorageNodeRpcListenerConfig::unix(&config.socket_path)]);
         let listeners = bind_storage_node_rpc_listeners(rpc_listeners, rpc_auth.as_deref())?;
@@ -874,7 +1004,9 @@ impl StorageNodeServer {
             runtime_route_state: Arc::new(RwLock::new(StorageNodeRuntimeRouteState {
                 config: Arc::new(config),
                 route_map_lease,
+                window_confirmation_peers: None,
             })),
+            window_confirmation_transport: None,
             runtime_config_install_lock: Mutex::new(()),
             pending_allocation_lifetime_replacements: Mutex::new(BTreeSet::new()),
             route_admission: StorageNodeRouteAdmissionGate::default(),
@@ -887,6 +1019,8 @@ impl StorageNodeServer {
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
             rpc_auth,
             #[cfg(test)]
+            complete_log_operations: matches!(grammar, StorageNodeStartupGrammar::Complete),
+            #[cfg(test)]
             runtime_config_stage_test_hook: Mutex::new(None),
             #[cfg(test)]
             runtime_route_capture_test_hook: Arc::new(Mutex::new(None)),
@@ -898,6 +1032,8 @@ impl StorageNodeServer {
             response_envelope_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             response_frame_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            metadata_command_before_release_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             metadata_command_before_commit_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -954,6 +1090,71 @@ impl StorageNodeServer {
                     return Ok(());
                 }
                 return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_observe_metadata_command_lock_wait(
+        &self,
+        hook: impl Fn(PgId) + Send + Sync + 'static,
+    ) {
+        self.metadata_command_locks.set_before_wait_hook(Arc::new(hook));
+    }
+
+    // Reusable owner-test listener. Shutdown must not enqueue a fake connection:
+    // it can race completion of the previous session and poison the next start.
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_serve_candidate_until_stop(
+        &self,
+        stop: &std::sync::atomic::AtomicBool,
+        concurrent: bool,
+    ) -> Result<(), StorageNodeServerError> {
+        let mut fds: Vec<_> = self
+            .listeners
+            .iter()
+            .map(|listener| libc::pollfd {
+                fd: listener.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            // SAFETY: fds owns the contiguous pollfd array, and the server keeps
+            // every listener open throughout this bounded wait.
+            let ready = unsafe {
+                libc::poll(
+                    fds.as_mut_ptr(),
+                    fds.len().try_into().expect("listener count fits nfds_t"),
+                    10,
+                )
+            };
+            if ready == 0 {
+                continue;
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(StorageNodeServerError::RpcListenerIo {
+                    context: "poll candidate test listener",
+                    endpoint: "listener set".into(),
+                    source: error,
+                });
+            }
+            if !fds.iter().any(|fd| fd.revents & libc::POLLIN != 0) {
+                return Err(StorageNodeServerError::RpcListenerIo {
+                    context: "poll candidate test listener",
+                    endpoint: "listener set".into(),
+                    source: io::Error::other("test listener not readable"),
+                });
+            }
+            if concurrent {
+                self.accept_and_spawn()?;
+            } else {
+                self.accept_one()?;
             }
         }
         Ok(())
@@ -1274,14 +1475,22 @@ impl StorageNodeServer {
         &self,
         refresh: StorageNodeControlPlaneRefresh,
     ) -> Result<HeartbeatLease, StorageNodeServerError> {
-        let (lease, _runtime_map, next_config) = refresh.into_parts();
-        self.install_control_plane_runtime_config(next_config)?;
+        let (lease, runtime_map, next_config) = refresh.into_parts();
+        self.install_runtime_config_with_peer_map(next_config, Some(&runtime_map))?;
         Ok(lease)
     }
 
     pub fn install_control_plane_runtime_config(
         &self,
         next_config: StorageNodeProcessConfig,
+    ) -> Result<(), StorageNodeServerError> {
+        self.install_runtime_config_with_peer_map(next_config, None)
+    }
+
+    fn install_runtime_config_with_peer_map(
+        &self,
+        next_config: StorageNodeProcessConfig,
+        map: Option<&ClusterRuntimeMapSnapshot>,
     ) -> Result<(), StorageNodeServerError> {
         let _install_guard = self
             .runtime_config_install_lock
@@ -1292,6 +1501,11 @@ impl StorageNodeServer {
             bind_storage_node_route_map_lease(next_config.route_map_validity)?;
         let current_config = self.config_snapshot_arc();
         validate_runtime_config_install(&current_config, &next_config)?;
+        let next_peers = self.window_confirmation_transport.as_ref().zip(map)
+            .map(|(transport, map)| {
+                transport.bind(&next_config, map, self.rpc_auth.as_deref()).map(Arc::new)
+            })
+            .transpose()?;
         let mut pending_lifetimes = self
             .pending_allocation_lifetime_replacements
             .lock()
@@ -1329,6 +1543,7 @@ impl StorageNodeServer {
                 *current_state = StorageNodeRuntimeRouteState {
                     config: Arc::new(next_config),
                     route_map_lease: next_route_map_lease,
+                    window_confirmation_peers: next_peers,
                 };
                 return Ok(());
             }
@@ -1406,6 +1621,7 @@ impl StorageNodeServer {
         *current_state = StorageNodeRuntimeRouteState {
             config: Arc::new(next_config),
             route_map_lease: next_route_map_lease,
+            window_confirmation_peers: next_peers,
         };
         Ok(())
     }
@@ -1526,6 +1742,7 @@ impl StorageNodeServer {
         StorageNodeConnectionHandler {
             config: runtime_route.config,
             route_map_lease: runtime_route.route_map_lease,
+            window_confirmation_peers: runtime_route.window_confirmation_peers,
             runtime_route_source: Arc::clone(&self.runtime_route_state),
             route_admission: self.route_admission.clone(),
             node: Arc::clone(&self._node),
@@ -1533,11 +1750,15 @@ impl StorageNodeServer {
             metadata_command_locks: self.metadata_command_locks.clone(),
             rpc_auth: self.rpc_auth.clone(),
             #[cfg(test)]
+            complete_log_operations: self.complete_log_operations,
+            #[cfg(test)]
             runtime_route_capture_test_hook: Arc::clone(&self.runtime_route_capture_test_hook),
             #[cfg(test)]
             response_envelope_test_hook: Arc::clone(&self.response_envelope_test_hook),
             #[cfg(test)]
             response_frame_test_hook: Arc::clone(&self.response_frame_test_hook),
+            #[cfg(test)]
+            metadata_command_before_release_test_hook: Arc::clone(&self.metadata_command_before_release_test_hook),
             #[cfg(test)]
             metadata_command_before_commit_test_hook: Arc::clone(
                 &self.metadata_command_before_commit_test_hook,
@@ -1547,6 +1768,11 @@ impl StorageNodeServer {
                 &self.metadata_checkpoint_rows_captured_test_hook,
             ),
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn select_complete_log_operations_for_test(&mut self) {
+        self.complete_log_operations = true;
     }
 
     #[cfg(test)]

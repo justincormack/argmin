@@ -23,19 +23,844 @@ time.
 ## Pre-activation Custody Checkpoint — 2026-11-08
 
 The reviewed pending-index, protection-discovery and complete-context custody
-foundations are checkpointed together before production activation. The current
-format vector is PG schema **12**, canonical state **10**, checkpoint **8**,
+foundations are checkpointed together before production activation. At this
+checkpoint the format vector was PG schema **12**, canonical state **10**, checkpoint **8**,
 applied command **13**, storage RPC **36** and abandoned-command record **2**.
 The schema-12 catalogue, pending-index literals, RPC-36 composites and private
 command-context V1 evidence below are frozen at this checkpoint. Subsequent
 incompatible changes require the affected version advances and append-only evidence;
 these are no longer uncommitted candidate formats.
 
+The subsequent RPC-v37 correction below supersedes the frame version. The
+historical-recovery correction below advances the PG schema to 13.
+
 Production pending-slot indexes and discovery are live, but complete-context
 command encoding, owner-creating application and accepted/uncertain frontend
 custody are not activated. The context preparation APIs grant neither acceptance
 nor physical cleanup authority. Checkpoint size/transfer limits remain the
 separate unresolved dependency recorded in the cleanup plan.
+
+### Cryptographically bound recovery observations — 2026-11-10
+
+Recovery authorization now carries mandatory SHA-256 of the complete encoded
+pending command, alongside its epoch, index and CRC64. CRC64 alone is never an
+exact-command authorization. The live V13 and candidate complete V14 encodings
+are hashed as stored, including V14's required context. The historical primary's
+reported digest must match, independently of a replica's own exact pending slot.
+
+Coordinated current versions: PG schema **13**, control-plane command **21**,
+logical state **33**, control-plane RPC **19**, persisted storage-node runtime
+configuration **6**, runtime-map content/current-state digest domains **V4**.
+The pending route-dependency table adds a mandatory 32-byte `command_sha256`;
+its checksum domain advances to `argmin.metadata.pending-route-dependencies.v3`
+and hashes those bytes immediately after the command CRC64 and before the
+dependency count. Slot insertion/replacement derives both digest and sidecar in
+the existing transaction. Heartbeat remains a bounded read; no fsync is added.
+The V3 zero/one/two/five-dependency CRCs are `7f2b0471b4c25795`,
+`9f4bc7119be6ed24`, `144ee564efb848b2`, and `5c360089831d90da`;
+the preceding V2 inputs and CRCs remain independently checked. The schema-13
+catalogue SHA-256 is
+`31b89e71da5a40c4ce24e990d7b35940181010459dbc276845847a27f784c5a5`.
+
+The sidecar is not materialized checkpoint state: canonical state **10** and
+checkpoint **8** are unchanged. Storage RPC **37**, snapshot envelope **1**,
+journal record/file **2**, Raft peer **4**, restart artifact **6**, and WAL
+grammars likewise remain unchanged; their independently versioned nested
+command/state composites are appended, not substituted. There is no old-format
+fallback. Schema catalogues 1–12 and all prior frozen bytes/hashes remain evidence.
+
+Exact current control-plane corpora (decoded bytes / SHA-256):
+
+- State-v33/canonical-v10: 11,221 /
+  `d3e01d164175b375ee8b78ee6caec2dc495c89bba8d1e0edacfaad85bc8e66b7`.
+- Command-v21/canonical-v10: 2,831 /
+  `753e001cfeadaa7a2efb486530dd0077ca616097ea8355d6990fdf4f10834492`.
+- RPC-v19/canonical-v10: 14,349 /
+  `852baf2de5494ed8e5f3ace2b91113c7fe6452e4fd3c60f5a445486c18c9ebaf`.
+
+The immediately preceding state-v32, command-v20 and RPC-v18 canonical-v10
+aggregates are independently frozen under `control_plane/testdata/` and rejected
+at their outer versions. Current and predecessor Raft composites are under
+`control_plane_raft/tests/`; schema 13 has its own immutable catalogue. Nested
+version advances do not rewrite enclosing-format evidence.
+
+Runtime configuration V5's affected present-recovery branch is independently
+frozen in `storage_node_server/testdata/runtime_config_v5_pending_recovery.txt`:
+326 bytes, SHA-256
+`b746fed324d1fa3790a558cad48ac77cffc4b13ac1a67044b1e800fd24dbf66d`.
+Its old five-field row is rejected specifically as unsupported version 5 by both
+the decoder and durable loader. Relabeling it as V6 still fails for the missing
+digest; supplying that new field is the positive decoding control. The earlier
+zero-recovery V5 specimens remain unchanged.
+
+### Retained-log validation-budget error — RPC v37, 2026-11-08
+
+Storage RPC advances **36 → 37**. Error code **28** is now
+`RetainedLogValidationBudgetExceeded`: the requested retained-log interval
+exceeds the server's cumulative validation-byte budget. This is distinct from
+generic `ResourceExhausted` (**11**), which never authorizes range-reduction
+retries. The error enum has no independent version, so its containing frame
+version advances; authentication, metadata-command, checkpoint and schema
+versions do not change. No transaction or fsync is added.
+
+Both error codes have independent literal payload and complete-frame specimens.
+All v36 frames, authentication bindings and 13 on-disk composite corpora remain
+unchanged as rejection evidence. Corresponding v37 composites are appended,
+including checkpoint-v7 nested-version rejection, checkpoint-v8 current reads,
+and the candidate command-v14/context-v1 retained-log response. The four original
+v36 checkpoint-composite SHA-256 fingerprints remain asserted independently.
+The candidate v37 complete-log fixture's file SHA-256 is
+`164712355d5d15cf48c20fbdeb58c4412743561b3c12441f8b8d1ec7c9d72fcb`.
+Installed authenticated tests reject unstructured errors immediately, including
+code 28: only the structured request-bound hint below permits a retry. Generic
+capacity failures stop immediately, including after that retry. The original
+immutable deadline and exact start index cover both attempts. Complete-command
+live dispatch is not activated.
+
+### Candidate complete-command carrier integration — 2026-11-08
+
+The private coordinated-integration codec proposes applied command **v14**:
+the existing command marker, ID and payload grammar followed by one mandatory
+context-V1 field. CRC64 and SHA-256 identify the complete bytes. Missing context,
+wrong kind/subject/topology, malformed/trailing data and unsupported versions fail
+closed. The unchanged live v13 reader rejects this candidate, and the candidate
+reader rejects v13; there is no production dual-version dispatch.
+
+`pg_store/testdata/staging_context_carrier_v14_context_v1.hex` appends seven exact
+metadata-only specimens, with literal CRC64 and SHA-256 values: ordinary,
+Direct PUT/stream PUT/UploadPart introduction, PUT/part append and source-bearing
+part abandonment. File SHA-256 is
+`67bfb147ef0a173c7b91c416d049b675ac4e4958096a2cb98feef814b8afde86`.
+These freeze the **candidate** composition, not a live-format advance or an
+installed RPC/log specimen. All predecessor command/context/source evidence is
+unchanged.
+
+The initial abandonment specimen contains source V1 with a v13 finalizer; that
+specific composite is now rejection evidence, with source V2 appended below.
+The other six compositions remain current candidate evidence unchanged. Pending
+installation/replacement, applied-command decoding, recovery dispatch, live
+builders, owning submission/custody and affected RPC admission still require
+coordinated integration. The original candidate bound (4 MiB + 29) grows to
+4 MiB + 32 for source V2's complete ordinary finalizer; production limits do not
+change here. This does not close the separate checkpoint-transfer workstream.
+
+### Candidate complete-command abandonment identity — 2026-11-08
+
+`pg_store/testdata/staging_terminal_tombstone_v2_command_v14_context_v1.hex`
+appends a 99-byte abandoned-record-V2 specimen whose original-command CRC64 and
+SHA-256 cover a **complete command V14 plus its required ordinary context V1**,
+not the payload draft's V13 encoding. The file SHA-256 is
+`5dea158b020add3d272a31ff6df2086ba686dd47cbfb9f0dd5e3ed181a1d4fa6`.
+The complete source CRC64 is `fd57f06a0af3b590`; the tombstone's own CRC64 is
+`b648b267a82908d3`. Exact stored bytes and checksums survive SQLite reopen.
+
+The tombstone grammar remains V2: its cryptographic original-command digest was
+already a field. The shared log/receipt validator now accepts an opaque complete
+identity for read-only inspection; an owner-local test adapter exercises the
+same abandonment transaction, chain and compaction machinery. Tests reject a
+substituted complete source with the same CRC64 and verify historical receipts
+against a later checkpoint after prefix pruning and epoch advancement. This is
+candidate integration evidence, not production V14 log writing or applied-V14
+decoding. All existing source-V1/command-V13 and tombstone-V2 literals remain
+unchanged. The source-carrier integration below consumes this complete identity;
+production pending/apply/recovery integration is still required before activation.
+The live format vector above is unchanged.
+
+### Complete abandonment source V2 — 2026-11-08
+
+The private integration source advances to V2 and retains complete command V14
+with ordinary context V1. Tombstone/receipt authentication uses that complete
+identity during preparation and apply, never the V13 payload draft. Only an
+ordinary `CommitStreamPart` is admitted; the decoder checks this before decoding
+context, rejecting recursive source-bearing aborts without walking the nesting.
+Source V1 is rejected, not an alternate supported representation.
+
+Append-only metadata-only specimens:
+
+- `pg_store/testdata/staging_abandonment_source_v2_command_v14_context_v1.hex`:
+  1,731 decoded bytes; file SHA-256
+  `d845b85092ca5f3887cdcd7f5bc523f9d13c9282c0e121f64a82d0523da57504`.
+  The nested complete-command CRC64 is `9a9be703ae747975`.
+- `pg_store/testdata/staging_context_carrier_v14_context_v1_source_v2.hex`:
+  complete source-bearing cleanup, CRC64 `77b79bc3eda9dc01`, command SHA-256
+  `1e882ef9aa670ce67ed5b2f3d5efec444a1c1c0e07e8c443f94f02722b2b40d0`;
+  file SHA-256 `72e5351e18a350e6bfd2ea2a586de05291bc548f4ac2d1fa87f38f76932d72de`.
+
+All preceding fixtures remain unchanged. Tests reject the exact V1 source and
+its original complete V14 cleanup composite at the nested source-version check,
+and reject genuinely linked V13 tombstones before custody mutation. There is no
+new production writer, format fallback, schema/checkpoint change or extra fsync.
+
+### Candidate complete retained-log response — 2026-11-08
+
+`pg_store/testdata/complete_log_range_rpc_v36_command_v14_context_v1.hex`
+appends an exact framed composite containing one abandoned and one applied row:
+storage RPC **v36**, complete applied command **v14**, required ordinary context
+**v1**, and abandoned-record **v2**. File SHA-256 is
+`65f14a04fd57f08cdc33fce4cd9f92c83e7c5fd0a5090dd1e434ade0416cd57f`.
+The retained-entry field order, optional digest arms and applied/abandoned tags
+are unchanged; an independently versioned command occupies the existing byte
+field, so this appends a composite rather than advancing the outer RPC version.
+All previous command, tombstone and response specimens remain unchanged.
+
+The wire parser borrows bounded opaque bodies and does not mint commands. The
+PG-store-owned request scope decodes only complete V14, retains its context and
+validates PG/epoch/range/order/hash linkage. Candidate per-item capacity is
+4 MiB + 32, with a fixed 16 MiB cumulative command-byte budget and 31-entry cap;
+headers remain bounded separately. The live V13 response decoder and installed
+dispatch are unchanged and reject this applied specimen. This is framed-codec
+evidence, not an installed/authenticated RPC or recovery-admission claim.
+
+The subsequent installed-reader integration tests the same composite grammar
+through authenticated Unix requests and signed responses, selected only by a
+private unit-test server switch. Review separated the validation-budget signal
+from generic capacity exhaustion in RPC v37, as recorded above. A subsequent
+review replaces geometric reduction with the request-bound hint below, without
+interpreting diagnostic strings. A successful opaque page retains the actual
+read interval and its complete contexts; it does not authorize recovery/apply.
+Live command dispatch remains V13 until coordinated activation. The v36 complete
+response above remains immutable; its v37 composite is appended, not substituted.
+
+The installed complete **hash** adapter also reuses the existing scalar
+successful request/page grammar. The server validates
+complete contexts before projecting hashes, bounded by 4,096 positions and
+16 MiB of encoded commands per attempt. Its client shares one covered-prefix retry
+and the immutable transport deadline with entry reads, then validates count,
+range, order, genesis and adjacent links against the actual reduced interval.
+The opaque result retains scope and covered range even when empty or sparse;
+it is a peer observation, not a complete-prefix or recovery-admission proof.
+Only explicit owner-local test selection enables the complete handler.
+
+Within the single pending RPC **36 → 37** transition, the complete entry/hash
+response grammar now reserves the impossible leading page count `0xffffffff`
+for a fixed-size validation-budget outcome: operation kind (`u16`), the exact
+32-byte range request (node/epoch/PG/first/last), then safe covered end (`u64`),
+all little-endian. The 46-byte outcome uses the ordinary authenticated transport
+payload envelope; it is not a successful page or a resume cursor. The client
+compares all request fields, requires `first <= covered_end < last`, and retries
+that prefix at most once under its original deadline. A second hint returns
+error 28 rather than repeating expensive validation. Generic errors, including
+unstructured code 28, never permit retries. The original successful page and
+error-code encodings are unchanged; independent literal entry/hash outcome
+specimens in `storage_rpc/complete_log_budget_tests.rs` pin the new grammar.
+This folds review corrections into the already pending v37 transition, preserving
+all committed v36 and earlier evidence. No schema, command, checkpoint,
+authentication version, transaction or fsync changes.
+
+The subsequent installed complete checkpoint/compaction adapter is likewise
+test-selected, not a format switch. It reuses checkpoint V8 and the existing RPC
+export/record/compact payloads, binding the exact PG and requested epoch before
+maintenance. Pending custody remains a barrier; complete log rows become exact
+terminal receipts through the existing compaction transaction. This adds no
+ordinary-path write/fsync and does not resolve checkpoint transfer size or
+aggregate-memory limits. Live startup/dispatch selection remains coordinated
+integration work.
+The request scope alone is read-only authority: recording and compaction also
+require the maintenance owner's opaque Active-primary mutation token, bound to
+the exact store/subject/operation and live serialization. Its captured route
+lease is rechecked at the transaction's final pre-write boundary. This is an
+in-process capability change, not another durable or wire-format transition.
+
+Complete pending inspection retains the existing pending-envelope response
+grammar: presence byte, optional CRC64/u32 length/command bytes, then the
+publication-start byte. Its candidate parser admits the complete command bound,
+rejects oversized lengths before body access, and returns only borrowed framing
+to the PG-owned decoder. The existing global response frame limit already
+accommodates this bound; no live request cap or format version changes here.
+`pg_store/testdata/complete_pending_rpc_v37_command_v14_context_v1.hex` appends
+an exact response-payload composite using the frozen complete ordinary command.
+Independent literal flags/outer-header and exact-at-cap framed tests cover the
+framing. Previous current-command fixtures are unchanged; current and complete
+command decoders continue to reject each other's present-command responses.
+
+Exact applied-peer inspection also preserves the existing command-request outer
+grammar (node, epoch, PG, CRC64, u32 length, command) and applied-hash outcome
+grammar. Its per-kind frame cap admits complete-command capacity plus that fixed
+overhead; the production decoder still rejects V14 until activation. The bounded
+parser returns borrowed untrusted bytes to the context owner. Exact-at-cap and
+cap-plus-one admission are tested independently of semantic command validity.
+`pg_store/testdata/complete_applied_rpc_v37_command_v14_context_v1.hex` appends the
+exact query composite. No predecessor fixture or version is changed.
+
+Exact abandoned-peer inspection shares that same request grammar and frozen
+RPC-v37/command-v14/context-v1 query specimen. Its per-kind cap now admits the
+same complete-command capacity; production decoding remains current-only.
+The existing boolean-outcome response grammar is unchanged, with independent
+literal `00 00` (false) and `00 01` (true) canaries. Both read-only message kinds
+have exact-at-cap and cap-plus-one admission coverage. No new format version or
+replacement historical specimen is required for this shared grammar.
+
+Complete application/abandonment acceptance inspection uses that same bounded
+request grammar and exact query specimen on the existing two acceptance message
+IDs. Both per-kind caps admit complete carrier capacity plus fixed overhead.
+Independent literal response tags `01` (next position) and `02` (exact terminal),
+typed conflict-subject validation and exact-at-cap/cap-plus-one tests pin the
+unchanged outcome/framing grammars. The question is the authenticated RPC message
+kind, not a caller-provided field inside the command. Production decoding remains
+current-only; no predecessor evidence or version changes in this slice.
+
+### Candidate complete publication payload V1 — 2026-11-09
+
+`storage_rpc/complete_publication.rs` owns a new, not-yet-selected payload
+contract. Its request is little-endian u16 version 1, mandatory u64 conservative
+wall cutoff, then node u32, epoch u64, PG u32, command CRC64 u64, length u32 and
+complete command bytes. The cap is `MAX_COMPLETE_COMMAND_BYTES + 38`. The bounded
+framing parser borrows bytes; only the context owner decodes command authority.
+The fixed 58-byte success acknowledgement is version u16, node u32, epoch u64,
+PG u32, log index u64, and the complete command's 32-byte SHA-256. It confirms
+the exact publication-start marker, not application or cleanup authorization.
+
+Independent literal outer-grammar tests pin both encodings. These complete
+composites are appended under `pg_store/testdata/`:
+
+- `complete_publication_payload_v1_command_v14_context_v1.hex`
+- `complete_publication_confirmation_v1_command_v14_context_v1.hex`
+
+The latter pins command SHA-256
+`5c1438e559d8e1dd4a19e1f6808e6693645dc489063c10cbf0835a979a1115f8`.
+No previous specimen is replaced. Unknown versions, truncation, trailing bytes,
+resealed retired commands/unknown contexts and crossed identities are rejected.
+Payload tests cover exactly the cap and one byte over. Installed per-kind frame
+admission and complete-frame evidence were added in the integration below.
+
+This is not a compatible extension of the existing deadline-less publication
+request/state response. Production dispatch still uses the preceding grammar;
+the owner-local complete selector uses this payload, with no fallback. The
+per-kind cap increase belongs to the already-pending RPC 36-to-37 transition.
+Selection requires strict replacement of the request/response grammar. Future
+incompatible edits to this independently tagged payload advance its version and
+append evidence; changed containing framing/interpretation also advances its
+containing RPC version under the one-transition-per-commit rule. Its command and
+context remain separately versioned composite dependencies.
+
+The installed candidate's request cap is pinned at
+`MAX_COMPLETE_COMMAND_BYTES + 38` (exact-cap acceptance and cap-plus-one rejection
+through request frame admission). Appended files under `storage_rpc/testdata/`:
+
+- `complete_publication_rpc_v37_payload_v1_command_v14_context_v1_request.hex`
+- `complete_publication_rpc_v37_payload_v1_command_v14_context_v1_response.hex`
+
+These retain literal complete frames including outer CRC64 and the response's
+success envelope. Tests compare the writer and decode the frozen bytes, and
+reject correctly resealed outer versions 36/38. The earlier bare payload and
+confirmation specimens remain immutable. Authenticated Unix tests cover the
+installed admission/marker/confirmation path; this does not select production
+publication or establish owning-client transport-loss handling.
+
+### Candidate complete application payload V1 — 2026-11-09
+
+`storage_rpc/complete_application.rs` adds the owner-test-selected application
+request/confirmation grammar on message ID 31. Live dispatch remains current-only;
+there is no missing-context/deadline fallback. This shares the pending RPC
+36-to-37 transition, not a second version advance within that uncommitted slice.
+
+The request is literal `APLY`, little-endian u16 version 1, mandatory conservative
+absolute wall cutoff u64, then node u32, epoch u64, PG u32, complete CRC64 u64,
+length u32 and complete command bytes. Its exact frame-admission cap is
+`MAX_COMPLETE_COMMAND_BYTES + 42`. The 96-byte confirmation is literal `APLD`,
+version u16, node u32, command epoch u64, PG u32, command index u64, complete
+SHA-256 (32 bytes), followed by the existing 34-byte replica-state encoding.
+The latter carries epoch, applied index, independently tagged log hash V1 and
+canonical state digest V10. The prefix must cover the confirmed position in the
+same epoch; it may be later during exact replay. Purpose tags prevent a
+publication-marker acknowledgement from substituting for application evidence.
+
+Appended immutable composites:
+
+- `pg_store/testdata/complete_application_payload_v1_command_v14_context_v1.hex`
+- `pg_store/testdata/complete_application_confirmation_v1_command_v14_context_v1_state_v10.hex`
+- `storage_rpc/testdata/complete_application_rpc_v37_payload_v1_command_v14_context_v1_request.hex`
+- `storage_rpc/testdata/complete_application_rpc_v37_payload_v1_command_v14_context_v1_state_v10_response.hex`
+
+Tests compare writers with the literal payloads/frames, decode them, and reject
+truncation, trailing bytes, wrong purpose/version, unsupported proof tags,
+crossed command identity, retired command/unknown context encodings and correctly
+resealed outer versions 36/38. Exact-at-cap and cap-plus-one request admission
+are pinned. No historical payload, frame, digest or schema evidence is replaced.
+Sender custody and live selection remain separate integration gates.
+
+### Candidate complete-slot retirement payload V1 — 2026-11-10
+
+`storage_rpc/complete_retirement.rs` defines bounded untrusted framing for the
+closed terminal sender. Receiver admission/dispatch is now integrated under the
+owner-test complete selector; live ID 19 still rejects this grammar through its
+legacy decoder. No fallback is added. The cap change is
+part of the pending RPC 36-to-37 transition, not a second version advance.
+
+The request is literal `RTIR`, little-endian u16 version 1, mandatory conservative
+absolute wall cutoff u64, then node u32, epoch u64, PG u32, complete-command CRC64
+u64, length u32 and complete command bytes. Its frame cap is
+`MAX_COMPLETE_COMMAND_BYTES + 42`. The 62-byte acknowledgement is literal `RTOK`,
+version u16, node u32, epoch u64, PG u32, index u64 and complete SHA-256 (32 bytes).
+Purpose/identity validation prevents another operation's success substituting for
+retirement. Framing alone is not evidence of terminal completion or cleanup authority.
+
+Appended immutable composites:
+
+- `pg_store/testdata/complete_retirement_payload_v1_command_v14_context_v1.hex`
+- `pg_store/testdata/complete_retirement_confirmation_v1_command_v14_context_v1.hex`
+- `storage_rpc/testdata/complete_retirement_rpc_v37_payload_v1_command_v14_context_v1_request.hex`
+- `storage_rpc/testdata/complete_retirement_rpc_v37_payload_v1_command_v14_context_v1_response.hex`
+
+They pin complete-command SHA-256
+`5c1438e559d8e1dd4a19e1f6808e6693645dc489063c10cbf0835a979a1115f8`,
+outer CRC64 and the response success envelope. Tests compare writers to literals,
+reject wrong purpose/version/subject, truncation/trailing bytes and resealed outer
+versions 36/38, and pin exact-cap/+1 frame admission. No predecessor evidence is
+edited. Future incompatible edits advance this payload's version and append
+evidence; changes to containing framing/interpretation also advance the containing
+RPC version under the one-transition-per-commit rule.
+
+The subsequent receiver integration consumes these unchanged specimens, binds the
+absolute cutoff once before context validation, and produces the acknowledgement
+only after admitted exact-slot retirement commits. Authenticated Unix/TLS tests
+cover lost reply, exact absence, restart/compaction and pre-effect expiry; these do
+not advance formats or select live production dispatch.
+
+### Candidate unstarted-primary abandonment payload V1 — 2026-11-11
+
+`storage_rpc/complete_abandonment.rs` adds the independently purpose-tagged
+`ABND` request and `ABOK` confirmation. Field widths and ordering match the
+retirement family above: request version u16, mandatory conservative absolute
+wall cutoff u64 and the complete command frame; confirmation version u16, node,
+command ID and complete-command SHA-256. The maximum request is
+`MAX_COMPLETE_COMMAND_BYTES + 42`; confirmation is exactly 62 bytes. Frame ID 28
+initially used this cap (subsequently raised for replica framing below) as part
+of the pending RPC **36 → 37** transition, not another
+advance within the same uncommitted integration. No old fixture is changed.
+
+Four new literal composites freeze the new family (paths relative to
+`crates/storage/src`; hashes cover the complete fixture files):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `pg_store/testdata/complete_abandonment_payload_v1_command_v14_context_v1.hex` | `9259e3d9e2846958f8388b22ac98e42dfe7304243b0efb3ad9f315271afb69c6` |
+| `pg_store/testdata/complete_abandonment_confirmation_v1_command_v14_context_v1.hex` | `202ab178b3bed3a3db85fe7b6a271aad8bc0ed3e3434fc81900963d5e096f9ac` |
+| `storage_rpc/testdata/complete_abandonment_rpc_v37_payload_v1_command_v14_context_v1_request.hex` | `cd114d3196d7c99824a0f18072ab9e78d02370a7fdebb1e2d885ace6c2967217` |
+| `storage_rpc/testdata/complete_abandonment_rpc_v37_payload_v1_command_v14_context_v1_response.hex` | `3830849d94db814a5ae41b4d6fb772bb8d5ccfae696ca7d4567a75e6285fd9d3` |
+
+Tests compare production encoding with these literals, pin outer checksum and
+success-envelope bytes, reject truncations/trailing data and crossed
+purpose/version/identity, and require exact-cap acceptance and cap-plus-one
+rejection. Framing is not authority: the owner-test-selected receiver separately
+requires the admitted primary section, exact unstarted pending context and
+captured deadlines before recording a tombstone. Live dispatch rejects this
+grammar. Confirmation does not authorize replica abandonment, slot retirement,
+resource release or cleanup.
+
+### Candidate settled-witness inspection V1 — 2026-11-13
+
+`storage_rpc/complete_settled_prefix.rs` adds a bounded read-only candidate grammar
+on frame ID 15 (`MetadataCommandReplicaState`). The 58-byte request is version
+u16, conservative absolute wall cutoff u64, node u32, epoch u64, PG u32 and
+canonical-topology SHA-256. The 92-byte success payload echoes those exact bytes
+and appends the existing 34-byte typed replica-state carrier (epoch/index,
+log-hash V1 and state-digest V10). Topology hashing uses the fixed domain
+`argmin.settled-witness-topology.v1` and canonical ascending little-endian u32 PGs.
+
+This slice initially advanced the frame cap 16 → 58 bytes in the pending RPC
+**36 → 37** transition; the primary-window grammar below raises the shared frame
+cap further without changing the witness's exact 58-byte decoder. Live dispatch
+still requires its raw 16-byte request; only explicitly
+selected complete-command owner-test servers accept the new grammar. Neither
+side interprets the other grammar as a fallback. This is inspection, not proof of
+physical authority. No historical frame, raw-state specimen or nested state
+version is rewritten.
+
+New literal framed evidence (paths relative to `crates/storage/src`; hashes cover
+the complete fixture files):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `storage_rpc/testdata/settled_witness_rpc_v37_payload_v1_request.hex` | `f41b6a2f8afbd8117ee11218e7d293c0744ba5d3e5a1cac57988cd3684d337bd` |
+| `storage_rpc/testdata/settled_witness_rpc_v37_payload_v1_state_v10_response.hex` | `31f20b892fd06b8eed73497d035e50895d0c0ca623e87d4ec5c10adfd011257b` |
+
+The codec tests pin payload/frame/checksum/success-envelope bytes, reject crossed
+subject/cutoff/topology/prefix version, truncation and trailing data, and require
+exact-cap admission and cap-plus-one rejection. Installed authenticated Unix/TLS
+tests separately exercise the admitted witness path and its bounded waits.
+
+### Candidate primary-window inspection V1 — 2026-11-13
+
+`storage_rpc/complete_window_primary.rs` adds `WPRI`/`WPOK` purposes to candidate
+frame ID 15. Requests contain magic4, the unchanged 58-byte witness route/cutoff
+header, descriptor length u32 and the bounded immutable introduction/append V1
+descriptor. The exact frame cap is **16,450 bytes**, including the 16 KiB
+descriptor cap. The 133-byte success payload is reply magic4, the unchanged
+92-byte route/prefix response, descriptor SHA-256, witness-present byte and
+witness node u32 (zero when absent). Node zero with presence true is distinct
+from singleton absence. The descriptor is descriptive only; it cannot install
+commands or authorize physical effects.
+
+This appends to the same pending RPC **36 → 37** transition without changing
+witness, raw-state or descriptor specimens. Owner-test selection is still
+required; live dispatch rejects this grammar. New complete literal fixtures
+(hashes cover fixture files, paths relative to `crates/storage/src`):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `storage_rpc/testdata/primary_window_rpc_v37_descriptor_v1_request.hex` | `066022d37c5d589ce5184cdaef2ed3522f7d8d2399bb00ad8e87d4a88575e175` |
+| `storage_rpc/testdata/primary_window_rpc_v37_descriptor_v1_state_v10_response.hex` | `ecf2c83d827a8db9e14b05828b736dfa4ffc932244212111cbb5d06fb8b82910` |
+
+Tests independently pin framing/checksum bytes, exact request and response
+bindings, cross-purpose rejection, singleton-versus-node-zero identity and
+exact-at-cap/one-byte-over framing. Installed Unix/TLS tests separately validate
+the same held section, admission, deadlines and durable window correspondence.
+
+### Candidate Direct PUT file-binding inspection V1 — 2026-11-13
+
+`storage_rpc/complete_window_primary.rs` appends `DPRI`/`DPOK` purposes to
+candidate frame ID 15. Their grammar and caps are identical to primary-window
+V1 above, but the receiver additionally checks the Direct PUT target, live
+original issuer and fixed generation reservation inside the same read snapshot.
+The response remains observational: it cannot authorize file writes. Request
+and response purpose checking is bidirectional; `WPRI`/`WPOK` cannot satisfy
+this exchange. Live dispatch still rejects the candidate payloads.
+
+This is part of the pending RPC **36 → 37** transition. Existing primary-window,
+witness and stream-allocation specimens are unchanged. New exact framed
+composites (paths relative to `crates/storage/src`; hashes cover fixture files):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `storage_rpc/testdata/direct_file_primary_rpc_v37_descriptor_v1_request.hex` | `bd4598321ac11fac26f26f2e77bb1720ca10e8c9eb0469b8e09d0e65a1244e49` |
+| `storage_rpc/testdata/direct_file_primary_rpc_v37_descriptor_v1_state_v10_response.hex` | `d7187cce29efffabb0d605740b21563de3fe0941e0f69cafa0f9c4a88b40f714` |
+
+Codec tests pin literal bytes/checksums, exact route/descriptor/witness response
+binding, truncated and crossed-purpose rejection, and exact-cap admission.
+Installed Unix/TLS tests cover the receiver's read-only admission and rejection.
+
+### Candidate stream-window allocation V1 — 2026-11-13
+
+`storage_rpc/complete_stream_allocation.rs` adds `SALL`/`SALR` purposes to
+candidate `ObjectStreamSegmentAppendPrepare`. Request: magic4, version u16,
+length-prefixed primary-window V1 request, 34-byte replica-state V10 prefix,
+and length-prefixed existing append-preparation/SSE-state grammar. The window
+retains its original absolute cutoff; the nested preparation must carry an
+expected session and no independent effect deadline. Node/PG/epoch and prefix
+epoch must agree. Response: magic4, version u16, SHA-256 of the exact request,
+and the existing stream-segment record encoding. The sender independently
+validates the returned record against its retained window and request.
+
+The allocation payload cap is **147,570 bytes**: 6 + 4 + 16,450 + 34 + 4 +
+131,072. The shared opcode's frame cap also admits the bounded stream-file
+inspection carrier below; the allocation decoder retains this smaller limit.
+Nested limits still apply. This appends to the same pending RPC
+**36 → 37** transition; old append-preparation, SSE-state, descriptor and
+primary-window specimens are unchanged. Live dispatch rejects the candidate
+grammar. These are codec specimens, not evidence of route admission or a grant.
+
+New literal framed composites (paths relative to `crates/storage/src`; hashes
+cover fixture files):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `storage_rpc/testdata/stream_allocation_rpc_v37_payload_v1_descriptor_v1_state_v10_sse_s3_v5_request.hex` | `12b0b3aa1f0ec831329328ac5c0e01140838d91e631644950b24c515907f6389` |
+| `storage_rpc/testdata/stream_allocation_rpc_v37_payload_v1_descriptor_v1_state_v10_sse_s3_v5_response.hex` | `34d4a63629991d51556bc5723f1ae5f8b2b5df2e3c539adc10448d5084a59b89` |
+
+Tests pin exact frame/checksum/envelope bytes, truncated/trailing/cross-purpose
+rejection, request-subject/response-digest binding and exact-cap/one-over framing.
+Installed Unix/TLS tests separately exercise actual retained windows and custody.
+
+### Candidate stream-file primary inspection V1 — 2026-11-13
+
+`storage_rpc/complete_stream_file_primary.rs` adds `SFPI`/`SFOK` purposes to
+candidate `ObjectStreamSegmentAppendPrepare`. The request is magic4, version
+u16, allocation-request length u32, unchanged `SALL` request bytes and a fresh
+allocated segment record (no integrity witness). The segment encoding has an
+independent 1,024-byte limit. The complete cap is **148,604 bytes**:
+6 + 4 + 147,570 + 1,024. Both nested limits remain enforced. The reply is
+magic4, version u16 and SHA-256 of the complete inspection request (38 bytes).
+It observes exact read-only validation and cannot substitute for `SALR` or
+grant file authority. Live dispatch rejects the candidate grammar.
+
+This appends to the pending RPC **36 → 37** transition; no predecessor
+allocation/window, command, schema or state evidence is replaced. Literal
+framed composites (paths relative to `crates/storage/src`; hashes cover files):
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `storage_rpc/testdata/stream_file_primary_rpc_v37_payload_v1_descriptor_v1_state_v10_sse_s3_v5_request.hex` | `6d78031400d708077f92a7fba46ec64a73e5a1e777d78266bb035f3805be0ea8` |
+| `storage_rpc/testdata/stream_file_primary_rpc_v37_payload_v1_descriptor_v1_state_v10_sse_s3_v5_response.hex` | `77e226a82daafd2357ccbd5e93048121c09213f15bc66d22aa9d0024b5fbbaa7` |
+
+Codec tests pin complete frame/envelope/checksum bytes, truncation, trailing
+bytes, unsupported purpose/version, request digest and bidirectional allocation
+purpose separation, plus exact-cap and one-over frame admission. Installed
+Unix/TLS tests independently verify the read-only receiver and its admission.
+
+### Candidate remote append preparation payload V1 — 2026-11-15
+
+`storage_rpc/complete_stream_append_prepare.rs` defines SAPP/SAPR V1. Its initial
+codec-only slice did not assign a message kind; the admitted receiver now uses
+distinct kind **180**, frontend-only and candidate-selector gated. There is no
+magic-based detection inside legacy append requests. Existing RPC-v37 frame
+grammars and fixtures are unchanged; the request cap is enforced before dispatch.
+
+Request: magic4, version u16, length-prefixed SART-v1 stream-only receipt carrier.
+The nested receiver is the original object-PG primary; route/topology and an
+equal-or-shorter absolute cutoff must match the SFPI/SALL allocation provenance.
+Segment/session fields match allocation, all k+m receipts are ordered and their
+sizes match the encrypted stored geometry. The cap is `10 + SART_MAX`.
+
+Reply: magic4, version u16, full-request SHA-256, then the existing borrowed
+complete-command carrier (node u32, epoch u64, PG u32, CRC64 u64, length-prefixed
+opaque bytes). The cap is `38 + COMPLETE_APPLIED_MAX`, including request-only
+overhead above maximal complete-command bytes. The response decoder checks exact
+request digest and primary/epoch/PG; the body is borrowed, not context-decoded.
+This does not establish receipt authenticity, durable state, matching command
+semantics or installation authority. Those remain consuming sender/admitted
+receiver responsibilities before activation.
+
+Frozen **unframed** specimens (not installed-server evidence):
+
+| Literal under `storage_rpc/testdata/` | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `stream_append_prepare_payload_v1_request.hex` (SART1/SFPI1/SALL1/descriptor1/state10/SSE-S3-5) | 1109 | `ebeeeed3987b31acfcd6491fb583588fb39ff20c8dd1ca56c98de09634670ecd` |
+| `stream_append_prepare_payload_v1_reply.hex` (deliberately untrusted opaque body) | 92 | `0655dac7d2d31a50df9cf90d6d82213ebfccc2af0c0e4d95f1e7af891554b946` |
+
+These specimens append evidence; they replace no historical payload or frame.
+The exact-cap response regression pins borrowed framing, not an installable
+maximal command. The tests independently cover both stream targets and crossed
+subjects, cutoffs, receipts, purposes, versions, lengths and response identities.
+
+The receiver's framing test additionally pins RPC-v37/request-ID-17 composites
+of these unchanged payload specimens (the reply uses the success envelope).
+Their SHA-256 values are `098a4beff69632e084c498b98c7b86a27f29d12449a0ad7e80a930e829dfddcd`
+(request) and `0321266c1c5fb51de332f357341004e72f6a46c9082e80f090e80537a7b092f7`
+(reply).
+Installed Unix/TLS receiver tests separately validate admitted read-only capture;
+the deliberately opaque frozen reply is not an installable command specimen.
+
+### Candidate remote append installation payload V1 — 2026-11-15
+
+`storage_rpc/complete_stream_append_install.rs` adds SAPI/SAIC V1 on distinct
+kind **181**, frontend-only with Progress admission. This extends the same
+uncommitted RPC **36 → 37** transition; all predecessor fixtures remain intact.
+Production dispatch returns unsupported until coordinated activation.
+
+SAPI is magic4, u16 version, u32 preparation length, exact SAPP V1 preparation,
+then the existing complete-command carrier (node/epoch/PG/CRC64/length/bytes).
+Both carriers must name the same primary/epoch/PG. The total admission cap is
+`10 + SAPP_MAX + COMPLETE_APPLIED_MAX`, not merely the command limit. SAIC is
+magic4, u16 version, SHA-256 of the entire SAPI request. There is no wire outcome
+claiming definitive nonacceptance: callers must retain uncertainty after errors.
+
+The codec test freezes an append-only composite from literal SAPI header bytes,
+the existing 1,109-byte `stream_append_prepare_payload_v1_request.hex`, and a
+literal borrowed command carrier containing `opaque context`. Its exact
+1,161-byte request SHA-256 is
+`7288fee2e3c7d4710031fd103894ea8114c04682f59a472d60d0814ce3ca1980`;
+the independent literal SAIC response pins that digest and purpose/version.
+This is framing evidence, not a valid installable-command specimen. Installed
+Unix/TLS tests use receiver-captured complete commands separately. Tests cover
+truncation, crossed routes, wrong purpose/version, changed-command reply binding,
+maximal complete-command framing and exact/one-over framed admission.
+
+### Candidate Direct PUT snapshot request/reply V1 — 2026-11-15
+
+`storage_rpc/complete_direct_snapshot.rs` adds DSNP/DSNR V1 on distinct kind
+**182**, frontend-only with Progress admission. This extends the same
+uncommitted RPC **36 → 37** transition; no predecessor evidence is rewritten.
+Live dispatch remains unsupported. Candidate-test servers now select a read-only
+admitted receiver and consuming sender; live publication remains gated.
+
+DSNP contains magic4, u16 version, u32 acknowledgement-carrier length and exact
+SART V1 bytes restricted to Direct provenance. DSNR contains magic4, u16 version,
+SHA-256 of the entire DSNP request, u32 snapshot length and borrowed snapshot
+bytes. The snapshot remains the existing untagged direct-commit storage snapshot
+grammar: incompatible changes to it must advance this containing payload version
+alongside its existing RPC dependants. Descriptor and SART remain independently
+versioned; nested changes require append-only composite evidence.
+
+The test freezes literal DSNP/SART framing around the independently frozen
+417-byte Direct PUT descriptor V1, plus three ordered receipts. The complete
+557-byte request SHA-256 is
+`09ef5cd13999ef1bb54134e3af4a437837ebe8b0b14da51742f59241b837bafc`.
+The literal DSNR reply contains that digest and the six-byte all-absent snapshot.
+These are framing specimens, not a claim of durable receipt or session authority.
+Request/reply decoding validates lengths before nested allocation; replies remain
+borrowed. The response cap includes its header and the six-byte success envelope
+within the existing 64 MiB RPC payload cap, preserving the transport budget for
+displaced multipart manifests rather than limiting them to a segment size.
+The request cap is **17,017 bytes**, accounting only for the Direct variant's
+16 KiB descriptor and 32 fixed-size receipts, not the stream carrier's larger cap.
+
+### Candidate Direct PUT terminal preparation V1 — 2026-11-16
+
+`storage_rpc/complete_direct_prepare.rs` adds DTPQ/DTPR V1 on distinct kind
+**183**, frontend-only with Progress admission. It extends the pending RPC
+**36 → 37** transition without replacing predecessor specimens. Live dispatch
+remains UnsupportedOperation. Candidate-test dispatch now selects an admitted,
+read-only terminal-preparation receiver. Its consuming candidate sender now binds
+the response to retained physical custody, the original held session and opaque
+committed-encryption evidence; remote installation and live selection remain gated.
+
+DTPQ carries magic4, u16 version, u32 length plus exact DSNP V1 request, the
+32-byte SHA-256 of the canonical prior direct-commit snapshot encoding, u64
+segment CRC64, and two length-delimited inputs: provisional object encryption
+and the existing logical StreamPutCommitInput grammar. Those untagged enclosing
+grammars are versioned by DTPQ; self-describing encryption-state changes require
+new complete version-vector evidence. Each input retains the 2 MiB command-payload
+budget independently; framing and the bounded DSNP descriptor/receipts are extra.
+The response binds SHA-256 of the entire request and borrows the complete-command
+carrier, validating the exact primary node/PG/epoch. It does not decode command
+authority. The complete-command response cap includes framing and fits within
+the outer frame including the six-byte success envelope.
+
+Literal `direct_prepare_payload_v1_{request,reply}.hex` fixtures pin the DSNP/
+descriptor-v1/SSE-S3-v5 composite. The 963-byte request SHA-256 is
+`a18d3396ec7173d894f644ac09dd6a6da61efe5d59d4d7f86b0c92dea8c29e81`.
+The 80-byte reply contains `opaque context`: this is framing evidence, not a
+valid terminal command, cryptographic rewrap or durable receipt assertion.
+Tests pin exact bytes, request/route correlation, profile and version-selection
+rejection, truncation/trailing data, pre-allocation nested-length bounds, and
+exact/one-over directional frame admission.
+
+### Candidate Direct PUT terminal installation V1 — 2026-11-16
+
+`storage_rpc/complete_direct_install.rs` adds DTIQ/DTIC V1 on distinct kind
+**184**, frontend-only with Progress admission, as part of the pending RPC
+**36 → 37** transition. Live dispatch remains unsupported. The candidate
+receiver now validates the admitted request and retained preparation inside the
+pending-slot transaction before returning confirmation; the framing types alone
+confer no decoded-command authority. No encoding changes accompany that receiver.
+
+DTIQ: magic4, u16 version, u32 preparation length, the exact DTPQ V1 preparation,
+then the existing borrowed complete-command carrier (node u32, epoch u64, PG u32,
+CRC64 u64, command length u32 and complete bytes). The two route subjects must
+match. DTIC: magic4, u16 version and SHA-256 of the entire DTIQ request.
+Its exact length is 38 bytes. All request fields, including the original cutoff,
+are bound by that digest; errors do not establish noninstallation.
+
+The cap is **8,405,753 bytes**, derived from ten framing bytes plus independent
+maximum preparation and complete-command capacities. Tests admit the exact cap
+and reject one byte above it at directional frame admission, preserve maximal
+complete-command capacity, and reject truncation, trailing bytes, crossed routes,
+unknown versions, oversized nested lengths and stream-installation carriers.
+
+`complete_direct_install_tests.rs` composes independent literal DTIQ V1 framing
+and a literal command carrier with the immutable
+`direct_prepare_payload_v1_request.hex` specimen. The 1,015-byte composite
+SHA-256 is `4a5e11e32c4cdae782a2670b1024aa3a6fb0a18f4ca1d9aa4b77d00082ee21c4`;
+the exact DTIC bytes are independently pinned. The command is `opaque context`,
+so this freezes the DTPQ1/DSNP1/descriptor1/state10/SSE-S3-5 framing combination,
+not a valid terminal command. No historical fixture was replaced.
+
+### Candidate acknowledgement request/reply V1 — 2026-11-14
+
+Related new framing: candidate acknowledgement request/reply `SART`/`SAOK` V1
+uses distinct kind **179**, frontend-only authentication and Progress admission.
+Both live and candidate dispatch reject it as unsupported pending effect
+integration. It extends the same uncommitted RPC **36 → 37** transition without
+replacing predecessor evidence.
+
+Acknowledgement request grammar: magic4, version u16, receiver-route V1 (58
+bytes, naming the **object PG**), provenance tag u8 and the existing direct or
+stream file provenance, receipt count u16, then ordered
+`(shard_index u8, stored_size u64, crc64 u64)` entries. Count is 1..=32, indices
+are contiguous from zero, and sizes are equal, nonzero and at most 16 MiB. This
+is framing validation, not retained-window geometry or custody validation. No
+physical keys or caller-selected data PG are encoded. The frame cap is
+`6 + 58 + 1 + max(8 + 4 + 16384, 4 + SFPI_MAX) + 2 + 32 * 17`.
+Reply: magic4, version u16, full-request SHA-256 (38 bytes). Receipt CRC64 zero
+is valid. The receiver must independently confirm provenance before any future
+acknowledgement-row SQL; framing alone cannot grant that authority.
+
+Frozen complete RPC-v37 composites, request ID 17, kind 179, SART/SAOK-v1:
+
+| Provenance | Request SHA-256 | Success-response SHA-256 |
+| --- | --- | --- |
+| Direct, descriptor-v1 | `dcb2f348c26c54a9665dbceb87af1926a7c1294a66f614a863305f939f8c4f55` | `c2e5f483f69aab2bf22dd1be45bf62c7384afba1982bbb237252b48605f628e7` |
+| Stream, SFPI-v1/SALL-v1/descriptor-v1/state-v10/SSE-S3-v5 | `542c96463a99e2a319c8600e0cd2922c85f27b5f206edecb8e2ba1ef15ed9dd0` | `c2ecb9e5034a687aaf2a09fc51b7c51c5f272b418254716a21459d17d33f28f1` |
+
+`storage_rpc/complete_staging_ack_tests.rs` freezes these specimens. Shared
+provenance encoding leaves all existing SWRT/SWOK specimens below unchanged.
+
+### Candidate physical file request/reply V1 — 2026-11-14
+
+`storage_rpc/complete_staging_file.rs` defines `SWRT`/`SWOK` V1, selected only by
+owner-test candidate servers, not live dispatch. The candidate owning Direct PUT,
+streamed PUT and UploadPart senders use the same unchanged bytes; live publisher
+selection remains gated.
+This is a transport grammar, not confirmation or physical authority. Distinct message kind
+`StagingShardWrite` (**178**) now selects it; live dispatch rejects that kind as
+unsupported. It appends to the same pending RPC **36 → 37** transition; no current or
+historical grammar/evidence is replaced and no storage schema changes.
+
+Request: magic4, version u16, existing 58-byte receiver-route V1, provenance tag
+u8, provenance fields, shard index u8, payload length u32 and payload bytes.
+Tag 0 carries logical size u64 and length-prefixed descriptor (maximum 16 KiB).
+Tag 1 carries length-prefixed `SFPI` V1 with its existing independent cap.
+Shard payload is bounded to 16 MiB; whole-request cap is
+`6 + 58 + 1 + max(8 + 4 + 16384, 4 + SFPI_MAX) + 1 + 4 + 16777216`.
+These are framing bounds, not authorization of any window geometry. The stream
+carrier retains its nested primary identity; the outer receiver may differ,
+but PG/epoch/topology must agree and the outer cutoff cannot extend it.
+
+Reply: magic4, version u16, complete-request SHA-256 bytes32, stored length u64,
+CRC64 u64 (54 bytes). The sender validates the digest and both acknowledgement
+fields against its encoded request; there is no repeated payload checksum pass
+on reply validation. Any future incompatible change to the outer grammar advances
+this V1. Independently versioned inner changes append new complete version-vector
+evidence without rewriting the following vectors.
+
+`complete_staging_file_tests.rs` freezes SHA-256 of the **complete binary RPC
+frames**, including envelope and frame checksum (not hashes of hex files).
+The initial kind-3 composites below remain frozen predecessor evidence, not a
+dispatch contract: epoch 1414682451 in the legacy grammar starts with `SWRT`, so
+payload-prefix dispatch is ambiguous and has been removed.
+
+| Composite | Request SHA-256 | Success-reply SHA-256 |
+| --- | --- | --- |
+| RPC37/file1/descriptor1, Direct PUT | `0a6410576a21a31f838dcbdba4fc201c4a3e58369d20dca8ec6bad1577e49bc6` | `51f3d10f4dd94baca153527f02e3d9c75aec38830276447b5a3e03c5e7edc71c` |
+| RPC37/file1/SFPI1/SALL1/descriptor1/state10/SSE-S3-5, stream | `84d37aa469eea7346ae42f7df3f641bc5e40fc89a3731b340b8e9ab59b6f3247` | `85df9f75f9d5ab0bead242886ae65d85ab8ff1f12106e02f66d96d735d4a5e89` |
+
+Appended kind-178 complete-frame composites (same nested version vectors):
+
+| Composite | Request SHA-256 | Success-reply SHA-256 |
+| --- | --- | --- |
+| RPC37/kind178/file1/descriptor1, Direct PUT | `95d937e81c31b6b81df270ad3cf90bcc347bdd27fd4f7f1b971c0e4e3420f275` | `4a95df34cc0c10cd91e4cc69d8df6ac800e6838153b8e7f38771bdffc1d73034` |
+| RPC37/kind178/file1/SFPI1/SALL1/descriptor1/state10/SSE-S3-5, stream | `410ff6adeb5d86cda4a677460a9f424f040db3633c023db3a1f14a871727a1c9` | `17707320f70171bfea8490cd833b4bd473a44a2ba836b7272686cf562f7ab722` |
+
+Installed receiver integration uses kind **178**, with the unchanged file V1
+payloads and exact `MAX_REQUEST_BYTES` frame-admission cap. It is explicitly
+frontend-only and uses `Progress` admission, matching the legacy write role without
+widening another principal's authority. Kind **3** always uses the legacy decoder,
+including on candidate servers. The raw test-send adapter is not a production
+file-write API. Request-bound errors/successes traverse the existing authenticated
+Unix/TLS envelope. All predecessor codec specimens remain unchanged.
+
+### Candidate replica abandonment payload V1 — 2026-11-11
+
+`storage_rpc/complete_replica_abandonment.rs` adds distinct `RABD`/`RAOK`
+purposes. The request is magic4, version u16, conservative absolute wall cutoff
+u64, primary node u32 and the unchanged complete-command frame. The response is
+magic4, version u16, primary node u32, recipient node u32, epoch u64, PG u32,
+log index u64 and complete-command SHA-256. The primary must differ from the
+recipient. Maximum request size is `MAX_COMPLETE_COMMAND_BYTES + 46`; response
+size is 66 bytes. ID 28 uses the larger replica cap while each payload decoder
+keeps its own exact bound. This appends to the same uncommitted RPC **36 → 37**
+transition. No primary-abandonment specimen or earlier format evidence changes.
+
+Four literal composites (paths relative to `crates/storage/src`; hashes cover
+complete fixture files) freeze this separate family:
+
+| Specimen | SHA-256 |
+| --- | --- |
+| `pg_store/testdata/complete_replica_abandonment_payload_v1_command_v14_context_v1.hex` | `793e17074d3c9fe9b6eafd4a221067c7a9485b2ca91f16b92a82243040df4b75` |
+| `pg_store/testdata/complete_replica_abandonment_confirmation_v1_command_v14_context_v1.hex` | `5e3f2a7be93c19a5ba9abf2539b7d4649882dd3d5f63c532c15dd5b7371c1740` |
+| `storage_rpc/testdata/complete_replica_abandonment_rpc_v37_payload_v1_command_v14_context_v1_request.hex` | `7df77722b3178a7b914fa23c77b519ddcdb9b011b0a0da481d891d1c50c01532` |
+| `storage_rpc/testdata/complete_replica_abandonment_rpc_v37_payload_v1_command_v14_context_v1_response.hex` | `8ec2b7b02982235acb3ea34b56cf6e02b67801e1b8a3cbddc8b9666baf2df523` |
+
+Tests pin encoder bytes, frame CRC64, success envelope, every confirmation field,
+purpose separation, version/length/trailing-data rejection and exact-cap/+1
+admission. Framing is not primary confirmation or cleanup authority. Only owner
+tests select the admitted replica receiver; live dispatch remains unchanged.
+
+The subsequent owning sender consumes these unchanged V1 specimens. It retains
+primary-confirmed custody, the exact primary section/session, immutable cutoffs
+and per-recipient uncertainty while validating the request-bound confirmation.
+There is no additional wire/schema advance or ordinary-path fsync in that slice.
 
 ## Pending Route Dependency Index V2 — 2026-11-06
 
@@ -403,15 +1228,15 @@ commands cannot carry extraneous descriptors or sources. `AbortStreamUpload`
 has two explicitly distinct contexts: ordinary closure and source-bearing
 abandonment. An exhaustive match on the command enum owns that classification.
 
-The descriptor body limit remains 16 KiB; the source body limit remains 22 bytes
-plus the 2 MiB command limit. Version/kind/length/bounds are checked before nested
+The descriptor body limit remains 16 KiB; the source V2 body limit is 22 header
+bytes plus the 2 MiB payload and three-byte ordinary context. Version/kind/length/bounds are checked before nested
 decoding, which also validates command correspondence and configured topology.
 The field adds three bytes for ordinary commands or seven framing bytes to a
 nested value. It adds no independent checksum or authentication pass.
 
-Frozen outer bytes are composed with the existing immutable V1 descriptor and
-V1/command-V13 source literals in `payload_staging_command_context_tests.rs` and
-the codec's owner-local source-composite test. Literal headers pin version,
+Frozen outer bytes are composed with the existing immutable V1 descriptors,
+historical V1/command-V13 source and appended V2/command-V14/context-V1 source
+literals in the owner-local codec tests. Literal headers pin version,
 kind, length and order independently of production constants. Nested format
 advances append new complete version-vector evidence; existing literals remain.
 
@@ -430,24 +1255,82 @@ abandonment tag, within the applied command, advance that enclosing grammar,
 and enforce combined command/RPC size bounds. Separate field validation cannot
 establish that bond. Current live format versions and custody are unchanged.
 
+### Candidate Direct PUT introduction preparation framing
+
+`storage_rpc/complete_direct_introduction.rs` defines a new candidate payload
+grammar, now assigned distinct kind **185** (`StagingDirectIntroductionPrepare`)
+within the pending RPC **36 → 37** change. It is frontend-only with Progress
+admission; ordinary dispatch remains unsupported and only candidate-test servers
+select preparation. V1 requests begin with literal `DINQ`
+and little-endian u16 version 1, followed by the V1 settled-prefix route tuple,
+bucket/key/attempt strings and exact bucket-write reservation proof. The request
+contains no caller-selected generation, command timestamp or descriptor.
+
+V1 replies begin with `DINR` and u16 version 1, followed by the request SHA-256,
+complete-command SHA-256, u64 absolute cutoff and the bounded complete-command
+observation frame. Only descriptive borrowed framing leaves the decoder; command
+validation and owning installation are distinct boundaries. Source proof field
+bounds, aggregate limits, route identity and non-extending cutoffs are checked.
+
+`storage_rpc/testdata/direct_introduction_v1_request.hex` and
+`direct_introduction_v1_reply.hex` are independent exact specimens. The reply's
+opaque body freezes outer framing only, not a complete-command composite; the
+receiver regression separately compares real complete-command bytes. The new
+`direct_introduction_rpc_v37_payload_v1_command_v14_context_v1_{request,reply}.hex`
+specimens append complete RPC37/DINQ-DINR1/command14/context1/descriptor1 evidence,
+including the six-byte success envelope. They are 353 and 720 bytes and embed the
+unchanged `direct` specimen from `staging_context_carrier_v14_context_v1.hex`.
+Tests pin exact bytes and independently decode the literal frames and complete
+command. They are metadata-only preparation evidence, not installation or
+physical-authority evidence. Earlier specimens and live frame versions remain
+unchanged. Further nested-version changes require new composites.
+
+### Candidate Direct PUT introduction installation framing
+
+`storage_rpc/complete_direct_introduction_install.rs` adds kind **186**
+(`StagingDirectIntroductionInstall`) within the same pending RPC **36 → 37**
+change. It is frontend-only with Progress admission and candidate-test-only
+receiver dispatch. V1 requests are `DIIQ`, little-endian u16 version 1, a u32
+length and exact DINQ1 preparation request, then a u32 length and exact DINR1
+preparation response. Each component and the aggregate have separate caps;
+decoding borrows the embedded bytes. V1 confirmations are `DIIC`, u16 version 1
+and SHA-256 of the entire continuation request, exactly 38 bytes. These bytes
+describe an exchange; only the original receiver section's parked holder can
+authorize installation. A valid request cannot recreate that holder on reconnect.
+
+The frozen outer composite in `complete_direct_introduction_install_tests.rs`
+uses literal headers and the unchanged `direct_introduction_v1_{request,reply}`
+specimens: 361 bytes, confirmation digest
+`55ec8efe91528a7b61631116ae0a03fdd2bfc6cf7c3722fd25eb04b6d6789265`.
+The complete-command composite in
+`payload_staging_direct_introduction_install_rpc_tests.rs` uses literal headers
+and the existing RPC37/DINQ-DINR1/command14/context1/descriptor1 specimens:
+977 bytes, confirmation digest
+`7cd4962755ee7e8cb834eef48fa86250d3be72ab8d6490fb7e71c1ff037430a7`.
+Both append evidence without regenerating predecessor bytes; nested changes
+require new composites. No schema, command or context grammar changes here.
+
 ### Staging abandonment-source carrier (not yet in live envelopes)
 
-`pg_store/payload_staging_abandonment_source.rs` owns an independent V1 carrier
+`pg_store/payload_staging_abandonment_source.rs` owns an independent V2 carrier
 for the exact failed `CommitStreamPart` command. Its layout is eight literal
-bytes `stg-abnd`, little-endian u16 version 1, u64 original command CRC64, u32
-canonical-command length, and those complete command bytes. The source retains
+bytes `stg-abnd`, little-endian u16 version 2, u64 complete command CRC64, u32
+canonical-command length, and those complete V14/ordinary-context-V1 bytes. The source retains
 its independently versioned applied-command grammar; it is not reconstructed
 from only a session ID, proof or selected segment list. Other command kinds,
 abandonment tombstones, unsupported carrier/nested versions, trailing bytes,
 bad lengths and checksum mismatches fail decoding.
 
-The complete carrier bound is **22 bytes plus the 2 MiB command limit**, not
-2 MiB including its header. The command limit is shared with RPC admission.
+The complete carrier bound is **22 + 2 MiB + 3 bytes**, not 2 MiB including its
+header/context. The payload keeps its existing 2 MiB capacity; enclosing RPC
+admission must account for the added overhead at the coordinated live switch.
 Framing and the declared nested length are checked before command decoding.
-`testdata/staging_abandonment_source_v1_command_v13.hex` freezes the complete
-V1/command-V13/SSE-S3-V5 composite using the unchanged source specimen from the
-predecessor command corpus. A future nested-only advance retains this specimen
-and appends a new version-vector composite; it does not silently rewrite V1.
+`testdata/staging_abandonment_source_v1_command_v13.hex` retains the historical
+V1/command-V13/SSE-S3-V5 composite unchanged as exact rejection evidence. The V2
+source and complete cleanup composites above append current candidate evidence;
+the outer context V1 and applied command V14 grammars did not change when their
+independently versioned nested source advanced. Future nested advances likewise
+append new complete version vectors rather than revising existing evidence.
 
 This value is descriptive evidence, **not an abandonment certificate or cleanup
 authority**. Applying it requires the exact durable source tombstone/terminal
@@ -817,21 +1700,21 @@ to add an inner frame. Neither status permits adding a fallback reader.
 
 | Boundary family | Owner | Current candidate baseline | Gate status |
 | --- | --- | --- | --- |
-| PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 10`; version zero is valid only with no user schema objects | Recorded: immutable catalogues retain versions 1 through 10. Version 10 adds the mandatory stream allocation issuer node and 128-bit process lifetime, and advances the replica-state digest constraint to 9. Production initialization matches the exact v10 catalogue; nonempty version-zero state, versions 1 through 9, and 11 are rejected before initialization. Checkpoint import rejects malformed issuer fields before mutation. |
+| PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 13`; version zero requires no user schema objects | Recorded: immutable catalogues retain versions 1–13. Schema 13 adds mandatory 32-byte pending-command SHA-256 to the transactionally maintained route sidecar; schema 12 is rejected before storage opens. The sidecar is excluded from materialized checkpoint state. |
 | Applied metadata-command envelope | `storage` | magic `argmin-metadata-command`; command encoding 13 | Recorded: v13 adds the stream allocation issuer to the exact generation/session creation command. All current variants have stable checksum evidence; the 30 literal v12/SSE-S3-v5 object specimens remain rejection-only beside earlier corpora. Header/full decoders reject noncurrent outer and nested versions before effects. |
 | Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 2 | Recorded: V2 binds original-command SHA-256 as well as CRC64; exact V1 bytes remain rejection evidence. Current literal/composite, framing/version failures, CRC-collision rejection and resealed persisted old/new-version rejection precede recovery effects. |
 | Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain and opaque fixed-width `MetadataCommandLogHash` carrier version 1 | Recorded for the coordinated carrier slice: PG hash columns remain schema-bound and every exported proof carries the independent version and value; broader command-log-format evidence remains a separate row below |
-| Metadata checkpoint payload | `storage` | private `ARGMCPKT` plus big-endian `u16` checkpoint encoding 7 | Recorded: v7 carries schema-10 stream issuer fields and canonical-state v9. A literal current v7/state-v9/schema-v10/SSE-S3-v5 specimen independently decodes, verifies, installs, and reopens. The complete v6/state-v8/schema-v9/SSE-S3-v5 bytes and earlier evidence remain immutable; retired/newer versions and malformed issuer rows are rejected before import. |
-| Canonical metadata state digest | `storage` | private domain `argmin.metadata.pg-state` and opaque fixed-width `CanonicalStateDigest` carrier version 9 | Recorded: v9 includes both durable stream issuer fields. Prior v8 composites remain immutable; current independently versioned outer carriers append state-v9 evidence without changing their grammar versions. Replica state and every exported proof carry version and value; runtime configuration, control-plane state/commands/RPC, checkpoint, and storage-RPC readers reject noncurrent carriers. |
-| Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v5`; every present PG read route contains both proof-carrier versions and values | Recorded for the coordinated carrier slice: exact v5 text, versions 4/6, incomplete/noncurrent carrier rejection, and restart/publication coverage are owner-local |
-| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 36 | Recorded: v36 adds slot/index/topology-bound pending-window cursor tag 8, appending complete v36 composites and preserving v35 rejection evidence. V35 adds exact-participant staging protection pages and appends v35 enclosing corpora, retaining v34 rejection evidence. V34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
+| Metadata checkpoint payload | `storage` | private `ARGMCPKT` plus big-endian `u16` checkpoint encoding 8 | Recorded: v8 carries the owner/window/resource materialized tables and canonical-state v10. Exact v8 composites are appended beside immutable v7 and earlier evidence; noncurrent nested checkpoints are rejected. Schema-13 pending sidecars are not checkpoint materialized state and do not advance this format. |
+| Canonical metadata state digest | `storage` | private domain `argmin.metadata.pg-state`; opaque `CanonicalStateDigest` carrier version 10 | Recorded: v10 includes owner/window/resource state. All earlier proof-carrier composites remain immutable; current independently versioned outer carriers append v10 evidence. The schema-13 pending-sidecar digest is outside materialized state and does not advance this carrier. |
+| Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v6`; exact recovery reports include SHA-256 | Recorded: v5 text remains rejection evidence; current v6 appends the mandatory report digest. Exact text, complete proof carriers, restart and publication are tested. |
+| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 37 | Recorded: v37 adds distinct retained-log validation-budget error 28, preserving generic resource exhaustion 11 and all v36 evidence with appended v37 composites. V36 adds slot/index/topology-bound pending-window cursor tag 8, appending complete v36 composites and preserving v35 rejection evidence. V35 adds exact-participant staging protection pages and appends v35 enclosing corpora, retaining v34 rejection evidence. V34 adds delegated acknowledgement-registration deadlines, with a maximum 17-byte request increase. Bounded/unbounded acknowledgement specimens, all 37 creation composites and authentication-v2 composites are appended at v34; immutable v33 and earlier specimens remain rejection evidence. |
 | Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Recorded: exact request/response bytes cover absent and present transcript tags, a fixed production-derived transcript digest seals its domain/length/input grammar, typed framing/version failures are distinct owner-locally, and authenticator-valid versions 0/3 are rejected before server dispatch or mutation |
 | Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Recorded: exact v1 bytes, owner-typed framing/version failures, allocation-ordering evidence, and valid signed inner envelopes in server-facing versions 0/2 fixtures prove rejection before authentication, dispatch, or mutation |
-| Control-plane logical state | `storage` | canonical text with leading `version=32` | Recorded: owner-typed missing/unsupported-version classification and an 11,041-byte representative aggregate sealing unavailable-node observations, proof-bound singleton unavailable-PG transitions, historical-route proof-floor/provenance, destination-route evidence, PG-local metadata log epochs, topology, leases, transfers, prior-primary state, route references, and pending-command branches. Immutable v28 through v31 aggregates remain rejection-only evidence; versions 28/29/30/31/33 are rejected through both single-authority open and replicated snapshot installation without mutation or publication. |
-| Control-plane command envelope | `storage` | magic `ARGCPCMD`; command encoding 20 | Recorded: owner-typed truncated/unknown-magic/unsupported-version failures and the sealed 2,799-byte all-variant v20 aggregate. Unavailable-PG begin and completion remain singleton, exact-CAS commands. Immutable v15 through v19 aggregates remain rejection-only evidence; versions 14 through 19 and 21 are rejected directly, from a valid single-authority journal without replay or file replacement, and from current WAL, restart, and peer-RPC containers before authority-state change. |
-| Control-plane replicated snapshot envelope | `storage` | magic `ARGCPSNP`; snapshot encoding 1 containing logical state 32 | Recorded: owner-typed truncated/unknown-magic/unsupported-version failures, exact v1 framing around canonical empty state v32 with immutable v28/v29/v30/v31 vectors, correctly resealed versions 0/2 rejected directly and before replicated state-machine replacement, and complete state validation before dispatch, publication, or restore. |
-| Control-plane RPC frame and payloads | `storage` | magic `argmin-control-plane-rpc`; frame/payload encoding 18 | Recorded: coordinated exact frame/proof grammar, owner-typed marker rejection, correctly checksummed versions 13 through 17 and 19 rejected before reservation, admission, or mutation, mutation response-loss confirmation, and an exhaustive 14,125-byte request/success/semantic-error catalogue. The immutable v14 through v17 operation aggregates remain rejection-only evidence. |
-| Authenticated control-plane RPC payload binding | `storage` | untagged big-endian RPC kind plus logical payload, bound to RPC encoding 18 | Recorded: `(control-plane RPC v14 through v17, authentication envelope v1)` fingerprints remain immutable rejection evidence, while `(v18, v1)` request and response fingerprints seal the exact current inner kind/payload bytes and production-derived authenticators. Validly re-signed request and response kind mismatches are rejected before dispatch or response decoding. |
+| Control-plane logical state | `storage` | canonical text with leading `version=33` | Recorded: exact 11,221-byte state-v33/canonical-v10 aggregate includes the mandatory pending-command digest. V32/canonical-v10 and all older composites remain immutable rejection evidence. |
+| Control-plane command envelope | `storage` | magic `ARGCPCMD`; command encoding 21 | Recorded: exact 2,831-byte all-variant command-v21/canonical-v10 corpus includes the heartbeat digest. V20 and older bytes remain rejection evidence, including nested journal/Raft composites. |
+| Control-plane replicated snapshot envelope | `storage` | magic `ARGCPSNP`; snapshot encoding 1 containing logical state 33 | Recorded: exact state-v33 composite appended beside immutable state-v28 through v32 specimens. Noncurrent inner state is rejected before installation. |
+| Control-plane RPC frame and payloads | `storage` | magic `argmin-control-plane-rpc`; frame/payload encoding 19 | Recorded: exact 14,349-byte request/success/error catalogue includes heartbeat, recovery listing, runtime-map and pending-command error digests. V18 and all older aggregates remain immutable rejection evidence. |
+| Authenticated control-plane RPC payload binding | `storage` | untagged big-endian RPC kind plus logical payload, bound to RPC encoding 19 | Recorded: authentication-envelope-v1 composites for RPC-v14 through v18 remain immutable; new v19 request/response fingerprints are appended. |
 | Shared control-plane authentication envelope | `storage` | magic `ARGCPAUT`; authentication-envelope encoding 1 | Recorded: owner-typed marker/version rejection, an exhaustive exact signed v1 catalogue, and correctly re-signed versions 0/2 rejected before dispatch or mutation by control-plane RPC, Raft peer RPC, and storage-node RPC |
 | Single-authority control-plane journal hash chain | `storage` | untagged CRC64 seed and transition algorithms, bound to journal-record encoding 2 | Recorded: fixed canonical-state-v32 seed, one-step and multi-step v20-command transition vectors, and exact journal-record-v2 bytes seal the current algorithm, byte order, command contribution, and containing version. Complete v28/v15, v29/v16, v30/v17, and v31/v19 seed, transition, and record bytes remain immutable rejection evidence. |
 | Shared durable-journal header and frame stream | `storage` | configured magic/version plus big-endian base offset, CRC64, and length/complement frames; bound to single-authority journal file 2, Raft WAL file 2, and Raft restart artifact 6 for logical-offset semantics | Recorded: the production shared reader has typed header failures, exact owner-specific full-file fixtures seal both v2 instantiations and every frame kind, and fixed restart-v6/compacted-WAL-frame-v2 plus predecessor v5/v1 pairs seal logical replay-offset semantics |
@@ -1101,6 +1984,11 @@ are no fallback readers and no mixed-version comparison or translation paths.
 
 ### Storage-node persisted runtime-config evidence inventory (2026-08-09)
 
+The V5 entries below retain the earlier evidence inventory. The recovery-report
+SHA-256 addition now requires V6; see the 2026-11-10 coordinated correction above.
+Its recovery record adds a sixth field, so this is an outer grammar change,
+not merely an inner-proof version advance.
+
 The proof-carrier audit found one additional independently versioned direct container that the
 initial baseline matrix omitted.
 
@@ -1135,6 +2023,10 @@ not implicitly versioned by the binding.
 
 ### Control-plane logical-state, command, and snapshot evidence inventory (2026-08-09)
 
+The V32/V20 descriptions below are retained predecessor evidence. Current state
+is V33 and commands V21; snapshot framing stays V1 with new composites, as
+recorded in the 2026-11-10 correction above.
+
 The former combined control-plane logical-state row contains three independently versioned
 formats. The command envelope is nested in single-authority journals, OpenRaft entries, restart
 artifacts, WAL records, and peer RPC payloads. The replicated snapshot envelope contains the
@@ -1164,6 +2056,9 @@ or the way those encoded bytes contribute to it advances the journal-record vers
 
 ### Control-plane RPC and shared-authentication evidence inventory (2026-08-09)
 
+RPC V18 below is predecessor evidence. Current RPC V19 carries mandatory recovery
+SHA-256; authentication framing remains V1, with appended authenticated composites.
+
 The former combined control-plane RPC/authentication row contains an outer control-plane RPC frame,
 an untagged control-plane-specific authenticated payload binding, and a shared authentication
 envelope. The shared envelope is also used by storage-node RPC authentication and Raft peer RPC;
@@ -1187,6 +2082,11 @@ authenticator rule advances version 1 and requires all three consuming protocols
 old/new envelope before dispatch.
 
 ### Single-authority durable-artifact evidence inventory (2026-08-09)
+
+Nested state V32/command V20 below are predecessor composites. Current journal
+records contain state V33-derived chain seeds and commands V21, without changing
+the independently versioned outer journal grammar. Both sets of exact evidence
+are retained.
 
 The former combined single-authority durable-artifact row contains four self-describing artifacts,
 the journal's length framing, and one untagged 32-byte binding shared across the identity,

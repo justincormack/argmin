@@ -721,48 +721,79 @@ impl PgStore {
         commit_context: &'static str,
         body: impl FnOnce(&Self) -> Result<T, MetadataError>,
     ) -> Result<T, MetadataError> {
-        if !self.conn.is_autocommit() {
-            return body(self);
-        }
-
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| MetadataError::Db {
-                context: begin_context,
-                source: source.into(),
-            })?;
+        let transaction =
+            super::metadata_transaction::MetadataTransaction::begin(self, begin_context)
+                .map_err(|error| Self::store_error_as_metadata_db(begin_context, error))?;
         let result = body(self);
+        self.finish_immediate_txn(transaction, result, commit_context)
+    }
+
+    fn begin_immediate_txn(
+        &self,
+        context: &'static str,
+    ) -> Result<super::metadata_transaction::MetadataTransaction<'_>, MetadataError> {
+        super::metadata_transaction::MetadataTransaction::begin_outer(self, context)
+            .map_err(|error| Self::store_error_as_metadata_db(context, error))
+    }
+
+    fn finish_immediate_txn<T>(
+        &self,
+        transaction: super::metadata_transaction::MetadataTransaction<'_>,
+        result: Result<T, MetadataError>,
+        commit_context: &'static str,
+    ) -> Result<T, MetadataError> {
+        #[cfg(test)]
+        let result = result.and_then(|value| {
+            manual_transaction_tests::before_finish(self)?;
+            Ok(value)
+        });
         match result {
             Ok(value) => {
-                self.commit_immediate_txn(commit_context)?;
+                transaction
+                    .commit(commit_context)
+                    .map_err(|error| Self::store_error_as_metadata_db(commit_context, error))?;
                 Ok(value)
             }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(MetadataError::Db {
+                    context: "metadata operation and rollback failed",
+                    source: crate::error::DatabaseError::new(format!(
+                        "operation: {error}; rollback: {rollback}"
+                    )),
+                }),
+            },
         }
     }
 
-    pub(super) fn commit_immediate_txn(&self, context: &'static str) -> Result<(), MetadataError> {
-        #[cfg(test)]
-        if self
-            .fail_next_metadata_txn_commit
-            .swap(false, Ordering::Relaxed)
-        {
-            let _ = self.conn.execute_batch("ROLLBACK");
-            self.invalidate_clean_metadata_digest_revision();
-            return Err(MetadataError::Db {
+    // Only adversarial fixtures may end an unmanaged transaction. Production
+    // operations must retain and consume their MetadataTransaction instead.
+    #[cfg(test)]
+    pub(super) fn commit_unmanaged_test_transaction(
+        &self,
+        context: &'static str,
+    ) -> Result<(), MetadataError> {
+        self.require_usable_connection()
+            .map_err(|error| Self::store_error_as_metadata_db(context, error))?;
+        // A raw-parent fixture cannot commit a newer owned scope (or a retired PG).
+        if self.metadata_transaction_scopes.has_active_scope() {
+            return Err(MetadataError::InvariantViolation {
                 context,
-                source: crate::error::DatabaseError::new(
-                    "injected metadata transaction commit failure",
-                ),
+                reason: "commit requires the owning metadata transaction scope".into(),
             });
         }
-
         if let Err(source) = self.conn.execute_batch("COMMIT") {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let rollback = self.execute_metadata_command_rollback("ROLLBACK");
             self.invalidate_clean_metadata_digest_revision();
+            if let Err(rollback) = rollback {
+                self.retire_connection();
+                return Err(MetadataError::Db {
+                    context,
+                    source: crate::error::DatabaseError::new(format!(
+                        "commit failed: {source}; rollback failed: {rollback}"
+                    )),
+                });
+            }
             return Err(MetadataError::Db {
                 context,
                 source: source.into(),
@@ -870,6 +901,4 @@ impl PgStore {
         }
         Ok(())
     }
-
-
 }

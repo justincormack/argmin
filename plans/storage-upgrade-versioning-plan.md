@@ -8,6 +8,13 @@
 Status: design and implementation not started. Current binaries still accept only current
 internal formats and homogeneous protocol versions.
 
+Current-format correction (2026-11-10): historical recovery observations now bind
+complete-command SHA-256. The coordinated schema/control-plane/configuration
+advances and append-only enclosing composites are recorded in the
+[format ledger](../guides/storage-format-ledger.md#cryptographically-bound-recovery-observations--2026-11-10).
+This does not introduce migration or mixed-version support; a future upgrade
+must not downgrade exact recovery authorization to CRC64-only reports.
+
 ## Related Documents
 
 - [`guides/versioning.md`](../guides/versioning.md) defines the rules for changing and evidencing

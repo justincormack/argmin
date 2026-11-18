@@ -342,18 +342,20 @@ pub(in super::super) fn apply_in_open_transaction(
             ))
         })
         .transpose()?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    pg.apply_commit_stream_part_command(command)?;
-    sql::publish_part(
-        &pg.conn,
-        owner.subject.object_pg,
-        configured_topology,
-        &checked,
-        &checked_after,
-        checked_displaced
-            .as_ref()
-            .map(|(old, retired)| (old, retired)),
-    )?;
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        pg.apply_commit_stream_part_command(command)?;
+        sql::publish_part(
+            pg,
+            owner.subject.object_pg,
+            configured_topology,
+            &checked,
+            &checked_after,
+            checked_displaced
+                .as_ref()
+                .map(|(old, retired)| (old, retired)),
+        )?;
+        Ok(())
+    })();
+    savepoint.finish(result)
 }

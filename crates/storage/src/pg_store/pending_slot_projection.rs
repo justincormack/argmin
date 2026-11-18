@@ -60,6 +60,7 @@ impl<'a> PendingSlotProjection<'a> {
             command.id(),
             command.checksum_crc64(),
             &routes.dependencies,
+            &routes.command_sha256,
         );
         Ok(Self {
             command,
@@ -75,9 +76,9 @@ impl<'a> PendingSlotProjection<'a> {
         self.command
     }
 
-    pub(super) fn install(self, pg: &PgStore) -> Result<(), StoreError> {
+    pub(super) fn install(&self, pg: &PgStore) -> Result<(), StoreError> {
         pg.replace_pending_metadata_command_route_dependency_sidecar(&self.routes)?;
-        match self.staging {
+        match &self.staging {
             StagingProjection::Empty => pg
                 .initialize_pending_staging_index(self.command.id(), self.command.checksum_crc64()),
             StagingProjection::Window { index, topology } => {
@@ -93,6 +94,7 @@ impl<'a> PendingSlotProjection<'a> {
         let expected = PendingMetadataCommandRouteReferences {
             id: self.command.id(),
             command_checksum: self.command.checksum_crc64(),
+            command_sha256: self.command.command_sha256(),
             dependencies: self.routes.dependencies.clone(),
         };
         if pg.pending_metadata_command_route_references(node_id)? != Some(expected) {
@@ -114,7 +116,7 @@ impl<'a> PendingSlotProjection<'a> {
 /// Compare every materialized page, not merely the slot's advertised counts.
 /// The caller has matched the exact envelope and holds the pending transaction.
 /// No repair or projection extraction is provided through this boundary.
-fn require_payload_pages(
+pub(super) fn require_payload_pages(
     pg: &PgStore,
     expected: &PendingShardScavengerReferencePages,
 ) -> Result<(), StoreError> {

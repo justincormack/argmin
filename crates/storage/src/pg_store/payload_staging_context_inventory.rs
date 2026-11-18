@@ -11,6 +11,7 @@ use crate::node_runtime::pg_store::PendingShardScavengerReferencePages;
 use crate::node_runtime::pg_store::PgStore;
 use crate::types::ShardScavengerPayloadReference;
 use crate::{PgTopology, StoreError};
+use rusqlite::OptionalExtension;
 
 #[path = "payload_staging_context_retention.rs"]
 mod retention;
@@ -18,8 +19,8 @@ mod retention;
 pub(in super::super::super) use retention::ContextPendingRetention;
 
 pub(in super::super::super) struct ContextPendingInventory {
-    retention: ContextPendingRetention,
-    payload: Vec<ShardScavengerPayloadReference>,
+    pub(super) retention: ContextPendingRetention,
+    pub(super) payload: Vec<ShardScavengerPayloadReference>,
 }
 
 /// Freely copyable diagnostics, not reference identities or encoded indexes.
@@ -69,6 +70,26 @@ pub(super) fn derive(
     pg: &PgStore,
     topology: &PgTopology,
 ) -> Result<ContextPendingInventory, ContextError> {
+    derive_inner(context, pg, topology, false)
+}
+
+// Startup inspection cannot require a live session after terminal application.
+// Only this read-only path uses the retained owner's immutable window geometry;
+// fresh installation keeps its existing live-session requirements.
+pub(super) fn derive_retained(
+    context: &ContextualCommand,
+    pg: &PgStore,
+    topology: &PgTopology,
+) -> Result<ContextPendingInventory, ContextError> {
+    derive_inner(context, pg, topology, true)
+}
+
+fn derive_inner(
+    context: &ContextualCommand,
+    pg: &PgStore,
+    topology: &PgTopology,
+    retained: bool,
+) -> Result<ContextPendingInventory, ContextError> {
     pg.require_usable_connection()?;
     let retention = retention::derive(context, topology)?;
     if context.id().pg_id().get() != pg.pg_id() {
@@ -80,6 +101,29 @@ pub(super) fn derive(
     let payload = match &context.input {
         Input::AbandonedPart(candidate) => {
             candidate.bind(topology)?.pending_payload_references()?
+        }
+        Input::Ordinary(command) if retained => retained_payload(pg, topology, command.payload())?,
+        Input::Described(candidate) if retained => {
+            let bound = candidate.bind(topology)?;
+            if let crate::metadata_command::MetadataCommandPayload::AppendStreamSegment(_) =
+                candidate.command().payload()
+            {
+                let protection = bound.pending_protection();
+                let (_, _, subject, _) = protection.index_inputs();
+                let owner = load_retained_owner(
+                    pg,
+                    topology,
+                    &subject.bucket,
+                    &subject.key,
+                    &subject.id.attempt,
+                )?;
+                if owner.subject != *subject {
+                    return Err(
+                        incomplete("retained append owner differs from captured subject").into(),
+                    );
+                }
+            }
+            retained_payload(pg, topology, candidate.command().payload())?
         }
         Input::Ordinary(command) => pg.pending_command_payload_references(command.payload())?,
         Input::Described(candidate) => {
@@ -99,6 +143,89 @@ pub(super) fn derive(
         }
     }
     Ok(ContextPendingInventory { retention, payload })
+}
+
+fn load_retained_owner(
+    pg: &PgStore,
+    topology: &PgTopology,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    session: &crate::SessionId,
+) -> Result<super::super::StagingOwnerRecord, StoreError> {
+    let owner = super::super::sql::load(&pg.conn, crate::PgId::new(pg.pg_id()), session)
+        .map_err(|e| incomplete(&e.to_string()))?
+        .ok_or_else(|| incomplete("missing retained owner for pending stream payload"))?;
+    owner
+        .validate(topology)
+        .map_err(|e| incomplete(&e.to_string()))?;
+    if owner.subject.bucket != *bucket
+        || owner.subject.key != *key
+        || owner.subject.id.attempt != *session
+        || matches!(owner.subject.target, super::super::StagingTarget::DirectPut)
+    {
+        return Err(incomplete(
+            "crossed retained owner for pending stream payload",
+        ));
+    }
+    let high_water = pg.conn.query_row(
+        "SELECT max_committed_generation FROM object_write_counters WHERE bucket = ?1 AND key = ?2",
+        rusqlite::params![bucket, key], |row| row.get::<_, Option<u64>>(0),
+    ).optional().map_err(|e| incomplete(&e.to_string()))?.flatten();
+    owner
+        .subject
+        .require_generation_high_water(high_water)
+        .map_err(|e| incomplete(&e.to_string()))?;
+    Ok(owner)
+}
+
+fn retained_payload(
+    pg: &PgStore,
+    topology: &PgTopology,
+    payload: &crate::metadata_command::MetadataCommandPayload,
+) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+    use crate::metadata_command::MetadataCommandPayload;
+    let (bucket, key, session, segments) = match payload {
+        MetadataCommandPayload::AppendStreamSegment(append) => (
+            &append.bucket,
+            &append.key,
+            &append.segment.session_id,
+            std::slice::from_ref(&append.segment),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(abort) => (
+            &abort.bucket,
+            &abort.key,
+            &abort.session_id,
+            abort.staged_segments.as_slice(),
+        ),
+        _ => return pg.pending_command_payload_references(payload),
+    };
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owner = load_retained_owner(pg, topology, bucket, key, session)?;
+    segments
+        .iter()
+        .map(|segment| {
+            let selected = owner
+                .selected_stream_reference(segment)
+                .map_err(|e| incomplete(&e.to_string()))?;
+            Ok(ShardScavengerPayloadReference::Placed(
+                crate::types::ShardScavengerPlacedShardSetReference {
+                    data_pg_id: segment.data_pg_id,
+                    okh: segment.segment_okh,
+                    generation_id: segment.segment_vid,
+                    placement_cluster_epoch: segment.placement_cluster_epoch,
+                    stored_size: selected.stored_size,
+                    crc64: segment.segment_crc64,
+                    ec: crate::EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                    shard_integrity: segment.shard_integrity.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]

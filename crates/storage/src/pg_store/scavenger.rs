@@ -1,7 +1,12 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::metadata_transaction::{with_rollback_error, MetadataTransaction};
 use super::*;
+
+#[cfg(test)]
+#[path = "repair_transaction_tests.rs"]
+mod transaction_tests;
 
 const PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN: usize = 54;
 const PENDING_RECLAIM_REFERENCE_RECORD_LEN: usize = 30;
@@ -776,31 +781,19 @@ impl PgStore {
         commit_context: &'static str,
         body: impl FnOnce(&Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        if !self.conn.is_autocommit() {
-            return body(self);
-        }
-
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| StoreError::Db {
-                context: begin_context,
-                source: source.into(),
-            })?;
+        let transaction = MetadataTransaction::begin(self, begin_context)?;
         let result = body(self);
+        #[cfg(test)]
+        let result = result.and_then(|value| {
+            transaction_tests::before_finish(self)?;
+            Ok(value)
+        });
         match result {
             Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|source| StoreError::Db {
-                        context: commit_context,
-                        source: source.into(),
-                    })?;
+                transaction.commit(commit_context)?;
                 Ok(value)
             }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+            Err(error) => Err(with_rollback_error(error, transaction.rollback())),
         }
     }
 

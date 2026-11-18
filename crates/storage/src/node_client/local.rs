@@ -2836,8 +2836,13 @@ impl RetainedBucketWriteReservationRoute for LocalRetainedBucketWriteReservation
                 .into());
             }
         }
-        require_metadata_command_operation_deadline(deadline)?;
-        Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
+        pg.release_metadata_command_bucket_write_reservation_with_deadline(proof, Some(deadline))
+            .map_err(|error| match error {
+                MetadataError::RouteEffectRejected { source } => {
+                    BucketSnapshotLoadError::Store(source)
+                }
+                error => BucketSnapshotLoadError::Metadata(error),
+            })
     }
 
     fn clear_durable_bucket_write_drain(

@@ -9,11 +9,133 @@ use crate::metadata_command::{MetadataTransferCommand, PendingMetadataCommandIns
 use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    AbandonedPartInstallation, AbandonedPartInstallationObservation, AbandonedPartPreparation,
+    AbandonedPartPreparationError, AbandonedPartPreparationFailure, AbandonedPartPublication,
+    AbandonedPartTerminalFailure, AbandonedPartTerminalHandoff, PreparedAbandonedPart,
+    PreparedAbandonedPartBorrow,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    AbandonmentHandoffError, AbandonmentHandoffFailure, CompleteAbandonmentHandoff,
+    CompleteReplicaAbandonmentAttempt,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    CompleteAbandonmentAttempt, CompleteAbandonmentSendError,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    CompleteAbandonmentQuery, CompleteAbandonmentRequest,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    CompleteReplicaAbandonmentQuery, CompleteReplicaAbandonmentRequest,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    DirectIntroductionFilePreparation, DirectStagingFileFailure,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    DirectStagingPreparation, DirectStagingSnapshot, DirectTerminalInstallation,
+    DirectTerminalInstallationObservation, DirectTerminalInstallationProof,
+    DirectTerminalPreparation, StreamAppendInstallation, StreamAppendInstallationObservation,
+    StreamAppendInstallationProof, StreamAppendPreparation,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    RemoteStagingAcknowledgementAttempt, StagingAcknowledgementBatch,
+};
 use std::time::Instant;
+
+#[path = "complete_prefix_validation_work.rs"]
+mod complete_prefix_validation_work;
+use complete_prefix_validation_work::PrefixValidationWork;
+
+// Preserve both existing deadline checks at the final pending-slot effect.
+struct PendingSlotEffectBounds {
+    cluster_epoch: ClusterEpoch,
+    fence: AdmittedRouteEffectFence,
+    operation_deadline: Option<Instant>,
+}
+
+#[path = "metadata_transfer_transaction.rs"]
+mod metadata_transfer_transaction;
+use metadata_transfer_transaction::MetadataTransferTransaction;
 
 #[path = "pending_slot_projection.rs"]
 mod pending_slot_projection;
 use pending_slot_projection::PendingSlotProjection;
+
+#[path = "pending_command_installation.rs"]
+mod pending_command_installation;
+use pending_command_installation::PendingInstallation;
+pub(super) use pending_command_installation::PendingInstallationTransaction;
+
+#[path = "terminal_command_identity.rs"]
+mod terminal_command_identity;
+use terminal_command_identity::{TerminalCommandIdentity, TerminalLogGrammar};
+
+#[path = "complete_command_log_range.rs"]
+mod complete_command_log_range;
+#[cfg(test)]
+pub(super) use complete_command_log_range::CompleteCommandLogEntryKind;
+pub(in crate::node_runtime) use complete_command_log_range::{
+    CompleteLogHashPage, CompleteLogHashRangeRequest, CompleteLogPage, CompleteLogRangeRequest,
+    CompleteLogReadError,
+};
+
+#[path = "complete_command_log_maintenance.rs"]
+mod complete_command_log_maintenance;
+pub(in crate::node_runtime) use complete_command_log_maintenance::{
+    CompleteLogMaintenanceRequest, CompleteMaintenanceError,
+};
+
+#[path = "complete_pending_inspection.rs"]
+mod complete_pending_inspection;
+pub(in crate::node_runtime) use complete_pending_inspection::ApplicationObservation;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_pending_inspection::CompleteAcceptanceDisposition;
+pub(in crate::node_runtime) use complete_pending_inspection::CompletePublicationError;
+pub(in crate::node_runtime) use complete_pending_inspection::CompletePublicationQuery;
+pub(in crate::node_runtime) use complete_pending_inspection::PublicationObservation;
+pub(in crate::node_runtime) use complete_pending_inspection::RemoteDirectStagingFileWriter;
+#[cfg(test)]
+pub(in crate::node_runtime) use complete_pending_inspection::RemoteStreamStagingFileWriter;
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    AllocatedStreamWindow, CompleteApplicationAttempt, CompleteApplicationSendError,
+    CompleteFanoutCompletion, CompleteFanoutSender, CompletePublicationAttempt,
+    CompletePublicationSendError, CompletePublicationSender, CompleteRetirementAttempt,
+    CompleteRetirementSendError, CompleteTerminalHandoff, CompleteUnstartedAbandonment,
+    ConfirmedStagingWindow, RemoteStreamAllocationAttempt, ReplicaAbandonmentObservation,
+    ReplicaAbandonmentPermit, StagingWindowHandoffFailure, StreamWindowAllocationFailure,
+    StreamWindowAllocationPermit, TerminalHandoffFailure, TerminalReservationAuthority,
+    TerminalReservationObservation, TerminalSlotRetirementAuthority,
+    TerminalSlotRetirementObservation, UnstartedAbandonmentAuthority,
+    UnstartedAbandonmentObservation,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    CompleteAbandonedEvidence, CompleteAbandonedQuery, CompleteAcceptanceEvidence,
+    CompleteAcceptanceKind, CompleteAcceptanceQuery, CompleteAppliedEvidence, CompleteAppliedQuery,
+    CompletePendingEvidence, CompletePendingInspectionError, CompletePendingRequest,
+    CompletePublicationRequest,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    CompleteRetirementQuery, CompleteRetirementRequest,
+};
+pub(in crate::node_runtime) use complete_pending_inspection::{
+    DirectStagingFileWriter, RemoteDirectFileAttempt, RemoteStreamFileAttempt,
+    StreamStagingFileWriter,
+};
+
+#[path = "complete_settled_prefix.rs"]
+#[allow(dead_code)] // Local bounded observation; admitted witness confirmation is not selected yet.
+mod complete_settled_prefix;
+pub(super) use complete_settled_prefix::CompletePrefixValidationCache;
+pub(in crate::node_runtime) use complete_settled_prefix::{
+    CompleteApplicationError, CompleteApplicationQuery, CompleteApplicationRequest,
+};
+pub(in crate::node_runtime) use complete_settled_prefix::{
+    CompleteSettledPrefixError, CompleteSettledPrefixRead,
+};
+
+#[path = "complete_abandonment_record.rs"]
+mod complete_abandonment_record;
+use complete_abandonment_record::AbandonmentRecord;
 
 #[cfg(test)]
 #[path = "pending_slot_effect_tests.rs"]
@@ -28,11 +150,27 @@ mod pending_index_format_tests;
 mod pending_route_index_tests;
 
 #[cfg(test)]
+#[path = "current_publication_transaction_tests.rs"]
+mod current_publication_transaction_tests;
+
+#[cfg(test)]
+#[path = "metadata_maintenance_transaction_tests.rs"]
+mod metadata_maintenance_transaction_tests;
+
+#[cfg(test)]
+#[path = "current_terminal_transaction_tests.rs"]
+mod current_terminal_transaction_tests;
+
+#[cfg(test)]
 type PendingSlotEffectHook = Box<dyn FnOnce(bool)>;
+#[cfg(test)]
+type PendingSlotFinishHook = Box<dyn FnOnce(&PgStore)>;
 
 #[cfg(test)]
 thread_local! {
     static BEFORE_PENDING_SLOT_EFFECT: std::cell::RefCell<Option<PendingSlotEffectHook>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_PENDING_SLOT_FINISH: std::cell::RefCell<Option<PendingSlotFinishHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -44,7 +182,7 @@ const METADATA_COMMAND_CHECKPOINT_CAPTURE_LIMIT: usize =
 const METADATA_COMMAND_CHECKPOINT_RETAIN_EPOCHS: usize = 4;
 const METADATA_COMMAND_TERMINAL_RECEIPT_RETAIN_PER_EPOCH: u64 = 4096;
 const PENDING_METADATA_COMMAND_ROUTE_DEPENDENCY_DOMAIN: &[u8] =
-    b"argmin.metadata.pending-route-dependencies.v2";
+    b"argmin.metadata.pending-route-dependencies.v3";
 // One ordinary reservation plus at most four distinct routes projected by a
 // bound introduction (current/origin object PG, window data PG, release PG).
 pub(super) const MAX_PENDING_METADATA_COMMAND_ROUTE_DEPENDENCIES: usize = 5;
@@ -1326,12 +1464,14 @@ impl PendingMetadataCommandRouteDependency {
 pub(crate) struct PendingMetadataCommandRouteReferences {
     pub(crate) id: MetadataCommandId,
     pub(crate) command_checksum: u64,
+    pub(crate) command_sha256: [u8; 32],
     pub(crate) dependencies: Vec<PendingMetadataCommandRouteDependency>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingMetadataCommandRouteDependencySidecar {
     command_checksum: u64,
+    command_sha256: [u8; 32],
     dependencies: Vec<PendingMetadataCommandRouteDependency>,
     checksum: u64,
 }
@@ -1400,6 +1540,7 @@ impl PgStore {
         command_id: MetadataCommandId,
         command_checksum: u64,
         dependencies: &[PendingMetadataCommandRouteDependency],
+        command_sha256: &[u8; 32],
     ) -> u64 {
         let mut hasher = checksum::crc64::Hasher::new();
         hasher.update(PENDING_METADATA_COMMAND_ROUTE_DEPENDENCY_DOMAIN);
@@ -1407,6 +1548,7 @@ impl PgStore {
         digest_u64(&mut hasher, u64::from(command_id.pg_id().get()));
         digest_u64(&mut hasher, command_id.log_index().get());
         digest_u64(&mut hasher, command_checksum);
+        hasher.update(command_sha256);
         digest_u8(
             &mut hasher,
             dependencies
@@ -1433,13 +1575,16 @@ impl PgStore {
             "metadata command route dependencies exceeded the schema bound"
         );
         let command_checksum = command.checksum_crc64();
+        let command_sha256 = command.command_sha256();
         let checksum = Self::pending_metadata_command_route_dependency_checksum(
             command.id(),
             command_checksum,
             &dependencies,
+            &command_sha256,
         );
         PendingMetadataCommandRouteDependencySidecar {
             command_checksum,
+            command_sha256,
             dependencies,
             checksum,
         }
@@ -1470,18 +1615,20 @@ impl PgStore {
         }
         self.execute_cached(
             "INSERT INTO metadata_command_pending_route_dependencies \
-             (singleton, command_checksum, dependency_count, encoded_dependencies, dependency_checksum) \
-             VALUES (0, ?1, ?2, ?3, ?4) \
+             (singleton, command_checksum, dependency_count, encoded_dependencies, dependency_checksum, command_sha256) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(singleton) DO UPDATE SET \
                  command_checksum = excluded.command_checksum, \
                  dependency_count = excluded.dependency_count, \
                  encoded_dependencies = excluded.encoded_dependencies, \
-                 dependency_checksum = excluded.dependency_checksum",
+                 dependency_checksum = excluded.dependency_checksum, \
+                 command_sha256 = excluded.command_sha256",
             params![
                 sidecar.command_checksum as i64,
                 sidecar.dependencies.len() as i64,
                 encoded,
                 sidecar.checksum as i64,
+                &sidecar.command_sha256[..],
             ],
             "replace pending metadata command route dependency sidecar",
         )?;
@@ -1492,31 +1639,19 @@ impl PgStore {
         &self,
         operation: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        if !self.conn.is_autocommit() {
-            return operation();
-        }
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| StoreError::Db {
-                context: "begin metadata command checkpoint transaction",
-                source: source.into(),
-            })?;
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "begin metadata command checkpoint transaction",
+        )?;
         match operation() {
-            Ok(value) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map(|()| value)
-                .map_err(|source| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit metadata command checkpoint transaction",
-                        source: source.into(),
-                    }
-                }),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
+            Ok(value) => {
+                transaction.commit("commit metadata command checkpoint transaction")?;
+                Ok(value)
             }
+            Err(error) => Err(super::metadata_transaction::with_rollback_error(
+                error,
+                transaction.rollback(),
+            )),
         }
     }
 
@@ -1524,31 +1659,19 @@ impl PgStore {
         &self,
         operation: impl FnOnce() -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        if !self.conn.is_autocommit() {
-            return operation();
-        }
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| StoreError::Db {
-                context: "begin pending metadata command slot transaction",
-                source: source.into(),
-            })?;
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "begin pending metadata command slot transaction",
+        )?;
         match operation() {
-            Ok(value) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map(|()| value)
-                .map_err(|source| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit pending metadata command slot transaction",
-                        source: source.into(),
-                    }
-                }),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
+            Ok(value) => {
+                transaction.commit("commit pending metadata command slot transaction")?;
+                Ok(value)
             }
+            Err(error) => Err(super::metadata_transaction::with_rollback_error(
+                error,
+                transaction.rollback(),
+            )),
         }
     }
 
@@ -1558,96 +1681,74 @@ impl PgStore {
     ) -> Result<T, PendingMetadataCommandSlotInsertError> {
         self.require_usable_connection()
             .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)?;
-        let nested = !self.conn.is_autocommit();
-        let begin = if nested {
-            "SAVEPOINT pending_slot_insert"
-        } else {
-            "BEGIN IMMEDIATE"
-        };
-        let commit = if nested {
-            "RELEASE pending_slot_insert"
-        } else {
-            "COMMIT"
-        };
-        let rollback = if nested {
-            "ROLLBACK TO pending_slot_insert; RELEASE pending_slot_insert"
-        } else {
-            "ROLLBACK"
-        };
-        self.conn
-            .execute_batch(begin)
-            .map_err(|source| StoreError::Db {
-                context: "begin pending metadata command slot transaction",
-                source: source.into(),
-            })
-            .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
-        match operation() {
-            Ok(value) => self
-                .conn
-                .execute_batch(commit)
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "begin pending metadata command slot transaction",
+        )
+        .map_err(|error| {
+            // A normal BEGIN/SAVEPOINT rejection precedes this attempt's writes.
+            // Lost scope ownership instead retires the store: do not use that
+            // uncertainty to restore a holder's previous ownership observation.
+            if self.require_usable_connection().is_err() {
+                PendingMetadataCommandSlotInsertError::may_have_applied(error)
+            } else {
+                PendingMetadataCommandSlotInsertError::definitive(error)
+            }
+        })?;
+        let result = operation();
+        #[cfg(test)]
+        if result.is_ok() {
+            if let Some(hook) = BEFORE_PENDING_SLOT_FINISH.with(|slot| slot.borrow_mut().take()) {
+                hook(self);
+            }
+        }
+        match result {
+            Ok(value) => transaction
+                .commit("commit pending metadata command slot transaction")
                 .map(|()| value)
-                .map_err(|source| {
-                    let error = StoreError::Db {
-                        context: "commit pending metadata command slot transaction",
-                        source: source.into(),
-                    };
-                    let error = self
-                        .rollback_pending_slot_insert(rollback, error)
-                        .unwrap_or_else(|error| error);
-                    PendingMetadataCommandSlotInsertError::may_have_applied(error)
-                }),
-            Err(error) => Err(match self.rollback_pending_slot_insert(rollback, error) {
-                Ok(error) => PendingMetadataCommandSlotInsertError::definitive(error),
-                Err(error) => PendingMetadataCommandSlotInsertError::may_have_applied(error),
+                // Even confirmed local rollback after COMMIT/RELEASE failure
+                // cannot turn an uncertain finish into definitive rejection.
+                .map_err(PendingMetadataCommandSlotInsertError::may_have_applied),
+            Err(error) => Err(match transaction.rollback() {
+                Ok(()) => PendingMetadataCommandSlotInsertError::definitive(error),
+                Err(rollback) => PendingMetadataCommandSlotInsertError::may_have_applied(
+                    super::metadata_transaction::with_rollback_error(error, Err(rollback)),
+                ),
             }),
         }
     }
 
-    /// Ok preserves the operation error only after rollback is confirmed. Err
-    /// means rollback itself failed and must keep uncertain installation custody,
-    /// even if the bounded connection-recovery attempt subsequently succeeds.
-    fn rollback_pending_slot_insert(
-        &self,
-        rollback: &str,
-        operation: StoreError,
-    ) -> Result<StoreError, StoreError> {
-        let Err(rollback_error) = self.execute_pending_slot_rollback(rollback) else {
-            return Ok(operation);
-        };
-        // A failed ROLLBACK TO/RELEASE cannot leave the enclosing transaction
-        // usable either. Recover the entire connection, not just the savepoint.
-        let recovery = if self.conn.is_autocommit() {
-            Ok(())
-        } else {
-            self.execute_pending_slot_rollback("ROLLBACK")
-        };
-        let retired = !self.conn.is_autocommit();
-        if retired {
-            self.retire_connection();
-        }
-        Err(StoreError::Db {
-            context: "recover failed pending metadata command rollback",
-            source: crate::error::DatabaseError::new(format!(
-                "operation: {operation}; rollback: {rollback_error}; recovery: {recovery:?}; connection retired: {retired}"
-            )),
-        })
-    }
-
-    fn execute_pending_slot_rollback(&self, sql: &str) -> rusqlite::Result<()> {
+    pub(super) fn execute_metadata_command_rollback(&self, sql: &str) -> rusqlite::Result<()> {
         #[cfg(test)]
-        if let Some(remaining) = self.fail_pending_slot_rollbacks.get().checked_sub(1) {
-            self.fail_pending_slot_rollbacks.set(remaining);
+        if let Some(remaining) = self.fail_metadata_command_rollbacks.get().checked_sub(1) {
+            self.fail_metadata_command_rollbacks.set(remaining);
             return Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
-                Some("injected pending-slot rollback failure".into()),
+                Some("injected metadata-command rollback failure".into()),
             ));
         }
         self.conn.execute_batch(sql)
     }
 
     #[cfg(test)]
-    pub(in crate::node_runtime) fn test_fail_pending_slot_rollbacks(&self, count: u8) {
-        self.fail_pending_slot_rollbacks.set(count);
+    pub(in crate::node_runtime) fn test_fail_metadata_command_rollbacks(&self, count: u8) {
+        self.fail_metadata_command_rollbacks.set(count);
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_before_pending_slot_finish_hook<T>(
+        hook: impl FnOnce(&Self) + 'static,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<PendingSlotFinishHook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_PENDING_SLOT_FINISH.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset =
+            Reset(BEFORE_PENDING_SLOT_FINISH.with(|slot| slot.replace(Some(Box::new(hook)))));
+        action()
     }
 
     fn replace_pending_placed_reference_pages(
@@ -1990,8 +2091,14 @@ impl PgStore {
     ) -> Result<(), StoreError> {
         let route_dependencies = PendingMetadataCommandRouteDependencySidecar {
             command_checksum: checksum,
+            command_sha256: checksum::sha256::digest(bytes),
             dependencies: Vec::new(),
-            checksum: Self::pending_metadata_command_route_dependency_checksum(id, checksum, &[]),
+            checksum: Self::pending_metadata_command_route_dependency_checksum(
+                id,
+                checksum,
+                &[],
+                &checksum::sha256::digest(bytes),
+            ),
         };
         self.with_pending_slot_transaction(|| {
             let changed = self.execute_cached(
@@ -2061,37 +2168,49 @@ impl PgStore {
     }
 
     pub(super) fn ensure_metadata_digest_bootstrap(&self) -> Result<(), StoreError> {
+        self.ensure_metadata_digest_bootstrap_inner(
+            #[cfg(test)]
+            || Ok(()),
+        )
+    }
+
+    fn ensure_metadata_digest_bootstrap_inner(
+        &self,
+        #[cfg(test)] before_commit: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.require_usable_connection()?;
         if self.metadata_digest_bootstrap_complete()? {
             self.validate_metadata_digest_bootstrap()?;
             return Ok(());
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "begin metadata digest bootstrap",
-                source: e.into(),
-            })?;
+        // Bootstrap owns durable completion, not a caller's unfinished scope.
+        if !self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "metadata digest bootstrap requires its own transaction",
+            });
+        }
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "begin metadata digest bootstrap",
+        )?;
         let result = (|| {
             if self.metadata_digest_bootstrap_complete()? {
                 return self.validate_metadata_digest_bootstrap();
             }
             self.install_metadata_digest_triggers()?;
             self.refresh_all_metadata_table_digests()?;
-            self.mark_metadata_digest_bootstrap_complete()
+            self.mark_metadata_digest_bootstrap_complete()?;
+            #[cfg(test)]
+            before_commit()?;
+            Ok(())
         })();
         match result {
-            Ok(()) => self.conn.execute_batch("COMMIT").map_err(|e| {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                StoreError::Db {
-                    context: "commit metadata digest bootstrap",
-                    source: e.into(),
-                }
-            }),
-            Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(err)
-            }
+            Ok(()) => transaction.commit("commit metadata digest bootstrap"),
+            Err(error) => Err(super::metadata_transaction::with_rollback_error(
+                error,
+                transaction.rollback(),
+            )),
         }
     }
 
@@ -2396,13 +2515,11 @@ impl PgStore {
         cluster_epoch: ClusterEpoch,
         expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "begin metadata transfer empty state initialization",
-                source: e.into(),
-            })?;
+        let transaction = MetadataTransferTransaction::begin(
+            self,
+            "begin metadata transfer empty state initialization",
+            "commit metadata transfer empty state initialization",
+        )?;
 
         let result = (|| {
             if self
@@ -2443,24 +2560,7 @@ impl PgStore {
             .map(|record| record.state)
         })();
 
-        match result {
-            Ok(state) => {
-                self.conn.execute_batch("COMMIT").map_err(|e| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit metadata transfer empty state initialization",
-                        source: e.into(),
-                    }
-                })?;
-                self.mark_metadata_state_digest_clean()?;
-                allocation_replacement.complete()?;
-                Ok(state)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        transaction.finish(result)
     }
 
     pub(crate) fn initialize_metadata_transfer_matching_state(
@@ -2481,13 +2581,11 @@ impl PgStore {
             });
         }
 
-        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "begin metadata transfer matching state initialization",
-                source: e.into(),
-            })?;
+        let transaction = MetadataTransferTransaction::begin(
+            self,
+            "begin metadata transfer matching state initialization",
+            "commit metadata transfer matching state initialization",
+        )?;
 
         let result = (|| {
             if self
@@ -2524,24 +2622,7 @@ impl PgStore {
             .map(|record| record.state)
         })();
 
-        match result {
-            Ok(state) => {
-                self.conn.execute_batch("COMMIT").map_err(|e| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit metadata transfer matching state initialization",
-                        source: e.into(),
-                    }
-                })?;
-                self.mark_metadata_state_digest_clean()?;
-                allocation_replacement.complete()?;
-                Ok(state)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        transaction.finish(result)
     }
 
     #[allow(dead_code)]
@@ -2592,24 +2673,19 @@ impl PgStore {
                 }
             })?;
         }
-        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "begin metadata transfer checkpoint install",
-                source: e.into(),
-            })?;
-        self.conn
-            .execute_batch("PRAGMA defer_foreign_keys = ON")
-            .map_err(|e| {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                StoreError::Db {
-                    context: "defer metadata transfer checkpoint foreign keys",
-                    source: e.into(),
-                }
-            })?;
+        let transaction = MetadataTransferTransaction::begin(
+            self,
+            "begin metadata transfer checkpoint install",
+            "commit metadata transfer checkpoint install",
+        )?;
 
         let result = (|| {
+            self.conn
+                .execute_batch("PRAGMA defer_foreign_keys = ON")
+                .map_err(|e| StoreError::Db {
+                    context: "defer metadata transfer checkpoint foreign keys",
+                    source: e.into(),
+                })?;
             if self
                 .query_row_cached_optional(
                     "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0",
@@ -2657,24 +2733,7 @@ impl PgStore {
             .map(|record| record.state)
         })();
 
-        match result {
-            Ok(state) => {
-                self.conn.execute_batch("COMMIT").map_err(|e| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit metadata transfer checkpoint install",
-                        source: e.into(),
-                    }
-                })?;
-                self.mark_metadata_state_digest_clean()?;
-                allocation_replacement.complete()?;
-                Ok(state)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        transaction.finish(result)
     }
 
     pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
@@ -2691,13 +2750,11 @@ impl PgStore {
             });
         }
 
-        let allocation_replacement = self.allocation_lifetime.begin_replacement()?;
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| StoreError::Db {
-                context: "begin metadata transfer state adoption",
-                source: e.into(),
-            })?;
+        let transaction = MetadataTransferTransaction::begin(
+            self,
+            "begin metadata transfer state adoption",
+            "commit metadata transfer state adoption",
+        )?;
 
         let result = (|| {
             if self
@@ -2808,24 +2865,7 @@ impl PgStore {
             .map(|record| record.state)
         })();
 
-        match result {
-            Ok(state) => {
-                self.conn.execute_batch("COMMIT").map_err(|e| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    StoreError::Db {
-                        context: "commit metadata transfer state adoption",
-                        source: e.into(),
-                    }
-                })?;
-                self.mark_metadata_state_digest_clean()?;
-                allocation_replacement.complete()?;
-                Ok(state)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        transaction.finish(result)
     }
 
     pub(crate) fn metadata_command_replica_state(
@@ -2997,6 +3037,17 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.applied_metadata_command_identity_hashes(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+        )
+    }
+
+    fn applied_metadata_command_identity_hashes(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
         let Some(entry) = self.load_metadata_command_log_entry(
             "load metadata command log entry for partial apply retry validation",
             command.id().cluster_epoch(),
@@ -3005,7 +3056,7 @@ impl PgStore {
         )?
         else {
             if let Some(hashes) =
-                self.metadata_command_terminal_receipt_matches(node_id, command, false)?
+                self.metadata_command_identity_terminal_receipt_matches(node_id, command, false)?
             {
                 return Ok(Some(hashes));
             }
@@ -3018,11 +3069,11 @@ impl PgStore {
                 )?
                 .is_some()
             {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             }
             return Ok(None);
         };
-        if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+        if !self.metadata_command_identity_log_entry_matches(node_id, command, &entry, false)? {
             return Err(StoreError::MetadataCommandLogConflict {
                 node_id,
                 pg_id: self.pg_id,
@@ -3295,6 +3346,32 @@ impl PgStore {
         &self,
         node_id: u32,
     ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
+        self.pending_metadata_command_slot_with_validator(node_id, |bytes, _, id| {
+            let header = decode_metadata_command_log_entry_header(bytes).map_err(|_| {
+                StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                }
+            })?;
+            if header.id() != id || header.kind() != MetadataCommandLogEntryKind::Applied {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn pending_metadata_command_slot_with_validator(
+        &self,
+        node_id: u32,
+        validate: impl FnOnce(&[u8], u64, MetadataCommandId) -> Result<(), StoreError>,
+    ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
         #[cfg(test)]
         if self
             .fail_next_pending_slot_inspection
@@ -3379,23 +3456,8 @@ impl PgStore {
                 computed_checksum,
             });
         }
-        let header = decode_metadata_command_log_entry_header(&command_bytes).map_err(|_| {
-            StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: stored_epoch,
-                log_index: log_index.get(),
-            }
-        })?;
         let id = MetadataCommandId::new(stored_epoch, PgId::new(self.pg_id), log_index);
-        if header.id() != id || header.kind() != MetadataCommandLogEntryKind::Applied {
-            return Err(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: stored_epoch,
-                log_index: log_index.get(),
-            });
-        }
+        validate(&command_bytes, command_checksum, id)?;
         let scope_bucket = raw_scope_bucket
             .map(BucketName::try_from)
             .transpose()
@@ -3459,6 +3521,54 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), BucketSnapshotLoadError> {
+        self.mark_pending_metadata_command_publication_started_inner(
+            node_id,
+            command,
+            #[cfg(test)]
+            |_| Ok(()),
+        )
+    }
+
+    fn mark_pending_metadata_command_publication_started_inner(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        #[cfg(test)] mut hook: impl FnMut(&'static str) -> Result<(), StoreError>,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        use super::metadata_transaction::MetadataTransaction;
+
+        fn rollback(
+            transaction: MetadataTransaction<'_>,
+            error: BucketSnapshotLoadError,
+        ) -> BucketSnapshotLoadError {
+            match transaction.rollback() {
+                Ok(()) => error,
+                Err(rollback) => {
+                    // BucketSnapshotLoadError's Display is intentionally
+                    // redacted. Retain both owner-internal diagnostics here.
+                    let cause = match error {
+                        BucketSnapshotLoadError::Store(error) => error.to_string(),
+                        BucketSnapshotLoadError::Metadata(error) => error.to_string(),
+                    };
+                    StoreError::Db {
+                        context: "metadata publication and rollback failed",
+                        source: crate::error::DatabaseError::new(format!(
+                            "operation: {cause}; rollback failed: {rollback}"
+                        )),
+                    }
+                    .into()
+                }
+            }
+        }
+
+        fn transaction_error(context: &'static str, error: StoreError) -> BucketSnapshotLoadError {
+            match error {
+                StoreError::Db { source, .. } => MetadataError::Db { context, source }.into(),
+                other => other.into(),
+            }
+        }
+
+        self.require_usable_connection()?;
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -3468,36 +3578,47 @@ impl PgStore {
             }
             .into());
         }
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE; SAVEPOINT validate_publication_start")
-            .map_err(|source| {
-                BucketSnapshotLoadError::Metadata(MetadataError::Db {
-                    context: "validate metadata command publication start (begin txn)",
-                    source: source.into(),
-                })
-            })?;
-        let result = (|| {
-            match self
-                .metadata_command_acceptance(node_id, command)
-                .map_err(BucketSnapshotLoadError::Store)?
-            {
-                MetadataCommandAcceptance::Apply => self
-                    .apply_metadata_command(command)
-                    .map_err(BucketSnapshotLoadError::Metadata)?,
-                MetadataCommandAcceptance::AlreadyApplied => {}
+        if !self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "start current metadata publication inside caller transaction",
             }
-            self.conn
-                .execute_batch(
-                    "ROLLBACK TO validate_publication_start; RELEASE validate_publication_start",
-                )
-                .map_err(|source| {
-                    BucketSnapshotLoadError::Metadata(MetadataError::Db {
-                        context: "validate metadata command publication start (rollback probe)",
-                        source: source.into(),
-                    })
-                })?;
-            self.invalidate_clean_metadata_digest_revision();
-
+            .into());
+        }
+        let transaction = MetadataTransaction::begin(
+            self,
+            "validate metadata command publication start (begin txn)",
+        )
+        .map_err(|error| {
+            transaction_error(
+                "validate metadata command publication start (begin txn)",
+                error,
+            )
+        })?;
+        let result = (|| {
+            let trial = MetadataTransaction::begin(
+                self,
+                "validate metadata command publication start (savepoint)",
+            )?;
+            let result = (|| {
+                match self
+                    .metadata_command_acceptance(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)?
+                {
+                    MetadataCommandAcceptance::Apply => self
+                        .apply_metadata_command(command)
+                        .map_err(BucketSnapshotLoadError::Metadata)?,
+                    MetadataCommandAcceptance::AlreadyApplied => {}
+                }
+                #[cfg(test)]
+                hook("after-trial")?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => trial.rollback()?,
+                Err(error) => return Err(rollback(trial, error)),
+            }
+            #[cfg(test)]
+            hook("before-marker")?;
             let changed = self
                 .update_pending_metadata_command_publication_started(command)
                 .map_err(BucketSnapshotLoadError::Store)?;
@@ -3506,6 +3627,8 @@ impl PgStore {
                     .pending_metadata_command_publication_started(node_id, command)
                     .map_err(BucketSnapshotLoadError::Store)?
             {
+                #[cfg(test)]
+                hook("before-commit")?;
                 Ok(())
             } else {
                 Err(BucketSnapshotLoadError::Store(
@@ -3520,15 +3643,21 @@ impl PgStore {
         })();
 
         match result {
-            Ok(()) => self
-                .commit_immediate_txn("mark metadata command publication started (commit txn)")
-                .map_err(BucketSnapshotLoadError::Metadata),
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                self.invalidate_clean_metadata_digest_revision();
-                Err(error)
-            }
+            Ok(()) => transaction
+                .commit("mark metadata command publication started (commit txn)")
+                .map_err(|error| {
+                    transaction_error(
+                        "mark metadata command publication started (commit txn)",
+                        error,
+                    )
+                })?,
+            Err(error) => return Err(rollback(transaction, error)),
         }
+        // An error or unwind after durable commit is a lost confirmation, never
+        // a reason for Drop to undo the accepted publication marker.
+        #[cfg(test)]
+        hook("after-commit")?;
+        Ok(())
     }
 
     fn update_pending_metadata_command_publication_started(
@@ -3615,6 +3744,64 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandStartupDisposition, StoreError> {
+        self.metadata_command_identity_startup_disposition(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+        )
+    }
+
+    /// Read-only integration boundary. The caller pins one SQLite view and
+    /// supplies an inseparable complete identity, never its v13 payload draft.
+    /// No production format fallback or recovery admission is selected here.
+    pub(super) fn complete_command_startup_disposition(
+        &self,
+        node_id: u32,
+        command: &payload_staging::EncodedContextualCommand<'_>,
+    ) -> Result<MetadataCommandStartupDisposition, StoreError> {
+        self.require_usable_connection()?;
+        if self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "inspect complete command terminal identity outside transaction",
+            });
+        }
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        self.metadata_command_identity_startup_disposition(
+            node_id,
+            &TerminalCommandIdentity::complete(command),
+        )
+    }
+
+    /// Conservative veto only, after authenticating the exact terminal source.
+    /// An unrelated pending command's format cannot affect that source's
+    /// publication flag; neither absence nor this scalar authorizes cleanup.
+    pub(super) fn complete_source_has_started_publication(
+        &self,
+        command: &payload_staging::EncodedContextualCommand<'_>,
+    ) -> Result<bool, StoreError> {
+        self.require_usable_connection()?;
+        if self.conn.is_autocommit() || command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "inspect complete source publication",
+            });
+        }
+        self.query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 AND publication_started = 1)",
+            params![command.id().cluster_epoch().get() as i64, command.id().pg_id().get(), command.id().log_index().get() as i64],
+            "inspect complete source publication", |row| row.get(0))
+    }
+
+    fn metadata_command_identity_startup_disposition(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+    ) -> Result<MetadataCommandStartupDisposition, StoreError> {
         let Some((abandoned, previous_log_hash, log_hash)) =
             self.validated_historical_terminal_metadata_command(node_id, command)?
         else {
@@ -3633,10 +3820,13 @@ impl PgStore {
         }
     }
 
-    fn validated_historical_terminal_metadata_command(
+    /// One exact retained terminal entry or receipt. This does not authenticate
+    /// its relationship to a checkpoint/prefix; historical recovery does that
+    /// separately below. Keep the target comparison shared with bounded probes.
+    fn exact_terminal_metadata_command(
         &self,
         node_id: u32,
-        command: &MetadataCommandEnvelope,
+        command: &TerminalCommandIdentity<'_>,
     ) -> Result<Option<(bool, u64, u64)>, StoreError> {
         let command_id = command.id();
         let terminal = if let Some(entry) = self.load_metadata_command_log_entry(
@@ -3645,19 +3835,19 @@ impl PgStore {
             command_id.pg_id(),
             command_id.log_index(),
         )? {
-            if !self.metadata_command_log_entry_matches(
+            if !self.metadata_command_identity_log_entry_matches(
                 node_id,
                 command,
                 &entry,
                 entry.abandoned,
             )? {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             }
             let Some(previous_log_hash) = entry.previous_log_hash else {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             };
             let Some(log_hash) = entry.log_hash else {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             };
             Some((entry.abandoned, previous_log_hash, log_hash))
         } else if let Some(receipt) = self.load_metadata_command_terminal_receipt(
@@ -3667,18 +3857,11 @@ impl PgStore {
             command_id.log_index(),
         )? {
             self.verify_metadata_command_terminal_receipt(node_id, command_id, &receipt)?;
-            let (expected_checksum, expected_bytes) = if receipt.abandoned {
-                (
-                    command.abandoned_log_checksum_crc64(),
-                    command.abandoned_log_bytes(),
-                )
-            } else {
-                (command.checksum_crc64(), command.command_bytes())
-            };
+            let (expected_checksum, expected_bytes) = command.record(receipt.abandoned);
             if receipt.command_checksum != expected_checksum
                 || receipt.command_sha256 != checksum::sha256::digest(&expected_bytes)
             {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             }
             Some((
                 receipt.abandoned,
@@ -3688,6 +3871,16 @@ impl PgStore {
         } else {
             None
         };
+        Ok(terminal)
+    }
+
+    fn validated_historical_terminal_metadata_command(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+    ) -> Result<Option<(bool, u64, u64)>, StoreError> {
+        let command_id = command.id();
+        let terminal = self.exact_terminal_metadata_command(node_id, command)?;
         let Some((abandoned, target_previous_log_hash, target_log_hash)) = terminal else {
             return Ok(None);
         };
@@ -3734,11 +3927,14 @@ impl PgStore {
                     command_id.pg_id(),
                     log_index,
                 )? {
-                self.verify_metadata_command_log_entry(
+                command.grammar().verify(
+                    self,
                     node_id,
-                    command_id.cluster_epoch(),
-                    command_id.pg_id(),
-                    log_index,
+                    MetadataCommandId::new(
+                        command_id.cluster_epoch(),
+                        command_id.pg_id(),
+                        log_index,
+                    ),
                     &entry,
                 )?;
                 (
@@ -3769,7 +3965,7 @@ impl PgStore {
                     Some(receipt.log_hash),
                 )
             } else {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             };
             let expected_log_hash = metadata_command_log_hash(
                 command_id.cluster_epoch(),
@@ -3865,7 +4061,8 @@ impl PgStore {
                     sidecar.dependency_count, \
                     CASE WHEN length(sidecar.encoded_dependencies) <= 85 \
                          THEN sidecar.encoded_dependencies ELSE NULL END, \
-                    sidecar.dependency_checksum \
+                    sidecar.dependency_checksum, \
+                    CASE WHEN length(sidecar.command_sha256) = 32 THEN sidecar.command_sha256 ELSE NULL END \
              FROM metadata_command_pending_slot AS pending \
              LEFT JOIN metadata_command_pending_route_dependencies AS sidecar \
                ON sidecar.singleton = pending.singleton \
@@ -3882,6 +4079,7 @@ impl PgStore {
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<Vec<u8>>>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
                 ))
             },
         )?;
@@ -3894,6 +4092,7 @@ impl PgStore {
             raw_dependency_count,
             encoded_dependencies,
             raw_dependency_checksum,
+            raw_command_sha256,
         )) = raw
         else {
             return Ok(None);
@@ -3978,10 +4177,15 @@ impl PgStore {
             return Err(conflict());
         };
         let command_checksum = raw_command_checksum as u64;
+        let command_sha256: [u8; 32] = raw_command_sha256
+            .ok_or_else(conflict)?
+            .try_into()
+            .map_err(|_| conflict())?;
         if Self::pending_metadata_command_route_dependency_checksum(
             id,
             command_checksum,
             &dependencies,
+            &command_sha256,
         ) != raw_dependency_checksum as u64
         {
             return Err(conflict());
@@ -3989,6 +4193,7 @@ impl PgStore {
         Ok(Some(PendingMetadataCommandRouteReferences {
             id,
             command_checksum,
+            command_sha256,
             dependencies,
         }))
     }
@@ -4107,10 +4312,11 @@ impl PgStore {
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
         self.try_insert_projected_pending_metadata_command_slot(
             node_id,
-            PendingSlotProjection::current(command),
+            PendingInstallation::Current(PendingSlotProjection::current(command)),
             scope_bucket,
             effect_fence,
             operation_deadline,
+            None,
         )
     }
 
@@ -4129,25 +4335,26 @@ impl PgStore {
             .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
         self.try_insert_projected_pending_metadata_command_slot(
             node_id,
-            projection,
+            PendingInstallation::Current(projection),
             scope_bucket,
             effect_fence,
             operation_deadline,
+            None,
         )
     }
 
     fn try_insert_projected_pending_metadata_command_slot(
         &self,
         node_id: u32,
-        projection: PendingSlotProjection<'_>,
+        command: PendingInstallation<'_>,
         scope_bucket: Option<&BucketName>,
         effect_fence: AdmittedRouteEffectFence,
         operation_deadline: Option<Instant>,
+        mut prefix: Option<&mut complete_settled_prefix::PrefixTransition<'_>>,
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
         self.require_usable_connection()
             .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)?;
-        let command = projection.command();
-        if command.payload().is_bucket_control_pending_slot_payload() {
+        if command.is_bucket_control() {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
                 StoreError::RouteCapabilitySubjectMismatch {
                     operation: "insert generic pending metadata command",
@@ -4187,24 +4394,24 @@ impl PgStore {
                 .map_err(PendingMetadataCommandSlotInsertError::definitive)?
         {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
-                self.metadata_command_log_conflict(node_id, command),
+                command.conflict(node_id),
             ));
         }
         self.with_pending_slot_insert_transaction(|| {
             // Session-backed geometry must come from the same SQLite view as
             // the slot and its indexes, not a cached pre-transaction projection.
-            let pages = match self.encode_pending_shard_scavenger_reference_pages(command) {
-                Ok(pages) => pages,
+            let transaction = PendingInstallationTransaction::new(self);
+            let projection = match command.prepare(&transaction, node_id) {
+                Ok(projection) => projection,
                 Err(error) => {
                     // Incomplete geometry rejects a fresh installation, but
                     // cannot establish nonacceptance of an exact existing slot.
                     // Keep that distinction under this same write transaction.
-                    return match self
-                        .pending_metadata_command_slot(node_id, command.id().cluster_epoch())
-                    {
+                    return match command.slot(self, node_id) {
                         Ok(Some(slot))
                             if slot.command_checksum == command.checksum_crc64()
-                                && slot.command_bytes == command.command_bytes() =>
+                                && slot.command_bytes.as_slice()
+                                    == command.command_bytes().as_ref() =>
                         {
                             Ok(Err(error))
                         }
@@ -4218,15 +4425,11 @@ impl PgStore {
                 placed_pages,
                 reclaim_reference_count,
                 reclaim_pages,
-            } = pages;
+            } = projection.pages();
             // Drain clearing performs the inverse check under the same SQLite
             // write serialization: either the mark slot protects its drain,
             // or a clear that linearized first makes this insert impossible.
-            self.require_mark_bucket_deleting_install_authorization(
-                command,
-                scope_bucket,
-                crate::clock::current_time_millis(),
-            )?;
+            command.require_authorization(self, scope_bucket)?;
             let inserted = self.execute_pending_slot_insert_with_effect_fence(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
@@ -4238,39 +4441,51 @@ impl PgStore {
                     command.id().pg_id().get() as i64,
                     command.id().log_index().get() as i64,
                     command.checksum_crc64() as i64,
-                    command.command_bytes(),
-                    placed_reference_count as i64,
-                    reclaim_reference_count as i64,
+                    command.command_bytes().as_ref(),
+                    i64::from(*placed_reference_count),
+                    i64::from(*reclaim_reference_count),
                     scope_bucket.map(BucketName::as_str),
                 ],
                 "insert metadata command pending slot",
-                command.id().cluster_epoch(),
-                effect_fence,
-                operation_deadline,
+                PendingSlotEffectBounds {
+                    cluster_epoch: command.id().cluster_epoch(),
+                    fence: effect_fence,
+                    operation_deadline,
+                },
+                prefix.as_deref_mut(),
             )?;
             if inserted == 1 {
-                self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
+                self.replace_pending_placed_reference_pages(*placed_reference_count, placed_pages)?;
                 self.replace_pending_reclaim_reference_pages(
-                    reclaim_reference_count,
-                    &reclaim_pages,
+                    *reclaim_reference_count,
+                    reclaim_pages,
                 )?;
                 projection.install(self)?;
+                if let Some(prefix) = prefix.as_deref_mut() {
+                    prefix.after_effect()?;
+                }
                 return Ok(Ok(()));
             }
-            let existing = self
-                .pending_metadata_command_slot(node_id, command.id().cluster_epoch())?
-                .ok_or_else(|| StoreError::MetadataCommandPendingConflict {
+            let existing = command.slot(self, node_id)?.ok_or_else(|| {
+                StoreError::MetadataCommandPendingConflict {
                     pg_id: self.pg_id,
                     cluster_epoch: command.id().cluster_epoch(),
                     existing_log_index: 0,
                     candidate_log_index: command.id().log_index().get(),
-                })?;
+                }
+            })?;
             if existing.command_checksum == command.checksum_crc64()
-                && existing.command_bytes == command.command_bytes()
+                && existing.command_bytes.as_slice() == command.command_bytes().as_ref()
             {
                 // An exact slot already owns this command. A damaged/mismatched
                 // projection cannot be classified as definitive nonacceptance.
-                return Ok(projection.require_existing(self, node_id));
+                let result = projection.require_existing(self, node_id);
+                if result.is_ok() {
+                    if let Some(prefix) = prefix {
+                        prefix.after_effect()?;
+                    }
+                }
+                return Ok(result);
             }
             Err(StoreError::MetadataCommandPendingConflict {
                 pg_id: self.pg_id,
@@ -4282,7 +4497,7 @@ impl PgStore {
         .map_err(PendingMetadataCommandSlotInsertError::may_have_applied)
     }
 
-    fn require_mark_bucket_deleting_install_authorization(
+    pub(super) fn require_mark_bucket_deleting_install_authorization(
         &self,
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
@@ -4442,9 +4657,12 @@ impl PgStore {
                     bucket.as_str(),
                 ],
                 "insert bucket control pending metadata command slot",
-                command.id().cluster_epoch(),
-                effect_fence,
-                operation_deadline,
+                PendingSlotEffectBounds {
+                    cluster_epoch: command.id().cluster_epoch(),
+                    fence: effect_fence,
+                    operation_deadline,
+                },
+                None,
             )?;
             if inserted == 1 {
                 self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
@@ -4472,9 +4690,8 @@ impl PgStore {
         sql: &str,
         params: P,
         context: &'static str,
-        cluster_epoch: ClusterEpoch,
-        effect_fence: AdmittedRouteEffectFence,
-        operation_deadline: Option<Instant>,
+        bounds: PendingSlotEffectBounds,
+        prefix: Option<&mut complete_settled_prefix::PrefixTransition<'_>>,
     ) -> Result<usize, StoreError> {
         let mut statement = self
             .conn
@@ -4487,8 +4704,14 @@ impl PgStore {
         if let Some(hook) = BEFORE_PENDING_SLOT_EFFECT.with(|slot| slot.borrow_mut().take()) {
             hook(!self.conn.is_autocommit());
         }
-        effect_fence.require_valid_for(cluster_epoch)?;
-        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if let Some(prefix) = prefix {
+            prefix.before_effect()?;
+        }
+        bounds.fence.require_valid_for(bounds.cluster_epoch)?;
+        if bounds
+            .operation_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err(StoreError::OperationDeadlineExceeded { context });
         }
         statement.execute(params).map_err(|source| StoreError::Db {
@@ -4518,33 +4741,47 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
-        if self.conn.is_autocommit() {
-            self.conn
-                .execute_batch("BEGIN IMMEDIATE")
-                .map_err(|source| StoreError::Db {
-                    context: "remove pending metadata command slot (begin txn)",
-                    source: source.into(),
-                })?;
-            let result = self.remove_pending_metadata_command_slot_inner(node_id, command);
-            match result {
-                Ok(removed) => {
-                    if let Err(source) = self.conn.execute_batch("COMMIT") {
-                        let _ = self.conn.execute_batch("ROLLBACK");
-                        return Err(StoreError::Db {
-                            context: "remove pending metadata command slot (commit txn)",
-                            source: source.into(),
-                        });
-                    }
-                    Ok(removed)
-                }
-                Err(error) => {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    Err(error)
-                }
+        self.remove_pending_metadata_command_slot_owned(
+            node_id,
+            command,
+            #[cfg(test)]
+            |_| Ok(()),
+        )
+    }
+
+    fn remove_pending_metadata_command_slot_owned(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        #[cfg(test)] mut hook: impl FnMut(&'static str) -> Result<(), StoreError>,
+    ) -> Result<bool, StoreError> {
+        // Nested removal owns only a child savepoint. Its release must never
+        // commit (or, on failure, roll back) a caller's unrelated work.
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "remove pending metadata command slot (begin txn)",
+        )?;
+        let result = (|| {
+            let removed = self.remove_pending_metadata_command_slot_inner(node_id, command)?;
+            #[cfg(test)]
+            hook("before-finish")?;
+            Ok(removed)
+        })();
+        let removed = match result {
+            Ok(removed) => {
+                transaction.commit("remove pending metadata command slot (commit txn)")?;
+                removed
             }
-        } else {
-            self.remove_pending_metadata_command_slot_inner(node_id, command)
-        }
+            Err(error) => {
+                return Err(super::metadata_transaction::with_rollback_error(
+                    error,
+                    transaction.rollback(),
+                ));
+            }
+        };
+        #[cfg(test)]
+        hook("after-finish")?;
+        Ok(removed)
     }
 
     fn remove_pending_metadata_command_slot_inner(
@@ -4627,8 +4864,8 @@ impl PgStore {
         }
         self.replace_pending_metadata_command_slot_for_reissue_inner(
             node_id,
-            PendingSlotProjection::current(expected),
-            PendingSlotProjection::current(replacement),
+            PendingInstallation::Current(PendingSlotProjection::current(expected)),
+            PendingInstallation::Current(PendingSlotProjection::current(replacement)),
             scope_bucket,
         )
     }
@@ -4653,10 +4890,36 @@ impl PgStore {
             .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
         self.replace_pending_metadata_command_slot_for_reissue_inner(
             node_id,
-            expected,
-            replacement,
+            PendingInstallation::Current(expected),
+            PendingInstallation::Current(replacement),
             scope_bucket,
         )
+    }
+
+    /// Complete-carrier same-epoch replacement only. The opaque attempt borrows
+    /// its owning reissue and records outcomes there; independent encodings
+    /// cannot enter this boundary. It does not mint recovery admission.
+    pub(super) fn replace_complete_pending_metadata_command_slot_for_reissue(
+        &self,
+        node_id: u32,
+        attempt: super::payload_staging::CompletePendingReplacement<'_>,
+    ) -> Result<bool, super::payload_staging::SubmissionError> {
+        attempt.execute(self, |expected, replacement, topology| {
+            self.replace_pending_metadata_command_slot_for_reissue_inner(
+                node_id,
+                PendingInstallation::Complete {
+                    command: expected,
+                    topology,
+                    direct: None,
+                },
+                PendingInstallation::Complete {
+                    command: replacement,
+                    topology,
+                    direct: None,
+                },
+                Some(replacement.scope_bucket()),
+            )
+        })
     }
 
     pub(crate) fn replace_pending_metadata_command_slot_for_recovery(
@@ -4706,8 +4969,8 @@ impl PgStore {
         }
         self.replace_pending_metadata_command_slot_for_reissue_inner(
             node_id,
-            PendingSlotProjection::current(expected),
-            PendingSlotProjection::current(replacement),
+            PendingInstallation::Current(PendingSlotProjection::current(expected)),
+            PendingInstallation::Current(PendingSlotProjection::current(replacement)),
             scope_bucket,
         )
     }
@@ -4715,15 +4978,16 @@ impl PgStore {
     fn replace_pending_metadata_command_slot_for_reissue_inner(
         &self,
         node_id: u32,
-        expected_projection: PendingSlotProjection<'_>,
-        replacement_projection: PendingSlotProjection<'_>,
+        expected: PendingInstallation<'_>,
+        replacement: PendingInstallation<'_>,
         scope_bucket: Option<&BucketName>,
     ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
         self.require_usable_connection()
             .map_err(PendingMetadataCommandSlotReplaceError::may_have_applied)?;
-        let expected = expected_projection.command();
-        let replacement = replacement_projection.command();
-        let Some(scope_bucket) = scope_bucket.filter(|scope| *scope == replacement.bucket_name())
+        replacement
+            .require_reissue_of(&expected)
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
+        let Some(scope_bucket) = scope_bucket.filter(|scope| *scope == replacement.scope_bucket())
         else {
             return Err(PendingMetadataCommandSlotReplaceError::definitive(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -4779,14 +5043,14 @@ impl PgStore {
                 },
             ));
         }
-        let Some(slot) = self
-            .pending_metadata_command_slot(node_id, expected.id().cluster_epoch())
-            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?
+        let Some(slot) = expected
+            .slot(self, node_id)
+            .map_err(|error| expected.replacement_observation_error(error))?
         else {
             return Ok(false);
         };
         if slot.scope_bucket.as_ref() != Some(scope_bucket) {
-            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+            return Err(expected.replacement_observation_error(
                 StoreError::RouteCapabilitySubjectMismatch {
                     operation: "replace pending metadata command existing bucket scope",
                 },
@@ -4794,16 +5058,15 @@ impl PgStore {
         }
         if slot.id == replacement.id()
             && slot.command_checksum == replacement.checksum_crc64()
-            && slot.command_bytes == replacement.command_bytes()
+            && slot.command_bytes.as_slice() == replacement.command_bytes().as_ref()
         {
             return self
                 .with_pending_slot_insert_transaction(|| {
-                    if self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
-                        != Some(slot)
-                    {
+                    if expected.slot(self, node_id)?.as_ref() != Some(&slot) {
                         return Ok(false);
                     }
-                    replacement_projection.require_existing(self, node_id)?;
+                    let transaction = PendingInstallationTransaction::new(self);
+                    replacement.require_existing(&transaction, node_id)?;
                     Ok(true)
                 })
                 .map_err(|error| {
@@ -4812,7 +5075,7 @@ impl PgStore {
         }
         if slot.id != expected.id()
             || slot.command_checksum != expected.checksum_crc64()
-            || slot.command_bytes != expected.command_bytes()
+            || slot.command_bytes.as_slice() != expected.command_bytes().as_ref()
         {
             return Ok(false);
         }
@@ -4859,21 +5122,26 @@ impl PgStore {
                 // Recheck the exact observed source and its indexes under the
                 // same SQL write serialization as the replacement. In particular,
                 // an ordinary projection must not erase retained window scope.
-                if self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
-                    != Some(slot)
-                {
+                if expected.slot(self, node_id)?.as_ref() != Some(&slot) {
                     return Ok(false);
                 }
-                expected_projection.require_existing(self, node_id)?;
+                let transaction = PendingInstallationTransaction::new(self);
+                expected.require_existing(&transaction, node_id)?;
                 // Never carry session-derived pages across transaction entry.
                 // Reinspect after validating the exact source under write
                 // serialization, before replacing either slot or sidecars.
+                let replacement_projection = replacement.prepare(&transaction, node_id)?;
                 let PendingShardScavengerReferencePages {
                     placed_reference_count,
                     placed_pages,
                     reclaim_reference_count,
                     reclaim_pages,
-                } = self.encode_pending_shard_scavenger_reference_pages(replacement)?;
+                } = replacement_projection.pages();
+                #[cfg(test)]
+                if let Some(hook) = BEFORE_PENDING_SLOT_EFFECT.with(|slot| slot.borrow_mut().take())
+                {
+                    hook(!self.conn.is_autocommit());
+                }
                 let updated = self.execute_cached(
                     "UPDATE metadata_command_pending_slot \
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
@@ -4894,26 +5162,26 @@ impl PgStore {
                         replacement.id().pg_id().get() as i64,
                         replacement.id().log_index().get() as i64,
                         replacement.checksum_crc64() as i64,
-                        replacement_bytes,
-                        placed_reference_count as i64,
-                        reclaim_reference_count as i64,
+                        replacement_bytes.as_ref(),
+                        *placed_reference_count as i64,
+                        *reclaim_reference_count as i64,
                         expected.id().cluster_epoch().get() as i64,
                         expected.id().pg_id().get() as i64,
                         expected.id().log_index().get() as i64,
                         expected.checksum_crc64() as i64,
-                        expected_bytes,
+                        expected_bytes.as_ref(),
                         scope_bucket.as_str(),
                     ],
                     "replace metadata command pending slot for reissue",
                 )?;
                 if updated == 1 {
                     self.replace_pending_placed_reference_pages(
-                        placed_reference_count,
-                        &placed_pages,
+                        *placed_reference_count,
+                        placed_pages,
                     )?;
                     self.replace_pending_reclaim_reference_pages(
-                        reclaim_reference_count,
-                        &reclaim_pages,
+                        *reclaim_reference_count,
+                        reclaim_pages,
                     )?;
                     replacement_projection.install(self)?;
                 }
@@ -5112,8 +5380,24 @@ impl PgStore {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandCheckpoint, StoreError> {
-        let state =
-            self.validate_metadata_command_checkpoint_state_read_only(node_id, cluster_epoch)?;
+        self.metadata_command_checkpoint_with_grammar(
+            node_id,
+            cluster_epoch,
+            TerminalLogGrammar::Current,
+        )
+    }
+
+    fn metadata_command_checkpoint_with_grammar(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        grammar: TerminalLogGrammar<'_>,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        let state = self.validate_metadata_command_checkpoint_state_read_only(
+            node_id,
+            cluster_epoch,
+            grammar,
+        )?;
         let table_blocks = self.metadata_checkpoint_table_blocks()?;
         let table_digests = METADATA_DIGEST_TABLES
             .iter()
@@ -5195,9 +5479,20 @@ impl PgStore {
         Ok(checkpoint)
     }
 
-    pub fn record_metadata_command_checkpoint(
+    fn record_metadata_command_checkpoint(
         &self,
         checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.record_metadata_command_checkpoint_authorized(
+            checkpoint,
+            complete_command_log_maintenance::CheckpointRecording::Current,
+        )
+    }
+
+    fn record_metadata_command_checkpoint_authorized(
+        &self,
+        checkpoint: &MetadataCommandCheckpoint,
+        recording: complete_command_log_maintenance::CheckpointRecording<'_>,
     ) -> Result<(), StoreError> {
         if checkpoint.pg_id != PgId::new(self.pg_id) {
             return Err(StoreError::MetadataCheckpointInvalid {
@@ -5229,6 +5524,9 @@ impl PgStore {
                 }
             })?;
         self.with_metadata_command_checkpoint_transaction(|| {
+            #[cfg(test)]
+            self.test_before_complete_maintenance_effect();
+            recording.require_effect(self, checkpoint.cluster_epoch)?;
             self.conn
                 .execute(
                     "INSERT INTO metadata_command_checkpoints \
@@ -5435,6 +5733,7 @@ impl PgStore {
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
+        grammar: TerminalLogGrammar<'_>,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
@@ -5445,10 +5744,7 @@ impl PgStore {
                 current_epoch: cluster_epoch,
             });
         }
-        if self
-            .pending_metadata_command_slot(node_id, cluster_epoch)?
-            .is_some()
-        {
+        if grammar.has_pending(self, node_id, cluster_epoch)? {
             return Err(StoreError::MetadataCommandContention {
                 context: "export metadata command checkpoint with pending command",
             });
@@ -5460,6 +5756,7 @@ impl PgStore {
             &state,
             "load metadata command log entry for checkpoint validation",
             false,
+            grammar,
         )?;
         if let Some(tail_log_index) =
             self.metadata_command_log_min_tail_after(cluster_epoch, state.applied_log_index)?
@@ -5514,10 +5811,60 @@ impl PgStore {
         state: &MetadataCommandReplicaState,
         load_context: &'static str,
         count_replay_validation_entries: bool,
+        grammar: TerminalLogGrammar<'_>,
+    ) -> Result<(), StoreError> {
+        self.validate_metadata_command_log_suffix_with_work(
+            node_id,
+            cluster_epoch,
+            state,
+            load_context,
+            (count_replay_validation_entries, None),
+            grammar,
+        )
+    }
+
+    fn validate_metadata_command_log_suffix_with_work(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: &MetadataCommandReplicaState,
+        load_context: &'static str,
+        (count_replay_validation_entries, mut work): (bool, Option<&mut PrefixValidationWork>),
+        grammar: TerminalLogGrammar<'_>,
     ) -> Result<(), StoreError> {
         let pg_id = PgId::new(self.pg_id);
+        if let Some(work) = work.as_deref_mut() {
+            // Charge every candidate the existing decoder may inspect, before
+            // loading its BLOB. The enclosing read transaction pins the lengths.
+            let mut stmt = self.conn.prepare_cached("SELECT length(checkpoint_bytes) FROM metadata_command_checkpoints WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index <= ?3 ORDER BY applied_log_index DESC, applied_log_hash DESC, state_digest DESC LIMIT ?4")
+                .map_err(|e| StoreError::Db { context: "budget complete validation checkpoints", source: e.into() })?;
+            let mut rows = stmt
+                .query(params![
+                    cluster_epoch.get() as i64,
+                    self.pg_id,
+                    state.applied_log_index as i64,
+                    METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH as i64
+                ])
+                .map_err(|e| StoreError::Db {
+                    context: "budget complete validation checkpoints",
+                    source: e.into(),
+                })?;
+            work.check()?;
+            while let Some(row) = rows.next().map_err(|e| StoreError::Db {
+                context: "budget complete validation checkpoint",
+                source: e.into(),
+            })? {
+                work.row(row.get::<_, usize>(0).map_err(|e| StoreError::Db {
+                    context: "size complete validation checkpoint",
+                    source: e.into(),
+                })?)?;
+            }
+        }
         let base =
             self.metadata_command_log_validation_base(cluster_epoch, state.applied_log_index)?;
+        if let Some(work) = work.as_deref_mut() {
+            work.check()?;
+        }
         let mut applied_log_hash = base.applied_log_hash;
         if base.applied_log_index < state.applied_log_index {
             let mut raw_log_index = base
@@ -5527,6 +5874,15 @@ impl PgStore {
             while raw_log_index <= state.applied_log_index {
                 let log_index = MetadataCommandLogIndex::new(raw_log_index)
                     .expect("applied metadata command log index is non-zero");
+                if let Some(work) = work.as_deref_mut() {
+                    work.check()?;
+                    let len = self.query_row_cached_optional(
+                        "SELECT length(command_bytes) FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                        params![cluster_epoch.get() as i64, self.pg_id, raw_log_index as i64],
+                        "size complete prefix validation entry", |row| row.get::<_, usize>(0),
+                    )?.ok_or(StoreError::MetadataCommandLogConflict { node_id, pg_id: self.pg_id, cluster_epoch, log_index: raw_log_index })?;
+                    work.entry(len)?;
+                }
                 if count_replay_validation_entries {
                     #[cfg(test)]
                     self.metadata_command_log_replay_validation_entries
@@ -5546,13 +5902,15 @@ impl PgStore {
                         log_index: raw_log_index,
                     });
                 };
-                self.verify_metadata_command_log_entry(
+                grammar.verify(
+                    self,
                     node_id,
-                    cluster_epoch,
-                    pg_id,
-                    log_index,
+                    MetadataCommandId::new(cluster_epoch, pg_id, log_index),
                     &entry,
                 )?;
+                if let Some(work) = work.as_deref_mut() {
+                    work.check()?;
+                }
                 let expected_log_hash = metadata_command_log_hash(
                     cluster_epoch,
                     pg_id,
@@ -5659,6 +6017,7 @@ impl PgStore {
             &state,
             "load metadata command log entry for replay validation",
             true,
+            TerminalLogGrammar::Current,
         )?;
         let actual_digest = self.metadata_state_digest()?;
         if state.state_digest.value() != actual_digest {
@@ -5911,6 +6270,19 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         abandoned: bool,
     ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.metadata_command_identity_terminal_receipt_matches(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+            abandoned,
+        )
+    }
+
+    fn metadata_command_identity_terminal_receipt_matches(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+        abandoned: bool,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
         let Some(receipt) = self.load_metadata_command_terminal_receipt(
             "load compacted metadata command terminal receipt",
             command.id().cluster_epoch(),
@@ -5921,14 +6293,7 @@ impl PgStore {
             return Ok(None);
         };
         self.verify_metadata_command_terminal_receipt(node_id, command.id(), &receipt)?;
-        let (expected_checksum, expected_bytes) = if abandoned {
-            (
-                command.abandoned_log_checksum_crc64(),
-                command.abandoned_log_bytes(),
-            )
-        } else {
-            (command.checksum_crc64(), command.command_bytes())
-        };
+        let (expected_checksum, expected_bytes) = command.record(abandoned);
         if receipt.abandoned != abandoned
             || receipt.command_checksum != expected_checksum
             || receipt.command_sha256 != checksum::sha256::digest(&expected_bytes)
@@ -5990,26 +6355,31 @@ impl PgStore {
         entry: &MetadataCommandLogEntry,
         abandoned: bool,
     ) -> Result<bool, StoreError> {
-        self.verify_metadata_command_log_entry(
+        self.metadata_command_identity_log_entry_matches(
             node_id,
-            command.id().cluster_epoch(),
-            command.id().pg_id(),
-            command.id().log_index(),
+            &TerminalCommandIdentity::current(command),
             entry,
-        )?;
+            abandoned,
+        )
+    }
+
+    fn metadata_command_identity_log_entry_matches(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+        entry: &MetadataCommandLogEntry,
+        abandoned: bool,
+    ) -> Result<bool, StoreError> {
+        command
+            .grammar()
+            .verify(self, node_id, command.id(), entry)?;
 
         if entry.abandoned != abandoned {
             return Ok(false);
         }
-        let (expected_checksum, expected_bytes) = if abandoned {
-            (
-                command.abandoned_log_checksum_crc64(),
-                command.abandoned_log_bytes(),
-            )
-        } else {
-            (command.checksum_crc64(), command.command_bytes())
-        };
-        Ok(entry.command_checksum == expected_checksum && entry.command_bytes == expected_bytes)
+        let (expected_checksum, expected_bytes) = command.record(abandoned);
+        Ok(entry.command_checksum == expected_checksum
+            && entry.command_bytes.as_slice() == expected_bytes.as_ref())
     }
 
     fn metadata_command_log_conflict(
@@ -6237,6 +6607,29 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_identity_acceptance(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+        )
+    }
+
+    fn metadata_command_identity_acceptance(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_identity_terminal_acceptance(node_id, command, false)
+    }
+
+    fn metadata_command_identity_terminal_acceptance(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+        abandoned: bool,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        if abandoned {
+            command.validate_terminal_generation_owner()?;
+        }
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -6257,7 +6650,7 @@ impl PgStore {
             });
         }
         let state = self.metadata_command_replica_state()?;
-        self.validate_metadata_command_record_position(node_id, command, &state)?;
+        self.validate_metadata_command_record_identity_position(node_id, command.id(), &state)?;
 
         let Some(entry) = self.load_metadata_command_log_entry(
             "load metadata command log entry",
@@ -6266,21 +6659,23 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
-            if !Self::metadata_command_is_next_record_position(command, &state) {
+            if !Self::metadata_command_identity_is_next_record_position(command.id(), &state) {
                 if self
-                    .metadata_command_terminal_receipt_matches(node_id, command, false)?
+                    .metadata_command_identity_terminal_receipt_matches(
+                        node_id, command, abandoned,
+                    )?
                     .is_some()
                 {
                     return Ok(MetadataCommandAcceptance::AlreadyApplied);
                 }
-                return Err(self.metadata_command_log_conflict(node_id, command));
+                return Err(command.conflict(node_id, self.pg_id));
             }
             return Ok(MetadataCommandAcceptance::Apply);
         };
-        if self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
+        if self.metadata_command_identity_log_entry_matches(node_id, command, &entry, abandoned)? {
             return Ok(MetadataCommandAcceptance::AlreadyApplied);
         }
-        Err(self.metadata_command_log_conflict(node_id, command))
+        Err(command.conflict(node_id, self.pg_id))
     }
 
     pub(crate) fn metadata_command_abandon_acceptance(
@@ -6288,50 +6683,11 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
-        command.payload().validate_terminal_generation_owner()?;
-        if command.id().pg_id().get() != self.pg_id {
-            return Err(StoreError::MetadataCommandWrongPg {
-                node_id,
-                command_pg_id: command.id().pg_id().get(),
-                target_pg_id: self.pg_id,
-                cluster_epoch: command.id().cluster_epoch(),
-            });
-        }
-        if let Some((cluster_epoch, expected_digest, actual_digest)) =
-            self.metadata_state_digest_mismatch()?
-        {
-            return Err(StoreError::MetadataStateDigestMismatch {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch,
-                expected_digest,
-                actual_digest,
-            });
-        }
-        let state = self.metadata_command_replica_state()?;
-        self.validate_metadata_command_record_position(node_id, command, &state)?;
-        let Some(entry) = self.load_metadata_command_log_entry(
-            "load metadata command abandon log entry",
-            command.id().cluster_epoch(),
-            command.id().pg_id(),
-            command.id().log_index(),
-        )?
-        else {
-            if !Self::metadata_command_is_next_record_position(command, &state) {
-                if self
-                    .metadata_command_terminal_receipt_matches(node_id, command, true)?
-                    .is_some()
-                {
-                    return Ok(MetadataCommandAcceptance::AlreadyApplied);
-                }
-                return Err(self.metadata_command_log_conflict(node_id, command));
-            }
-            return Ok(MetadataCommandAcceptance::Apply);
-        };
-        if self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
-            return Ok(MetadataCommandAcceptance::AlreadyApplied);
-        }
-        Err(self.metadata_command_log_conflict(node_id, command))
+        self.metadata_command_identity_terminal_acceptance(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+            true,
+        )
     }
 
     pub(crate) fn metadata_command_abandoned(
@@ -6362,7 +6718,16 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         state: &MetadataCommandReplicaState,
     ) -> Result<(), StoreError> {
-        let command_epoch = command.id().cluster_epoch();
+        self.validate_metadata_command_record_identity_position(node_id, command.id(), state)
+    }
+
+    fn validate_metadata_command_record_identity_position(
+        &self,
+        node_id: u32,
+        id: MetadataCommandId,
+        state: &MetadataCommandReplicaState,
+    ) -> Result<(), StoreError> {
+        let command_epoch = id.cluster_epoch();
         if command_epoch < state.cluster_epoch {
             return Err(StoreError::StaleMetadataCommand {
                 node_id,
@@ -6372,7 +6737,7 @@ impl PgStore {
             });
         }
 
-        let log_index = command.id().log_index().get();
+        let log_index = id.log_index().get();
         let expected_log_index = if command_epoch == state.cluster_epoch {
             state
                 .applied_log_index
@@ -6397,8 +6762,15 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         state: &MetadataCommandReplicaState,
     ) -> bool {
-        let command_epoch = command.id().cluster_epoch();
-        let log_index = command.id().log_index().get();
+        Self::metadata_command_identity_is_next_record_position(command.id(), state)
+    }
+
+    fn metadata_command_identity_is_next_record_position(
+        id: MetadataCommandId,
+        state: &MetadataCommandReplicaState,
+    ) -> bool {
+        let command_epoch = id.cluster_epoch();
+        let log_index = id.log_index().get();
         let expected_log_index = if command_epoch == state.cluster_epoch {
             state
                 .applied_log_index
@@ -6425,6 +6797,17 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandRecordResult, StoreError> {
+        self.record_metadata_command_identity_applied_inner(
+            node_id,
+            &TerminalCommandIdentity::current(command),
+        )
+    }
+
+    fn record_metadata_command_identity_applied_inner(
+        &self,
+        node_id: u32,
+        command: &TerminalCommandIdentity<'_>,
+    ) -> Result<MetadataCommandRecordResult, StoreError> {
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -6434,7 +6817,7 @@ impl PgStore {
             });
         }
         let state = self.metadata_command_replica_state()?;
-        self.validate_metadata_command_record_position(node_id, command, &state)?;
+        self.validate_metadata_command_record_identity_position(node_id, command.id(), &state)?;
         if command.id().cluster_epoch() == state.cluster_epoch
             && command.id().log_index().get() <= state.applied_log_index
             && self
@@ -6447,7 +6830,7 @@ impl PgStore {
                 .is_none()
         {
             if self
-                .metadata_command_terminal_receipt_matches(node_id, command, false)?
+                .metadata_command_identity_terminal_receipt_matches(node_id, command, false)?
                 .is_some()
             {
                 return Ok(MetadataCommandRecordResult {
@@ -6455,9 +6838,9 @@ impl PgStore {
                     digest_revision: self.metadata_digest_revision()?,
                 });
             }
-            return Err(self.metadata_command_log_conflict(node_id, command));
+            return Err(command.conflict(node_id, self.pg_id));
         }
-        let command_bytes = command.command_bytes();
+        let (command_checksum, command_bytes) = command.record(false);
         let inserted = self.execute_cached(
             "INSERT INTO metadata_command_log \
              (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest) \
@@ -6467,8 +6850,8 @@ impl PgStore {
                 command.id().cluster_epoch().get() as i64,
                 command.id().pg_id().get() as i64,
                 command.id().log_index().get() as i64,
-                command.checksum_crc64() as i64,
-                command_bytes,
+                command_checksum as i64,
+                command_bytes.as_ref(),
             ],
             "record metadata command log entry",
         )?;
@@ -6482,16 +6865,17 @@ impl PgStore {
                     command.id().log_index(),
                 )?
                 .expect("metadata command log conflict must leave an entry");
-            if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+            if !self.metadata_command_identity_log_entry_matches(node_id, command, &entry, false)? {
+                return Err(command.conflict(node_id, self.pg_id));
             }
         }
         let inserted_entry =
-            (inserted > 0).then_some((command.id().log_index(), command.checksum_crc64(), false));
-        self.advance_metadata_command_log_state_with_inserted(
+            (inserted > 0).then_some((command.id().log_index(), command_checksum, false));
+        self.advance_metadata_command_log_state_with_grammar(
             node_id,
             command.id().cluster_epoch(),
             inserted_entry,
+            command.grammar(),
         )
     }
 
@@ -6500,6 +6884,47 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.record_metadata_command_identity_abandoned(
+            node_id,
+            &AbandonmentRecord::Current(command),
+        )
+    }
+
+    /// Owner-local setup until the joined recovery/installation paths carry the
+    /// complete command. Uses the same transaction, position, checksum, chain
+    /// and receipt implementation; never manually injects an authenticated row.
+    #[cfg(test)]
+    pub(super) fn test_record_complete_command_abandoned(
+        &self,
+        node_id: u32,
+        command: &payload_staging::EncodedContextualCommand<'_>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.record_metadata_command_identity_abandoned(
+            node_id,
+            &AbandonmentRecord::Fixture(command),
+        )
+    }
+
+    fn record_metadata_command_identity_abandoned(
+        &self,
+        node_id: u32,
+        record: &AbandonmentRecord<'_>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.record_metadata_command_identity_abandoned_owned(
+            node_id,
+            record,
+            #[cfg(test)]
+            |_| Ok(()),
+        )
+    }
+
+    fn record_metadata_command_identity_abandoned_owned(
+        &self,
+        node_id: u32,
+        record: &AbandonmentRecord<'_>,
+        #[cfg(test)] mut hook: impl FnMut(&'static str) -> Result<(), StoreError>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.require_usable_connection()?;
         #[cfg(test)]
         if self
             .fail_next_metadata_command_abandon_before_commit
@@ -6523,41 +6948,52 @@ impl PgStore {
                 }),
             });
         }
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| StoreError::Db {
-                context: "record abandoned metadata command (begin txn)",
-                source: source.into(),
-            })?;
-
-        let result = self.record_metadata_command_abandoned_inner(node_id, command);
-        match result {
+        if !self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "record abandoned metadata command requires its own transaction",
+            });
+        }
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "record abandoned metadata command (begin txn)",
+        )?;
+        let result = (|| {
+            let record = self.record_metadata_command_abandoned_inner(
+                node_id,
+                record,
+                #[cfg(test)]
+                || Ok(()),
+            )?;
+            #[cfg(test)]
+            hook("before-finish")?;
+            Ok(record)
+        })();
+        let state = match result {
             Ok(record) => {
-                if let Err(source) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(StoreError::Db {
-                        context: "record abandoned metadata command (commit txn)",
-                        source: source.into(),
-                    });
-                }
+                transaction.commit("record abandoned metadata command (commit txn)")?;
                 self.invalidate_clean_metadata_digest_revision();
-                Ok(record.state)
+                record.state
             }
             Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                self.invalidate_clean_metadata_digest_revision();
-                Err(error)
+                return Err(super::metadata_transaction::with_rollback_error(
+                    error,
+                    transaction.rollback(),
+                ));
             }
-        }
+        };
+        #[cfg(test)]
+        hook("after-finish")?;
+        Ok(state)
     }
 
     fn record_metadata_command_abandoned_inner(
         &self,
         node_id: u32,
-        command: &MetadataCommandEnvelope,
+        record: &AbandonmentRecord<'_>,
+        #[cfg(test)] before_insert: impl FnOnce() -> Result<(), StoreError>,
     ) -> Result<MetadataCommandRecordResult, StoreError> {
-        command.payload().validate_terminal_generation_owner()?;
+        let command = &record.identity();
+        command.validate_terminal_generation_owner()?;
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -6567,7 +7003,7 @@ impl PgStore {
             });
         }
         let state = self.metadata_command_replica_state()?;
-        self.validate_metadata_command_record_position(node_id, command, &state)?;
+        self.validate_metadata_command_record_identity_position(node_id, command.id(), &state)?;
         if command.id().cluster_epoch() == state.cluster_epoch
             && command.id().log_index().get() <= state.applied_log_index
             && self
@@ -6580,7 +7016,7 @@ impl PgStore {
                 .is_none()
         {
             if self
-                .metadata_command_terminal_receipt_matches(node_id, command, true)?
+                .metadata_command_identity_terminal_receipt_matches(node_id, command, true)?
                 .is_some()
             {
                 return Ok(MetadataCommandRecordResult {
@@ -6588,10 +7024,14 @@ impl PgStore {
                     digest_revision: self.metadata_digest_revision()?,
                 });
             }
-            return Err(self.metadata_command_log_conflict(node_id, command));
+            return Err(command.conflict(node_id, self.pg_id));
         }
-        let command_bytes = command.abandoned_log_bytes();
-        let command_checksum = command.abandoned_log_checksum_crc64();
+        let (command_checksum, command_bytes) = command.record(true);
+        #[cfg(test)]
+        before_insert()?;
+        // Complete authority is checked after position/receipt reads and
+        // encoding, immediately beside the first durable write.
+        record.require_effect(self, node_id)?;
         let inserted = self.execute_cached(
                 "INSERT INTO metadata_command_log \
              (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash, pre_state_digest, post_state_digest) \
@@ -6602,7 +7042,7 @@ impl PgStore {
                 command.id().pg_id().get() as i64,
                 command.id().log_index().get() as i64,
                 command_checksum as i64,
-                command_bytes,
+                command_bytes.as_ref(),
             ],
             "record abandoned metadata command log entry",
         )?;
@@ -6616,16 +7056,17 @@ impl PgStore {
                     command.id().log_index(),
                 )?
                 .expect("abandoned metadata command log conflict must leave an entry");
-            if !self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
-                return Err(self.metadata_command_log_conflict(node_id, command));
+            if !self.metadata_command_identity_log_entry_matches(node_id, command, &entry, true)? {
+                return Err(command.conflict(node_id, self.pg_id));
             }
         }
         let inserted_entry =
             (inserted > 0).then_some((command.id().log_index(), command_checksum, true));
-        self.advance_metadata_command_log_state_with_inserted(
+        self.advance_metadata_command_log_state_with_grammar(
             node_id,
             command.id().cluster_epoch(),
             inserted_entry,
+            command.grammar(),
         )
     }
 
@@ -6720,6 +7161,37 @@ impl PgStore {
         cluster_epoch: ClusterEpoch,
         receipt_retention: u64,
     ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        self.compact_metadata_command_log_with_grammar(
+            cluster_epoch,
+            receipt_retention,
+            complete_command_log_maintenance::LogCompaction::Current,
+        )
+    }
+
+    fn compact_metadata_command_log_with_grammar(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        receipt_retention: u64,
+        compaction: complete_command_log_maintenance::LogCompaction<'_>,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        self.compact_metadata_command_log_with_grammar_inner(
+            cluster_epoch,
+            receipt_retention,
+            compaction,
+            #[cfg(test)]
+            || Ok(()),
+        )
+    }
+
+    fn compact_metadata_command_log_with_grammar_inner(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        receipt_retention: u64,
+        compaction: complete_command_log_maintenance::LogCompaction<'_>,
+        #[cfg(test)] before_commit: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        self.require_usable_connection()?;
+        let grammar = compaction.grammar();
         assert!(receipt_retention > 0, "receipt retention must not be zero");
         let stats = self.metadata_command_log_stats(cluster_epoch)?;
         let Some(compactable_before) = stats.compactable_before else {
@@ -6727,11 +7199,7 @@ impl PgStore {
                 retained_entries: stats.retained_entries,
             });
         };
-        if stats.pending_tail_entries > 0
-            || self
-                .pending_metadata_command_slot(0, cluster_epoch)?
-                .is_some()
-        {
+        if stats.pending_tail_entries > 0 || grammar.has_pending(self, 0, cluster_epoch)? {
             return Ok(MetadataCommandLogCompactionStatus::PendingCommand {
                 retained_entries: stats.retained_entries,
             });
@@ -6740,14 +7208,19 @@ impl PgStore {
         let max_compacted_log_index = compactable_before
             .checked_sub(1)
             .expect("compactable bound is exclusive and non-zero");
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|source| StoreError::Db {
-                context: "begin metadata command log compaction",
-                source: source.into(),
-            })?;
+        // Preserve the standalone compaction boundary. A savepoint release
+        // inside caller-owned work would not establish durable compaction.
+        if !self.conn.is_autocommit() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "metadata command log compaction requires its own transaction",
+            });
+        }
+        let transaction = super::metadata_transaction::MetadataTransaction::begin(
+            self,
+            "begin metadata command log compaction",
+        )?;
         let result = (|| {
-            self.validate_metadata_command_checkpoint_state_read_only(0, cluster_epoch)?;
+            self.validate_metadata_command_checkpoint_state_read_only(0, cluster_epoch, grammar)?;
             let first_retained_receipt = max_compacted_log_index
                 .saturating_sub(receipt_retention - 1)
                 .max(1);
@@ -6755,7 +7228,11 @@ impl PgStore {
                 cluster_epoch,
                 first_retained_receipt,
                 max_compacted_log_index,
+                grammar,
             )?;
+            #[cfg(test)]
+            self.test_before_complete_maintenance_effect();
+            compaction.require_effect(self, cluster_epoch)?;
             for (log_index, receipt) in receipts {
                 self.insert_metadata_command_terminal_receipt(cluster_epoch, log_index, &receipt)?;
             }
@@ -6770,22 +7247,20 @@ impl PgStore {
                 "compact metadata command log through checkpoint",
             )?;
             self.prune_metadata_command_terminal_receipts(cluster_epoch, first_retained_receipt)?;
+            #[cfg(test)]
+            before_commit()?;
             Ok(deleted)
         })();
         let deleted = match result {
             Ok(deleted) => {
-                if let Err(source) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(StoreError::Db {
-                        context: "commit metadata command log compaction",
-                        source: source.into(),
-                    });
-                }
+                transaction.commit("commit metadata command log compaction")?;
                 deleted
             }
             Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(error);
+                return Err(super::metadata_transaction::with_rollback_error(
+                    error,
+                    transaction.rollback(),
+                ));
             }
         };
         Ok(MetadataCommandLogCompactionStatus::Compacted {
@@ -6799,6 +7274,7 @@ impl PgStore {
         cluster_epoch: ClusterEpoch,
         min_log_index: u64,
         max_log_index: u64,
+        grammar: TerminalLogGrammar<'_>,
     ) -> Result<Vec<(MetadataCommandLogIndex, MetadataCommandTerminalReceipt)>, StoreError> {
         let mut stmt = self
             .conn
@@ -6856,11 +7332,10 @@ impl PgStore {
                     log_index,
                 }
             })?;
-            self.verify_metadata_command_log_entry(
+            grammar.verify(
+                self,
                 0,
-                cluster_epoch,
-                PgId::new(self.pg_id),
-                log_index,
+                MetadataCommandId::new(cluster_epoch, PgId::new(self.pg_id), log_index),
                 &entry,
             )?;
             let Some(previous_log_hash) = entry.previous_log_hash else {
@@ -7006,6 +7481,7 @@ impl PgStore {
     }
 
     pub(super) fn invalidate_clean_metadata_digest_revision(&self) {
+        self.complete_prefix_validation.invalidate();
         self.clean_metadata_digest_revision
             .store(UNCLEAN_METADATA_DIGEST_REVISION, Ordering::Relaxed);
     }
@@ -7045,11 +7521,12 @@ impl PgStore {
         )))
     }
 
-    fn advance_metadata_command_log_state_with_inserted(
+    fn advance_metadata_command_log_state_with_grammar(
         &self,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
         inserted_entry: Option<(MetadataCommandLogIndex, u64, bool)>,
+        grammar: TerminalLogGrammar<'_>,
     ) -> Result<MetadataCommandRecordResult, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
@@ -7184,11 +7661,10 @@ impl PgStore {
                     else {
                         break;
                     };
-                    self.verify_metadata_command_log_entry(
+                    grammar.verify(
+                        self,
                         node_id,
-                        cluster_epoch,
-                        pg_id,
-                        log_index,
+                        MetadataCommandId::new(cluster_epoch, pg_id, log_index),
                         &entry,
                     )?;
                     let expected_log_hash = metadata_command_log_hash(
@@ -7527,10 +8003,18 @@ impl PgStore {
     }
 
     pub(super) fn metadata_state_digest(&self) -> Result<u64, StoreError> {
+        self.metadata_state_digest_with_work(None)
+    }
+
+    fn metadata_state_digest_with_work(
+        &self,
+        mut work: Option<&mut PrefixValidationWork>,
+    ) -> Result<u64, StoreError> {
         let mut hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut hasher);
         for table in METADATA_DIGEST_TABLES {
-            let table_digest = self.metadata_table_digest(table)?;
+            let stats = self.metadata_table_digest_stats_with_work(table, work.as_deref_mut())?;
+            let table_digest = metadata_table_digest_from_stats(table, stats);
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
         Ok(hasher.finalize())
@@ -7982,6 +8466,17 @@ impl PgStore {
         &self,
         table: &MetadataDigestTable,
     ) -> Result<MetadataTableDigestStats, StoreError> {
+        self.metadata_table_digest_stats_with_work(table, None)
+    }
+
+    fn metadata_table_digest_stats_with_work(
+        &self,
+        table: &MetadataDigestTable,
+        mut work: Option<&mut PrefixValidationWork>,
+    ) -> Result<MetadataTableDigestStats, StoreError> {
+        if let Some(work) = work.as_deref_mut() {
+            work.check()?;
+        }
         let where_clause = Self::metadata_digest_where_clause(table.filter);
         let table_sql = quote_sql_identifier(table.name);
         let quoted_columns: Vec<String> = table
@@ -8015,6 +8510,21 @@ impl PgStore {
             context: "scan canonical metadata table range row",
             source: e.into(),
         })? {
+            if let Some(work) = work.as_deref_mut() {
+                let mut bytes = 0usize;
+                for index in 0..table.columns.len() {
+                    let value = row.get_ref(index).map_err(|e| StoreError::Db {
+                        context: "size complete validation state row",
+                        source: e.into(),
+                    })?;
+                    bytes = bytes.saturating_add(match value {
+                        rusqlite::types::ValueRef::Blob(value)
+                        | rusqlite::types::ValueRef::Text(value) => value.len(),
+                        _ => 8,
+                    });
+                }
+                work.row(bytes)?;
+            }
             let mut hasher = checksum::crc64::Hasher::new();
             digest_u8(&mut hasher, 0x20);
             digest_len_prefixed_bytes(&mut hasher, table.name.as_bytes());

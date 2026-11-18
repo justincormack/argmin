@@ -199,7 +199,7 @@ fn staging_context_preparation_preserves_ordinary_and_abandonment_variants() {
             );
             let context = if source_bound {
                 ContextualCommand::abandoned_part(
-                    PartFinalizationSource::capture(&source)
+                    PartFinalizationSource::capture_for_test(&source)
                         .unwrap()
                         .bind_cleanup(command.clone(), &topology())
                         .unwrap(),

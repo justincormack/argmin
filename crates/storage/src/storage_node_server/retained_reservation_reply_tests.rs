@@ -157,3 +157,161 @@ fn authenticated_unix_retained_reservation_release_response_failure() {
 fn authenticated_tls_tcp_retained_reservation_release_response_failure() {
     authenticated_retained_reservation_release_response_failure(true);
 }
+
+fn proof_release_deadline_at_sql_effect(tcp: bool) {
+    use crate::node_runtime::pg_store::PgStore;
+    use std::sync::atomic::AtomicBool;
+
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+        instance_id: "frontend-1".to_owned(),
+    });
+    let prepared = PreparedStorageNodeServer::new(config.clone())
+        .with_rpc_auth(storage_rpc_server_auth(&credential));
+    let server = if tcp {
+        prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+            "127.0.0.1:0".parse().unwrap(),
+            storage_rpc_tls_server_config(),
+        )])
+    } else {
+        prepared
+    }
+    .bind()
+    .unwrap();
+    let auth = storage_rpc_client_auth(credential, 9);
+    let client = || {
+        // This is an explicit reconnect after a deadline response. Do not keep
+        // the first endpoint's pool alive across the single-connection worker:
+        // it would retain a socket which that worker has already closed.
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(Arc::clone(&auth)),
+        )
+    };
+    let bucket = crate::tests::bucket_name("proof-release-effect");
+    let pg_id = server._node.bucket_metadata_pg_for(&bucket);
+    let (proof, canary) = {
+        let pg = server._node.get_pg(pg_id.get()).unwrap();
+        create_probe_bucket_direct(&pg, &bucket);
+        let now = crate::clock::current_time_millis();
+        let acquire = |id| {
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: id,
+                    owner_token: "owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind:
+                        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    created_at: now,
+                    lease_deadline: now + 60_000,
+                    target_context: Some("key"),
+                },
+            )
+            .unwrap()
+        };
+        (BucketWriteReservationProof::from(&acquire("target")), acquire("canary"))
+    };
+    let observe = || {
+        let pg = server._node.get_pg(pg_id.get()).unwrap();
+        (
+            pg.test_proof_release_sql_changes(),
+            PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap(),
+            pg.metadata_command_replica_state().unwrap(),
+        )
+    };
+    let before = observe();
+    let reached = Arc::new(AtomicBool::new(false));
+    let replies = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&replies);
+    server.set_response_frame_test_hook(Arc::new(move |kind, frame| {
+        if kind == StorageRpcMessageKind::ProofRelease
+            && count.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            let error = decode_storage_rpc_response_payload(&frame.payload).unwrap().unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::TransportTimeout);
+            assert!(error.message.contains("release metadata command bucket write reservation"));
+        }
+    }));
+    thread::scope(|scope| {
+        let hook_reached = Arc::clone(&reached);
+        let worker = scope.spawn(|| {
+            PgStore::test_with_before_proof_release_effect_hook(
+                move |in_transaction, deadline| {
+                    assert!(in_transaction);
+                    let deadline = deadline.expect("portable cutoff must reach SQLite");
+                    assert!(Instant::now() < deadline, "must reach the gap before expiry");
+                    hook_reached.store(true, Ordering::SeqCst);
+                    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                        thread::sleep(remaining);
+                    }
+                },
+                || server.accept_one().unwrap(),
+            );
+        });
+        let client = client();
+        let route = client
+            .open_retained_bucket_write_reservation_route(pg_id, &bucket)
+            .unwrap();
+        let error = route.release_metadata_command_bucket_write_reservation_until(
+            &proof, Instant::now() + Duration::from_secs(5),
+        ).unwrap_err();
+        assert!(matches!(error, BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::TransportTimeout, ..
+        })), "{error:?}");
+        drop(route);
+        drop(client);
+        worker.join().unwrap();
+    });
+    assert!(reached.load(Ordering::SeqCst));
+    assert_eq!(replies.load(Ordering::SeqCst), 1, "no implicit retry");
+    assert_eq!(observe(), before, "expiry must precede the DELETE");
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| server.accept_one().unwrap());
+        let client = client();
+        let route = client
+            .open_retained_bucket_write_reservation_route(pg_id, &bucket)
+            .unwrap();
+        for _ in 0..2 {
+            route.release_metadata_command_bucket_write_reservation_until(
+                &proof, Instant::now() + Duration::from_secs(30),
+            ).unwrap();
+        }
+        drop(route);
+        drop(client);
+        worker.join().unwrap();
+    });
+    let after = observe();
+    assert_eq!(after.0, before.0 + 1, "only the first exact retry deletes");
+    assert_eq!(after.1, vec![canary]);
+    assert_eq!(after.2, before.2, "release does not advance the object command log");
+    assert_eq!(replies.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn authenticated_unix_proof_release_deadline_reaches_sql_effect() {
+    proof_release_deadline_at_sql_effect(false);
+}
+
+#[test]
+fn authenticated_tls_proof_release_deadline_reaches_sql_effect() {
+    proof_release_deadline_at_sql_effect(true);
+}

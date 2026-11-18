@@ -534,6 +534,130 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
         assert_eq!(actual.socket_path, expected.socket_path);
         assert_eq!(actual.pg_routes, expected.pg_routes);
         assert_eq!(actual.historical_pg_routes, expected.historical_pg_routes);
+        assert_eq!(
+            actual.pending_metadata_command_recoveries,
+            expected.pending_metadata_command_recoveries,
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_v5_present_recovery_row_is_frozen_rejection_evidence() {
+        // Immutable predecessor bytes: V5's present recovery row has five fields,
+        // not V6's six. Do not regenerate this specimen with the current writer.
+        const V5: &str = include_str!("testdata/runtime_config_v5_pending_recovery.txt");
+        assert_eq!(V5.len(), 326);
+        assert_eq!(checksum::sha256::digest(V5.as_bytes()), [
+            0xb7, 0x46, 0xfe, 0xd3, 0x24, 0xd1, 0xfa, 0x37,
+            0x90, 0xa5, 0x58, 0xca, 0xd4, 0x8a, 0xc7, 0x7c,
+            0xff, 0xc4, 0xb1, 0x3a, 0xc1, 0xa6, 0x70, 0x44,
+            0xb1, 0xe8, 0x00, 0xfd, 0x24, 0xdb, 0xf6, 0x6d,
+        ]);
+        assert!(V5.ends_with("pending_metadata_command_recoveries 1\n0 7 3 11 123\n"));
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        assert!(matches!(
+            decode_control_plane_runtime_config(
+                &path, config.data_dir.clone(), config.default_ec_shape, V5,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigUnsupportedVersion {
+                path: error_path, actual: 5,
+            }) if error_path == path
+        ));
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        fs::write(&path, V5).unwrap();
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir, config.node_id, config.default_ec_shape, &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigUnsupportedVersion {
+                path: error_path, actual: 5,
+            }) if error_path == path
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), V5);
+
+        // Relabeling alone must not smuggle a digest-less row into V6. Adding
+        // exactly the new field makes this otherwise-valid configuration decode.
+        let relabeled = V5.replacen("runtime-config-v5", "runtime-config-v6", 1);
+        assert!(matches!(
+            decode_control_plane_runtime_config(
+                &path, config.data_dir.clone(), config.default_ec_shape, &relabeled,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message == "invalid pending metadata command recovery"
+        ));
+        let current = relabeled.replace("0 7 3 11 123\n", concat!(
+            "0 7 3 11 123 ",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n",
+        ));
+        let decoded = decode_control_plane_runtime_config(
+            &path, config.data_dir.clone(), config.default_ec_shape, &current,
+        ).unwrap();
+        validate_process_config_route_table(&decoded).unwrap();
+        assert_eq!(decoded.pending_metadata_command_recoveries, vec![(
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    ClusterEpoch::new(3).unwrap(),
+                    std::num::NonZeroU64::new(11).unwrap(),
+                    123,
+                    std::array::from_fn(|i| i as u8),
+                ),
+            ),
+        )]);
+    }
+
+    #[test]
+    fn storage_node_runtime_config_v6_recovery_sha256_is_exact_and_survives_restart() {
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        config.pending_metadata_command_recoveries = vec![(
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                config.node_id,
+                PendingMetadataCommandObservation::new(
+                    config.cluster_epoch,
+                    std::num::NonZeroU64::MIN,
+                    123,
+                    std::array::from_fn(|i| i as u8),
+                ),
+            ),
+        )];
+        let raw = encode_control_plane_runtime_config(&config);
+        const SHA: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert!(raw.starts_with("argmin-storage-node-runtime-config-v6\n"));
+        assert!(raw.ends_with(concat!(
+            "pending_metadata_command_recoveries 1\n0 7 1 1 123 ",
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\n",
+        )));
+        config.persist_control_plane_runtime_config().unwrap();
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &config.data_dir,
+            config.node_id,
+            config.default_ec_shape,
+            &config.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&loaded, &config);
+        for invalid in [
+            "".to_owned(),
+            SHA[..62].to_owned(),
+            format!("{SHA}00"),
+            "zz".repeat(32),
+        ] {
+            let bad = raw.replace(SHA, &invalid);
+            assert!(
+                decode_control_plane_runtime_config(
+                    &control_plane_runtime_config_path(&config.data_dir),
+                    config.data_dir.clone(),
+                    config.default_ec_shape,
+                    &bad,
+                ).is_err(),
+                "malformed recovery digest {invalid:?}",
+            );
+        }
     }
 
     fn replace_runtime_config_count(raw: &str, label: &str, count: usize) -> String {
@@ -654,9 +778,13 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
         let historical_state_v9 = historical_state_v8
             .replace("101 1 202 8 303", "101 1 202 9 303")
             .replace("404 1 505 8 606", "404 1 505 9 606");
-        let current_state_v10 = historical_state_v8
+        let historical_state_v10 = historical_state_v8
             .replace("101 1 202 8 303", "101 1 202 10 303")
             .replace("404 1 505 8 606", "404 1 505 10 606");
+        let current_state_v10 = historical_state_v10.replace("runtime-config-v5", "runtime-config-v6");
+        assert!(matches!(decode_control_plane_runtime_config(
+            &config.data_dir.join("historical-runtime-config"), config.data_dir.clone(), config.default_ec_shape, &historical_state_v10,
+        ), Err(StorageNodeServerError::RuntimeConfigUnsupportedVersion { actual: 5, .. })));
         assert_eq!(encode_control_plane_runtime_config(&config), current_state_v10);
         assert!(decode_control_plane_runtime_config(
             &config.data_dir.join("historical-runtime-config"), config.data_dir.clone(), config.default_ec_shape, &historical_state_v9,
@@ -689,7 +817,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
             "argmin-storage-node-runtime-config-vx",
         ] {
             let raw = encode_control_plane_runtime_config(&config).replacen(
-                "argmin-storage-node-runtime-config-v5",
+                "argmin-storage-node-runtime-config-v6",
                 magic,
                 1,
             );
@@ -762,13 +890,13 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
 
     #[test]
     fn storage_node_restart_rejects_unsupported_runtime_config_before_storage_open() {
-        for version in [4_u16, 6] {
+        for version in [4_u16, 5, 7] {
             let tmp = test_util::tempdir();
             let config = test_config(&tmp);
             prepare_private_data_dir(&config.data_dir).unwrap();
             let path = control_plane_runtime_config_path(&config.data_dir);
             let raw = encode_control_plane_runtime_config(&config).replacen(
-                "argmin-storage-node-runtime-config-v5",
+                "argmin-storage-node-runtime-config-v6",
                 &format!("argmin-storage-node-runtime-config-v{version}"),
                 1,
             );
@@ -1333,6 +1461,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
         assert_eq!(pending.cluster_epoch(), old_epoch);
         assert_eq!(pending.log_index(), command.id().log_index().get());
         assert_eq!(pending.command_checksum(), command.checksum_crc64());
+        assert_eq!(pending.command_sha256(), command.command_sha256());
         assert!(heartbeat.cluster_map_history_route_references.iter().any(
             |reference| reference
                 == crate::PgClusterMapHistoryRouteReference::new(
@@ -5669,7 +5798,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -8454,6 +8583,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
                     config.cluster_epoch,
                     std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
                     command.checksum_crc64(),
+                    command.command_sha256(),
                 ),
             ),
         ));
@@ -8614,6 +8744,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
                     source_epoch,
                     std::num::NonZeroU64::new(previous.id().log_index().get()).unwrap(),
                     previous.checksum_crc64(),
+                    previous.command_sha256(),
                 ),
             ),
         ));
@@ -11612,6 +11743,7 @@ fn encode_unbounded_shard_ack_record_request(batch: &crate::storage_rpc::Storage
                     source_epoch,
                     std::num::NonZeroU64::MIN,
                     command.checksum_crc64(),
+                    command.command_sha256(),
                 ),
             ),
         ));

@@ -5,6 +5,7 @@
 struct StorageNodeConnectionHandler {
     config: Arc<StorageNodeProcessConfig>,
     route_map_lease: Option<BoundRouteMapLease>,
+    window_confirmation_peers: Option<Arc<complete_window_peers::WindowPeers>>,
     runtime_route_source: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     route_admission: StorageNodeRouteAdmissionGate,
     node: Arc<SharedStorageNode>,
@@ -12,11 +13,15 @@ struct StorageNodeConnectionHandler {
     metadata_command_locks: StorageNodeMetadataCommandLocks,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     #[cfg(test)]
+    complete_log_operations: bool,
+    #[cfg(test)]
     runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
     #[cfg(test)]
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
     #[cfg(test)]
     response_frame_test_hook: Arc<Mutex<Option<StorageRpcResponseFrameTestHook>>>,
+    #[cfg(test)]
+    metadata_command_before_release_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
     #[cfg(test)]
     metadata_command_before_commit_test_hook:
         Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,

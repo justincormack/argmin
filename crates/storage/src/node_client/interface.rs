@@ -374,6 +374,20 @@ pub(crate) trait RetainedBucketWriteReservationNodeClient: Send + Sync {
 }
 
 pub(crate) trait RetainedBucketWriteReservationRoute: Send {
+    /// Reuse an owner's first absolute cutoff. Never project a fresh wire
+    /// deadline from a later clock sample during terminal retry.
+    fn release_metadata_command_bucket_write_reservation_with_fixed_deadline(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+        portable: crate::storage_rpc::StorageRpcOperationDeadline,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.release_metadata_command_bucket_write_reservation_until(
+            proof,
+            deadline.min(portable.local_deadline()),
+        )
+    }
+
     fn release_durable_bucket_write_reservation(
         &self,
         record: &BucketWriteReservationRecord,
@@ -1634,6 +1648,19 @@ pub(crate) trait RetainedStreamUploadAbortMetadataRoute: Send {
 /// Implementations may validate stored invariants but must not publish,
 /// replay, compact, or otherwise mutate command state.
 pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
+    /// Candidate bounded witness observation, not the raw replica-state query.
+    /// Unsupported adapters fail closed; never substitute a raw state read.
+    fn complete_settled_witness_prefix_until(
+        &self,
+        _pg_id: PgId,
+        _epoch: ClusterEpoch,
+        _deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        Err(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "complete settled witness inspection unavailable",
+        })
+    }
+
     fn max_metadata_command_log_index(
         &self,
         pg_id: PgId,

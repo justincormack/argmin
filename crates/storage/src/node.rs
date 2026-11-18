@@ -83,6 +83,14 @@ use crate::{ClusterEpoch, PgId, PgState};
 const TRACE_TARGET: &str = "storage";
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const PG_STARTUP_MAX_PARALLELISM: usize = 8;
+
+enum PgOpenRecovery<'a> {
+    DeferredCurrent,
+    Complete {
+        guard: &'a super::server::StorageNodeDataDirGuard,
+        node_id: NodeId,
+    },
+}
 pub(crate) const OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG: usize = 2;
 #[path = "node/bucket_ops.rs"]
 mod bucket_ops;
@@ -525,6 +533,25 @@ pub(crate) struct LocalNodeRuntime {
     client: Arc<LocalStorageNodeClient>,
 }
 
+#[path = "node/complete_publication.rs"]
+mod complete_publication;
+#[path = "node/direct_introduction.rs"]
+mod direct_introduction;
+pub(in crate::node_runtime) use direct_introduction::DirectIntroductionAuthority;
+#[path = "node/staging_window_confirmation.rs"]
+mod staging_window_confirmation;
+pub(in crate::node_runtime) use complete_publication::{
+    EmbeddedPublicationAuthority, EmbeddedStagingAckAuthority,
+};
+
+#[path = "node/complete_application.rs"]
+mod complete_application;
+pub(in crate::node_runtime) use complete_application::EmbeddedApplicationAuthority;
+
+#[path = "node/complete_replica_abandonment.rs"]
+mod complete_replica_abandonment;
+pub(in crate::node_runtime) use complete_replica_abandonment::EmbeddedReplicaAbandonmentAuthority;
+
 pub(crate) struct LocalNodeClients {
     pub(crate) object_payload_lease: Arc<dyn ObjectPayloadLeaseNodeClient>,
     pub(crate) retained_object_payload_reclaim: Arc<dyn RetainedObjectPayloadReclaimNodeClient>,
@@ -933,6 +960,39 @@ impl SharedStorageNode {
         default_ec_shape: EcShape,
         initial_cluster_epoch: ClusterEpoch,
     ) -> Result<Self, StoreError> {
+        Self::open_with_pg_recovery(
+            data_dir,
+            pg_ids,
+            default_ec_shape,
+            initial_cluster_epoch,
+            PgOpenRecovery::DeferredCurrent,
+        )
+    }
+
+    /// Own all opened PGs until complete recovery has succeeded everywhere.
+    /// There is deliberately no complete-recovery mutator on a published node.
+    pub(in crate::node_runtime) fn open_complete_for_startup(
+        guard: &super::server::StorageNodeDataDirGuard,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        node_id: NodeId,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_pg_recovery(
+            guard.locked_data_dir(),
+            pg_ids,
+            default_ec_shape,
+            ClusterEpoch::INITIAL,
+            PgOpenRecovery::Complete { guard, node_id },
+        )
+    }
+
+    fn open_with_pg_recovery(
+        data_dir: &Path,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        initial_cluster_epoch: ClusterEpoch,
+        recovery: PgOpenRecovery<'_>,
+    ) -> Result<Self, StoreError> {
         EcConfig::new(default_ec_shape.k, default_ec_shape.m).map_err(|error| {
             StoreError::ErasureCoding {
                 context: "validate storage default ec shape",
@@ -955,11 +1015,21 @@ impl SharedStorageNode {
             pg_startup_parallelism(pg_id_list.len()),
             &|pg_id| {
                 let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
-                let store = PgStore::open_with_initial_cluster_epoch(
-                    &pg_dir,
-                    pg_id,
-                    initial_cluster_epoch,
-                )?;
+                let store = match recovery {
+                    PgOpenRecovery::DeferredCurrent => PgStore::open_with_initial_cluster_epoch(
+                        &pg_dir,
+                        pg_id,
+                        initial_cluster_epoch,
+                    )?,
+                    PgOpenRecovery::Complete { guard, node_id } => {
+                        PgStore::open_complete_for_startup(
+                            guard,
+                            pg_id,
+                            PgStoreRecoveryContext::for_node(node_id),
+                            &pg_topology,
+                        )?
+                    }
+                };
                 let paths = PgDataPaths {
                     shards_dir: pg_dir.join("shards"),
                     tmp_dir: pg_dir.join("tmp"),
@@ -1828,6 +1898,7 @@ impl SharedStorageNode {
                 NonZeroU64::new(pending.id.log_index().get())
                     .expect("pending metadata command log index is nonzero"),
                 pending.command_checksum,
+                pending.command_sha256,
             )
         });
         Ok(NodePgHeartbeatObservation {
@@ -3523,6 +3594,7 @@ mod tests {
                 command.id().cluster_epoch(),
                 NonZeroU64::new(command.id().log_index().get()).unwrap(),
                 command.checksum_crc64(),
+                command.command_sha256(),
             ))
         );
     }
@@ -3665,6 +3737,7 @@ mod tests {
                 ClusterEpoch::INITIAL,
                 NonZeroU64::MIN,
                 command.checksum_crc64(),
+                command.command_sha256(),
             ))
         );
     }

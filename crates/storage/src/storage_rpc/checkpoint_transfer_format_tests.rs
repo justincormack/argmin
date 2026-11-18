@@ -35,22 +35,22 @@ fn frozen_frame(
 ) -> (Vec<u8>, StorageRpcFrame) {
     // An outer-version or checksum rejection cannot satisfy the nested-format
     // regressions: the production frame reader must first accept these bytes.
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 36);
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 37);
     let bytes = crate::tests::frozen_hex_fixture(input);
     assert_eq!(bytes.len(), len);
     assert_eq!(checksum::sha256::digest(&bytes), sha256);
-    let frame = decode_storage_rpc_frame(&bytes).expect("valid v36 outer frame");
+    let frame = decode_storage_rpc_frame(&bytes).expect("valid v37 outer frame");
     assert_eq!(frame.request_id, REQUEST_ID);
     assert_eq!(frame.kind, kind);
     (bytes, frame)
 }
 
 #[test]
-fn checkpoint_transfer_v36_v7_install_request_rejects_exact_nested_version() {
+fn checkpoint_transfer_v37_v7_install_request_rejects_exact_nested_version() {
     let (_, frame) = frozen_frame(
-        include_str!("testdata/checkpoint_transfer_rpc_v36_checkpoint_v7_install_request_canonical_v9_pg_v10.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v37_checkpoint_v7_install_request_canonical_v9_pg_v10.hex"),
         7_884,
-        [112, 184, 64, 121, 39, 254, 233, 87, 33, 82, 181, 65, 71, 165, 12, 166, 116, 216, 15, 196, 216, 81, 112, 194, 85, 207, 9, 104, 46, 177, 242, 213],
+        [224, 200, 232, 194, 103, 149, 187, 215, 234, 165, 204, 177, 199, 45, 28, 125, 164, 223, 198, 8, 236, 111, 7, 85, 242, 58, 233, 8, 253, 13, 73, 66],
         StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
     );
     validate_storage_rpc_request_frame_payload_limit(&frame).unwrap();
@@ -69,11 +69,11 @@ fn checkpoint_transfer_v36_v7_install_request_rejects_exact_nested_version() {
 }
 
 #[test]
-fn checkpoint_transfer_v36_v7_export_response_rejects_exact_nested_version() {
+fn checkpoint_transfer_v37_v7_export_response_rejects_exact_nested_version() {
     let (_, frame) = frozen_frame(
-        include_str!("testdata/checkpoint_transfer_rpc_v36_checkpoint_v7_export_response_canonical_v9_pg_v10.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v37_checkpoint_v7_export_response_canonical_v9_pg_v10.hex"),
         7_874,
-        [106, 118, 241, 133, 110, 205, 112, 45, 237, 140, 239, 183, 77, 91, 51, 44, 139, 132, 34, 222, 64, 28, 205, 112, 219, 7, 206, 13, 15, 13, 227, 0],
+        [88, 229, 133, 93, 177, 164, 139, 252, 110, 254, 157, 195, 179, 201, 129, 224, 168, 28, 211, 198, 84, 13, 141, 2, 118, 13, 148, 155, 11, 153, 9, 183],
         StorageRpcMessageKind::MetadataCommandCheckpointExport,
     );
     let payload = decode_storage_rpc_response_payload(&frame.payload)
@@ -90,11 +90,11 @@ fn checkpoint_transfer_v36_v7_export_response_rejects_exact_nested_version() {
 }
 
 #[test]
-fn checkpoint_transfer_v36_v8_install_request_matches_frozen_composite() {
+fn checkpoint_transfer_v37_v8_install_request_matches_frozen_composite() {
     let (bytes, frame) = frozen_frame(
-        include_str!("testdata/checkpoint_transfer_rpc_v36_checkpoint_v8_install_request_canonical_v10_pg_v11.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v37_checkpoint_v8_install_request_canonical_v10_pg_v11.hex"),
         9_707,
-        [169, 230, 129, 116, 19, 150, 149, 105, 202, 14, 53, 169, 81, 213, 64, 16, 60, 52, 253, 19, 185, 168, 137, 205, 17, 235, 241, 59, 206, 138, 218, 165],
+        [254, 142, 64, 205, 93, 85, 169, 176, 102, 102, 210, 243, 103, 92, 83, 31, 7, 209, 172, 158, 26, 3, 223, 245, 67, 85, 164, 12, 160, 38, 76, 39],
         StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
     );
     validate_storage_rpc_request_frame_payload_limit(&frame).unwrap();
@@ -116,11 +116,11 @@ fn checkpoint_transfer_v36_v8_install_request_matches_frozen_composite() {
 }
 
 #[test]
-fn checkpoint_transfer_v36_v8_export_response_matches_frozen_composite() {
+fn checkpoint_transfer_v37_v8_export_response_matches_frozen_composite() {
     let (bytes, frame) = frozen_frame(
-        include_str!("testdata/checkpoint_transfer_rpc_v36_checkpoint_v8_export_response_canonical_v10_pg_v11.hex"),
+        include_str!("testdata/checkpoint_transfer_rpc_v37_checkpoint_v8_export_response_canonical_v10_pg_v11.hex"),
         9_697,
-        [43, 217, 39, 208, 129, 160, 246, 158, 188, 98, 233, 184, 107, 58, 233, 34, 56, 236, 154, 210, 40, 193, 137, 211, 31, 175, 186, 189, 187, 147, 90, 34],
+        [182, 153, 79, 212, 244, 13, 235, 25, 53, 75, 237, 10, 244, 174, 37, 96, 20, 191, 211, 193, 198, 126, 145, 235, 213, 102, 195, 6, 208, 62, 75, 133],
         StorageRpcMessageKind::MetadataCommandCheckpointExport,
     );
     let payload = decode_storage_rpc_response_payload(&frame.payload)

@@ -14,6 +14,8 @@ use crate::metadata_command::{
 };
 use crate::types::{BucketName, ObjectKey, PgId, SessionId};
 
+pub(crate) use pg_store::DirectPutRequestCustody;
+
 /// PG containing payload shard data for an object segment or multipart part.
 ///
 /// A standalone placement-only `PgTopology` returns raw `PgId` values. Only
@@ -163,6 +165,9 @@ impl CreateMultipartUploadCommandBuildAuthority {
 pub(crate) struct MetadataCommandDecodeAuthority {
     _private: (),
 }
+
+pub(crate) use pg_store::CommandContextCodecAuthority;
+pub(crate) use pg_store::CompleteTerminalReservationRelease;
 
 impl MetadataCommandDecodeAuthority {
     pub(in crate::node_runtime) const fn new() -> Self {

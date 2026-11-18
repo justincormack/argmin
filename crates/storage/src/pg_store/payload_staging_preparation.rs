@@ -8,8 +8,12 @@
 //! permitted here, and its returned record is NOT physical-write authority.
 
 use super::*;
+use crate::node_runtime::engine::EmbeddedPublicationAuthority;
 use crate::node_runtime::payload_placement::PayloadPlacementInput;
 use crate::node_runtime::pg_store::PgStore;
+use crate::node_runtime::pg_store::{
+    CompletePublicationRequest, StagingWindowConfirmationError, StreamWindowAllocationPermit,
+};
 use crate::node_runtime::traits::PgMetadataStore;
 use crate::types::{AdmittedRouteEffectFence, ExpectedStreamAppendState};
 use crate::{
@@ -17,6 +21,60 @@ use crate::{
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
 };
 use rusqlite::OptionalExtension;
+
+struct EmbeddedConfirmedAuthority<'a, 'route> {
+    permit: &'a StreamWindowAllocationPermit<'a, 'route>,
+    authority: &'a EmbeddedPublicationAuthority<'a>,
+    request: &'a CompletePublicationRequest<'a>,
+}
+
+enum ConfirmedAuthority<'a, 'route> {
+    Embedded(EmbeddedConfirmedAuthority<'a, 'route>),
+    Remote(&'a crate::node_runtime::server::RemoteStreamAllocationAuthority<'a>),
+}
+
+pub(super) fn prepare_remote_confirmed_stream_window(
+    pg: &PgStore,
+    authority: &crate::node_runtime::server::RemoteStreamAllocationAuthority<'_>,
+) -> Result<StreamUploadSegmentRecord, StagingWindowConfirmationError> {
+    let (request, expected, fence) = authority.query().preparation_inputs();
+    prepare_inner(
+        pg,
+        authority.query().topology(),
+        authority.query().route().node,
+        authority.placement(),
+        fence,
+        request,
+        expected,
+        Some(ConfirmedAuthority::Remote(authority)),
+    )
+    .map_err(|e| StagingWindowConfirmationError::Window(e.to_string()))
+}
+
+pub(in super::super) fn prepare_confirmed_stream_window(
+    pg: &PgStore,
+    placement: PayloadPlacementInput<'_>,
+    permit: &StreamWindowAllocationPermit<'_, '_>,
+    authority: &EmbeddedPublicationAuthority<'_>,
+    publication: &CompletePublicationRequest<'_>,
+) -> Result<StreamUploadSegmentRecord, StagingWindowConfirmationError> {
+    let (request, expected, fence) = permit.preparation_inputs();
+    prepare_inner(
+        pg,
+        publication.topology(),
+        publication.node_id(),
+        placement,
+        fence,
+        request,
+        expected,
+        Some(ConfirmedAuthority::Embedded(EmbeddedConfirmedAuthority {
+            permit,
+            authority,
+            request: publication,
+        })),
+    )
+    .map_err(|e| StagingWindowConfirmationError::Window(e.to_string()))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum PreparationError {
@@ -37,10 +95,12 @@ pub(in super::super) enum PreparationError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
+    Confirmation(#[from] StagingWindowConfirmationError),
+    #[error(transparent)]
     Database(#[from] rusqlite::Error),
 }
 
-fn validate_session(
+pub(super) fn validate_session(
     pg: &PgStore,
     owner: &StagingOwnerRecord,
     expected: &ExpectedStreamAppendState,
@@ -150,6 +210,7 @@ fn validate_session(
 /// write transaction. Do not expose the result until that transaction commits.
 /// This consumes only the local cursor, never extends the replicated reservation
 /// or cutoff, and does not allocate another slot after an ambiguous/lost reply.
+#[cfg(test)]
 pub(in super::super) fn prepare_in_open_transaction(
     pg: &PgStore,
     topology: &PgTopology,
@@ -158,6 +219,29 @@ pub(in super::super) fn prepare_in_open_transaction(
     effect_fence: AdmittedRouteEffectFence,
     request: &PrepareStreamUploadSegmentAppendReq,
     expected: &ExpectedStreamAppendState,
+) -> Result<StreamUploadSegmentRecord, PreparationError> {
+    prepare_inner(
+        pg,
+        topology,
+        node_id,
+        placement,
+        effect_fence,
+        request,
+        expected,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Shared implementation; only tests omit confirmed custody.
+fn prepare_inner(
+    pg: &PgStore,
+    topology: &PgTopology,
+    node_id: NodeId,
+    placement: PayloadPlacementInput<'_>,
+    effect_fence: AdmittedRouteEffectFence,
+    request: &PrepareStreamUploadSegmentAppendReq,
+    expected: &ExpectedStreamAppendState,
+    confirmed: Option<ConfirmedAuthority<'_, '_>>,
 ) -> Result<StreamUploadSegmentRecord, PreparationError> {
     // A merely open deferred/read transaction could wait for the SQLite writer
     // AFTER the last fence check. Require writer admission before any reads.
@@ -235,6 +319,16 @@ pub(in super::super) fn prepare_in_open_transaction(
     }
     if pg.stream_allocation_issuer(node_id)? != owner.subject.issuer {
         return Err(StoreError::PgAllocationLifetimeUnavailable { pg_id: pg.pg_id }.into());
+    }
+    if let Some(confirmed) = &confirmed {
+        match confirmed {
+            ConfirmedAuthority::Embedded(confirmed) => {
+                confirmed
+                    .permit
+                    .require_effect(pg, confirmed.authority, confirmed.request)?
+            }
+            ConfirmedAuthority::Remote(authority) => authority.require_effect(pg)?,
+        }
     }
     // No authority/metadata lookup or writer admission after this check.
     fence.require_valid_for(epoch)?;

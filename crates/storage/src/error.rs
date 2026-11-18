@@ -857,6 +857,7 @@ impl StoreError {
                 | StorageRpcWireErrorCode::ShardIntegrity
                 | StorageRpcWireErrorCode::MetadataCommandIntegrity
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
+                | StorageRpcWireErrorCode::RetainedLogValidationBudgetExceeded
                 | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
                     StoreOperationFailureClass::Other
                 }
@@ -991,6 +992,7 @@ impl StoreError {
                 }
                 StorageRpcWireErrorCode::FrameDecode
                 | StorageRpcWireErrorCode::PayloadDecode
+                | StorageRpcWireErrorCode::RetainedLogValidationBudgetExceeded
                 | StorageRpcWireErrorCode::UnsupportedOperation => {
                     StoreFailureDiagnosticCategory::RpcProtocol
                 }
@@ -1108,6 +1110,7 @@ impl StoreError {
                 | StorageRpcWireErrorCode::ShardIntegrity
                 | StorageRpcWireErrorCode::MetadataCommandIntegrity
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
+                | StorageRpcWireErrorCode::RetainedLogValidationBudgetExceeded
                 | StorageRpcWireErrorCode::MetadataCommandMutationUncertain => None,
             },
             _ => None,

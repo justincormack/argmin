@@ -205,15 +205,17 @@ pub(super) fn apply_in_open_transaction(
     after.maximum_cutoff_ms = after.maximum_cutoff_ms.max(next.cutoff_ms);
     after.windows.push(next.clone());
     let checked_after = after.validate(configured_topology)?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    pg.apply_append_stream_segment_command(command)?;
-    sql::append_selection(
-        &pg.conn,
-        subject.object_pg,
-        configured_topology,
-        &checked,
-        &checked_after,
-    )?;
-    savepoint.commit()?;
-    Ok(AppendApplied::Appended)
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        pg.apply_append_stream_segment_command(command)?;
+        sql::append_selection(
+            pg,
+            subject.object_pg,
+            configured_topology,
+            &checked,
+            &checked_after,
+        )?;
+        Ok(AppendApplied::Appended)
+    })();
+    savepoint.finish(result)
 }

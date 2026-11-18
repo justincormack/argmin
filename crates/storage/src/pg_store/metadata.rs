@@ -13,8 +13,13 @@ mod bucket_reservation_acquire;
 #[path = "metadata/bucket_drain_begin.rs"]
 mod bucket_drain_begin;
 
+#[cfg(test)]
+#[path = "metadata/manual_transaction_tests.rs"]
+mod manual_transaction_tests;
 #[path = "metadata/reservation_heartbeat.rs"]
 mod reservation_heartbeat;
+#[path = "metadata/reservation_proof_release.rs"]
+mod reservation_proof_release;
 #[cfg(test)]
 #[path = "metadata/reservation_release_tests.rs"]
 mod reservation_release_tests;

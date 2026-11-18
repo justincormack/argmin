@@ -1957,6 +1957,7 @@
                     source_route_epoch,
                     std::num::NonZeroU64::MIN,
                     command.checksum_crc64(),
+                    command.command_sha256(),
                 ),
             ),
         ));
@@ -2117,6 +2118,7 @@
                     source_route_epoch,
                     std::num::NonZeroU64::MIN,
                     source.checksum_crc64(),
+                    source.command_sha256(),
                 ),
             ),
         ));
@@ -2333,6 +2335,7 @@
                     source_route_epoch,
                     std::num::NonZeroU64::MIN,
                     source.checksum_crc64(),
+                    source.command_sha256(),
                 ),
             ),
         ));
@@ -2559,6 +2562,7 @@
                     source_route_epoch,
                     std::num::NonZeroU64::MIN,
                     command.checksum_crc64(),
+                    command.command_sha256(),
                 ),
             ),
         ));

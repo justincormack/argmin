@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 20;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 21;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -2465,6 +2465,7 @@ fn write_pending_metadata_command_observation(
             write_u64(out, pending.cluster_epoch().get());
             write_u64(out, pending.log_index());
             write_u64(out, pending.command_checksum());
+            out.extend_from_slice(&pending.command_sha256());
         }
         None => write_u8(out, 0),
     }
@@ -2482,10 +2483,12 @@ fn read_pending_metadata_command_observation(
                 command_protocol_error("pending metadata command log index must be nonzero")
             })?;
             let command_checksum = reader.read_u64()?;
+            let command_sha256 = reader.read_exact(32)?.try_into().expect("fixed SHA-256");
             Ok(Some(PendingMetadataCommandObservation::new(
                 cluster_epoch,
                 log_index,
                 command_checksum,
+                command_sha256,
             )))
         }
         present => Err(command_protocol_error(format!(
@@ -2918,6 +2921,7 @@ mod tests {
                             ClusterEpoch::new(13).unwrap(),
                             NonZeroU64::new(7).unwrap(),
                             0xfeed,
+                            [0xA5; 32],
                         )),
                     }],
                 },
@@ -3469,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v20_aggregate_encoding_is_stable() {
+    fn control_plane_command_v21_aggregate_encoding_is_stable() {
         let historical_v9 = crate::tests::frozen_hex_fixture(include_str!(
             "control_plane_command_v20_canonical_v9_aggregate.hex"
         ));
@@ -3494,7 +3498,7 @@ mod tests {
                 .split_at(usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap());
             if let Err(error) = decode_control_plane_command(command) {
                 assert!(
-                    matches!(error, ControlPlaneError::CommandDecode { message } if message == "unsupported canonical-state digest encoding version 9")
+                    matches!(error, ControlPlaneError::CommandDecode { message } if message == "unsupported control-plane command version 20")
                 );
                 rejected += 1;
             }
@@ -3523,13 +3527,11 @@ mod tests {
             );
             aggregate.extend_from_slice(&encoded);
         }
-        let digest: [u8; 32] =
-            checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, &aggregate)
-                .bytes()
-                .try_into()
-                .unwrap();
+        let frozen = crate::tests::frozen_hex_fixture(include_str!(
+            "control_plane/testdata/command_v20_canonical_v10_aggregate.hex"
+        ));
         assert_eq!(
-            (aggregate.len(), digest),
+            (frozen.len(), checksum::sha256::digest(&frozen)),
             (
                 2_799,
                 [
@@ -3537,6 +3539,22 @@ mod tests {
                     236, 205, 160, 69, 229, 141, 56, 164, 221, 128, 80, 76, 238, 158, 35, 153,
                 ],
             )
+        );
+        let mut remaining = frozen.as_slice();
+        while !remaining.is_empty() {
+            let (length, tail) = remaining.split_at(4);
+            let (bytes, tail) = tail
+                .split_at(usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap());
+            assert!(
+                matches!(decode_control_plane_command(bytes), Err(ControlPlaneError::CommandDecode { message }) if message == "unsupported control-plane command version 20")
+            );
+            remaining = tail;
+        }
+        assert_eq!(
+            aggregate,
+            crate::tests::frozen_hex_fixture(include_str!(
+                "control_plane/testdata/command_v21_canonical_v10_aggregate.hex"
+            ))
         );
     }
 
@@ -3561,7 +3579,7 @@ mod tests {
             Err(ControlPlaneCommandFormatError::UnknownMagic)
         );
 
-        for version in [15_u16, 16, 17, 18, 19, 21] {
+        for version in [15_u16, 16, 17, 18, 19, 20, 22] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
             assert_eq!(
@@ -3594,7 +3612,7 @@ mod tests {
         append_control_plane_command_checksum(&mut bad_magic);
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
-        for version in [14, 15, 16, 17, 18, 19, 21] {
+        for version in [14, 15, 16, 17, 18, 19, 20, 22] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
                     expire_at_ms: 1_000,
@@ -4046,7 +4064,11 @@ mod tests {
         const PREVIOUS_V29: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=29\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x29\x77\xbc\xe3\x91\x56\xe8\x17";
         const PREVIOUS_V30: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=30\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x35\x70\x48\x5b\xde\xd8\xcf\x9e";
         const PREVIOUS_V31: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=31\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xe5\xf3\x95\x02\x93\x4e\xfe\x03";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=32\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xa0\xae\xd4\xba\x1d\x63\x3f\xcf";
+        const PREVIOUS_V32: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=32\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xa0\xae\xd4\xba\x1d\x63\x3f\xcf";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=33\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x70\x2d\x09\xe3\x50\xf5\x0e\x52";
+        assert!(
+            matches!(decode_control_plane_snapshot(PREVIOUS_V32), Err(ControlPlaneError::Parse {message, ..}) if message == "unsupported control-plane state version 32")
+        );
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -4154,9 +4176,9 @@ mod tests {
     #[test]
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
-        for version in [28, 29, 30, 31, 33] {
+        for version in [28, 29, 30, 31, 32, 34] {
             let unsupported_contents =
-                current_contents.replacen("version=32\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=33\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();

@@ -25,6 +25,22 @@ use crate::PgTopology;
 #[path = "payload_staging_application.rs"]
 mod application;
 
+#[path = "payload_staging_direct_terminal.rs"]
+mod direct_terminal;
+#[path = "payload_staging_remote_direct_preparation.rs"]
+mod remote_direct_preparation;
+pub(in crate::node_runtime) use direct_terminal::CapturedDirectTerminal;
+pub(in crate::node_runtime::pg_store) use remote_direct_preparation::DirectInstallationCheck;
+pub(in crate::node_runtime) use remote_direct_preparation::RemoteDirectPreparationQuery;
+
+#[path = "payload_staging_context_carrier.rs"]
+mod carrier;
+
+// Source capture lives below the retained context so it can copy only an
+// ordinary finalizer without exposing a raw envelope to surrounding callers.
+#[path = "payload_staging_abandonment_source.rs"]
+pub(super) mod finalization_source;
+
 #[path = "payload_staging_context_reissue.rs"]
 mod reissue;
 
@@ -40,9 +56,28 @@ mod inventory;
 #[path = "payload_staging_context_preparation.rs"]
 mod preparation;
 
+#[path = "payload_staging_terminal_custody.rs"]
+mod terminal_custody;
+#[path = "payload_staging_terminal_work.rs"]
+mod terminal_work;
+#[path = "payload_staging_window_read.rs"]
+mod window_read;
+pub(crate) use finalization_source::CompleteTerminalReservationRelease;
+pub(in crate::node_runtime) use terminal_custody::{
+    AbandonedPartCustodyError, AbandonedPartCustodyObservation,
+};
+pub(in crate::node_runtime::pg_store) use terminal_work::{
+    TerminalPayloadWork, TerminalReservationWork, TerminalSlotWork, TerminalWorkObservation,
+};
+pub(in crate::node_runtime::pg_store) use window_read::CapturedWindowRead;
+
 #[cfg(test)]
 pub(in super::super) use application::Applied;
 pub(in super::super) use application::{ApplicationError, CommandApplication};
+pub(in super::super) use carrier::CarrierError;
+pub(crate) use carrier::CommandContextCodecAuthority;
+pub(in super::super) use carrier::EncodedContextualCommand;
+pub(in super::super) use carrier::{CompletePendingIndexes, CompletePendingProjection};
 #[cfg(test)]
 pub(in super::super) use inventory::ContextPendingRetention;
 pub(in super::super) use inventory::{ContextPendingInventory, PendingInventoryObservation};
@@ -161,6 +196,8 @@ pub(in super::super) enum ContextError {
     #[error(transparent)]
     Abandonment(#[from] AbandonmentError),
     #[error(transparent)]
+    ObjectRetirement(#[from] super::object::ObjectError),
+    #[error(transparent)]
     Retention(#[from] crate::StoreError),
 }
 
@@ -183,6 +220,76 @@ pub(in super::super) struct ContextualCommand {
 }
 
 impl ContextualCommand {
+    pub(super) fn require_remote_direct_introduction(
+        &self,
+        request: &crate::storage_rpc::complete_direct_introduction::Request,
+        cutoff: u64,
+    ) -> Result<(), ContextError> {
+        if self.id().pg_id() != request.route.pg
+            || self.id().cluster_epoch() != request.route.epoch
+            || !matches!(&self.input, Input::Described(candidate) if candidate.matches_remote_direct_request(request, cutoff))
+        {
+            return Err(ContextError::Encoding(
+                "direct introduction reply differs from request",
+            ));
+        }
+        Ok(())
+    }
+    pub(in crate::node_runtime::pg_store) fn inspect_window_confirmation_remote(
+        &self,
+        route: &crate::cluster::CompleteFanoutRoute<'_>,
+        client: &crate::node_client::UnixStorageNodeClient,
+        session: &crate::node_client::UnixStorageNodeMetadataCommandSession,
+        deadline: std::time::Instant,
+        #[cfg(test)] hook: impl FnMut(&'static str),
+    ) -> Result<super::StagingWindowConfirmationObservation, super::StagingWindowConfirmationError>
+    {
+        let Input::Described(candidate) = &self.input else {
+            return Err(super::StagingWindowConfirmationError::Window(
+                "command has no future window".into(),
+            ));
+        };
+        let bound = candidate
+            .bind(&self.topology)
+            .map_err(|error| super::StagingWindowConfirmationError::Window(error.to_string()))?;
+        route
+            .inspect_staging_window_remote(
+                &bound.pending_protection().confirmation_request(),
+                client,
+                session,
+                deadline,
+                #[cfg(test)]
+                hook,
+            )
+            .map(|(observation, _, _)| observation)
+    }
+
+    /// Read-only candidate integration. Keep the complete context borrowed while
+    /// deriving and checking its future window; do not expose a detachable index
+    /// or mint a physical grant from the resulting scalar observation.
+    pub(in crate::node_runtime::pg_store) fn inspect_window_confirmation_embedded(
+        &self,
+        section: &crate::cluster::EmbeddedPublicationSection<'_>,
+        deadline: std::time::Instant,
+        #[cfg(test)] hook: impl FnMut(&'static str),
+    ) -> Result<super::StagingWindowConfirmationObservation, super::StagingWindowConfirmationError>
+    {
+        let Input::Described(candidate) = &self.input else {
+            return Err(super::StagingWindowConfirmationError::Window(
+                "command has no future window".into(),
+            ));
+        };
+        let bound = candidate
+            .bind(&self.topology)
+            .map_err(|error| super::StagingWindowConfirmationError::Window(error.to_string()))?;
+        section.inspect_staging_window(
+            &bound.pending_protection().confirmation_request(),
+            deadline,
+            #[cfg(test)]
+            hook,
+        )
+    }
+
     pub(in super::super) fn described(
         candidate: DescribedStagingCommand,
         topology: &PgTopology,
@@ -295,8 +402,10 @@ impl ContextualCommand {
         ) {
             return Err(ContextError::CommandKind);
         }
+        let retained = finalization_source::PartFinalizationSource::capture(self)
+            .map_err(AbandonmentError::from)?;
         let candidate = super::abandonment::capture_part_cleanup_in_open_transaction(
-            pg, node_id, topology, source, id,
+            pg, node_id, topology, retained, id,
         )?;
         Self::abandoned_part(candidate, topology)
     }

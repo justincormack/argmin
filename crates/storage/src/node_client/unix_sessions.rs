@@ -3,6 +3,38 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static INTRODUCTION_RETIRE_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static INTRODUCTION_INSTALL_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static DIRECT_INSTALL_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static APPEND_INSTALL_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static APPEND_PUBLISH_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static APPEND_APPLY_BEFORE_DISPATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+impl UnixStorageNodeMetadataCommandSession {
+    pub(in crate::node_runtime) fn test_introduction_retire_before_dispatch(&self, unwind: bool) {
+        INTRODUCTION_RETIRE_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+    pub(in crate::node_runtime) fn test_introduction_install_before_dispatch(&self, unwind: bool) {
+        INTRODUCTION_INSTALL_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+    pub(in crate::node_runtime) fn test_direct_install_before_dispatch(&self, unwind: bool) {
+        DIRECT_INSTALL_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+    pub(in crate::node_runtime) fn test_append_install_before_dispatch(&self, unwind: bool) {
+        APPEND_INSTALL_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+    pub(in crate::node_runtime) fn test_append_publish_before_dispatch(&self, unwind: bool) {
+        APPEND_PUBLISH_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+    pub(in crate::node_runtime) fn test_append_apply_before_dispatch(&self, unwind: bool) {
+        APPEND_APPLY_BEFORE_DISPATCH.with(|slot| slot.set(Some(unwind)));
+    }
+}
+
 pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     route_cluster_epoch: ClusterEpoch,
@@ -17,19 +49,542 @@ pub(crate) struct UnixStorageNodeReadHandleSession {
 }
 
 pub(crate) struct UnixStorageNodeMetadataCommandSession {
+    origin: Arc<UnixStorageNodeClientInstance>,
+    identity: Arc<()>,
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     inner: Mutex<UnixStorageNodeMetadataCommandSessionInner>,
 }
 
+/// Process-local identity of one acquired section, not its client or endpoint.
+/// Retaining the allocation prevents address reuse after the session closes.
+pub(crate) struct MetadataCommandSessionIdentity(Arc<()>);
+
 struct UnixStorageNodeMetadataCommandSessionInner {
     stream: BoxStorageRpcStream,
     next_request_id: u64,
     io_timeout: Duration,
-    pg_id: PgId,
     released: bool,
+}
+
+/// Keeps the exact acquired session alive and excludes concurrent transport or
+/// shutdown while an embedded replica applies or a witness is inspected. This
+/// is not evidence that a
+/// remote process cannot fail: primary confirmation is still separately needed.
+pub(crate) struct CompletePrimarySessionBorrow<'a> {
+    inner: std::sync::MutexGuard<'a, UnixStorageNodeMetadataCommandSessionInner>,
+    session: &'a UnixStorageNodeMetadataCommandSession,
+    deadline: Instant,
+}
+
+/// Successful preparation has already claimed receiver custody. Until the
+/// owning decoder accepts it, every error/unwind must invalidate this exact
+/// connection rather than strand an inaccessible preparation on a reusable one.
+pub(in crate::node_runtime) struct UnvalidatedDirectIntroductionReply<'a> {
+    held: CompletePrimarySessionBorrow<'a>,
+    bytes: Vec<u8>,
+    validated: bool,
+}
+
+impl UnvalidatedDirectIntroductionReply<'_> {
+    pub(in crate::node_runtime) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(in crate::node_runtime) fn finish_validation(mut self) -> Result<Vec<u8>, StoreError> {
+        require_metadata_command_operation_deadline(self.held.deadline)?;
+        if self.held.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "direct introduction preparation lost held section",
+            });
+        }
+        self.validated = true;
+        Ok(std::mem::take(&mut self.bytes))
+    }
+}
+
+impl Drop for UnvalidatedDirectIntroductionReply<'_> {
+    fn drop(&mut self) {
+        if !self.validated {
+            self.held.inner.released = true;
+            let _ = self.held.inner.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl<'a> CompletePrimarySessionBorrow<'a> {
+    pub(in crate::node_runtime) fn install_direct_introduction(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::RemoteDirectIntroductionAttempt<'_, '_>,
+    ) -> Result<(), crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        if let Err(error) = attempt.require_session(self) {
+            return Err(attempt.not_sent(error));
+        }
+        let kind = StorageRpcMessageKind::StagingDirectIntroductionInstall;
+        let deadline = self.deadline.min(attempt.deadline());
+        #[cfg(test)]
+        let deadline = match INTRODUCTION_INSTALL_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected introduction installation unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        match self.session.rpc_request_result_locked(
+            &mut self.inner,
+            kind,
+            attempt.bytes().to_vec(),
+            deadline,
+        ) {
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+            Ok(Err(error)) => {
+                Err(attempt.unconfirmed(self.session.rpc_response_error(kind, error)))
+            }
+            Ok(Ok(reply)) => attempt.confirm(&reply),
+        }
+    }
+
+    pub(in crate::node_runtime) fn prepare_direct_introduction(
+        mut self,
+        request: &crate::storage_rpc::complete_direct_introduction::EncodedRequest,
+    ) -> Result<UnvalidatedDirectIntroductionReply<'a>, StoreError> {
+        let route = request.route();
+        if route.node != self.session.node_id
+            || route.pg != self.session.pg_id
+            || route.epoch != self.session.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "direct introduction original primary section",
+            });
+        }
+        let kind = StorageRpcMessageKind::StagingDirectIntroductionPrepare;
+        let bytes = self
+            .session
+            .rpc_request_result_locked(
+                &mut self.inner,
+                kind,
+                request.bytes().to_vec(),
+                self.deadline,
+            )
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|e| self.session.rpc_response_error(kind, e))?;
+        Ok(UnvalidatedDirectIntroductionReply {
+            held: self,
+            bytes,
+            validated: false,
+        })
+    }
+    pub(in crate::node_runtime) fn install_direct_terminal(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::RemoteDirectInstallationAttempt<'_, '_>,
+    ) -> Result<(), crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        if let Err(error) = attempt.require_session(self) {
+            return Err(attempt.not_sent(error));
+        }
+        let kind = StorageRpcMessageKind::StagingDirectInstall;
+        let deadline = self.deadline.min(attempt.deadline());
+        #[cfg(test)]
+        let deadline = match DIRECT_INSTALL_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected direct installation unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        match self.session.rpc_request_result_locked(
+            &mut self.inner,
+            kind,
+            attempt.bytes().to_vec(),
+            deadline,
+        ) {
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => {
+                Err(attempt.not_sent(error.into()))
+            }
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+            Ok(Err(error)) => {
+                Err(attempt.unconfirmed(self.session.rpc_response_error(kind, error)))
+            }
+            Ok(Ok(reply)) => attempt.confirm(&reply),
+        }
+    }
+    pub(in crate::node_runtime) fn prepare_direct_terminal(
+        &mut self,
+        client: &UnixStorageNodeClient,
+        permit: &crate::node_runtime::pg_store::DirectTerminalPreparation<'_, '_>,
+    ) -> Result<
+        crate::node_runtime::pg_store::CapturedDirectTerminal,
+        crate::node_runtime::pg_store::StagingWindowConfirmationError,
+    > {
+        self.session.require_origin(client)?;
+        permit.require_remote_session(self)?;
+        let request = permit.remote_request()?;
+        let kind = StorageRpcMessageKind::StagingDirectPrepare;
+        let reply = self
+            .session
+            .rpc_request_result_locked(
+                &mut self.inner,
+                kind,
+                request.bytes().to_vec(),
+                self.deadline.min(permit.deadline()),
+            )
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|e| self.session.rpc_response_error(kind, e))?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "remote direct terminal preparation lost held section",
+            }
+            .into());
+        }
+        crate::node_runtime::pg_store::CapturedDirectTerminal::decode_remote(permit, self, &reply)
+    }
+    pub(in crate::node_runtime) fn prepare_direct_snapshot(
+        &mut self,
+        client: &UnixStorageNodeClient,
+        permit: &crate::node_runtime::pg_store::DirectStagingPreparation<'_, '_>,
+    ) -> Result<
+        crate::node_runtime::pg_store::DirectStagingSnapshot,
+        crate::node_runtime::pg_store::StagingWindowConfirmationError,
+    > {
+        self.session.require_origin(client)?;
+        permit.require_remote_session(self)?;
+        let request = permit.remote_request()?;
+        let kind = StorageRpcMessageKind::StagingDirectSnapshot;
+        let reply = self
+            .session
+            .rpc_request_result_locked(
+                &mut self.inner,
+                kind,
+                request.bytes().to_vec(),
+                self.deadline.min(permit.deadline()),
+            )
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|e| self.session.rpc_response_error(kind, e))?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "remote direct snapshot lost held section",
+            }
+            .into());
+        }
+        permit.capture_remote_reply(client, self, &request, &reply)
+    }
+    pub(in crate::node_runtime) fn send_complete_retirement(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::CompleteRetirementAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompleteRetirementSendError> {
+        let deadline = self.deadline.min(attempt.deadline());
+        #[cfg(test)]
+        let deadline = match INTRODUCTION_RETIRE_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected introduction retirement unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        self.session
+            .send_complete_retirement_locked(&mut self.inner, attempt, deadline)
+    }
+    pub(in crate::node_runtime) fn send_complete_application(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        let deadline = self.deadline.min(attempt.deadline());
+        #[cfg(test)]
+        let deadline = match APPEND_APPLY_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected append application unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        self.session
+            .send_complete_application_locked(&mut self.inner, attempt, deadline)
+    }
+    pub(in crate::node_runtime) fn send_complete_publication(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::CompletePublicationAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompletePublicationSendError> {
+        let deadline = self.deadline.min(attempt.transport().deadline());
+        #[cfg(test)]
+        let deadline = match APPEND_PUBLISH_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected append publication unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        self.session
+            .send_complete_publication_locked(&mut self.inner, attempt, deadline)
+    }
+    pub(in crate::node_runtime) fn install_stream_append(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::RemoteStreamAppendInstallationAttempt<'_, '_>,
+    ) -> Result<(), crate::node_runtime::pg_store::StagingWindowConfirmationError> {
+        if let Err(error) = attempt.require_session(self) {
+            return Err(attempt.not_sent(error));
+        }
+        let kind = StorageRpcMessageKind::StagingStreamAppendInstall;
+        let deadline = self.deadline.min(attempt.deadline());
+        #[cfg(test)]
+        let deadline = match APPEND_INSTALL_BEFORE_DISPATCH.with(|slot| slot.replace(None)) {
+            Some(true) => panic!("injected append installation unwind before transport"),
+            Some(false) => Instant::now(),
+            None => deadline,
+        };
+        let result = self.session.rpc_request_result_locked(
+            &mut self.inner,
+            kind,
+            attempt.bytes().to_vec(),
+            deadline,
+        );
+        match result {
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => {
+                Err(attempt.not_sent(error.into()))
+            }
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+            Ok(Err(error)) => {
+                Err(attempt.unconfirmed(self.session.rpc_response_error(kind, error)))
+            }
+            Ok(Ok(reply)) => attempt.confirm(&reply),
+        }
+    }
+    pub(in crate::node_runtime) fn prepare_stream_append(
+        &mut self,
+        permit: &crate::node_runtime::pg_store::StreamAppendPreparation<'_, '_>,
+    ) -> Result<
+        crate::node_runtime::pg_store::CapturedStreamAppend,
+        crate::node_runtime::pg_store::StagingWindowConfirmationError,
+    > {
+        permit.require_valid()?;
+        let original = permit.publication_request()?;
+        if original.node_id() != self.session.node_id
+            || original.id().pg_id() != self.session.pg_id
+            || original.id().cluster_epoch() != self.session.cluster_epoch
+            || self.inner.released
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "acknowledged append preparation session",
+            }
+            .into());
+        }
+        let request = permit.remote_request()?;
+        let kind = StorageRpcMessageKind::StagingStreamAppendPrepare;
+        let reply = self
+            .session
+            .rpc_request_result_locked(
+                &mut self.inner,
+                kind,
+                request.bytes().to_vec(),
+                self.deadline.min(permit.deadline()),
+            )
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|e| self.session.rpc_response_error(kind, e))?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "remote append preparation lost held section",
+            }
+            .into());
+        }
+        crate::node_runtime::pg_store::CapturedStreamAppend::decode_remote(permit, &reply)
+    }
+
+    /// Consume this exact held section and confirm remote guard removal. Socket
+    /// shutdown alone is only best-effort teardown, never release evidence.
+    pub(in crate::node_runtime) fn release_until(mut self) -> Result<(), StoreError> {
+        let kind = StorageRpcMessageKind::MetadataCommandPgLockRelease;
+        let payload = self
+            .session
+            .encode_metadata_command_state_request(self.session.pg_id);
+        let result = self
+            .session
+            .rpc_request_result_locked(&mut self.inner, kind, payload, self.deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)
+            .and_then(|reply| reply.map_err(|error| self.session.rpc_response_error(kind, error)))
+            .and_then(|reply| {
+                if reply.is_empty() {
+                    require_metadata_command_operation_deadline(self.deadline)
+                } else {
+                    Err(self.session.rpc_payload_error(
+                        "release complete primary section",
+                        "nonempty release acknowledgement".into(),
+                    ))
+                }
+            });
+        // Never reuse/reconnect after either a confirmed or uncertain release.
+        let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);
+        self.inner.released = true;
+        result
+    }
+
+    pub(crate) fn require_identity(
+        &self,
+        expected: &MetadataCommandSessionIdentity,
+    ) -> Result<(), StoreError> {
+        self.session.require_identity(expected)
+    }
+
+    pub(in crate::node_runtime) fn send_stream_allocation(
+        &mut self,
+        attempt: crate::node_runtime::pg_store::RemoteStreamAllocationAttempt<'_, '_>,
+    ) -> Result<
+        StreamUploadSegmentRecord,
+        crate::node_runtime::pg_store::StagingWindowConfirmationError,
+    > {
+        // Validate the retained confirmation identity under the held transport
+        // mutex, before allocating a request ID or sending any allocation RPC.
+        attempt.require_session(self)?;
+        let session = self.session;
+        if attempt.node_id() != session.node_id
+            || attempt.id().pg_id() != session.pg_id
+            || attempt.id().cluster_epoch() != session.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream allocation session",
+            }
+            .into());
+        }
+        let kind = StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare;
+        let reply = session
+            .rpc_request_result_locked(
+                &mut self.inner,
+                kind,
+                attempt.bytes().to_vec(),
+                self.deadline.min(attempt.deadline()),
+            )
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|e| session.rpc_response_error(kind, e))?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream allocation lost held section",
+            }
+            .into());
+        }
+        attempt.confirm(&reply)
+    }
+    pub(in crate::node_runtime) fn inspect_window_primary(
+        &mut self,
+        request: crate::storage_rpc::complete_window_primary::Request<'_>,
+        witness: Option<NodeId>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.inspect_window_primary_for(
+            crate::storage_rpc::complete_window_primary::Purpose::RetainedWindow,
+            request,
+            witness,
+        )
+    }
+
+    /// Read-only exact-request observation, never an allocation or file grant.
+    /// The consuming holder separately binds this borrow to its captured session.
+    pub(in crate::node_runtime) fn inspect_stream_file_primary(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inspect_stream_file_primary_with_kind(
+            bytes,
+            StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+        )
+    }
+
+    pub(in crate::node_runtime) fn inspect_stream_file_primary_as_peer(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inspect_stream_file_primary_with_kind(
+            bytes,
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+        )
+    }
+
+    fn inspect_stream_file_primary_with_kind(
+        &mut self,
+        bytes: &[u8],
+        kind: StorageRpcMessageKind,
+    ) -> Result<(), StoreError> {
+        use crate::storage_rpc::{
+            complete_stream_allocation as allocation, complete_stream_file_primary as files,
+        };
+        let session = self.session;
+        let invalid = |error: crate::storage_rpc::StorageRpcPayloadError| {
+            session.rpc_payload_error("stream file inspection", error.to_string())
+        };
+        let request = files::decode_request(bytes).map_err(invalid)?;
+        let route = allocation::decode_request(request.allocation)
+            .map_err(invalid)?
+            .window
+            .route;
+        if route.node != session.node_id
+            || route.pg != session.pg_id
+            || route.epoch != session.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream file inspection session",
+            });
+        }
+        let deadline = self.deadline.min(route.deadline.local_deadline());
+        let reply = session
+            .rpc_request_result_locked(&mut self.inner, kind, bytes.to_vec(), deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|error| session.rpc_response_error(kind, error))?;
+        require_metadata_command_operation_deadline(deadline)?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "stream file inspection lost its held section",
+            });
+        }
+        files::decode_response(&reply, bytes).map_err(invalid)
+    }
+
+    /// Read-only prerequisite, never a file grant. The consuming owner must
+    /// retain its original window and compare the returned settled prefix.
+    pub(in crate::node_runtime) fn inspect_direct_file_primary(
+        &mut self,
+        request: crate::storage_rpc::complete_window_primary::Request<'_>,
+        witness: Option<NodeId>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.inspect_window_primary_for(
+            crate::storage_rpc::complete_window_primary::Purpose::DirectFileBinding,
+            request,
+            witness,
+        )
+    }
+
+    fn inspect_window_primary_for(
+        &mut self,
+        purpose: crate::storage_rpc::complete_window_primary::Purpose,
+        request: crate::storage_rpc::complete_window_primary::Request<'_>,
+        witness: Option<NodeId>,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        use crate::storage_rpc::complete_window_primary as wire;
+        let session = self.session;
+        if request.route.node != session.node_id
+            || request.route.pg != session.pg_id
+            || request.route.epoch != session.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "primary window inspection session",
+            });
+        }
+        let deadline = self.deadline.min(request.route.deadline.local_deadline());
+        let payload = wire::encode_request_for(purpose, request).map_err(|e| {
+            session.rpc_payload_error("encode primary window inspection", e.to_string())
+        })?;
+        let kind = StorageRpcMessageKind::MetadataCommandReplicaState;
+        let reply = session
+            .rpc_request_result_locked(&mut self.inner, kind, payload, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+            .map_err(|error| session.rpc_response_error(kind, error))?;
+        require_metadata_command_operation_deadline(deadline)?;
+        if self.inner.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "primary window inspection lost its held section",
+            });
+        }
+        wire::decode_response_for(purpose, &reply, request, witness).map_err(|error| {
+            session.rpc_payload_error("decode primary window inspection", error.to_string())
+        })
+    }
 }
 
 struct UnixStorageNodeReadHandleLease {
@@ -261,6 +816,37 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         deadline: Instant,
     ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
+        self.open_metadata_command_section_at_epoch(pg_id, self.cluster_epoch, deadline)
+    }
+
+    pub(crate) fn open_complete_historical_primary(
+        &self,
+        route: &crate::cluster::HistoricalRemoteApplicationRoute<'_>,
+        deadline: Instant,
+    ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
+        let (pg_id, epoch, deadline) = route.primary_session_parameters(self, deadline)?;
+        let session = self.open_metadata_command_section_at_epoch(pg_id, epoch, deadline)?;
+        route.primary_session_parameters(self, deadline)?;
+        Ok(session)
+    }
+
+    pub(crate) fn open_complete_fanout_primary(
+        &self,
+        route: &crate::cluster::CompleteFanoutRoute<'_>,
+        deadline: Instant,
+    ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
+        let (pg_id, epoch, deadline) = route.primary_session_parameters(self, deadline)?;
+        let session = self.open_metadata_command_section_at_epoch(pg_id, epoch, deadline)?;
+        route.primary_session_parameters(self, deadline)?;
+        Ok(session)
+    }
+
+    fn open_metadata_command_section_at_epoch(
+        &self,
+        pg_id: PgId,
+        epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
         let rpc_permit = self.acquire_rpc_admission_with_class_until(
             StorageRpcMessageKind::MetadataCommandPgLockAcquire,
             storage_rpc_admission_class(StorageRpcMessageKind::MetadataCommandPgLockAcquire),
@@ -271,15 +857,17 @@ impl UnixStorageNodeClient {
             deadline,
         )?;
         let session = UnixStorageNodeMetadataCommandSession {
+            origin: Arc::clone(&self.instance),
+            identity: Arc::new(()),
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            cluster_epoch: epoch,
+            pg_id,
             rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: rpc_permit,
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream,
                 next_request_id: 1,
                 io_timeout: storage_rpc_io_timeout(self.rpc_auth.as_deref()),
-                pg_id,
                 released: false,
             }),
         };
@@ -596,8 +1184,444 @@ impl UnixStorageNodeReadHandleSession {
 }
 
 impl UnixStorageNodeMetadataCommandSession {
+    pub(in crate::node_runtime) fn identity(&self) -> MetadataCommandSessionIdentity {
+        MetadataCommandSessionIdentity(Arc::clone(&self.identity))
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_close_primary_section(&self) {
+        self.close_metadata_command_pg_lock_on_drop();
+    }
+
+    pub(in crate::node_runtime) fn send_stream_allocation(
+        &self,
+        client: &UnixStorageNodeClient,
+        attempt: crate::node_runtime::pg_store::RemoteStreamAllocationAttempt<'_, '_>,
+    ) -> Result<
+        StreamUploadSegmentRecord,
+        crate::node_runtime::pg_store::StagingWindowConfirmationError,
+    > {
+        let mut session = self.borrow_complete_primary(
+            client,
+            attempt.id().pg_id(),
+            attempt.id().cluster_epoch(),
+            attempt.deadline(),
+        )?;
+        session.send_stream_allocation(attempt)
+    }
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_direct_snapshot_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingDirectSnapshot, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_direct_install_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingDirectInstall, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_direct_introduction_install_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(
+            StorageRpcMessageKind::StagingDirectIntroductionInstall,
+            payload,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_direct_prepare_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingDirectPrepare, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_stream_append_prepare_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingStreamAppendPrepare, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_stream_append_install_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingStreamAppendInstall, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_staging_file_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::StagingShardWrite, payload)
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_window_primary_request(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result(StorageRpcMessageKind::MetadataCommandReplicaState, payload)
+    }
+
+    /// One abandonment attempt on the exact held primary section. The owning
+    /// abandonment holder is the only producer; no reconnect or automatic retry.
+    pub(in crate::node_runtime) fn send_complete_abandonment(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteAbandonmentAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompleteAbandonmentSendError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandRecordAbandoned;
+        if attempt.node_id() != self.node_id
+            || attempt.id().cluster_epoch() != self.cluster_epoch
+            || attempt.id().pg_id() != self.metadata_command_pg_id()
+        {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete abandonment session subject",
+                }),
+            );
+        }
+        let payload = match attempt.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        match self.rpc_request_result_until(KIND, payload, attempt.deadline()) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    /// One retirement attempt on the exact held primary section. The owning
+    /// terminal holder is the only producer; no reconnect or automatic retry.
+    pub(in crate::node_runtime) fn send_complete_retirement(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteRetirementAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompleteRetirementSendError> {
+        let deadline = attempt.deadline();
+        let mut inner = match self.lock_until(deadline, "acquire metadata command session RPC") {
+            Ok(inner) => inner,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        self.send_complete_retirement_locked(&mut inner, attempt, deadline)
+    }
+
+    fn send_complete_retirement_locked(
+        &self,
+        inner: &mut UnixStorageNodeMetadataCommandSessionInner,
+        attempt: crate::node_runtime::pg_store::CompleteRetirementAttempt<'_>,
+        deadline: Instant,
+    ) -> Result<(), crate::node_runtime::pg_store::CompleteRetirementSendError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandPendingSlotRemove;
+        if attempt.node_id() != self.node_id
+            || attempt.id().cluster_epoch() != self.cluster_epoch
+            || attempt.id().pg_id() != self.metadata_command_pg_id()
+        {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete retirement session subject",
+                }),
+            );
+        }
+        let payload = match attempt.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        match self.rpc_request_result_locked(inner, KIND, payload, deadline) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    pub(in crate::node_runtime) fn require_origin(
+        &self,
+        client: &UnixStorageNodeClient,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(&self.origin, &client.instance) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "complete fanout session belongs to another client instance",
+            });
+        }
+        Ok(())
+    }
+
+    /// Identity is immutable for the lifetime of this session. Checking it does
+    /// not acquire/release the transport mutex or claim that the section is open;
+    /// the following operation still performs bounded, locked live admission.
+    pub(in crate::node_runtime) fn require_identity(
+        &self,
+        expected: &MetadataCommandSessionIdentity,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(&self.identity, &expected.0) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "confirmed window requires its original remote primary session",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn borrow_complete_primary(
+        &self,
+        client: &UnixStorageNodeClient,
+        pg_id: PgId,
+        epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<CompletePrimarySessionBorrow<'_>, StoreError> {
+        self.require_origin(client)?;
+        let inner = self.lock_until(deadline, "borrow complete primary session")?;
+        if self.node_id != client.node_id()
+            || self.cluster_epoch != epoch
+            || self.pg_id != pg_id
+            || inner.released
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "complete embedded application requires the exact open primary session",
+            });
+        }
+        Ok(CompletePrimarySessionBorrow {
+            inner,
+            session: self,
+            deadline,
+        })
+    }
+
+    // Borrowing and RPC sends share this wait. Neither may inherit another
+    // operation's longer timeout while retaining its own admitted route.
+    fn lock_until(
+        &self,
+        deadline: Instant,
+        context: &'static str,
+    ) -> Result<std::sync::MutexGuard<'_, UnixStorageNodeMetadataCommandSessionInner>, StoreError>
+    {
+        let inner = loop {
+            if Instant::now() >= deadline {
+                return Err(storage_rpc_deadline_expired(context));
+            }
+            match self.inner.try_lock() {
+                Ok(inner) => break inner,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                    }
+                }
+            }
+        };
+        // Keep the successfully acquired guard; do not probe then reacquire.
+        if Instant::now() >= deadline {
+            return Err(storage_rpc_deadline_expired(context));
+        }
+        Ok(inner)
+    }
+    pub(in crate::node_runtime) fn send_complete_application(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        let deadline = attempt.deadline();
+        let mut inner = match self.lock_until(deadline, "acquire metadata command session RPC") {
+            Ok(inner) => inner,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        self.send_complete_application_locked(&mut inner, attempt, deadline)
+    }
+
+    fn send_complete_application_locked(
+        &self,
+        inner: &mut UnixStorageNodeMetadataCommandSessionInner,
+        attempt: crate::node_runtime::pg_store::CompleteApplicationAttempt<'_>,
+        deadline: Instant,
+    ) -> Result<
+        MetadataCommandReplicaState,
+        crate::node_runtime::pg_store::CompleteApplicationSendError,
+    > {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandApplyAndRecord;
+        if attempt.node_id() != self.node_id
+            || attempt.id().cluster_epoch() != self.cluster_epoch
+            || attempt.id().pg_id() != self.metadata_command_pg_id()
+        {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete application session subject",
+                }),
+            );
+        }
+        let payload = match attempt.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        match self.rpc_request_result_locked(inner, KIND, payload, deadline) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    /// One typed attempt on the retained authenticated section. No reconnect or
+    /// automatic retry, and no generic remote error establishes non-acceptance.
+    pub(in crate::node_runtime) fn send_complete_publication(
+        &self,
+        attempt: crate::node_runtime::pg_store::CompletePublicationAttempt<'_>,
+    ) -> Result<(), crate::node_runtime::pg_store::CompletePublicationSendError> {
+        let deadline = attempt.transport().deadline();
+        let mut inner = match self.lock_until(deadline, "acquire metadata command session RPC") {
+            Ok(inner) => inner,
+            Err(error) => return Err(attempt.not_sent(error)),
+        };
+        self.send_complete_publication_locked(&mut inner, attempt, deadline)
+    }
+
+    fn send_complete_publication_locked(
+        &self,
+        inner: &mut UnixStorageNodeMetadataCommandSessionInner,
+        attempt: crate::node_runtime::pg_store::CompletePublicationAttempt<'_>,
+        deadline: Instant,
+    ) -> Result<(), crate::node_runtime::pg_store::CompletePublicationSendError> {
+        const KIND: StorageRpcMessageKind = StorageRpcMessageKind::MetadataCommandPublicationStart;
+        let transport = attempt.transport();
+        if transport.node_id() != self.node_id
+            || transport.id().cluster_epoch() != self.cluster_epoch
+            || transport.id().pg_id() != self.metadata_command_pg_id()
+        {
+            return Err(
+                attempt.not_sent(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete publication session subject",
+                }),
+            );
+        }
+        let payload = match transport.encode_request() {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Err(attempt.not_sent(match error {
+                    crate::node_runtime::pg_store::CompletePendingInspectionError::Store(error) => {
+                        error
+                    }
+                    other => {
+                        self.rpc_payload_error("encode complete publication", other.to_string())
+                    }
+                }))
+            }
+        };
+        match self.rpc_request_result_locked(inner, KIND, payload, deadline) {
+            Ok(Ok(response)) => attempt.confirm(&response),
+            Ok(Err(error)) => Err(attempt.unconfirmed(self.rpc_response_error(KIND, error))),
+            Err(StorageRpcRequestDispatchFailure::NotSent(error)) => Err(attempt.not_sent(error)),
+            Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error)) => {
+                Err(attempt.unconfirmed(error))
+            }
+        }
+    }
+
+    /// Inspect the real session dispatch classification without making it a
+    /// production publication/custody API. A later NotSent does not resolve an
+    /// earlier uncertain attempt; that still belongs to the owning sender.
+    #[cfg(test)]
+    pub(crate) fn test_complete_publication_dispatch_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, MetadataCommandApplyError> {
+        self.rpc_request_result_until(
+            StorageRpcMessageKind::MetadataCommandPublicationStart,
+            payload,
+            deadline,
+        )
+        .map_err(StorageRpcRequestDispatchFailure::into_metadata_command_apply_error)
+    }
+
+    /// Owner-local malformed-wire and lost-response tests. Production callers
+    /// must use the owning publication sender, not detach raw bytes.
+    #[cfg(test)]
+    pub(crate) fn test_complete_publication_payload_until(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPublicationStart,
+            payload,
+            deadline,
+        )
+    }
+
     fn metadata_command_pg_id(&self) -> PgId {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).pg_id
+        self.pg_id
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_retirement_payload(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+            payload,
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_stream_inspection_payload(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+            payload,
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_stream_allocation_payload(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.rpc_request_until(
+            StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+            payload,
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_abandonment_payload(
+        &self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+            deadline,
+        )
     }
 
     fn encode_metadata_command_state_request(&self, pg_id: PgId) -> Vec<u8> {
@@ -915,65 +1939,101 @@ impl UnixStorageNodeMetadataCommandSession {
                 storage_rpc_deadline_expired("start metadata command session RPC"),
             ));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self
+            .lock_until(deadline, "acquire metadata command session RPC")
+            .map_err(StorageRpcRequestDispatchFailure::NotSent)?;
+        self.rpc_request_result_locked(&mut inner, kind, payload, deadline)
+    }
+
+    fn rpc_request_result_locked(
+        &self,
+        inner: &mut UnixStorageNodeMetadataCommandSessionInner,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcRequestDispatchFailure> {
         if Instant::now() >= deadline {
             return Err(StorageRpcRequestDispatchFailure::NotSent(
                 storage_rpc_deadline_expired("start metadata command session RPC"),
             ));
         }
-        inner
-            .stream
-            .set_operation_deadline(deadline)
-            .map_err(|source| {
-                StorageRpcRequestDispatchFailure::NotSent(StoreError::Io {
-                    context: "set storage-node metadata command session RPC deadline",
-                    source,
-                })
-            })?;
-        let request_id = inner.next_request_id;
-        inner.next_request_id = inner.next_request_id.checked_add(1).ok_or_else(|| {
-            StorageRpcRequestDispatchFailure::NotSent(self.rpc_payload_error(
-                "allocate metadata command session request id",
-                "metadata command session request id overflowed".to_string(),
-            ))
-        })?;
-        let request = StorageRpcFrame {
-            request_id,
-            kind,
-            payload,
-        };
-        let request_proof = write_unix_storage_rpc_request_classified(
-            &mut inner.stream,
-            self.node_id,
-            self.rpc_auth.as_deref(),
-            &request,
-            "write metadata command session RPC request",
-        )?;
-        let response = read_unix_storage_rpc_response(
-            &mut inner.stream,
-            self.node_id,
-            self.rpc_auth.as_deref(),
-            request_proof.as_ref(),
-            "read metadata command session RPC response",
-        )
-        .map_err(StorageRpcRequestDispatchFailure::MayHaveApplied)?;
-        if response.request_id != request_id || response.kind != kind {
-            return Err(StorageRpcRequestDispatchFailure::MayHaveApplied(
+        if inner.released {
+            return Err(StorageRpcRequestDispatchFailure::NotSent(
                 self.rpc_payload_error(
-                    "validate metadata command session RPC response",
-                    format!(
-                        "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
-                        response.request_id, response.kind
-                    ),
+                    "start metadata command session RPC",
+                    "metadata command session transport is closed".to_string(),
                 ),
             ));
         }
-        decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
-            StorageRpcRequestDispatchFailure::MayHaveApplied(self.rpc_payload_error(
-                "decode metadata command session RPC response",
-                error.to_string(),
-            ))
-        })
+        let result = (|| {
+            inner
+                .stream
+                .set_operation_deadline(deadline)
+                .map_err(|source| {
+                    StorageRpcRequestDispatchFailure::NotSent(StoreError::Io {
+                        context: "set storage-node metadata command session RPC deadline",
+                        source,
+                    })
+                })?;
+            let request_id = inner.next_request_id;
+            inner.next_request_id = inner.next_request_id.checked_add(1).ok_or_else(|| {
+                StorageRpcRequestDispatchFailure::NotSent(self.rpc_payload_error(
+                    "allocate metadata command session request id",
+                    "metadata command session request id overflowed".to_string(),
+                ))
+            })?;
+            let request = StorageRpcFrame {
+                request_id,
+                kind,
+                payload,
+            };
+            let request_proof = write_unix_storage_rpc_request_classified(
+                &mut inner.stream,
+                self.node_id,
+                self.rpc_auth.as_deref(),
+                &request,
+                "write metadata command session RPC request",
+            )?;
+            let response = read_unix_storage_rpc_response(
+                &mut inner.stream,
+                self.node_id,
+                self.rpc_auth.as_deref(),
+                request_proof.as_ref(),
+                "read metadata command session RPC response",
+            )
+            .map_err(StorageRpcRequestDispatchFailure::MayHaveApplied)?;
+            if response.request_id != request_id || response.kind != kind {
+                return Err(StorageRpcRequestDispatchFailure::MayHaveApplied(
+                    self.rpc_payload_error(
+                        "validate metadata command session RPC response",
+                        format!(
+                            "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
+                            response.request_id, response.kind
+                        ),
+                    ),
+                ));
+            }
+            decode_storage_rpc_response_payload_with_connection_disposition(&response.payload)
+                .map_err(|error| {
+                    StorageRpcRequestDispatchFailure::MayHaveApplied(self.rpc_payload_error(
+                        "decode metadata command session RPC response",
+                        error.to_string(),
+                    ))
+                })
+        })();
+        // A failed exchange cannot prove the remote critical section is still
+        // held. Do not let it authorize a later local application (or reuse a
+        // potentially desynchronized stream). A peer-declared closed connection
+        // also revokes the borrow, even when its operation succeeded. Semantic
+        // errors keep the session only when the peer explicitly retains it.
+        if !result
+            .as_ref()
+            .is_ok_and(|response| response.connection_reusable)
+        {
+            let _ = inner.stream.shutdown(std::net::Shutdown::Both);
+            inner.released = true;
+        }
+        result.map(|response| response.response)
     }
 
     fn rpc_response_error(
@@ -1950,7 +3010,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
                 current_epoch: self.cluster_epoch,
             });
         }
-        let held_pg_id = self.inner.lock().unwrap_or_else(|e| e.into_inner()).pg_id;
+        let held_pg_id = self.pg_id;
         if pg_id != held_pg_id {
             return Err(self.rpc_payload_error(
                 "open nested metadata command critical section",
@@ -2982,6 +4042,51 @@ mod tests {
     }
 
     #[test]
+    fn staging_complete_primary_borrow_holds_transport_mutex_and_rejects_epoch_or_closed_session() {
+        // Private mechanical fixture; the separate installed Unix/TLS fanout
+        // tests establish actual authenticated lock acquisition.
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let epoch = ClusterEpoch::new(7).unwrap();
+        let pg_id = PgId::new(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let client = UnixStorageNodeClient::new(NodeId::new(4), epoch, "/unused");
+        let session = UnixStorageNodeMetadataCommandSession {
+            origin: Arc::clone(&client.instance),
+            identity: Arc::new(()),
+            node_id: NodeId::new(4),
+            cluster_epoch: epoch,
+            pg_id,
+            rpc_auth: None,
+            _rpc_permit: test_rpc_admission_permit(),
+            inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
+                stream: accepted_unix_stream(stream, deadline).unwrap(),
+                next_request_id: 1,
+                io_timeout: Duration::from_secs(5),
+                released: false,
+            }),
+        };
+        let held = session
+            .borrow_complete_primary(&client, pg_id, epoch, deadline)
+            .unwrap();
+        assert!(matches!(
+            session.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        assert!(session.inner.try_lock().is_ok());
+        assert!(session
+            .borrow_complete_primary(&client, pg_id, ClusterEpoch::new(8).unwrap(), deadline)
+            .is_err());
+        assert!(session
+            .borrow_complete_primary(&client, pg_id, epoch, Instant::now())
+            .is_err());
+        session.close_metadata_command_pg_lock_on_drop();
+        assert!(session
+            .borrow_complete_primary(&client, pg_id, epoch, deadline)
+            .is_err());
+    }
+
+    #[test]
     fn peering_session_reads_retained_entries_from_an_older_log_epoch() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pg_id = PgId::new(3);
@@ -3016,12 +4121,19 @@ mod tests {
                     }
                     _ => unreachable!(),
                 };
+                let mut response_payload =
+                    crate::storage_rpc::encode_storage_rpc_success_response(&payload);
+                crate::storage_rpc::set_storage_rpc_response_connection_reusable(
+                    &mut response_payload,
+                    true,
+                )
+                .unwrap();
                 crate::storage_rpc::write_storage_rpc_frame_to(
                     &mut server_stream,
                     &StorageRpcFrame {
                         request_id: request.request_id,
                         kind,
-                        payload: crate::storage_rpc::encode_storage_rpc_success_response(&payload),
+                        payload: response_payload,
                     },
                 )
                 .unwrap();
@@ -3029,15 +4141,17 @@ mod tests {
         });
         let io_timeout = Duration::from_secs(1);
         let session = UnixStorageNodeMetadataCommandSession {
+            origin: Arc::new(UnixStorageNodeClientInstance),
+            identity: Arc::new(()),
             node_id: NodeId::new(7),
             cluster_epoch: route_epoch,
+            pg_id,
             rpc_auth: None,
             _rpc_permit: test_rpc_admission_permit(),
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream: accepted_unix_stream(client_stream, Instant::now() + io_timeout).unwrap(),
                 next_request_id: 1,
                 io_timeout,
-                pg_id,
                 released: false,
             }),
         };
@@ -3114,15 +4228,17 @@ mod tests {
         let (metadata_stream, _metadata_peer) = UnixStream::pair().unwrap();
         let io_timeout = Duration::from_secs(1);
         let metadata_session = UnixStorageNodeMetadataCommandSession {
+            origin: Arc::new(UnixStorageNodeClientInstance),
+            identity: Arc::new(()),
             node_id: NodeId::new(9),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(3),
             rpc_auth: None,
             _rpc_permit: test_rpc_admission_permit(),
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream: accepted_unix_stream(metadata_stream, Instant::now() + io_timeout).unwrap(),
                 next_request_id: 1,
                 io_timeout,
-                pg_id: PgId::new(3),
                 released: true,
             }),
         };

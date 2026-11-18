@@ -169,7 +169,7 @@ fn staging_context_submission_reissue_retains_ordinary_and_original_abandoned_so
         let source = part::command(&pg, &owner);
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
         let abandoned = ContextualCommand::abandoned_part(
-            PartFinalizationSource::capture(&source)
+            PartFinalizationSource::capture_for_test(&source)
                 .unwrap()
                 .bind_cleanup(cleanup.clone(), &topology())
                 .unwrap(),

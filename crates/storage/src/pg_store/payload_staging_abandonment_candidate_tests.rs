@@ -12,7 +12,9 @@ fn receive(
     source: &MetadataCommandEnvelope,
     cleanup: &MetadataCommandEnvelope,
 ) -> Result<AbandonedPartCleanupCommand, AbandonmentError> {
-    let bytes = PartFinalizationSource::capture(source).unwrap().encode();
+    let bytes = PartFinalizationSource::capture_for_test(source)
+        .unwrap()
+        .encode();
     let cleanup = crate::metadata_command::decode_metadata_command_envelope(
         &cleanup.command_bytes(),
         &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
@@ -140,8 +142,10 @@ fn staging_abandonment_candidate_reissue_keeps_original_source_through_compactio
         let owner = part::initialize(&pg, count);
         let source = part::command(&pg, &owner);
         let cleanup = cleanup(&pg, &owner, &source);
-        let original_bytes = PartFinalizationSource::capture(&source).unwrap().encode();
-        let candidate = PartFinalizationSource::capture(&source)
+        let original_bytes = PartFinalizationSource::capture_for_test(&source)
+            .unwrap()
+            .encode();
+        let candidate = PartFinalizationSource::capture_for_test(&source)
             .unwrap()
             .bind_cleanup(cleanup.clone(), &topology())
             .unwrap();

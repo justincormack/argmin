@@ -332,7 +332,7 @@ fn staging_completion_overwrite_requires_unique_bound_owner_even_for_empty_stand
                     generation.reservation_id = duplicate.subject.id.attempt.clone();
                 }
                 super::super::sql::insert(
-                    &pg.conn,
+                    &pg,
                     PgId::new(pg.pg_id),
                     &topology(),
                     &duplicate.validate(&topology()).unwrap(),

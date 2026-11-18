@@ -48,20 +48,12 @@ use crate::error::{
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, BucketPropertyMutation,
     BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionMode, DeleteObjectVersionTarget,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, MetadataTransferCommand,
-    ObjectPayloadReclaimCommand, PendingMetadataCommandInspection, PutObjectMetadataMutation,
-    ReleaseObjectGenerationCommand, ReserveObjectVersionCommand,
-    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
-    DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
-    DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
-    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
-    PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+    CreateStreamUploadCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
+    PendingMetadataCommandInspection, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
+    ReserveObjectVersionCommand, PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::BucketMutationReceipt;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -143,6 +135,18 @@ use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 mod local;
 mod request_ops;
 mod scavenger_progress;
+
+// Candidate complete publication, not yet selected by production publishers.
+#[allow(dead_code)]
+mod complete_publication_route;
+pub(crate) use complete_publication_route::{
+    EmbeddedApplicationTarget, EmbeddedPublicationSection, EmbeddedPublicationSectionIdentity,
+    HistoricalRemoteApplicationRoute,
+};
+
+#[allow(dead_code)] // Candidate fanout; live publisher selection remains gated.
+mod complete_fanout_route;
+pub(crate) use complete_fanout_route::{CompleteFanoutRoute, DirectPutTerminalWork};
 
 include!("cluster/core.rs");
 

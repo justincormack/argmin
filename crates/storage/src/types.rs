@@ -2880,7 +2880,68 @@ impl std::fmt::Debug for ObjectEncryption {
     }
 }
 
+/// Process-local evidence retained by candidate publication custody. Decoding a
+/// durable encryption state cannot mint it: the exact canonical subject is kept
+/// only by the provisional-to-committed ciphertext binding operation.
+#[must_use]
+pub struct CommittedObjectEncryption {
+    subject: Box<[u8]>,
+    provisional: ObjectEncryptionImmutableBinding,
+    encryption: ObjectEncryption,
+}
+
+impl CommittedObjectEncryption {
+    /// Borrow the durable encryption state without detaching its subject evidence.
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.encryption
+    }
+
+    /// Consume the process-local subject evidence when only the durable state
+    /// is needed. The durable state cannot reconstruct this evidence.
+    #[must_use]
+    pub fn into_encryption(self) -> ObjectEncryption {
+        self.encryption
+    }
+
+    pub(crate) fn matches(
+        &self,
+        subject: &ObjectEncryptionSubject,
+        encryption: &ObjectEncryption,
+    ) -> bool {
+        self.subject == subject.canonical
+            && self.provisional == subject.immutable_encryption_binding
+            && self.encryption == *encryption
+            && subject.matches_committed_encryption(encryption)
+    }
+}
+
 impl ObjectEncryption {
+    /// Preserve the subject used by the crypto owner alongside the committed
+    /// state. Unlike the durable state alone, this evidence can distinguish
+    /// rewrapping the same encryption instance for two different objects.
+    pub fn bind_committed_object_ciphertexts_with_evidence(
+        &self,
+        subject: &ObjectEncryptionSubject,
+        wrap_nonce: [u8; OBJECT_ENCRYPTION_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; OBJECT_ENCRYPTION_WRAPPED_DEK_LEN],
+        checksum_nonce: [u8; OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN],
+        encrypted_checksum_metadata: Vec<u8>,
+    ) -> Result<CommittedObjectEncryption, ObjectEncryptionStateError> {
+        let encryption = self.bind_committed_object_ciphertexts(
+            subject,
+            wrap_nonce,
+            wrapped_dek,
+            checksum_nonce,
+            encrypted_checksum_metadata,
+        )?;
+        Ok(CommittedObjectEncryption {
+            subject: subject.canonical.clone(),
+            provisional: ObjectEncryptionImmutableBinding::from_encryption(self),
+            encryption,
+        })
+    }
+
     fn encryption_instance_id(&self) -> [u8; OBJECT_ENCRYPTION_INSTANCE_ID_LEN] {
         let (mode, random_id) = match self {
             Self::SseCustomer(state) => (

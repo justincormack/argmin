@@ -2,21 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::node_runtime::pg_store::PgStore;
 use rusqlite::{Connection, OptionalExtension};
 
 #[path = "payload_staging_persistence_tests.rs"]
 mod live;
 
-fn connection() -> Connection {
+fn schema_connection() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
     conn.execute_batch(sql::SCHEMA).unwrap();
     conn
 }
 
-fn insert(conn: &Connection, owner: &StagingOwnerRecord) {
+fn store(pg_id: PgId) -> (test_util::TempDir, PgStore) {
+    let dir = test_util::tempdir();
+    let pg = PgStore::open(dir.path(), pg_id.get()).unwrap();
+    (dir, pg)
+}
+
+fn insert(pg: &PgStore, owner: &StagingOwnerRecord) {
     sql::insert(
-        conn,
+        pg,
         owner.subject.object_pg,
         &topology(),
         &owner.validate(&topology()).unwrap(),
@@ -43,12 +50,13 @@ fn assert_empty(conn: &Connection) {
 }
 
 fn round_trip(owner: &StagingOwnerRecord) {
-    let conn = connection();
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    insert(&conn, owner);
-    assert_eq!(load(&conn, owner).unwrap().as_ref(), Some(owner));
+    insert(&pg, owner);
+    assert_eq!(load(conn, owner).unwrap().as_ref(), Some(owner));
     conn.execute_batch("COMMIT; BEGIN").unwrap();
-    let loaded = load(&conn, owner).unwrap().unwrap();
+    let loaded = load(conn, owner).unwrap().unwrap();
     assert_eq!(&loaded, owner);
     loaded.validate(&topology()).unwrap();
     conn.execute_batch("COMMIT").unwrap();
@@ -121,54 +129,51 @@ fn staging_sql_round_trips_target_lifecycle_destination_and_resource_matrix() {
 
 #[test]
 fn staging_sql_requires_outer_transaction_and_does_not_commit_it() {
-    let conn = connection();
     let owner = fixture(StagingTarget::DirectPut);
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     let configured_topology = topology();
     let checked = owner.validate(&configured_topology).unwrap();
     assert!(matches!(
-        sql::insert(
-            &conn,
-            owner.subject.object_pg,
-            &configured_topology,
-            &checked
-        ),
+        sql::insert(&pg, owner.subject.object_pg, &configured_topology, &checked),
         Err(sql::PersistenceError::TransactionRequired)
     ));
     assert!(matches!(
-        load(&conn, &owner),
+        load(conn, &owner),
         Err(sql::PersistenceError::TransactionRequired)
     ));
-    assert_empty(&conn);
+    assert_empty(conn);
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    insert(&conn, &owner);
+    insert(&pg, &owner);
     assert!(!conn.is_autocommit());
-    assert_eq!(load(&conn, &owner).unwrap(), Some(owner));
+    assert_eq!(load(conn, &owner).unwrap(), Some(owner));
     conn.execute_batch("ROLLBACK").unwrap();
-    assert_empty(&conn);
+    assert_empty(conn);
 }
 
 #[test]
 fn staging_sql_rejects_crossed_pg_before_mutation_or_observation() {
-    let conn = connection();
     let owner = fixture(StagingTarget::DirectPut);
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     let foreign = PgId::new(owner.subject.object_pg.get() + 1);
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert!(matches!(
         sql::insert(
-            &conn,
+            &pg,
             foreign,
             &topology(),
             &owner.validate(&topology()).unwrap()
         ),
         Err(sql::PersistenceError::WrongPg)
     ));
-    assert_empty(&conn);
-    insert(&conn, &owner);
+    assert_empty(conn);
+    insert(&pg, &owner);
     assert!(matches!(
-        sql::load(&conn, foreign, &owner.subject.id.attempt),
+        sql::load(conn, foreign, &owner.subject.id.attempt),
         Err(sql::PersistenceError::WrongPg)
     ));
-    assert_eq!(load(&conn, &owner).unwrap(), Some(owner));
+    assert_eq!(load(conn, &owner).unwrap(), Some(owner));
 }
 
 // Select subjects under two independently constructed topologies. The object
@@ -257,17 +262,18 @@ fn assert_crossed_topology_rejected(data_differs: bool) {
         );
 
         let checked = owner.validate(&source).unwrap();
-        let conn = connection();
+        let (_dir, pg) = store(owner.subject.object_pg);
+        let conn = &pg.conn;
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert!(matches!(
-            sql::insert(&conn, owner.subject.object_pg, &destination, &checked),
+            sql::insert(&pg, owner.subject.object_pg, &destination, &checked),
             Err(sql::PersistenceError::Invariant(StagingInvariant::Topology))
         ));
-        assert_empty(&conn);
+        assert_empty(conn);
         assert!(!conn.is_autocommit());
         // The exact same record/view is insertable under its actual topology.
-        sql::insert(&conn, owner.subject.object_pg, &source, &checked).unwrap();
-        assert_eq!(load(&conn, &owner).unwrap().as_ref(), Some(&owner));
+        sql::insert(&pg, owner.subject.object_pg, &source, &checked).unwrap();
+        assert_eq!(load(conn, &owner).unwrap().as_ref(), Some(&owner));
     }
 }
 
@@ -288,10 +294,11 @@ fn staging_sql_accepts_independent_canonically_equivalent_topology() {
     assert!(!std::ptr::eq(&source, &destination));
     let owner = fixture(StagingTarget::DirectPut);
     let checked = owner.validate(&source).unwrap();
-    let conn = connection();
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    sql::insert(&conn, owner.subject.object_pg, &destination, &checked).unwrap();
-    assert_eq!(load(&conn, &owner).unwrap(), Some(owner));
+    sql::insert(&pg, owner.subject.object_pg, &destination, &checked).unwrap();
+    assert_eq!(load(conn, &owner).unwrap(), Some(owner));
 }
 
 #[test]
@@ -300,14 +307,15 @@ fn staging_sql_failed_child_insert_rolls_back_whole_owner_only() {
     append(&mut owner);
     publish(&mut owner);
     for table in sql::TABLES {
-        let conn = connection();
+        let (_dir, pg) = store(owner.subject.object_pg);
+        let conn = &pg.conn;
         conn.execute_batch(&format!(
             "CREATE TABLE sentinel (value INTEGER); BEGIN IMMEDIATE; INSERT INTO sentinel VALUES (7); \
              CREATE TEMP TRIGGER fail_staging_insert BEFORE INSERT ON {} BEGIN \
              SELECT RAISE(ABORT, 'injected staging child failure'); END", table.name,
         )).unwrap();
         let error = sql::insert(
-            &conn,
+            &pg,
             owner.subject.object_pg,
             &topology(),
             &owner.validate(&topology()).unwrap(),
@@ -316,7 +324,7 @@ fn staging_sql_failed_child_insert_rolls_back_whole_owner_only() {
         assert!(matches!(error, sql::PersistenceError::Sql(_)), "{error:?}");
         assert!(error.to_string().contains("injected staging child failure"));
         assert!(!conn.is_autocommit());
-        assert_empty(&conn);
+        assert_empty(conn);
         assert_eq!(
             conn.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, u64>(0))
                 .unwrap(),
@@ -324,19 +332,20 @@ fn staging_sql_failed_child_insert_rolls_back_whole_owner_only() {
         );
         conn.execute_batch("DROP TRIGGER fail_staging_insert")
             .unwrap();
-        insert(&conn, &owner);
-        assert_eq!(load(&conn, &owner).unwrap().as_ref(), Some(&owner));
+        insert(&pg, &owner);
+        assert_eq!(load(conn, &owner).unwrap().as_ref(), Some(&owner));
         conn.execute_batch("ROLLBACK").unwrap();
-        assert_empty(&conn);
+        assert_empty(conn);
     }
 }
 
 #[test]
 fn staging_sql_does_not_adopt_exact_or_crossed_existing_owner() {
-    let conn = connection();
     let owner = fixture(StagingTarget::DirectPut);
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    insert(&conn, &owner);
+    insert(&pg, &owner);
     let mut different = owner.clone();
     different.resources.creation = ResourceResponsibility::Live(StagingBucketResource::capture(
         &BucketWriteReservationProof {
@@ -348,21 +357,20 @@ fn staging_sql_does_not_adopt_exact_or_crossed_existing_owner() {
     for contender in [&owner, &different] {
         assert!(matches!(
             sql::insert(
-                &conn,
+                &pg,
                 owner.subject.object_pg,
                 &topology(),
                 &contender.validate(&topology()).unwrap()
             ),
             Err(sql::PersistenceError::OwnerExists)
         ));
-        assert_eq!(load(&conn, &owner).unwrap().as_ref(), Some(&owner));
+        assert_eq!(load(conn, &owner).unwrap().as_ref(), Some(&owner));
     }
 }
 
 #[test]
 fn staging_sql_retains_exact_participants_and_both_historical_release_routes_on_reopen() {
     let tmp = test_util::tempdir();
-    let path = tmp.path().join("owner-contract.sqlite");
     let mut owner = fixture(multipart_target());
     append(&mut owner);
     publish(&mut owner);
@@ -373,16 +381,16 @@ fn staging_sql_retains_exact_participants_and_both_historical_release_routes_on_
     finalization.observed_lease_deadline = 22_000;
     owner.windows[1].participants.placement_epoch = ClusterEpoch::new(7).unwrap();
     {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-        conn.execute_batch(sql::SCHEMA).unwrap();
+        let pg = PgStore::open(tmp.path(), owner.subject.object_pg.get()).unwrap();
+        let conn = &pg.conn;
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        insert(&conn, &owner);
+        insert(&pg, &owner);
         conn.execute_batch("COMMIT").unwrap();
     }
-    let conn = Connection::open(&path).unwrap();
+    let pg = PgStore::open(tmp.path(), owner.subject.object_pg.get()).unwrap();
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN").unwrap();
-    let loaded = load(&conn, &owner).unwrap().unwrap();
+    let loaded = load(conn, &owner).unwrap().unwrap();
     assert_eq!(loaded, owner);
     assert_eq!(
         loaded.windows[0].participants.files,
@@ -396,7 +404,7 @@ fn staging_sql_retains_exact_participants_and_both_historical_release_routes_on_
 
 #[test]
 fn staging_sql_column_inventory_covers_every_table_and_column() {
-    let conn = connection();
+    let conn = schema_connection();
     let actual = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -435,13 +443,14 @@ fn staging_sql_column_inventory_covers_every_table_and_column() {
 }
 
 fn reject_mutation(owner: &StagingOwnerRecord, statement: &str, invariant: StagingInvariant) {
-    let conn = connection();
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    insert(&conn, owner);
-    assert_eq!(load(&conn, owner).unwrap().as_ref(), Some(owner));
+    insert(&pg, owner);
+    assert_eq!(load(conn, owner).unwrap().as_ref(), Some(owner));
     assert!(conn.execute(statement, []).unwrap() > 0, "{statement}");
     assert!(
-        matches!(load(&conn, owner), Err(sql::PersistenceError::Invariant(error)) if error == invariant),
+        matches!(load(conn, owner), Err(sql::PersistenceError::Invariant(error)) if error == invariant),
         "{statement}"
     );
 }
@@ -552,16 +561,17 @@ fn staging_sql_decoders_reject_unknown_tags_and_crossed_optional_shapes() {
         "UPDATE payload_staging_resources SET role = 9",
         "UPDATE payload_staging_resources SET state = 0",
     ] {
-        let conn = connection();
         let owner = fixture(StagingTarget::DirectPut);
+        let (_dir, pg) = store(owner.subject.object_pg);
+        let conn = &pg.conn;
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        insert(&conn, &owner);
+        insert(&pg, &owner);
         // Model corrupted/imported rows independently of SQL CHECK constraints.
         conn.execute_batch("PRAGMA ignore_check_constraints = ON")
             .unwrap();
         assert!(conn.execute(statement, []).unwrap() > 0);
         assert!(
-            matches!(load(&conn, &owner), Err(sql::PersistenceError::Row(_))),
+            matches!(load(conn, &owner), Err(sql::PersistenceError::Row(_))),
             "{statement}"
         );
     }
@@ -577,22 +587,24 @@ fn staging_obligations_sql_round_trip_rejects_gaps_live_extras_and_duplicate_pro
         "UPDATE payload_staging_resources SET reservation_id = (SELECT reservation_id FROM payload_staging_resources WHERE role = 2), owner_token = (SELECT owner_token FROM payload_staging_resources WHERE role = 2), cluster_epoch = (SELECT cluster_epoch FROM payload_staging_resources WHERE role = 2), observed_lease_deadline = observed_lease_deadline + 1000 WHERE role = 3",
         "UPDATE payload_staging_resources SET reservation_id = (SELECT reservation_id FROM payload_staging_resources WHERE role = 1), owner_token = (SELECT owner_token FROM payload_staging_resources WHERE role = 1), cluster_epoch = (SELECT cluster_epoch FROM payload_staging_resources WHERE role = 1) WHERE role = 2",
     ] {
-        let conn = connection();
+        let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        insert(&conn, &owner);
-        assert_eq!(load(&conn, &owner).unwrap(), Some(owner.clone()));
+        insert(&pg, &owner);
+        assert_eq!(load(conn, &owner).unwrap(), Some(owner.clone()));
         conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
         conn.execute_batch(statement).unwrap();
-        assert!(load(&conn, &owner).is_err(), "{statement}");
+        assert!(load(conn, &owner).is_err(), "{statement}");
     }
 }
 
 #[test]
 fn staging_sql_foreign_keys_reject_orphan_windows_and_participants() {
-    let conn = connection();
     let owner = fixture(StagingTarget::DirectPut);
+    let (_dir, pg) = store(owner.subject.object_pg);
+    let conn = &pg.conn;
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    insert(&conn, &owner);
+    insert(&pg, &owner);
     for table in [
         "payload_staging_windows",
         "payload_staging_participants",
@@ -601,7 +613,7 @@ fn staging_sql_foreign_keys_reject_orphan_windows_and_participants() {
         let result = conn.execute(&format!("UPDATE {table} SET attempt = 'absent-owner'"), []);
         assert!(result.is_err(), "{table}");
     }
-    assert_eq!(load(&conn, &owner).unwrap(), Some(owner));
+    assert_eq!(load(conn, &owner).unwrap(), Some(owner));
     assert!(conn
         .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
         .optional()
@@ -624,7 +636,7 @@ fn checkpoint_blocks(
                 owner.subject.payload_generation,
             )
             .unwrap();
-        insert(&store.conn, owner);
+        insert(&store, owner);
     }
     store.refresh_metadata_command_state_digest().unwrap();
     let checkpoint = store

@@ -1,0 +1,3 @@
+# Candidate publication confirmation V1 / command V14 / context V1.
+# Complete command SHA-256, not CRC64 or a payload-only digest.
+0100040000000500000000000000040000000b000000000000005c1438e559d8e1dd4a19e1f6808e6693645dc489063c10cbf0835a979a1115f8

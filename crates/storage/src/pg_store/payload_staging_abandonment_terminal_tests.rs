@@ -164,7 +164,11 @@ fn staging_abandonment_pruned_prefix_authenticates_source_against_later_checkpoi
                 assert_eq!(follow_up.id().log_index().get(), 1);
             }
             assert!(matches!(
-                pg.metadata_command_startup_disposition(0, &source).unwrap(),
+                source_context(&source)
+                    .encode_command()
+                    .unwrap()
+                    .inspect_terminal_in_open_transaction(&pg, 0)
+                    .unwrap(),
                 crate::pg_store::MetadataCommandStartupDisposition::Abandoned { .. }
             ));
             assert_eq!(
@@ -477,7 +481,11 @@ fn staging_abandonment_compacted_source_requires_contiguous_authenticated_receip
         // Positive canary before corrupting the chain: only source-to-checkpoint
         // receipts survive; all full entries and the older prefix are gone.
         assert!(matches!(
-            pg.metadata_command_startup_disposition(0, &source).unwrap(),
+            source_context(&source)
+                .encode_command()
+                .unwrap()
+                .inspect_terminal_in_open_transaction(&pg, 0)
+                .unwrap(),
             crate::pg_store::MetadataCommandStartupDisposition::Abandoned { .. }
         ));
         match case {
@@ -558,7 +566,6 @@ fn staging_abandonment_exact_published_custody_preserves_references_and_renewabl
             let owner = part::initialize(&pg, count);
             let published = part::command(&pg, &owner);
             let abort = cleanup(&pg, &owner, &published);
-            part::apply(&pg, &published).unwrap();
             terminal(&pg, &published, false);
             // A later rejected duplicate carries the same stable reservation
             // with renewed lease evidence, not the already-applied command ID.
@@ -569,7 +576,7 @@ fn staging_abandonment_exact_published_custody_preserves_references_and_renewabl
                 MetadataCommandPayload::CommitStreamPart(Box::new(duplicate)),
             );
             pg.conn.execute_batch("COMMIT").unwrap();
-            pg.record_metadata_command_abandoned(0, &source).unwrap();
+            record_source_abandoned(&pg, &source);
             pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             match destination {
                 "part" => (),

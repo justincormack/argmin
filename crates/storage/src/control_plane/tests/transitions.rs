@@ -975,8 +975,12 @@ fn published_pending_command_blocks_unavailable_pg_transfer_source() {
         )
         .unwrap();
     let pending_epoch = authority.snapshot().cluster_epoch();
-    let pending =
-        PendingMetadataCommandObservation::new(pending_epoch, NonZeroU64::new(18).unwrap(), 0xfeed);
+    let pending = PendingMetadataCommandObservation::new(
+        pending_epoch,
+        NonZeroU64::new(18).unwrap(),
+        0xfeed,
+        [0xA5; 32],
+    );
     for node_id in 1..=3 {
         heartbeat_with_pg_proof_and_lease_duration(
             &mut authority,
@@ -1098,8 +1102,12 @@ fn peering_floor_gap_with_pending_slot_does_not_certify_a_transfer_source() {
         )
         .unwrap();
     let pending_epoch = authority.snapshot().cluster_epoch();
-    let pending =
-        PendingMetadataCommandObservation::new(pending_epoch, NonZeroU64::new(15).unwrap(), 0x1515);
+    let pending = PendingMetadataCommandObservation::new(
+        pending_epoch,
+        NonZeroU64::new(15).unwrap(),
+        0x1515,
+        [0xA5; 32],
+    );
     for node_id in 1..=3 {
         heartbeat_with_pg_proof_and_lease_duration(
             &mut authority,

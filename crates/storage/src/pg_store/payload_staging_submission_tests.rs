@@ -328,10 +328,10 @@ fn staging_submission_unwind_keeps_description_and_uncertainty_without_cleanup()
         assert_eq!(submission.observation(), Observed::Unconfirmed);
         assert_eq!(submission.description().command(), &expected);
         assert_eq!(submission.description().descriptor_bytes(), bytes);
-        // The SQL owner, not the descriptive holder, handles its connection
-        // after an unwind. Rolling it back must not clear installation history.
-        assert!(!pg.conn.is_autocommit());
-        pg.conn.execute_batch("ROLLBACK").unwrap();
+        // The SQL owner rolls back on unwind; that does not clear the
+        // descriptive holder's conservative installation history.
+        assert!(pg.conn.is_autocommit());
+        pg.require_usable_connection().unwrap();
         expired_retry(&mut submission, &pg);
         assert_eq!(submission.observation(), Observed::Unconfirmed);
         drop(submission);
@@ -342,7 +342,7 @@ fn staging_submission_unwind_keeps_description_and_uncertainty_without_cleanup()
 }
 
 #[test]
-fn staging_submission_rollback_failure_is_uncertain_with_connection_recovery_or_retirement() {
+fn staging_submission_rollback_failure_keeps_uncertainty_until_reopen() {
     let _clock = test_time_override_guard(2_000);
     for (target, is_append) in candidate::cases() {
         for commit_failure in [false, true] {
@@ -362,7 +362,7 @@ fn staging_submission_rollback_failure_is_uncertain_with_connection_recovery_or_
                     // before INSERT would not exercise rollback's custody gap.
                     pg.conn.execute_batch("CREATE TEMP TRIGGER fail_pending BEFORE INSERT ON metadata_command_pending_staging_protection BEGIN SELECT RAISE(ABORT, 'submission sidecar failure'); END;").unwrap();
                 }
-                pg.test_fail_pending_slot_rollbacks(rollback_failures);
+                pg.test_fail_metadata_command_rollbacks(rollback_failures);
                 let error = install(&mut submission, &pg).unwrap_err();
                 assert!(
                     matches!(&error, SubmissionError::Unconfirmed(_)),
@@ -370,7 +370,7 @@ fn staging_submission_rollback_failure_is_uncertain_with_connection_recovery_or_
                 );
                 let diagnostic = error.to_string();
                 assert!(
-                    diagnostic.contains("injected pending-slot rollback failure"),
+                    diagnostic.contains("injected metadata-command rollback failure"),
                     "{diagnostic}"
                 );
                 assert!(
@@ -388,24 +388,15 @@ fn staging_submission_rollback_failure_is_uncertain_with_connection_recovery_or_
                 assert_eq!(submission.observation(), Observed::Unconfirmed);
                 assert_eq!(submission.description().command(), &expected);
                 assert_eq!(submission.description().descriptor_bytes(), descriptor);
-                if rollback_failures == 1 {
-                    assert!(pg.conn.is_autocommit());
-                    pg.require_usable_connection().unwrap();
-                    pending_install::assert_empty(&pg);
-                    assert_eq!(introduction::state(&pg), before);
-                    expired_retry(&mut submission, &pg);
-                    assert_eq!(submission.observation(), Observed::Unconfirmed);
-                    pg.conn.execute_batch("DROP TRIGGER fail_pending").unwrap();
-                    install(&mut submission, &pg).unwrap();
-                    assert_eq!(submission.observation(), Observed::Installed);
-                } else {
+                {
                     assert!(!pg.conn.is_autocommit());
                     assert!(pg.require_usable_connection().is_err());
                     assert!(pg.require_live_allocation_lifetime().is_err());
                     assert!(pg.begin_allocation_lifetime_replacement().is_err());
-                    assert!(
-                        diagnostic.contains("connection retired: true"),
-                        "{diagnostic}"
+                    assert_eq!(
+                        pg.fail_metadata_command_rollbacks.get(),
+                        rollback_failures - 1,
+                        "teardown secretly retried rollback"
                     );
                     // Owner-local inspection proves the poisoned transaction is
                     // still present. It must not be exposed by the node facade.

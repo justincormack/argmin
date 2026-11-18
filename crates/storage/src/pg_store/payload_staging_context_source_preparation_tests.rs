@@ -42,7 +42,7 @@ fn context(
     cleanup: &MetadataCommandEnvelope,
 ) -> ContextualCommand {
     ContextualCommand::abandoned_part(
-        PartFinalizationSource::capture(source)
+        PartFinalizationSource::capture_for_test(source)
             .unwrap()
             .bind_cleanup(cleanup.clone(), &topology())
             .unwrap(),
@@ -213,7 +213,6 @@ fn staging_context_source_preparation_rejects_missing_applied_unlinked_started_a
                     .test_insert_abandoned_metadata_command_log_entry(&source)
                     .unwrap(),
                 "applied" => {
-                    part::apply(&pg, &source).unwrap();
                     abandonment::terminal(&pg, &source, false);
                 }
                 "started" => {
@@ -246,7 +245,9 @@ fn staging_context_source_preparation_rejects_missing_applied_unlinked_started_a
                 .prepare_abandoned_part_pending(&pg, 0, &topology())
                 .err()
                 .expect(case);
-            if ["absent", "pending", "applied", "started"].contains(&case) {
+            // The exact complete finalizer is now applied, not abandoned. Its
+            // identity authenticates successfully but cannot authorize cleanup.
+            if ["absent", "pending", "started", "applied"].contains(&case) {
                 assert!(
                     matches!(
                         failure.error(),

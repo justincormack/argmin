@@ -13,6 +13,12 @@ use crate::metadata_command::{
 };
 use crate::storage_rpc::StorageRpcStreamUploadsListResponse;
 
+#[cfg(test)]
+thread_local! {
+    static PROOF_RELEASE_DEADLINES: std::cell::RefCell<Option<Vec<StorageRpcOperationDeadline>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct UnixObjectReadMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataPgId,
@@ -1554,7 +1560,7 @@ impl UnixStorageNodeClient {
         pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
-        self.release_metadata_command_bucket_write_reservation_inner(pg_id, proof, None)
+        self.release_metadata_command_bucket_write_reservation_inner(pg_id, proof, None, None)
     }
 
     fn release_metadata_command_bucket_write_reservation_until(
@@ -1563,7 +1569,28 @@ impl UnixStorageNodeClient {
         proof: &BucketWriteReservationProof,
         deadline: Instant,
     ) -> Result<(), BucketSnapshotLoadError> {
-        self.release_metadata_command_bucket_write_reservation_inner(pg_id, proof, Some(deadline))
+        self.release_metadata_command_bucket_write_reservation_inner(
+            pg_id,
+            proof,
+            Some(deadline),
+            Some(StorageRpcOperationDeadline::from_instant(deadline)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::node_runtime) fn test_observe_proof_release_deadlines<T>(
+        action: impl FnOnce() -> T,
+    ) -> (T, Vec<StorageRpcOperationDeadline>) {
+        struct Reset(Option<Vec<StorageRpcOperationDeadline>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROOF_RELEASE_DEADLINES.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        let _reset = Reset(PROOF_RELEASE_DEADLINES.with(|slot| slot.replace(Some(Vec::new()))));
+        let result = action();
+        let observed = PROOF_RELEASE_DEADLINES.with(|slot| slot.take().unwrap());
+        (result, observed)
     }
 
     fn release_metadata_command_bucket_write_reservation_inner(
@@ -1571,19 +1598,33 @@ impl UnixStorageNodeClient {
         pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
         deadline: Option<Instant>,
+        operation_deadline: Option<StorageRpcOperationDeadline>,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcProofReleaseRequest {
             node_id: self.node_id,
             route_cluster_epoch: proof.cluster_epoch,
             pg_id: pg_id.pg_id(),
             proof: proof.clone(),
-            operation_deadline: deadline.map(StorageRpcOperationDeadline::from_instant),
+            operation_deadline,
         };
         let payload = encode_proof_release_request(&request).map_err(|error| {
             BucketSnapshotLoadError::Store(
                 self.rpc_payload_error("encode proof release request", error.to_string()),
             )
         })?;
+        #[cfg(test)]
+        PROOF_RELEASE_DEADLINES.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                // Inspect the actual encoded request, not only the supplied
+                // deadline, so a codec-side reprojection also fails the canary.
+                if let Some(deadline) = crate::storage_rpc::decode_proof_release_request(&payload)
+                    .unwrap()
+                    .operation_deadline
+                {
+                    observed.push(deadline);
+                }
+            }
+        });
         let response = match deadline {
             Some(deadline) => self.rpc_request_bucket_snapshot_until(
                 StorageRpcMessageKind::ProofRelease,
@@ -2235,6 +2276,25 @@ impl RetainedBucketWriteReservationNodeClient for UnixStorageNodeClient {
 }
 
 impl RetainedBucketWriteReservationRoute for UnixRetainedBucketWriteReservationRoute<'_> {
+    fn release_metadata_command_bucket_write_reservation_with_fixed_deadline(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+        portable: StorageRpcOperationDeadline,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(
+            &proof.bucket,
+            "release terminal command bucket write reservation",
+        )?;
+        self.client
+            .release_metadata_command_bucket_write_reservation_inner(
+                self.pg_id,
+                proof,
+                Some(deadline),
+                Some(portable),
+            )
+    }
+
     fn release_durable_bucket_write_reservation(
         &self,
         record: &BucketWriteReservationRecord,

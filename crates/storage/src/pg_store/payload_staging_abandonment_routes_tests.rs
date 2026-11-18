@@ -55,7 +55,7 @@ fn staging_abandonment_routes_include_the_independent_original_bucket_release_pg
             0,
             "bare UploadPart abort cannot retain its finalizer's release route"
         );
-        let candidate = PartFinalizationSource::capture(&source)
+        let candidate = PartFinalizationSource::capture_for_test(&source)
             .unwrap()
             .bind_cleanup(follow_up.clone(), &topology)
             .unwrap();
@@ -89,11 +89,13 @@ fn staging_abandonment_routes_keep_original_source_and_release_epochs_after_reis
         let owner = part::initialize(&pg, count);
         let source = part::command(&pg, &owner);
         let follow_up = cleanup(&pg, &owner, &source);
-        let original = PartFinalizationSource::capture(&source).unwrap().encode();
+        let original = PartFinalizationSource::capture_for_test(&source)
+            .unwrap()
+            .encode();
         let topology = topology();
         let bucket_pg = PgId::new(topology.bucket_pg_for(&owner.subject.bucket));
         assert_ne!(bucket_pg, owner.subject.object_pg);
-        let mut candidate = PartFinalizationSource::capture(&source)
+        let mut candidate = PartFinalizationSource::capture_for_test(&source)
             .unwrap()
             .bind_cleanup(follow_up.clone(), &topology)
             .unwrap();
@@ -186,7 +188,7 @@ fn staging_abandonment_routes_reject_a_same_object_pg_topology_with_a_different_
     let source = part::command(&pg, &owner);
     let follow_up = cleanup(&pg, &owner, &source);
     let topology = topology();
-    let candidate = PartFinalizationSource::capture(&source)
+    let candidate = PartFinalizationSource::capture_for_test(&source)
         .unwrap()
         .bind_cleanup(follow_up.clone(), &topology)
         .unwrap();
@@ -244,7 +246,7 @@ fn staging_abandonment_route_projection_does_not_authenticate_terminal_source() 
     let source = part::command(&pg, &owner);
     let follow_up = cleanup(&pg, &owner, &source);
     let topology = topology();
-    let candidate = PartFinalizationSource::capture(&source)
+    let candidate = PartFinalizationSource::capture_for_test(&source)
         .unwrap()
         .bind_cleanup(follow_up, &topology)
         .unwrap();

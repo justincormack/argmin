@@ -575,6 +575,23 @@ impl ControlPlaneScopedCredentialStore {
         &self.credentials
     }
 
+    /// Check local signer configuration without exposing secret material or
+    /// sending a request. Use the verifier's exact identity lookup and HMAC
+    /// verification, including its constant-time authenticator comparison.
+    pub(crate) fn accepts_credential(&self, candidate: &ControlPlaneScopedCredential) -> bool {
+        const PROBE: &[u8] = b"argmin/local-credential-acceptance/v1\0";
+        let Some(accepted) = self.find_identity(
+            &candidate.cluster_id,
+            &candidate.credential_id,
+            candidate.credential_version,
+            &candidate.principal,
+        ) else {
+            return false;
+        };
+        let authenticator = Sha256Key::new(&candidate.secret).sign(PROBE);
+        Sha256Key::new(&accepted.secret).verify(PROBE, &authenticator)
+    }
+
     #[must_use]
     pub(crate) fn verify_envelope(
         &self,
@@ -636,11 +653,26 @@ impl ControlPlaneScopedCredentialStore {
         &self,
         header: &ControlPlaneAuthEnvelopeHeader,
     ) -> Option<&ControlPlaneScopedCredential> {
+        self.find_identity(
+            header.cluster_id(),
+            header.credential_id(),
+            header.credential_version(),
+            header.source(),
+        )
+    }
+
+    fn find_identity(
+        &self,
+        cluster_id: &str,
+        credential_id: &str,
+        credential_version: u64,
+        principal: &ControlPlaneAuthPrincipal,
+    ) -> Option<&ControlPlaneScopedCredential> {
         self.credentials.iter().find(|credential| {
-            credential.cluster_id == header.cluster_id()
-                && credential.credential_id == header.credential_id()
-                && credential.credential_version == header.credential_version()
-                && credential.principal == *header.source()
+            credential.cluster_id == cluster_id
+                && credential.credential_id == credential_id
+                && credential.credential_version == credential_version
+                && credential.principal == *principal
         })
     }
 }

@@ -92,6 +92,57 @@ include!("storage_rpc/operation_codec.rs");
 
 include!("storage_rpc/metadata_command_codec.rs");
 
+// Candidate complete-context framing; live dispatch still selects the current
+// command grammar. This module returns only borrowed, untrusted wire records.
+#[allow(dead_code)] // Candidate complete application; live dispatch remains gated.
+#[path = "storage_rpc/complete_application.rs"]
+pub(crate) mod complete_application;
+#[allow(dead_code)]
+#[path = "storage_rpc/complete_applied.rs"]
+pub(crate) mod complete_applied;
+#[allow(dead_code)] // Candidate framing only; admitted installation remains gated.
+pub(crate) mod complete_direct_install;
+#[allow(dead_code)]
+#[path = "storage_rpc/complete_direct_introduction.rs"]
+pub(crate) mod complete_direct_introduction;
+#[path = "storage_rpc/complete_direct_introduction_install.rs"]
+pub(crate) mod complete_direct_introduction_install;
+#[allow(dead_code)] // Candidate sender/receiver; live dispatch remains gated.
+pub(crate) mod complete_direct_prepare;
+#[allow(dead_code)] // Candidate sender/receiver; live dispatch remains gated.
+pub(crate) mod complete_direct_snapshot;
+#[allow(dead_code)] // Selected at coordinated complete-command activation.
+#[path = "storage_rpc/complete_log_budget.rs"]
+pub(crate) mod complete_log_budget;
+#[allow(dead_code)]
+#[path = "storage_rpc/complete_log_range.rs"]
+pub(crate) mod complete_log_range;
+#[allow(dead_code)]
+#[path = "storage_rpc/complete_pending.rs"]
+pub(crate) mod complete_pending;
+#[allow(dead_code)] // Candidate payload grammar; not selected by live RPC dispatch.
+#[path = "storage_rpc/complete_publication.rs"]
+pub(crate) mod complete_publication;
+pub(crate) mod complete_settled_prefix;
+#[allow(dead_code)] // Candidate framing only; receiver and owning sender remain gated.
+pub(crate) mod complete_staging_ack;
+pub(crate) mod complete_staging_file;
+pub(crate) mod complete_stream_allocation;
+pub(crate) mod complete_stream_append_install;
+#[allow(dead_code)] // Candidate framing; owning sender and admitted receiver are not installed.
+pub(crate) mod complete_stream_append_prepare;
+pub(crate) mod complete_stream_file_primary;
+pub(crate) mod complete_window_primary;
+
+#[path = "storage_rpc/complete_abandonment.rs"]
+pub(crate) mod complete_abandonment;
+#[path = "storage_rpc/complete_replica_abandonment.rs"]
+#[allow(dead_code)] // Candidate framing; live sender/dispatch not selected.
+pub(crate) mod complete_replica_abandonment;
+#[allow(dead_code)] // Candidate receiver framing; live dispatch is not selected.
+#[path = "storage_rpc/complete_retirement.rs"]
+pub(crate) mod complete_retirement;
+
 include!("storage_rpc/shard_maintenance_codec.rs");
 
 include!("storage_rpc/decoder.rs");
@@ -122,3 +173,6 @@ mod checkpoint_transfer_format_tests;
 
 #[cfg(test)]
 mod staging_scavenger_format_tests;
+
+#[cfg(test)]
+mod retained_log_budget_format_tests;

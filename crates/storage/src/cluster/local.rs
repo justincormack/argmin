@@ -785,6 +785,42 @@ impl LocalNodeStore {
         &self.runtime
     }
 
+    pub(super) fn embedded_publication_runtime(&self) -> Result<&LocalNodeRuntime, StoreError> {
+        if !matches!(
+            self.route_execution_endpoint,
+            LocalRouteExecutionEndpoint::Embedded(_)
+        ) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "embedded publication requires an embedded execution endpoint",
+            });
+        }
+        Ok(&self.runtime)
+    }
+
+    pub(super) fn confirmation_embedded_runtime(
+        &self,
+    ) -> Result<Option<&LocalNodeRuntime>, StoreError> {
+        match self.route_execution_endpoint {
+            LocalRouteExecutionEndpoint::Embedded(_) => Ok(Some(&self.runtime)),
+            LocalRouteExecutionEndpoint::RpcUnix(_) | LocalRouteExecutionEndpoint::RpcTcp(_) => {
+                Ok(None)
+            }
+            LocalRouteExecutionEndpoint::TopologyOnly => {
+                Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "settled witness has no execution endpoint",
+                })
+            }
+        }
+    }
+
+    pub(super) fn is_complete_fanout_client(&self, client: &UnixStorageNodeClient) -> bool {
+        self.node_id == client.node_id()
+            && std::ptr::eq(
+                Arc::as_ptr(&self.metadata_command_client).cast::<()>(),
+                std::ptr::from_ref(client).cast::<()>(),
+            )
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_node(&self) -> &Arc<SharedStorageNode> {
         self.runtime.test_node()
@@ -4440,6 +4476,24 @@ impl LocalClusterMap {
 
     pub(crate) fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_register_complete_fanout_client(
+        &mut self,
+        client: Arc<UnixStorageNodeClient>,
+    ) {
+        let node_id = client.node_id();
+        let node = self.nodes.get_mut(&node_id).unwrap();
+        // Owner fixtures must classify the same endpoint they actually call.
+        // Otherwise a mixed cohort could silently apply to a shadow local store.
+        node.route_execution_endpoint =
+            LocalRouteExecutionEndpoint::for_rpc(client.test_execution_endpoint());
+        node.bucket_metadata_client = client.clone();
+        node.bucket_write_reservation_client = client.clone();
+        node.retained_bucket_write_reservation_client = client.clone();
+        node.metadata_command_inspection_client = client.clone();
+        node.metadata_command_client = client;
     }
 
     #[cfg(test)]

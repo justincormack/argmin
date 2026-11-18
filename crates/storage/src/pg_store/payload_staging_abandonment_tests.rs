@@ -77,7 +77,7 @@ pub(super) fn terminal(pg: &PgStore, source: &MetadataCommandEnvelope, abandoned
     }
     let before = pg.metadata_state_digest().unwrap();
     if abandoned {
-        pg.record_metadata_command_abandoned(0, source).unwrap();
+        record_source_abandoned(pg, source);
         assert_eq!(
             pg.metadata_state_digest().unwrap(),
             before,
@@ -91,9 +91,32 @@ pub(super) fn terminal(pg: &PgStore, source: &MetadataCommandEnvelope, abandoned
             before
         );
     } else {
-        pg.apply_metadata_command_and_record(0, source).unwrap();
+        let context = source_context(source);
+        pg.apply_complete_metadata_command_and_record(
+            0,
+            &context.encode_command().unwrap(),
+            &topology(),
+        )
+        .unwrap();
     }
     pg.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+}
+
+pub(super) fn source_context(
+    source: &MetadataCommandEnvelope,
+) -> super::super::command_context::ContextualCommand {
+    super::super::command_context::ContextualCommand::decode_field(
+        source.clone(),
+        &[1, 0, 0],
+        &topology(),
+    )
+    .unwrap()
+}
+
+pub(super) fn record_source_abandoned(pg: &PgStore, source: &MetadataCommandEnvelope) {
+    let context = source_context(source);
+    pg.test_record_complete_command_abandoned(0, &context.encode_command().unwrap())
+        .unwrap();
 }
 
 fn apply(
@@ -108,8 +131,8 @@ fn apply(
         )
         .unwrap()
     };
-    let source = PartFinalizationSource::capture(source).unwrap();
-    let source = PartFinalizationSource::decode(&source.encode()).unwrap();
+    let source = PartFinalizationSource::capture_for_test(source).unwrap();
+    let source = PartFinalizationSource::decode_for_test(&source.encode()).unwrap();
     apply_carrier(pg, &source, &decode(follow_up))
 }
 
@@ -391,7 +414,6 @@ fn staging_abandonment_requires_linked_exact_source_not_absence_or_started_publi
                 .test_insert_abandoned_metadata_command_log_entry(&source)
                 .unwrap(),
             "applied" => {
-                part::apply(&pg, &source).unwrap();
                 terminal(&pg, &source, false);
             }
             "started" => {

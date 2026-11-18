@@ -4,6 +4,9 @@
 //! Metadata-only transaction fixtures: no shard files or payload decryption.
 //! Real introduction/append/publication mutations run in one caller-owned txn.
 
+#[path = "payload_staging_object_retirement_tests.rs"]
+mod retirement;
+
 use super::super::object::{apply_in_open_transaction, ObjectError};
 use super::*;
 use crate::clock::with_time_and_monotonic_override;

@@ -18,11 +18,18 @@ pub(in super::super) mod reissue;
 #[path = "payload_staging_context_submission.rs"]
 mod contextual;
 
+pub(in crate::node_runtime) use contextual::RemoteDirectInstallationAttempt;
+pub(in crate::node_runtime) use contextual::RemoteDirectIntroductionAttempt;
+pub(in crate::node_runtime) use contextual::RemoteStreamAppendInstallationAttempt;
+
+pub(in super::super) use contextual::CompletePendingReplacement;
+pub(in super::super) use contextual::ContextualSubmission;
+pub(in super::super) use contextual::{ContextSubmissionObservation, SubmittedPublicationEvidence};
+
 #[cfg(test)]
 pub(in super::super) use contextual::{
-    ContextSubmissionObservation, ContextualEpochReissue, ContextualPartAbandonment,
-    ContextualPartAbandonmentReissue, ContextualReissue, ContextualReissueInspectionFailure,
-    ContextualReissuePreparationFailure, ContextualSubmission,
+    ContextualEpochReissue, ContextualPartAbandonment, ContextualPartAbandonmentReissue,
+    ContextualReissue, ContextualReissueInspectionFailure, ContextualReissuePreparationFailure,
     ContextualSubmissionPreparationFailure, EpochReissueInspectionFailure,
     FreshContextSubmissionError, PartAbandonmentPreparationFailure, PartAbandonmentReissueFailure,
     PartAbandonmentReissueInspectionFailure, PreparedContextualReissue,
@@ -44,6 +51,8 @@ pub(in super::super) enum InstallationObservation {
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum SubmissionError {
+    #[error(transparent)]
+    Carrier(#[from] super::command_context::CarrierError),
     #[error("staging submission cannot confirm installation inside an outer transaction")]
     OpenTransaction,
     #[error(transparent)]

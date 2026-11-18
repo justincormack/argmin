@@ -115,6 +115,7 @@ fn control_plane_rpc_catalogue_recovery_snapshot() -> ClusterRuntimeMapSnapshot 
             ClusterEpoch::INITIAL,
             NonZeroU64::new(10).unwrap(),
             11,
+            [0xA5; 32],
         ),
     ));
     snapshot
@@ -132,6 +133,7 @@ fn control_plane_rpc_catalogue_current_recovery_snapshot() -> ClusterRuntimeMapS
                 snapshot.cluster_epoch(),
                 NonZeroU64::new(12).unwrap(),
                 13,
+                [0xA5; 32],
             ),
         ));
     snapshot
@@ -301,6 +303,7 @@ fn control_plane_rpc_catalogue_heartbeat() -> NodeHeartbeat {
                         ClusterEpoch::new(u64::try_from(index).unwrap() + 11).unwrap(),
                         NonZeroU64::new(u64::try_from(index).unwrap() + 12).unwrap(),
                         u64::try_from(index).unwrap() + 13,
+                        [0xA5; 32],
                     )
                 }),
             })
@@ -616,6 +619,7 @@ fn control_plane_rpc_catalogue_recoveries() -> PendingMetadataCommandRecoveryLis
                     ClusterEpoch::new(9).unwrap(),
                     NonZeroU64::new(11).unwrap(),
                     13,
+                    [0xA5; 32],
                 ),
             ),
         )],
@@ -802,6 +806,7 @@ fn control_plane_rpc_catalogue_errors() -> Vec<ControlPlaneError> {
                 ClusterEpoch::new(4).unwrap(),
                 NonZeroU64::new(5).unwrap(),
                 6,
+                [0xA5; 32],
             ),
         },
         ControlPlaneError::PgMetadataMigrationSourceNotReady {
@@ -1401,7 +1406,7 @@ fn control_plane_rpc_v17_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v18_operation_catalogue_is_exact() {
+fn control_plane_rpc_v19_operation_catalogue_is_exact() {
     let historical = crate::tests::frozen_hex_fixture(include_str!(
         "../testdata/rpc_v18_canonical_v8_aggregate.hex"
     ));
@@ -1629,21 +1634,38 @@ fn control_plane_rpc_v18_operation_catalogue_is_exact() {
             "d6664e05b4b9be005dbb0dc85a3a38ab600fa7ae84daf23a6da9ec788567c6b5".to_owned()
         )
     );
+    let frozen = crate::tests::frozen_hex_fixture(include_str!(
+        "../testdata/rpc_v18_canonical_v10_aggregate.hex"
+    ));
     assert_eq!(
-        (
-            aggregate.len(),
-            hex_encode(&checksum::sha256::digest(&aggregate))
-        ),
+        (frozen.len(), hex_encode(&checksum::sha256::digest(&frozen))),
         (
             14_125,
             "a90661e5561a862c07fe3c94fa4488b90d580dc6efd7d4cc6e56e4ce9811b78e".to_owned()
         )
     );
+    let mut remaining = frozen.as_slice();
+    while !remaining.is_empty() {
+        remaining = &remaining[1..];
+        let (length, tail) = remaining.split_at(4);
+        let (bytes, tail) =
+            tail.split_at(usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap());
+        assert!(
+            matches!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(bytes)), Err(ControlPlaneError::RpcProtocol { diagnostic }) if diagnostic.as_str() == "unsupported control-plane RPC version 18")
+        );
+        remaining = tail;
+    }
+    assert_eq!(
+        aggregate,
+        crate::tests::frozen_hex_fixture(include_str!(
+            "../testdata/rpc_v19_canonical_v10_aggregate.hex"
+        ))
+    );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v14_through_v18_auth_v1_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 18);
+fn authenticated_control_plane_rpc_v14_through_v19_auth_v1_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 19);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1660,7 +1682,7 @@ fn authenticated_control_plane_rpc_v14_through_v18_auth_v1_payload_bindings_are_
             .unwrap();
     assert_eq!(request_envelope.payload(), &[0x00, 0x0c]);
     let request_frame = encode_control_plane_rpc_frame(kind, &request.payload).unwrap();
-    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x12"));
+    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x13"));
     let v14_request_frame =
         encode_control_plane_rpc_frame_with_version(kind, &request.payload, 14).unwrap();
     assert_eq!(
@@ -1761,10 +1783,25 @@ fn authenticated_control_plane_rpc_v14_through_v18_auth_v1_payload_bindings_are_
         )
     );
 
+    let mut old_request = request_frame.clone();
+    let mut old_response = response_frame.clone();
+    // The auth-v1 signed payload is unchanged; only outer v18 framing differs.
+    old_request = encode_control_plane_rpc_frame_with_version(
+        kind,
+        &old_request[CONTROL_PLANE_RPC_MAGIC.len() + 16..],
+        18,
+    )
+    .unwrap();
+    old_response = encode_control_plane_rpc_frame_with_version(
+        kind,
+        &old_response[CONTROL_PLANE_RPC_MAGIC.len() + 16..],
+        18,
+    )
+    .unwrap();
     assert_eq!(
         (
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame))
+            old_request.len(),
+            hex_encode(&checksum::sha256::digest(&old_request))
         ),
         (
             182,
@@ -1773,13 +1810,21 @@ fn authenticated_control_plane_rpc_v14_through_v18_auth_v1_payload_bindings_are_
     );
     assert_eq!(
         (
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame))
+            old_response.len(),
+            hex_encode(&checksum::sha256::digest(&old_response))
         ),
         (
             190,
             "4495d60d3e3b5cc2bd733ff0b9e92c28af038c505b61fd8718e68d5a8a908ad5".to_owned()
         )
+    );
+    assert_eq!(
+        hex_encode(&checksum::sha256::digest(&request_frame)),
+        "395f801671ecd79703728ae2a796ce9fc14d0fcb658bbbdcc5e7302245e3a7b1"
+    );
+    assert_eq!(
+        hex_encode(&checksum::sha256::digest(&response_frame)),
+        "92aff4ad3f25ab335ae755722a6c5e17e8c309d40cc8062d24ec54839ad6d6c4"
     );
 }
 
@@ -1998,6 +2043,7 @@ fn control_plane_rpc_preserves_pending_metadata_command_error_identity() {
         ClusterEpoch::new(41).unwrap(),
         NonZeroU64::new(17).unwrap(),
         0xfeed_beef,
+        [0xA5; 32],
     );
     let encoded = encode_control_plane_rpc_response(Err(
         ControlPlaneError::PgPeeringPendingMetadataCommand {
@@ -2175,6 +2221,7 @@ fn runtime_map_observation_retry_classification_uses_semantic_errors() {
                 ClusterEpoch::new(41).unwrap(),
                 NonZeroU64::new(17).unwrap(),
                 0xfeed_beef,
+                [0xA5; 32],
             ),
         },
         ControlPlaneError::AuthorityNotServing,
@@ -2898,6 +2945,7 @@ fn unix_control_plane_client_reads_pending_recoveries_without_runtime_map() {
                     ClusterEpoch::new(9).unwrap(),
                     NonZeroU64::new(11).unwrap(),
                     0x1234,
+                    [0xA5; 32],
                 ),
             ),
         )],
@@ -5316,6 +5364,7 @@ fn pg_acting_set_retry_waits_for_pending_and_unsafe_routes_before_resubmission()
         before.cluster_epoch(),
         NonZeroU64::new(3).unwrap(),
         0xfeed_beef,
+        [0xA5; 32],
     );
     let mut recovery = before.clone();
     recovery.cluster_epoch = ClusterEpoch::new(12).unwrap();
@@ -5596,6 +5645,7 @@ fn runtime_map_serving_gap_test_errors() -> [ControlPlaneError; 4] {
                 ClusterEpoch::new(2).unwrap(),
                 NonZeroU64::new(1).unwrap(),
                 0xfeed_beef,
+                [0xA5; 32],
             ),
         },
     ]
@@ -7048,7 +7098,8 @@ fn authenticated_heartbeat_response_carries_current_active_recovery_authorizatio
         false,
         2_020,
     );
-    let pending = PendingMetadataCommandObservation::new(active_epoch, NonZeroU64::MIN, 0x1234);
+    let pending =
+        PendingMetadataCommandObservation::new(active_epoch, NonZeroU64::MIN, 0x1234, [0xA5; 32]);
     let node_incarnation = node_incarnation(&authority, 1);
     let mut heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
@@ -10864,7 +10915,12 @@ fn control_plane_rpc_round_trips_historical_pending_command_recovery_authorizati
     snapshot.pg_routes[0].pending_metadata_command_recovery =
         Some(PendingMetadataCommandRecovery::new(
             NodeId::new(1),
-            PendingMetadataCommandObservation::new(ClusterEpoch::INITIAL, NonZeroU64::MIN, 0x1234),
+            PendingMetadataCommandObservation::new(
+                ClusterEpoch::INITIAL,
+                NonZeroU64::MIN,
+                0x1234,
+                [0xA5; 32],
+            ),
         ));
     snapshot
         .historical_cluster_epochs
@@ -10885,6 +10941,7 @@ fn control_plane_rpc_round_trips_current_active_pending_command_recovery_authori
                 snapshot.cluster_epoch(),
                 NonZeroU64::MIN,
                 0x1234,
+                [0xA5; 32],
             ),
         ));
 
@@ -10900,7 +10957,12 @@ fn control_plane_rpc_rejects_active_pending_recovery_from_non_current_epoch() {
     snapshot.pg_routes[0].pending_metadata_command_recovery =
         Some(PendingMetadataCommandRecovery::new(
             NodeId::new(1),
-            PendingMetadataCommandObservation::new(ClusterEpoch::INITIAL, NonZeroU64::MIN, 0x1234),
+            PendingMetadataCommandObservation::new(
+                ClusterEpoch::INITIAL,
+                NonZeroU64::MIN,
+                0x1234,
+                [0xA5; 32],
+            ),
         ));
 
     let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
@@ -10928,6 +10990,7 @@ fn control_plane_rpc_rejects_active_pending_recovery_from_non_primary_reporter()
                 snapshot.cluster_epoch(),
                 NonZeroU64::MIN,
                 0x1234,
+                [0xA5; 32],
             ),
         ));
 
@@ -10952,6 +11015,7 @@ fn control_plane_rpc_rejects_peering_pending_recovery_from_current_epoch() {
                 snapshot.cluster_epoch(),
                 NonZeroU64::MIN,
                 0x1234,
+                [0xA5; 32],
             ),
         ));
 
@@ -10969,7 +11033,12 @@ fn control_plane_rpc_rejects_pending_recovery_on_historical_route() {
     let mut historical = snapshot.pg_routes[0].without_serving_authority();
     historical.pending_metadata_command_recovery = Some(PendingMetadataCommandRecovery::new(
         NodeId::new(1),
-        PendingMetadataCommandObservation::new(ClusterEpoch::INITIAL, NonZeroU64::MIN, 0x1234),
+        PendingMetadataCommandObservation::new(
+            ClusterEpoch::INITIAL,
+            NonZeroU64::MIN,
+            0x1234,
+            [0xA5; 32],
+        ),
     ));
     snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
     snapshot.pg_routes[0].cluster_epoch = snapshot.cluster_epoch;

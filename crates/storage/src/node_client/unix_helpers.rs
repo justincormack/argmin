@@ -1901,7 +1901,7 @@ impl UnixStorageNodeClient {
         Ok(())
     }
 
-    pub(super) fn validate_direct_put_commit_snapshot_response(
+    pub(in crate::node_runtime) fn validate_direct_put_commit_snapshot_response(
         &self,
         snapshot: &DirectPutCommitStorageSnapshot,
         bucket: &BucketName,

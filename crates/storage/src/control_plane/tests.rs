@@ -267,9 +267,12 @@ fn control_plane_rpc_v16_frame_remains_rejected_evidence() {
 
 #[test]
 fn control_plane_rpc_v18_frame_encoding_is_exact() {
-    let frame =
-        encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
-            .unwrap();
+    let frame = encode_control_plane_rpc_frame_with_version(
+        ControlPlaneRpcKind::RuntimeMapStatus,
+        &[0x01, 0x02, 0x03],
+        18,
+    )
+    .unwrap();
 
     assert_eq!(
         frame,
@@ -277,6 +280,23 @@ fn control_plane_rpc_v18_frame_encoding_is_exact() {
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
             110, 101, 45, 114, 112, 99, 0, 18, 0, 12, 0, 0, 0, 3, 12, 61, 255, 12, 156, 154, 11,
             93, 1, 2, 3,
+        ]
+    );
+    assert!(
+        matches!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)), Err(ControlPlaneError::RpcProtocol {diagnostic}) if diagnostic.as_str() == "unsupported control-plane RPC version 18")
+    );
+}
+
+#[test]
+fn control_plane_rpc_v19_frame_encoding_is_exact() {
+    let frame =
+        encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[1, 2, 3]).unwrap();
+    assert_eq!(
+        frame,
+        [
+            97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
+            110, 101, 45, 114, 112, 99, 0, 19, 0, 12, 0, 0, 0, 3, 94, 78, 177, 175, 123, 188, 247,
+            9, 1, 2, 3
         ]
     );
 }
@@ -1417,7 +1437,7 @@ fn runtime_map_current_state_digest_v3_is_stable() {
     };
 
     assert_eq!(
-        runtime_map_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
+        frozen_v3_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
         [
             122, 23, 230, 153, 140, 165, 1, 61, 132, 101, 90, 83, 106, 114, 177, 144, 107, 128, 61,
             211, 179, 111, 196, 63, 160, 2, 97, 96, 185, 134, 124, 80,
@@ -1430,18 +1450,25 @@ fn runtime_map_current_state_digest_v3_is_stable() {
         .state_digest
         .encoding_version = 9;
     assert_eq!(
-        runtime_map_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
+        frozen_v3_current_state_digest(&control_snapshot, &historical_routes).as_bytes(),
         [
             16, 51, 80, 191, 215, 133, 78, 47, 217, 12, 168, 148, 191, 10, 254, 105, 72, 11, 171,
             178, 210, 141, 38, 176, 63, 19, 149, 150, 66, 164, 107, 118,
         ]
     );
     assert_eq!(
-        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        frozen_v3_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
         [
             164, 200, 177, 241, 82, 193, 229, 14, 62, 72, 82, 43, 114, 92, 74, 231, 180, 235, 43,
             198, 36, 172, 93, 119, 131, 119, 215, 81, 155, 47, 223, 219
         ]
+    );
+    assert_eq!(
+        hex_encode(
+            &runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes())
+                .as_bytes()
+        ),
+        "f4ecadd39f19a70beb8f972bcdfaa53c0cb58e368d57339b5cd9ede970d29873"
     );
 }
 
@@ -1613,15 +1640,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 30, 31, 33] {
+    for version in [28, 29, 30, 31, 32, 34] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(32)),
-        Ok(32)
+        require_current_control_plane_state_version(Some(33)),
+        Ok(33)
     );
 
     assert!(matches!(
@@ -1782,11 +1809,11 @@ fn canonical_control_plane_state_v30_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v32_text_is_exact() {
+fn canonical_control_plane_state_v33_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=32\n",
+            "version=33\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1860,7 +1887,7 @@ fn canonical_control_plane_state_v31_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
     let historical = crate::tests::frozen_hex_fixture(include_str!(
         "testdata/state_v32_canonical_v8_aggregate.hex"
     ));
@@ -2378,7 +2405,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=32\n",
+        "version=33\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2422,7 +2449,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
             tail.split_at(usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap());
         if let Err(error) = parse_snapshot(std::str::from_utf8(snapshot).unwrap()) {
             assert!(
-                matches!(error, ControlPlaneError::Parse { message, .. } if message == "unsupported canonical-state digest encoding version 9")
+                matches!(error, ControlPlaneError::Parse { message, .. } if message == "unsupported control-plane state version 32")
             );
             rejected += 1;
         }
@@ -2432,15 +2459,31 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         rejected > 0,
         "historical proof-bearing snapshots must be rejected"
     );
+    let frozen = crate::tests::frozen_hex_fixture(include_str!(
+        "testdata/state_v32_canonical_v10_aggregate.hex"
+    ));
     assert_eq!(
-        (
-            aggregate.len(),
-            hex_encode(&checksum::sha256::digest(&aggregate))
-        ),
+        (frozen.len(), hex_encode(&checksum::sha256::digest(&frozen))),
         (
             11_085,
             "631110a77132387a62727e0a83f850823ef5bcf7c818a21a6e03b08cc97cd607".to_owned()
         )
+    );
+    let mut remaining = frozen.as_slice();
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let (bytes, tail) =
+            tail.split_at(usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap());
+        assert!(
+            matches!(parse_snapshot(std::str::from_utf8(bytes).unwrap()), Err(ControlPlaneError::Parse { message, .. }) if message == "unsupported control-plane state version 32")
+        );
+        remaining = tail;
+    }
+    assert_eq!(
+        aggregate,
+        crate::tests::frozen_hex_fixture(include_str!(
+            "testdata/state_v33_canonical_v10_aggregate.hex"
+        ))
     );
 }
 
@@ -3595,7 +3638,7 @@ fn heartbeat_model_proof(seed: u8) -> PgMetadataProof {
 }
 
 fn test_pending_metadata_command(cluster_epoch: ClusterEpoch) -> PendingMetadataCommandObservation {
-    PendingMetadataCommandObservation::new(cluster_epoch, NonZeroU64::MIN, 0xfeed)
+    PendingMetadataCommandObservation::new(cluster_epoch, NonZeroU64::MIN, 0xfeed, [0xA5; 32])
 }
 
 #[test]
@@ -3636,10 +3679,18 @@ fn pending_recovery_listing_preserves_valid_task_after_other_pg_validation_failu
         pg.active_metadata_proof = None;
         pg.active_metadata_proof_epoch = None;
     }
-    let valid_pending =
-        PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0x1111);
-    let invalid_pending =
-        PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0x2222);
+    let valid_pending = PendingMetadataCommandObservation::new(
+        historical_epoch,
+        NonZeroU64::MIN,
+        0x1111,
+        [0xA5; 32],
+    );
+    let invalid_pending = PendingMetadataCommandObservation::new(
+        historical_epoch,
+        NonZeroU64::MIN,
+        0x2222,
+        [0xA5; 32],
+    );
     snapshot
         .nodes
         .get_mut(&primary)
@@ -6214,4 +6265,35 @@ fn control_plane_command_replay_matches_single_authority_snapshot() {
         ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 7).unwrap()
     );
     assert_eq!(replayed.cluster_map_history().len(), 7);
+}
+
+fn frozen_v3_current_state_digest(
+    snapshot: &ClusterControlSnapshot,
+    pg_routes: &[PgRouteSnapshot],
+) -> RuntimeMapContentDigest {
+    assert!(pg_routes
+        .iter()
+        .all(|r| r.pending_metadata_command_recovery.is_none()));
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(&mut hasher, b"argmin/runtime-map-current-state/v3");
+    digest_u64(&mut hasher, snapshot.cluster_epoch().get());
+    digest_len(&mut hasher, snapshot.nodes.len());
+    for node in snapshot.nodes() {
+        digest_u32(&mut hasher, node.node_id().as_u32());
+        digest_u64(&mut hasher, node.node_incarnation());
+        digest_bytes(&mut hasher, node.endpoint().as_bytes());
+        digest_option_u64(
+            &mut hasher,
+            node.cluster_map_history_floor_epoch()
+                .map(ClusterEpoch::get),
+        );
+    }
+    digest_pg_routes(&mut hasher, pg_routes);
+    let checksum = hasher.finalize();
+    RuntimeMapContentDigest::from_bytes(
+        checksum
+            .bytes()
+            .try_into()
+            .expect("SHA-256 current runtime-map digest must contain 32 bytes"),
+    )
 }

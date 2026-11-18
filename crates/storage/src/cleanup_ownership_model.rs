@@ -28,6 +28,7 @@ mod publication;
 mod renewal;
 mod replacement;
 mod retirement;
+mod settled_prefix;
 
 #[derive(Clone, Copy, Debug)]
 enum Protocol {

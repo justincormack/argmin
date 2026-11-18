@@ -239,12 +239,21 @@ impl ActiveWriteEncryption {
         subject: &storage::ObjectEncryptionSubject,
         checksum: Option<&ObjectChecksumMetadata>,
     ) -> Result<ObjectEncryption, ServerError> {
+        self.seal_committed_object_encryption_with_evidence(subject, checksum)
+            .map(storage::CommittedObjectEncryption::into_encryption)
+    }
+
+    pub(super) fn seal_committed_object_encryption_with_evidence(
+        &self,
+        subject: &storage::ObjectEncryptionSubject,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<storage::CommittedObjectEncryption, ServerError> {
         match &self.kind {
             ActiveWriteEncryptionKind::SseCustomer {
                 write: Some(write), ..
-            } => write.seal_committed_object_encryption(subject, checksum),
+            } => write.seal_committed_object_encryption_with_evidence(subject, checksum),
             ActiveWriteEncryptionKind::Managed { write, .. } => {
-                write.seal_committed_object_encryption(subject, checksum)
+                write.seal_committed_object_encryption_with_evidence(subject, checksum)
             }
             ActiveWriteEncryptionKind::SseCustomer { write: None, .. } => {
                 Err(ServerError::InvalidRequest {

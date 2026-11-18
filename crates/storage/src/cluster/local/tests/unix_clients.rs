@@ -1970,6 +1970,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         command_epoch,
         std::num::NonZeroU64::new(2).unwrap(),
         command.checksum_crc64(),
+        command.command_sha256(),
     );
     let recovery =
         crate::control_plane::PendingMetadataCommandRecovery::new(NodeId::new(0), pending);
@@ -2387,6 +2388,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_direct_put_generation() {
         command_epoch,
         std::num::NonZeroU64::MIN,
         source.checksum_crc64(),
+        source.command_sha256(),
     );
     let recovery = crate::control_plane::PendingMetadataCommandRecovery::new(node_id, pending);
     let historical_routes = pg_ids.map(|raw_pg_id| StorageNodePgRoute {
@@ -6701,6 +6703,7 @@ fn authenticated_unix_direct_put_recovers_across_delayed_route_transition_certif
                     source_epoch,
                     std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
                     command.checksum_crc64(),
+                    command.command_sha256(),
                 ),
             ),
         ));

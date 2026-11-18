@@ -267,7 +267,7 @@ fn staging_command_context_preserves_source_and_requires_durable_abandonment() {
         let owner = part::initialize(&pg, count);
         let source = part::command(&pg, &owner);
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
-        let carrier = PartFinalizationSource::capture(&source).unwrap();
+        let carrier = PartFinalizationSource::capture_for_test(&source).unwrap();
         let original_source = carrier.encode();
         let candidate = carrier.bind_cleanup(cleanup.clone(), &topology()).unwrap();
         let input = ContextualCommand::abandoned_part(candidate, &topology()).unwrap();
@@ -321,7 +321,9 @@ fn staging_command_context_source_bounds_and_wrong_command_fail_before_storage()
     let owner = part::initialize(&pg, 2);
     let source = part::command(&pg, &owner);
     let cleanup = abandonment::cleanup(&pg, &owner, &source);
-    let body = PartFinalizationSource::capture(&source).unwrap().encode();
+    let body = PartFinalizationSource::capture_for_test(&source)
+        .unwrap()
+        .encode();
     let valid = field(3, &body);
     let before = introduction::state(&pg);
     let writes = pg.conn.total_changes();
@@ -329,7 +331,7 @@ fn staging_command_context_source_bounds_and_wrong_command_fail_before_storage()
         ContextualCommand::decode_field(source.clone(), &valid, &topology()),
         Err(ContextError::CommandKind)
     ));
-    for length in [2 * 1024 * 1024 + 23, u32::MAX] {
+    for length in [2 * 1024 * 1024 + 26, u32::MAX] {
         let mut wrong = valid.clone();
         wrong[3..7].copy_from_slice(&length.to_le_bytes());
         assert!(matches!(
@@ -344,7 +346,7 @@ fn staging_command_context_source_bounds_and_wrong_command_fail_before_storage()
         );
     }
     let mut wrong = valid.clone();
-    wrong[7 + 8] = 2;
+    wrong[7 + 8] = 1; // retired source version
     assert!(matches!(
         ContextualCommand::decode_field(cleanup.clone(), &wrong, &topology()),
         Err(ContextError::Abandonment(_))
@@ -401,7 +403,9 @@ fn staging_command_context_cannot_be_downgraded_to_ordinary_abort() {
         let cleanup = abandonment::cleanup(&pg, &owner, &source);
         let bytes = field(
             3,
-            &PartFinalizationSource::capture(&source).unwrap().encode(),
+            &PartFinalizationSource::capture_for_test(&source)
+                .unwrap()
+                .encode(),
         );
         let topology = topology();
         let received = ContextualCommand::decode_field(cleanup.clone(), &bytes, &topology).unwrap();

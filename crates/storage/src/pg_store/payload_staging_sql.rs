@@ -5,6 +5,7 @@
 //! canonical/checkpoint inventory. Command integration remains incomplete;
 //! these records alone do not transfer frontend custody or authorize cleanup.
 
+use super::super::{metadata_transaction::MetadataTransaction, PgStore};
 use super::*;
 use crate::metadata_command::MetadataCommandLogIndex;
 use rusqlite::{params, types::FromSql, types::ValueRef, Connection, OptionalExtension, Row};
@@ -23,7 +24,7 @@ pub(in super::super) const ROUTE_REFERENCES: &str = "\
     UNION SELECT release_pg, cluster_epoch FROM payload_staging_resources";
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum PersistenceError {
+pub(in super::super) enum PersistenceError {
     #[error("staging persistence requires the enclosing metadata transaction")]
     TransactionRequired,
     #[error("staging owner belongs to another object PG")]
@@ -50,6 +51,19 @@ pub(super) enum PersistenceError {
     Invariant(#[from] StagingInvariant),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(Box<crate::StoreError>),
+    #[error("staging operation failed: {operation}; rollback failed: {rollback}")]
+    Rollback {
+        operation: String,
+        rollback: Box<crate::StoreError>,
+    },
+}
+
+impl From<crate::StoreError> for PersistenceError {
+    fn from(error: crate::StoreError) -> Self {
+        Self::Store(Box::new(error))
+    }
 }
 
 // No FK points at a session, upload, object, reclaim or reservation. Deleting
@@ -296,11 +310,16 @@ fn responsibility_tag<T>(resource: &ResourceResponsibility<T>) -> u8 {
 /// `configured_topology` must come from the owning node configuration, not from
 /// the record. Compare its complete canonical PG set before any SQL access.
 pub(super) fn insert(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     configured_topology: &PgTopology,
     owner: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -318,41 +337,82 @@ pub(super) fn insert(
     if exists.is_some() {
         return Err(PersistenceError::OwnerExists);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    insert_rows(conn, record)?;
-    savepoint.commit()?;
-    Ok(())
-}
-
-struct InsertionSavepoint<'a> {
-    conn: &'a Connection,
-    active: bool,
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = insert_rows(conn, record);
+    savepoint.finish(result)
 }
 
 /// The live metadata mutation and its ownership update must roll back together,
 /// even if the caller catches the error and commits unrelated outer work.
-pub(super) struct CommandApplySavepoint<'a>(&'a Connection, bool);
-
-impl<'a> CommandApplySavepoint<'a> {
-    pub(super) fn begin(conn: &'a Connection) -> rusqlite::Result<Self> {
-        conn.execute_batch("SAVEPOINT apply_payload_staging_command")?;
-        Ok(Self(conn, true))
-    }
-
-    pub(super) fn commit(mut self) -> rusqlite::Result<()> {
-        self.0
-            .execute_batch("RELEASE apply_payload_staging_command")?;
-        self.1 = false;
-        Ok(())
-    }
+/// This owner can only nest in an existing transaction; it cannot add a commit.
+pub(super) struct CommandApplySavepoint<'a> {
+    transaction: MetadataTransaction<'a>,
+    #[cfg(test)]
+    pg: &'a PgStore,
 }
 
-impl Drop for CommandApplySavepoint<'_> {
-    fn drop(&mut self) {
-        if self.1 {
-            let _ = self.0.execute_batch(
-                "ROLLBACK TO apply_payload_staging_command; RELEASE apply_payload_staging_command",
-            );
+#[cfg(test)]
+type FinishHook = Box<dyn FnOnce(&PgStore) -> Result<(), PersistenceError>>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_COMPONENT_FINISH: std::cell::RefCell<Option<FinishHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn test_with_before_component_finish<T>(
+    hook: impl FnOnce(&PgStore) -> Result<(), PersistenceError> + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<FinishHook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BEFORE_COMPONENT_FINISH.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(BEFORE_COMPONENT_FINISH.with(|slot| slot.replace(Some(Box::new(hook)))));
+    action()
+}
+
+impl<'a> CommandApplySavepoint<'a> {
+    pub(super) fn begin(pg: &'a PgStore) -> Result<Self, PersistenceError> {
+        pg.require_usable_connection()?;
+        if pg.conn.is_autocommit() {
+            return Err(PersistenceError::TransactionRequired);
+        }
+        Ok(Self {
+            transaction: MetadataTransaction::begin(pg, "begin staging component savepoint")?,
+            #[cfg(test)]
+            pg,
+        })
+    }
+
+    pub(super) fn finish<T, E>(self, result: Result<T, E>) -> Result<T, E>
+    where
+        E: std::fmt::Display + From<PersistenceError>,
+    {
+        #[cfg(test)]
+        let result = result.and_then(|value| {
+            if let Some(hook) = BEFORE_COMPONENT_FINISH.with(|slot| slot.borrow_mut().take()) {
+                hook(self.pg)?;
+            }
+            Ok(value)
+        });
+        match result {
+            Ok(value) => {
+                self.transaction
+                    .commit("release staging component savepoint")
+                    .map_err(PersistenceError::from)?;
+                Ok(value)
+            }
+            Err(error) => match self.transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(PersistenceError::Rollback {
+                    operation: error.to_string(),
+                    rollback: Box::new(rollback),
+                }
+                .into()),
+            },
         }
     }
 }
@@ -360,12 +420,17 @@ impl Drop for CommandApplySavepoint<'_> {
 /// Incremental ownership half of append, inside the command's transaction.
 /// Earlier descriptors/references and all resource obligations are immutable.
 pub(super) fn append_selection(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     configured_topology: &PgTopology,
     before: &CheckedStagingOwner<'_>,
     after: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -387,30 +452,37 @@ pub(super) fn append_selection(
     {
         return Err(PersistenceError::AppendConflict);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    insert_window(conn, &after.windows[before.windows.len()])?;
-    insert_reference(
-        conn,
-        &after.subject.id.attempt,
-        &after.references[before.references.len()],
-    )?;
-    conn.execute(
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        insert_window(conn, &after.windows[before.windows.len()])?;
+        insert_reference(
+            conn,
+            &after.subject.id.attempt,
+            &after.references[before.references.len()],
+        )?;
+        conn.execute(
         "UPDATE payload_staging_owners SET reserved_end = ?1, maximum_cutoff_ms = ?2 WHERE attempt = ?3",
         params![after.reserved_end.get(), after.maximum_cutoff_ms, after.subject.id.attempt],
     )?;
-    savepoint.commit()?;
-    Ok(())
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// The ownership half of ordinary release/abort. Only selected stream bindings
 /// disappear; every issued window, participant and exact resource survives.
 pub(super) fn close_unpublished(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     configured_topology: &PgTopology,
     before: &CheckedStagingOwner<'_>,
     after: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -424,33 +496,40 @@ pub(super) fn close_unpublished(
     {
         return Err(PersistenceError::CloseConflict);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    conn.execute(
-        "DELETE FROM payload_staging_references WHERE attempt = ?1",
-        [&before.subject.id.attempt],
-    )?;
-    conn.execute(
-        "UPDATE payload_staging_resources SET state = 2 WHERE attempt = ?1 AND state = 1",
-        [&before.subject.id.attempt],
-    )?;
-    conn.execute(
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        conn.execute(
+            "DELETE FROM payload_staging_references WHERE attempt = ?1",
+            [&before.subject.id.attempt],
+        )?;
+        conn.execute(
+            "UPDATE payload_staging_resources SET state = 2 WHERE attempt = ?1 AND state = 1",
+            [&before.subject.id.attempt],
+        )?;
+        conn.execute(
         "UPDATE payload_staging_owners SET lifecycle = ?1, generation_state = 2 WHERE attempt = ?2",
         params![lifecycle_tag(after.lifecycle), before.subject.id.attempt],
     )?;
-    savepoint.commit()?;
-    Ok(())
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// The abandonment follow-up's outer savepoint also encloses ordinary session
 /// closure. The tombstone itself never mutates materialized ownership.
 pub(super) fn retain_abandoned_part_finalization(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     topology: &PgTopology,
     closed: &CheckedStagingOwner<'_>,
     retained: &CheckedStagingOwner<'_>,
     finalization: &StagingBucketResource,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -472,39 +551,17 @@ pub(super) fn retain_abandoned_part_finalization(
     } else {
         closed.resources.abandoned_finalizations.len() + 2
     };
-    let savepoint = CommandApplySavepoint::begin(conn)?;
-    insert_resource(
-        conn,
-        &closed.subject.id.attempt,
-        role,
-        &ResourceResponsibility::ReleaseDue(finalization.clone()),
-    )?;
-    savepoint.commit()?;
-    Ok(())
-}
-
-impl<'a> InsertionSavepoint<'a> {
-    fn begin(conn: &'a Connection) -> Result<Self, rusqlite::Error> {
-        conn.execute_batch("SAVEPOINT insert_payload_staging_owner")?;
-        Ok(Self { conn, active: true })
-    }
-
-    fn commit(mut self) -> Result<(), rusqlite::Error> {
-        self.conn
-            .execute_batch("RELEASE insert_payload_staging_owner")?;
-        self.active = false;
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        insert_resource(
+            conn,
+            &closed.subject.id.attempt,
+            role,
+            &ResourceResponsibility::ReleaseDue(finalization.clone()),
+        )?;
         Ok(())
-    }
-}
-
-impl Drop for InsertionSavepoint<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            let _ = self.conn.execute_batch(
-                "ROLLBACK TO insert_payload_staging_owner; RELEASE insert_payload_staging_owner",
-            );
-        }
-    }
+    })();
+    savepoint.finish(result)
 }
 
 fn insert_rows(conn: &Connection, owner: &StagingOwnerRecord) -> Result<(), PersistenceError> {
@@ -640,13 +697,18 @@ pub(super) fn owner_for_part(
 /// are one SQL transition. The caller's outer savepoint also encloses part and
 /// session mutations. No window, participant or creation proof is rewritten.
 pub(super) fn publish_part(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     configured_topology: &PgTopology,
     before: &CheckedStagingOwner<'_>,
     after: &CheckedStagingOwner<'_>,
     displaced: Option<(&CheckedStagingOwner<'_>, &CheckedStagingOwner<'_>)>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -692,33 +754,35 @@ pub(super) fn publish_part(
     else {
         return Err(PersistenceError::PartConflict);
     };
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    insert_resource(
-        conn,
-        &after.subject.id.attempt,
-        1,
-        &after.resources.finalization,
-    )?;
-    conn.execute(
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        insert_resource(
+            conn,
+            &after.subject.id.attempt,
+            1,
+            &after.resources.finalization,
+        )?;
+        conn.execute(
         "UPDATE payload_staging_references SET destination = 1, upload_id = ?1, generation = ?2, part_number = ?3 WHERE attempt = ?4",
         params![upload_id, after.subject.payload_generation.get(), part_number, after.subject.id.attempt],
     )?;
-    conn.execute(
+        conn.execute(
         "UPDATE payload_staging_owners SET lifecycle = ?1, generation_state = 2 WHERE attempt = ?2",
         params![lifecycle_tag(after.lifecycle), after.subject.id.attempt],
     )?;
-    if let Some((old, retired)) = displaced {
-        conn.execute(
-            "DELETE FROM payload_staging_references WHERE attempt = ?1",
-            [&old.subject.id.attempt],
-        )?;
-        conn.execute(
-            "UPDATE payload_staging_owners SET lifecycle = ?1 WHERE attempt = ?2",
-            params![lifecycle_tag(retired.lifecycle), old.subject.id.attempt],
-        )?;
-    }
-    savepoint.commit()?;
-    Ok(())
+        if let Some((old, retired)) = displaced {
+            conn.execute(
+                "DELETE FROM payload_staging_references WHERE attempt = ?1",
+                [&old.subject.id.attempt],
+            )?;
+            conn.execute(
+                "UPDATE payload_staging_owners SET lifecycle = ?1 WHERE attempt = ?2",
+                params![lifecycle_tag(retired.lifecycle), old.subject.id.attempt],
+            )?;
+        }
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// Resolve the complete logical standard-object generation, even for an empty
@@ -751,12 +815,17 @@ pub(super) fn owner_for_standard(
 /// Publish the new standard owner inside the caller's manifest transaction.
 /// Displaced ownership uses the shared retained-reclaim transition below.
 pub(super) fn publish_standard(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     configured_topology: &PgTopology,
     before: &CheckedStagingOwner<'_>,
     after: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -770,38 +839,45 @@ pub(super) fn publish_standard(
     {
         return Err(PersistenceError::ObjectConflict);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    let attempt = &after.subject.id.attempt;
-    if before.subject.target == StagingTarget::DirectPut {
-        insert_reference(conn, attempt, &after.references[0])?;
-    } else {
-        conn.execute(
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        let attempt = &after.subject.id.attempt;
+        if before.subject.target == StagingTarget::DirectPut {
+            insert_reference(conn, attempt, &after.references[0])?;
+        } else {
+            conn.execute(
             "UPDATE payload_staging_references SET destination = 2, generation = ?1 WHERE attempt = ?2",
             params![after.subject.payload_generation.get(), attempt],
         )?;
-    }
-    conn.execute(
-        "UPDATE payload_staging_resources SET state = 2 WHERE attempt = ?1 AND role = 0",
-        [attempt],
-    )?;
-    conn.execute(
+        }
+        conn.execute(
+            "UPDATE payload_staging_resources SET state = 2 WHERE attempt = ?1 AND role = 0",
+            [attempt],
+        )?;
+        conn.execute(
         "UPDATE payload_staging_owners SET lifecycle = 1, generation_state = 2 WHERE attempt = ?1",
         [attempt],
     )?;
-    savepoint.commit()?;
-    Ok(())
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// Object-to-Reclaim handoff shared by PUT, MPU completion and both delete commands. The
 /// caller encloses live replacement, reclaim insertion and this transition in
 /// one rollback savepoint. No resource proof or physical window is released.
 pub(super) fn retain_object_reclaim(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     topology: &PgTopology,
     old: &CheckedStagingOwner<'_>,
     retired: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -815,17 +891,19 @@ pub(super) fn retain_object_reclaim(
     {
         return Err(PersistenceError::ObjectConflict);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    conn.execute(
-        "UPDATE payload_staging_references SET destination = 3 WHERE attempt = ?1",
-        [&old.subject.id.attempt],
-    )?;
-    conn.execute(
-        "UPDATE payload_staging_owners SET lifecycle = ?1 WHERE attempt = ?2",
-        params![lifecycle_tag(retired.lifecycle), old.subject.id.attempt],
-    )?;
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        conn.execute(
+            "UPDATE payload_staging_references SET destination = 3 WHERE attempt = ?1",
+            [&old.subject.id.attempt],
+        )?;
+        conn.execute(
+            "UPDATE payload_staging_owners SET lifecycle = ?1 WHERE attempt = ?2",
+            params![lifecycle_tag(retired.lifecycle), old.subject.id.attempt],
+        )?;
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// Include closed attempts as well: their evidence survives parent MPU removal.
@@ -860,12 +938,17 @@ pub(super) fn owners_for_object_generation(
 /// enclosing savepoint also protects the root and claim. This is not retirement
 /// or evidence of confirmed physical deletion/release.
 pub(super) fn complete_reclaim(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     topology: &PgTopology,
     before: &CheckedStagingOwner<'_>,
     after: &CheckedStagingOwner<'_>,
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
     }
@@ -879,17 +962,19 @@ pub(super) fn complete_reclaim(
     {
         return Err(PersistenceError::ObjectConflict);
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    conn.execute(
-        "DELETE FROM payload_staging_references WHERE attempt = ?1",
-        [&before.subject.id.attempt],
-    )?;
-    conn.execute(
-        "UPDATE payload_staging_owners SET lifecycle = 4 WHERE attempt = ?1",
-        [&before.subject.id.attempt],
-    )?;
-    savepoint.commit()?;
-    Ok(())
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        conn.execute(
+            "DELETE FROM payload_staging_references WHERE attempt = ?1",
+            [&before.subject.id.attempt],
+        )?;
+        conn.execute(
+            "UPDATE payload_staging_owners SET lifecycle = 4 WHERE attempt = ?1",
+            [&before.subject.id.attempt],
+        )?;
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 /// Include closed attempts as well: their evidence survives parent MPU removal.
@@ -917,7 +1002,7 @@ pub(super) fn owners_for_upload(
 /// The outer savepoint encloses upload/manifest/session removal and every
 /// transition here. No windows, participants, proof identities or cutoffs change.
 pub(super) fn transfer_multipart_ownership(
-    conn: &Connection,
+    pg: &PgStore,
     pg_id: PgId,
     topology: &PgTopology,
     transfers: &[(
@@ -926,6 +1011,11 @@ pub(super) fn transfer_multipart_ownership(
         CheckedStagingOwner<'_>,
     )],
 ) -> Result<(), PersistenceError> {
+    pg.require_usable_connection()?;
+    if pg.pg_id != pg_id.get() {
+        return Err(PersistenceError::WrongPg);
+    }
+    let conn = &pg.conn;
     use super::multipart::Disposition;
     if conn.is_autocommit() {
         return Err(PersistenceError::TransactionRequired);
@@ -945,34 +1035,36 @@ pub(super) fn transfer_multipart_ownership(
             return Err(PersistenceError::MultipartTransferConflict);
         }
     }
-    let savepoint = InsertionSavepoint::begin(conn)?;
-    for (disposition, before, after) in transfers {
-        let before = before.record_for_topology(topology)?;
-        let after = after.record_for_topology(topology)?;
-        let attempt = &before.subject.id.attempt;
-        match disposition {
-            Disposition::Selected => {
-                let StagingTarget::UploadPart {
-                    upload_generation, ..
-                } = before.subject.target
-                else {
-                    return Err(PersistenceError::MultipartTransferConflict);
-                };
-                conn.execute("UPDATE payload_staging_references SET destination = 2, upload_id = NULL, generation = ?1 WHERE attempt = ?2",
+    let savepoint = CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        for (disposition, before, after) in transfers {
+            let before = before.record_for_topology(topology)?;
+            let after = after.record_for_topology(topology)?;
+            let attempt = &before.subject.id.attempt;
+            match disposition {
+                Disposition::Selected => {
+                    let StagingTarget::UploadPart {
+                        upload_generation, ..
+                    } = before.subject.target
+                    else {
+                        return Err(PersistenceError::MultipartTransferConflict);
+                    };
+                    conn.execute("UPDATE payload_staging_references SET destination = 2, upload_id = NULL, generation = ?1 WHERE attempt = ?2",
                     params![upload_generation.get(), attempt])?;
-            }
-            Disposition::Omitted | Disposition::Active => {
-                conn.execute(
-                    "DELETE FROM payload_staging_references WHERE attempt = ?1",
-                    [attempt],
-                )?;
-                conn.execute("UPDATE payload_staging_owners SET lifecycle = ?1, generation_state = 2 WHERE attempt = ?2",
+                }
+                Disposition::Omitted | Disposition::Active => {
+                    conn.execute(
+                        "DELETE FROM payload_staging_references WHERE attempt = ?1",
+                        [attempt],
+                    )?;
+                    conn.execute("UPDATE payload_staging_owners SET lifecycle = ?1, generation_state = 2 WHERE attempt = ?2",
                     params![lifecycle_tag(after.lifecycle), attempt])?;
+                }
             }
         }
-    }
-    savepoint.commit()?;
-    Ok(())
+        Ok(())
+    })();
+    savepoint.finish(result)
 }
 
 fn insert_window(conn: &Connection, window: &StagingWindow) -> Result<(), PersistenceError> {
@@ -1375,6 +1467,189 @@ pub(super) fn load(
     }
     owner.validate_structure()?;
     Ok(Some(owner))
+}
+
+/// Retiring the creation slot must leave its exact durable cleanup owner intact.
+/// Validate only the immutable introduction and its creation obligation (live
+/// for Direct PUT, release-due for UploadPart):
+/// later appends/terminal transitions may legitimately extend this owner before
+/// a lost retirement reply is retried. No unbounded manifest/history scan and no
+/// reservation release or owner mutation occurs here.
+pub(super) fn require_creation_retirement(
+    conn: &Connection,
+    expected: &StagingOwnerRecord,
+    topology: &PgTopology,
+) -> Result<(), PersistenceError> {
+    if conn.is_autocommit() {
+        return Err(PersistenceError::TransactionRequired);
+    }
+    let subject = &expected.subject;
+    let attempt = &subject.id.attempt;
+    let initial = &expected.windows[0]; // Bound introduction, not a raw record.
+    let mut statement =
+        conn.prepare_cached("SELECT * FROM payload_staging_owners WHERE attempt = ?1")?;
+    let mut rows = statement.query([attempt])?;
+    let owner = read_owner(
+        rows.next()?
+            .ok_or(PersistenceError::Row("creation retirement owner missing"))?,
+    )?;
+    if owner.subject != *subject
+        || owner.reserved_end.get() < initial.end.get()
+        || owner.maximum_cutoff_ms < initial.cutoff_ms
+        || topology.object_pg_for(&subject.bucket, &subject.key) != subject.object_pg.get()
+        || subject.data_pg(topology, initial.index) != initial.participants.data_pg.get()
+    {
+        return Err(PersistenceError::Row("creation retirement owner differs"));
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT * FROM payload_staging_windows WHERE attempt = ?1 AND window_index = 0",
+    )?;
+    let mut rows = statement.query([attempt])?;
+    let mut window = read_window(
+        rows.next()?
+            .ok_or(PersistenceError::Row("creation retirement window missing"))?,
+        subject,
+    )?;
+    let mut statement = conn.prepare_cached(
+        "SELECT shard_index, node_id FROM payload_staging_participants \
+         WHERE attempt = ?1 AND window_index = 0 ORDER BY shard_index LIMIT 33",
+    )?;
+    let mut rows = statement.query([attempt])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, u32>(0)? as usize != window.participants.files.len()
+            || window.participants.files.len() == 32
+        {
+            return Err(StagingInvariant::Placement.into());
+        }
+        window.participants.files.push(NodeId::new(row.get(1)?));
+    }
+    window.validate(subject)?;
+    if window != *initial {
+        return Err(PersistenceError::Row("creation retirement window differs"));
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT * FROM payload_staging_resources WHERE attempt = ?1 AND role = 0",
+    )?;
+    let mut rows = statement.query([attempt])?;
+    let retained = read_resource(rows.next()?.ok_or(PersistenceError::Row(
+        "creation retirement resource missing",
+    ))?)?;
+    let proof = match (&subject.target, &retained) {
+        (StagingTarget::DirectPut, ResourceResponsibility::Live(proof))
+        | (StagingTarget::UploadPart { .. }, ResourceResponsibility::ReleaseDue(proof)) => proof,
+        _ => return Err(StagingInvariant::Resource.into()),
+    };
+    proof.validate(subject, subject.creation_operation())?;
+    if retained != expected.resources.creation
+        || proof.release_pg.get() != topology.bucket_pg_for(&subject.bucket)
+    {
+        return Err(PersistenceError::Row(
+            "creation retirement resource differs",
+        ));
+    }
+    let high_water = conn.query_row(
+        "SELECT max_committed_generation FROM object_write_counters WHERE bucket = ?1 AND key = ?2",
+        params![subject.bucket, subject.key], |row| row.get::<_, Option<u64>>(0),
+    ).optional()?.flatten();
+    subject.require_generation_high_water(high_water)?;
+    Ok(())
+}
+
+/// Bounded active-frontier observation under the caller's settled read snapshot.
+/// Never load all earlier windows/references or abandoned finalization history.
+/// This does not mint physical authority or repair invalidated prefix evidence.
+pub(super) fn require_current_window(
+    conn: &Connection,
+    subject: &StagingSubject,
+    expected: &StagingWindow,
+    creation: Option<&StagingBucketResource>,
+    topology: &PgTopology,
+) -> Result<(), PersistenceError> {
+    if conn.is_autocommit() {
+        return Err(PersistenceError::TransactionRequired);
+    }
+    let attempt = &subject.id.attempt;
+    let mut statement =
+        conn.prepare_cached("SELECT * FROM payload_staging_owners WHERE attempt = ?1")?;
+    let mut rows = statement.query([attempt])?;
+    let mut owner = read_owner(
+        rows.next()?
+            .ok_or(PersistenceError::Row("confirmation owner missing"))?,
+    )?;
+    if owner.subject != *subject
+        || owner.lifecycle != StagingLifecycle::Active
+        || owner.reserved_end != expected.end
+        || owner.maximum_cutoff_ms < expected.cutoff_ms
+        || topology.object_pg_for(&subject.bucket, &subject.key) != subject.object_pg.get()
+        || subject.data_pg(topology, expected.index) != expected.participants.data_pg.get()
+    {
+        return Err(PersistenceError::Row("confirmation owner/frontier differs"));
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT * FROM payload_staging_windows WHERE attempt = ?1 ORDER BY window_index DESC LIMIT 1",
+    )?;
+    let mut rows = statement.query([attempt])?;
+    let mut window = read_window(
+        rows.next()?
+            .ok_or(PersistenceError::Row("confirmation window missing"))?,
+        subject,
+    )?;
+    let mut statement = conn.prepare_cached(
+        "SELECT shard_index, node_id FROM payload_staging_participants \
+         WHERE attempt = ?1 AND window_index = ?2 ORDER BY shard_index LIMIT 33",
+    )?;
+    let mut rows = statement.query(rusqlite::params![attempt, window.index])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, u32>(0)? as usize != window.participants.files.len()
+            || window.participants.files.len() == 32
+        {
+            return Err(StagingInvariant::Placement.into());
+        }
+        window.participants.files.push(NodeId::new(row.get(1)?));
+    }
+    window.validate(subject)?;
+    if window != *expected {
+        return Err(PersistenceError::Row(
+            "confirmation immutable window differs",
+        ));
+    }
+    let mut statement = conn.prepare_cached(
+        "SELECT * FROM payload_staging_resources WHERE attempt = ?1 ORDER BY role LIMIT 2",
+    )?;
+    let mut rows = statement.query([attempt])?;
+    append_resource(
+        &mut owner,
+        rows.next()?.ok_or(PersistenceError::Row(
+            "confirmation creation resource missing",
+        ))?,
+    )?;
+    if rows.next()?.is_some() {
+        return Err(StagingInvariant::Resource.into());
+    }
+    owner.validate_resources()?;
+    let retained_creation = match &owner.resources.creation {
+        ResourceResponsibility::Live(proof) | ResourceResponsibility::ReleaseDue(proof) => proof,
+        ResourceResponsibility::NoResource => return Err(StagingInvariant::Resource.into()),
+    };
+    if retained_creation.release_pg.get() != topology.bucket_pg_for(&subject.bucket)
+        || creation.is_some_and(|proof| proof != retained_creation)
+    {
+        return Err(StagingInvariant::Resource.into());
+    }
+    let has_selected_window: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM payload_staging_references WHERE attempt = ?1 AND window_index >= ?2)",
+        rusqlite::params![attempt, window.index], |row| row.get(0),
+    )?;
+    if has_selected_window {
+        return Err(StagingInvariant::Reference.into());
+    }
+    use rusqlite::OptionalExtension;
+    let high_water = conn.query_row(
+        "SELECT max_committed_generation FROM object_write_counters WHERE bucket = ?1 AND key = ?2",
+        rusqlite::params![subject.bucket, subject.key], |row| row.get::<_, Option<u64>>(0),
+    ).optional()?.flatten();
+    subject.require_generation_high_water(high_water)?;
+    Ok(())
 }
 
 /// Validate the allocator fence in the complete checkpoint, not just the owner

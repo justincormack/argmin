@@ -14,8 +14,7 @@ use crate::node_runtime::traits::PgMetadataStore;
 use crate::{MetadataError, StoreError};
 use rusqlite::OptionalExtension;
 
-#[path = "payload_staging_abandonment_source.rs"]
-pub(super) mod source;
+pub(super) use super::command_context::finalization_source as source;
 
 /// Custody only, never a physical-cleanup or already-applied-command receipt.
 /// The enclosing acceptance boundary must still record this exact follow-up.
@@ -42,6 +41,10 @@ pub(in super::super) enum AbandonmentError {
     NotAbandoned,
     #[error("staging abandonment cleanup found conflicting terminal responsibility")]
     TerminalResponsibility,
+    #[error(
+        "staging abandonment published custody differs from the authenticated source manifest"
+    )]
+    PublishedManifest,
     #[error(transparent)]
     Closure(#[from] close::CloseError),
     #[error(transparent)]
@@ -156,7 +159,7 @@ fn retain_on_terminal_owner(
         return Ok(AbandonmentOutcome::AlreadyRetained);
     };
     sql::retain_abandoned_part_finalization(
-        &pg.conn,
+        pg,
         owner.subject.object_pg,
         topology,
         &owner.validate(topology)?,
@@ -166,7 +169,7 @@ fn retain_on_terminal_owner(
     Ok(AbandonmentOutcome::RetainedOnClosedOwner)
 }
 
-fn validate_part_closure_subject(
+pub(super) fn validate_part_closure_subject(
     topology: &PgTopology,
     abandoned: &MetadataCommandEnvelope,
     cleanup: &MetadataCommandEnvelope,
@@ -206,7 +209,7 @@ fn validate_part_closure_subject(
 // Shared by read-only primary inspection and replica apply. The bound input
 // prevents independent substitution of the source, follow-up or topology.
 // Success is an observation in THIS transaction, never cached apply authority.
-fn require_abandoned_source_in_open_transaction(
+pub(super) fn require_abandoned_source_in_open_transaction(
     pg: &PgStore,
     node_id: u32,
     bound: &source::BoundPartCleanup<'_>,
@@ -222,15 +225,12 @@ fn require_abandoned_source_in_open_transaction(
     // A raw tombstone row, pending slot, expired lease or missing command is
     // insufficient. Reuse the historical terminal-chain/receipt validator.
     if !matches!(
-        pg.metadata_command_startup_disposition(node_id, abandoned)?,
+        bound.inspect_source_terminal(pg, node_id)?,
         MetadataCommandStartupDisposition::Abandoned { .. }
     ) {
         return Err(AbandonmentError::NotAbandoned);
     }
-    if pg
-        .pending_metadata_command_slot_any_epoch(node_id)?
-        .is_some_and(|slot| slot.id == abandoned.id() && slot.publication_started)
-    {
+    if bound.source_has_started_publication(pg)? {
         return Err(AbandonmentError::NotAbandoned);
     }
     Ok(())
@@ -238,7 +238,7 @@ fn require_abandoned_source_in_open_transaction(
 
 // The deepest mutation boundary accepts only the private, source-bound view.
 // A caller cannot substitute another source, cleanup command or topology here.
-fn apply_part_closure_in_open_transaction(
+pub(super) fn apply_part_closure_in_open_transaction(
     pg: &PgStore,
     node_id: u32,
     bound: source::BoundPartCleanup<'_>,
@@ -278,18 +278,20 @@ fn apply_part_closure_in_open_transaction(
     let retained = closed.with_abandoned_part_finalization(&finalization)?;
     let checked_closed = closed.validate(topology)?;
     let checked_retained = retained.validate(topology)?;
-    let savepoint = sql::CommandApplySavepoint::begin(&pg.conn)?;
-    close::apply_in_open_transaction(pg, topology, cleanup)?;
-    sql::retain_abandoned_part_finalization(
-        &pg.conn,
-        PgId::new(pg.pg_id),
-        topology,
-        &checked_closed,
-        &checked_retained,
-        &finalization,
-    )?;
-    savepoint.commit()?;
-    Ok(AbandonmentOutcome::ClosedAndRetained)
+    let savepoint = sql::CommandApplySavepoint::begin(pg)?;
+    let result = (|| {
+        close::apply_in_open_transaction(pg, topology, cleanup)?;
+        sql::retain_abandoned_part_finalization(
+            pg,
+            PgId::new(pg.pg_id),
+            topology,
+            &checked_closed,
+            &checked_retained,
+            &finalization,
+        )?;
+        Ok(AbandonmentOutcome::ClosedAndRetained)
+    })();
+    savepoint.finish(result)
 }
 
 fn load_source_owner(
@@ -323,20 +325,125 @@ fn load_source_owner(
     Ok(owner)
 }
 
+/// Validate retained custody after exact cleanup application, without producing
+/// physical exclusion, release confirmation, or permission to retire a slot.
+/// The caller separately authenticates the complete cleanup's Applied receipt.
+pub(super) fn inspect_terminal_custody_in_open_transaction(
+    pg: &PgStore,
+    node_id: u32,
+    bound: source::BoundPartCleanup<'_>,
+) -> Result<(usize, usize, usize), AbandonmentError> {
+    require_abandoned_source_in_open_transaction(pg, node_id, &bound)?;
+    let (topology, source, cleanup) = bound.inputs();
+    let owner = load_source_owner(pg, topology, source)?;
+    let MetadataCommandPayload::CommitStreamPart(source) = source.payload() else {
+        unreachable!("bound source kind");
+    };
+    let MetadataCommandPayload::AbortStreamUpload(cleanup) = cleanup.payload() else {
+        unreachable!("bound cleanup kind");
+    };
+    if owner.lifecycle == StagingLifecycle::Active {
+        return Err(AbandonmentError::TerminalResponsibility);
+    }
+    let proof = StagingBucketResource::capture(
+        &source.bucket_write_reservation,
+        PgId::new(topology.bucket_pg_for(&source.bucket)),
+    );
+    // None means exact stable proof custody already exists. Some would describe
+    // a new transfer: inspection must reject, never silently perform or infer it.
+    if terminal_retention(pg, topology, &owner, &proof)?.is_some() {
+        return Err(AbandonmentError::TerminalResponsibility);
+    }
+    if matches!(
+        owner.lifecycle,
+        StagingLifecycle::Published
+            | StagingLifecycle::Retiring(
+                StagingRetirement::PublishedRetained | StagingRetirement::PublishedUnreferenced
+            )
+    ) {
+        require_published_source_manifest(&owner, source)?;
+    }
+    if owner.lifecycle == StagingLifecycle::Retiring(StagingRetirement::Unpublished) {
+        // Even an empty unpublished manifest owns exactly one unused lookahead
+        // window. Coherent allocator summaries cannot authorize extra windows.
+        if owner.windows.len() != cleanup.staged_segments.len() + 1 {
+            return Err(AbandonmentError::TerminalResponsibility);
+        }
+        for (index, segment) in cleanup.staged_segments.iter().enumerate() {
+            if segment.segment_index as usize != index {
+                return Err(AbandonmentError::Subject);
+            }
+            // Closure removed stream references, but retained every physical
+            // window, including the final unused lookahead window.
+            owner.selected_stream_reference(segment)?;
+        }
+    } else if !cleanup.staged_segments.is_empty() {
+        return Err(AbandonmentError::TerminalResponsibility);
+    }
+    Ok((
+        owner.windows.len(),
+        owner.references.len(),
+        owner.resources.abandoned_finalizations.len(),
+    ))
+}
+
+/// A published cleanup has no abort manifest. Bind the retained projection to
+/// the authenticated finalizer instead, even after publication transferred its
+/// destinations or removed references. Structural window/reference agreement
+/// alone cannot detect a coherent substitution of size or placement.
+fn require_published_source_manifest(
+    owner: &StagingOwnerRecord,
+    source: &crate::metadata_command::CommitStreamPartCommand,
+) -> Result<(), AbandonmentError> {
+    if owner.windows.len() != source.segments.len() + 1 {
+        return Err(AbandonmentError::PublishedManifest);
+    }
+    for (index, segment) in source.segments.iter().enumerate() {
+        let window = &owner.windows[index];
+        if segment.version_id != crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64()
+            || segment.segment_index as usize != index
+            || segment.segment_okh != window.segment_hash
+            || segment.segment_vid != window.start
+            || segment.size > window.geometry.logical_bound
+            || segment.data_pg_id != window.participants.data_pg.get()
+            || segment.placement_cluster_epoch != window.participants.placement_epoch
+            || segment.ec_k != window.geometry.ec.k
+            || segment.ec_m != window.geometry.ec.m
+            || window.geometry.codec != source.upload.encryption.payload_codec()
+        {
+            return Err(AbandonmentError::PublishedManifest);
+        }
+        // Owner validation has already pinned cardinality, ordering and the
+        // destination identity appropriate to the current lifecycle. A later
+        // Part -> Object -> Reclaim transition must not change payload identity.
+        if let Some(reference) = owner.references.get(index) {
+            if reference.window_index != segment.segment_index
+                || reference.segment_hash != segment.segment_okh
+                || reference.physical_vid != segment.segment_vid
+                || reference.logical_size != segment.size
+                || Some(reference.stored_size) != window.geometry.codec.stored_size(segment.size)
+            {
+                return Err(AbandonmentError::PublishedManifest);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build from the exact durable owner in the caller's pinned read snapshot.
 /// This neither records abandonment nor grants recovery or deletion authority.
 pub(super) fn capture_part_cleanup_in_open_transaction(
     pg: &PgStore,
     node_id: u32,
     topology: &PgTopology,
-    abandoned: &MetadataCommandEnvelope,
+    source: source::PartFinalizationSource,
     id: MetadataCommandId,
 ) -> Result<source::AbandonedPartCleanupCommand, AbandonmentError> {
     use crate::metadata_command::AbortStreamUploadCommand;
+    let abandoned = source.draft();
     let MetadataCommandPayload::CommitStreamPart(part) = abandoned.payload() else {
         return Err(AbandonmentError::Subject);
     };
-    let source = source::PartFinalizationSource::capture(abandoned)?;
     let mut abort = AbortStreamUploadCommand {
         bucket: part.bucket.clone(),
         key: part.key.clone(),

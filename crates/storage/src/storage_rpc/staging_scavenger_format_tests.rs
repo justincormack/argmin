@@ -81,8 +81,8 @@ fn page() -> ShardScavengerReferencePage {
 }
 
 #[test]
-fn staging_scavenger_v36_matches_frozen_request_and_response() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 36);
+fn staging_scavenger_v37_matches_frozen_request_and_response() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 37);
     let request = StorageRpcShardScavengerReferencePageRequest {
         route: StorageRpcBucketPgRequest {
             node_id: NodeId::new(7),
@@ -94,11 +94,11 @@ fn staging_scavenger_v36_matches_frozen_request_and_response() {
     };
     for (input, payload) in [
         (
-            include_str!("testdata/staging_scavenger_rpc_v36_request.hex"),
+            include_str!("testdata/staging_scavenger_rpc_v37_request.hex"),
             encode_shard_scavenger_reference_page_request(&request).unwrap(),
         ),
         (
-            include_str!("testdata/staging_scavenger_rpc_v36_response.hex"),
+            include_str!("testdata/staging_scavenger_rpc_v37_response.hex"),
             encode_storage_rpc_success_response(
                 &encode_shard_scavenger_reference_page_response(&page()).unwrap(),
             ),
@@ -118,7 +118,7 @@ fn staging_scavenger_v36_matches_frozen_request_and_response() {
         assert_eq!(decoded.payload, payload);
     }
     let request_frame = crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/staging_scavenger_rpc_v36_request.hex"
+        "testdata/staging_scavenger_rpc_v37_request.hex"
     ));
     let decoded =
         read_storage_rpc_request_frame_from(&mut std::io::Cursor::new(request_frame)).unwrap();
@@ -127,7 +127,7 @@ fn staging_scavenger_v36_matches_frozen_request_and_response() {
         request
     );
     let response_frame = decode_storage_rpc_frame(&crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/staging_scavenger_rpc_v36_response.hex"
+        "testdata/staging_scavenger_rpc_v37_response.hex"
     )))
     .unwrap();
     let response = decode_storage_rpc_response_payload(&response_frame.payload)
@@ -140,8 +140,8 @@ fn staging_scavenger_v36_matches_frozen_request_and_response() {
 }
 
 #[test]
-fn pending_staging_scavenger_v36_matches_frozen_request_and_response() {
-    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 36);
+fn pending_staging_scavenger_v37_matches_frozen_request_and_response() {
+    assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 37);
     let request = StorageRpcShardScavengerReferencePageRequest {
         route: StorageRpcBucketPgRequest {
             node_id: NodeId::new(7),
@@ -152,10 +152,10 @@ fn pending_staging_scavenger_v36_matches_frozen_request_and_response() {
         limit: NonZeroU16::new(64).unwrap(),
     };
     let request_bytes = crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/pending_staging_scavenger_rpc_v36_request.hex"
+        "testdata/pending_staging_scavenger_rpc_v37_request.hex"
     ));
     let response_bytes = crate::tests::frozen_hex_fixture(include_str!(
-        "testdata/pending_staging_scavenger_rpc_v36_response.hex"
+        "testdata/pending_staging_scavenger_rpc_v37_response.hex"
     ));
     for (bytes, payload) in [
         (
@@ -197,7 +197,7 @@ fn pending_staging_scavenger_v36_matches_frozen_request_and_response() {
 }
 
 #[test]
-fn pending_staging_scavenger_v36_rejects_malformed_and_crossed_evidence() {
+fn pending_staging_scavenger_v37_rejects_malformed_and_crossed_evidence() {
     let original = pending_page();
     let bytes = encode_shard_scavenger_reference_page_response(&original).unwrap();
     for end in 0..bytes.len() {
@@ -266,7 +266,7 @@ fn pending_staging_scavenger_v36_rejects_malformed_and_crossed_evidence() {
 }
 
 #[test]
-fn staging_scavenger_v36_rejects_malformed_participants_and_crossed_cursor() {
+fn staging_scavenger_v37_rejects_malformed_participants_and_crossed_cursor() {
     let original = page();
     let bytes = encode_shard_scavenger_reference_page_response(&original).unwrap();
     for end in 0..bytes.len() {

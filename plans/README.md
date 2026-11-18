@@ -30,10 +30,10 @@ documents.
    Make the six ignored Direct PUT and stream late-write regressions pass by
    establishing one storage-owned write/cleanup exclusion contract.
 2. Design and implement [bounded metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md)
-   as a separate workstream. Resolve the pre-existing durable/transport size
-   mismatch and aggregate-memory exposure without spool files or expanding the
-   storage interface. This gates cleanup-owner production activation, not its
-   ongoing protocol integration; the withdrawn paging experiment is not a fix.
+   as a separate workstream after cleanup ownership is complete. Resolve the
+   pre-existing durable/transport size mismatch and aggregate-memory exposure without spool files or expanding the
+   storage interface. This is not a dependency for cleanup-owner activation or
+   completion; the withdrawn paging experiment is not a fix.
 3. Resolve the remaining independent durability gaps recorded under
    [known gaps and required follow-up](../guides/durable-storage.md#known-gaps-and-required-follow-up):
    - [DUR-4](../guides/durable-storage.md#dur-4-mechanical-inventory-enforcement):
@@ -87,8 +87,8 @@ documents.
 
 | Status | Plan | Next bounded slice | Dependency or note |
 | --- | --- | --- | --- |
-| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Foundation checkpoint recorded; connect command descriptors, pending protection and frontend custody for coordinated activation. | Committing the foundations does not activate the protocol. Six ignored regressions remain unresolved. No added ordinary PUT/segment commit is the target. Checkpoint scalability is a separate activation dependency. |
-| Next | [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md) | Audit live PG sizes, capture allocations and the minimal bounded stream/transaction contract. | Separate workstream; no implementation active. No application spool files. Long receive transactions initially; database receive staging deferred. |
+| Active | [Durable generation cleanup ownership](durable-generation-cleanup-ownership.md) | Foundation checkpoint recorded; connect command descriptors, pending protection and frontend custody for coordinated activation. | Committing the foundations does not activate the protocol. Six ignored regressions remain unresolved. No added ordinary PUT/segment commit is the target. Checkpoint scalability is separate follow-up work scheduled after this plan completes, not an activation or completion dependency. |
+| Next | [Metadata checkpoint transfer](metadata-checkpoint-transfer-plan.md) | After cleanup ownership completes, audit live PG sizes, capture allocations and the minimal bounded stream/transaction contract. | Separate workstream, not a cleanup activation/completion dependency; no implementation active. No application spool files. Long receive transactions initially; database receive staging deferred. |
 | Active | [Multihost follow-up](multihost-followup-plan.md) | Reconcile the plan with landed replacement/capability work, then define the remaining release gate. | Keep outage and rejoin evidence authoritative. |
 | Active | [Bounded model checking](bounded-model-checking-plan.md) | Model the selected cleanup ownership protocol and its restart/transport interleavings. | Companion to production fixes. |
 | Active | [Background worker throttling](background-worker-throttling-plan.md) | Bound node/prefix/file work within one PG and expose worker metrics. | Required input to capacity policy. |
